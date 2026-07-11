@@ -1,0 +1,27 @@
+# Python caches and tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# Local environments and secrets
+.env
+.env.*
+.venv/
+venv/
+
+# IDE settings
+.idea/
+.vscode/
+
+# Zvec runtime data
+image_collection/
+image_collection.meta.json
+image_collection.state.json
+search_results/
+
+# Runtime logs
+zvec.log*
+*.log
