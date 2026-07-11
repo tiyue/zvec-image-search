@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from pathlib import Path
 from typing import Any
 
 
@@ -33,10 +32,14 @@ class FileFailure:
 @dataclass
 class ScanResult:
     scanned: int = 0
+    supported: int = 0
     skipped: int = 0
+    complete: bool = True
     seen_supported_ids: set[str] = field(default_factory=set)
+    fast_unchanged_ids: set[str] = field(default_factory=set)
     records: list[ImageRecord] = field(default_factory=list)
     failures: list[FileFailure] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -50,10 +53,13 @@ class IndexReport:
     unchanged: int = 0
     skipped: int = 0
     deleted: int = 0
+    would_delete: int = 0
+    sync_aborted: bool = False
     failed: int = 0
     api_requests: int = 0
     usage: list[dict[str, Any]] = field(default_factory=list)
     failures: list[FileFailure] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import os
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from PIL import Image
 
 from .models import FileFailure, ImageRecord, ScanResult
-
 
 SUPPORTED_EXTENSIONS = {
     ".jpg": "image/jpeg",
@@ -63,11 +64,25 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _iter_files(root: Path, recursive: bool):
+def _iter_files(root: Path, recursive: bool, result: ScanResult):
     if not recursive:
-        for entry in os.scandir(root):
-            if entry.is_file(follow_symlinks=False):
-                yield Path(entry.path)
+        try:
+            entries = list(os.scandir(root))
+        except OSError as exc:
+            result.complete = False
+            result.failures.append(
+                FileFailure(str(root), f"directory scan failed: {exc}")
+            )
+            return
+        for entry in entries:
+            try:
+                if entry.is_symlink():
+                    result.skipped += 1
+                elif entry.is_file(follow_symlinks=False):
+                    yield Path(entry.path)
+            except OSError as exc:
+                result.complete = False
+                result.failures.append(FileFailure(entry.path, str(exc)))
         return
 
     pending = [root]
@@ -75,15 +90,24 @@ def _iter_files(root: Path, recursive: bool):
         directory = pending.pop()
         try:
             entries = list(os.scandir(directory))
-        except OSError:
+        except OSError as exc:
+            result.complete = False
+            result.failures.append(
+                FileFailure(str(directory), f"directory scan failed: {exc}")
+            )
             continue
         for entry in entries:
-            if entry.is_symlink():
-                continue
-            if entry.is_dir(follow_symlinks=False):
-                pending.append(Path(entry.path))
-            elif entry.is_file(follow_symlinks=False):
-                yield Path(entry.path)
+            try:
+                if entry.is_symlink():
+                    result.skipped += 1
+                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append(Path(entry.path))
+                elif entry.is_file(follow_symlinks=False):
+                    yield Path(entry.path)
+            except OSError as exc:
+                result.complete = False
+                result.failures.append(FileFailure(entry.path, str(exc)))
 
 
 def inspect_image(path: Path, root: Path) -> ImageRecord:
@@ -91,9 +115,15 @@ def inspect_image(path: Path, root: Path) -> ImageRecord:
     if extension not in SUPPORTED_EXTENSIONS:
         raise ValueError(f"unsupported extension: {extension or '<none>'}")
 
-    actual_format, mime_type, width, height = inspect_image_content(path)
-
+    stat_before = path.stat()
+    _actual_format, mime_type, width, height = inspect_image_content(path)
+    sha256 = file_sha256(path)
     stat = path.stat()
+    if (stat.st_size, stat.st_mtime_ns) != (
+        stat_before.st_size,
+        stat_before.st_mtime_ns,
+    ):
+        raise RuntimeError("file changed while it was being scanned; run index again")
     resolved = path.resolve()
     return ImageRecord(
         doc_id=document_id(resolved),
@@ -103,7 +133,7 @@ def inspect_image(path: Path, root: Path) -> ImageRecord:
         file_name=resolved.name,
         extension=extension.lstrip("."),
         mime_type=mime_type,
-        sha256=file_sha256(resolved),
+        sha256=sha256,
         size_bytes=stat.st_size,
         mtime_ns=stat.st_mtime_ns,
         width=width,
@@ -111,20 +141,43 @@ def inspect_image(path: Path, root: Path) -> ImageRecord:
     )
 
 
-def scan_folder(folder_path: str | Path, recursive: bool = True) -> ScanResult:
+def scan_folder(
+    folder_path: str | Path,
+    recursive: bool = True,
+    previous_lookup: Callable[[str], dict[str, Any] | None] | None = None,
+    verify_hash: bool = False,
+) -> ScanResult:
     root = Path(folder_path).expanduser().resolve()
     if not root.is_dir():
         raise NotADirectoryError(root)
 
     result = ScanResult()
-    for path in _iter_files(root, recursive):
+    for path in _iter_files(root, recursive, result):
         result.scanned += 1
         if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
             result.skipped += 1
             continue
-        result.seen_supported_ids.add(document_id(path))
+        result.supported += 1
+        doc_id = document_id(path)
+        result.seen_supported_ids.add(doc_id)
         try:
-            result.records.append(inspect_image(path, root))
+            previous = previous_lookup(doc_id) if previous_lookup else None
+            stat = path.stat()
+            if (
+                previous
+                and not verify_hash
+                and int(previous["size_bytes"]) == stat.st_size
+                and int(previous["mtime_ns"]) == stat.st_mtime_ns
+                and previous["root_path"] == normalize_path(root)
+                and previous["absolute_path"] == str(path.resolve())
+            ):
+                record = ImageRecord(
+                    **{key: previous[key] for key in ImageRecord.__dataclass_fields__}
+                )
+                result.records.append(record)
+                result.fast_unchanged_ids.add(doc_id)
+            else:
+                result.records.append(inspect_image(path, root))
         except Exception as exc:
             result.failures.append(FileFailure(str(path), str(exc)))
     return result

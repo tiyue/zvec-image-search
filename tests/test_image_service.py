@@ -6,11 +6,17 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from PIL import Image
 
-from image_vector_service.config import ServiceConfig
-from image_vector_service.dashscope_client import EmbeddingResponse
+from image_vector_service.config import ConfigurationError, ServiceConfig
+from image_vector_service.dashscope_client import (
+    DashScopeEmbeddingClient,
+    DashScopeError,
+    EmbeddingResponse,
+)
+from image_vector_service.models import FileFailure, ScanResult
 from image_vector_service.service import ImageVectorService
 
 
@@ -51,6 +57,20 @@ class FakeEmbeddingClient:
         return [*rgb, 0.01, *([0.0] * (self.dimension - 4))]
 
 
+class GlobalErrorClient:
+    def __init__(self):
+        self.request_count = 0
+
+    def embed_images(self, _image_paths):
+        self.request_count += 1
+        raise DashScopeError(
+            "invalid API key",
+            status_code=401,
+            code="InvalidApiKey",
+            splittable=False,
+        )
+
+
 class ImageVectorServiceTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -74,6 +94,7 @@ class ImageVectorServiceTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        cls.service.close()
         del cls.service
         gc.collect()
         shutil.rmtree(cls.temp_dir, ignore_errors=True)
@@ -92,6 +113,13 @@ class ImageVectorServiceTest(unittest.TestCase):
         self.assertEqual(second.inserted, 0)
         self.assertEqual(second.updated, 0)
         self.assertEqual(self.fake_client.request_count, request_count)
+
+        with patch(
+            "image_vector_service.image_scanner.file_sha256",
+            side_effect=AssertionError("unchanged files should not be rehashed"),
+        ):
+            fast = self.service.index_folder(str(self.images_dir))
+        self.assertEqual(fast.unchanged, 3)
 
     def test_02_text_search_exports_new_directory(self):
         report = self.service.search_by_text("red image", top_k=2)
@@ -122,12 +150,77 @@ class ImageVectorServiceTest(unittest.TestCase):
         self.assertEqual(combined.result_count, 2)
         self.assertTrue(all(item.fused_score is not None for item in combined.results))
 
-    def test_04_sync_removes_missing_file(self):
+    def test_04_global_api_error_is_not_split(self):
+        Image.new("RGB", (20, 20), (0, 255, 0)).save(self.images_dir / "green.png")
+        Image.new("RGB", (20, 20), (255, 255, 0)).save(self.images_dir / "yellow.png")
+        error_client = GlobalErrorClient()
+        original_client = self.service._embedding_client
+        self.service._embedding_client = error_client
+        try:
+            with self.assertRaises(DashScopeError):
+                self.service.index_folder(str(self.images_dir))
+            self.assertEqual(error_client.request_count, 1)
+        finally:
+            self.service._embedding_client = original_client
+            (self.images_dir / "green.png").unlink()
+            (self.images_dir / "yellow.png").unlink()
+
+    def test_05_sync_is_fail_closed_and_supports_dry_run(self):
+        incomplete = ScanResult(
+            complete=False,
+            failures=[FileFailure(str(self.images_dir), "permission denied")],
+        )
+        with patch("image_vector_service.service.scan_folder", return_value=incomplete):
+            report = self.service.sync_folder(str(self.images_dir))
+        self.assertTrue(report.sync_aborted)
+        self.assertEqual(report.deleted, 0)
+        self.assertEqual(self.service.stats()["tracked_files"], 3)
+
         blue = self.images_dir / "blue.webp"
         blue.unlink()
+        dry_run = self.service.sync_folder(str(self.images_dir), dry_run=True)
+        self.assertEqual(dry_run.would_delete, 1)
+        self.assertEqual(dry_run.deleted, 0)
+        self.assertEqual(self.service.stats()["tracked_files"], 3)
+
         report = self.service.sync_folder(str(self.images_dir))
         self.assertEqual(report.deleted, 1)
         self.assertEqual(self.service.stats()["tracked_files"], 2)
+
+    def test_06_scope_change_and_concurrent_service_are_rejected(self):
+        with self.assertRaises(ConfigurationError):
+            self.service.sync_folder(str(self.images_dir), recursive=False)
+        with self.assertRaises(ConfigurationError):
+            ImageVectorService(
+                config=self.config,
+                embedding_client=FakeEmbeddingClient(self.config.dimension),
+            )
+
+    def test_07_new_collection_resets_stale_state(self):
+        self.service.repository.collection.destroy()
+        self.service.close()
+        replacement = ImageVectorService(
+            config=self.config,
+            embedding_client=self.fake_client,
+        )
+        self.service = replacement
+        self.__class__.service = replacement
+        self.assertTrue(replacement.state_reset)
+        self.assertEqual(replacement.stats()["tracked_files"], 0)
+
+    def test_08_limits_and_error_classification(self):
+        with self.assertRaises(ValueError):
+            self.service.search_by_text("red", top_k=self.config.max_top_k + 1)
+        self.assertTrue(
+            DashScopeEmbeddingClient._is_splittable_input_error(
+                400, "InvalidImage", "image format is invalid"
+            )
+        )
+        self.assertFalse(
+            DashScopeEmbeddingClient._is_splittable_input_error(
+                401, "InvalidApiKey", "invalid API key"
+            )
+        )
 
 
 if __name__ == "__main__":

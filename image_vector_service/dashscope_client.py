@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import base64
 import json
+import math
+import random
 import time
 import urllib.error
 import urllib.request
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -21,9 +24,21 @@ class EmbeddingResponse:
 
 
 class DashScopeError(RuntimeError):
-    def __init__(self, message: str, status_code: int | None = None):
+    def __init__(
+        self,
+        message: str,
+        status_code: int | None = None,
+        code: str = "",
+        splittable: bool = False,
+    ):
         super().__init__(message)
         self.status_code = status_code
+        self.code = code
+        self.splittable = splittable
+
+
+class ImageInputError(ValueError):
+    splittable = True
 
 
 class DashScopeEmbeddingClient:
@@ -45,9 +60,20 @@ class DashScopeEmbeddingClient:
         for path in image_paths:
             extension = path.suffix.lower()
             if extension not in SUPPORTED_EXTENSIONS:
-                raise ValueError(f"Unsupported image extension: {extension}")
-            _format, mime_type, _width, _height = inspect_image_content(path)
-            encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+                raise ImageInputError(f"Unsupported image extension: {extension}")
+            try:
+                size = path.stat().st_size
+            except OSError as exc:
+                raise ImageInputError(f"Cannot read image {path}: {exc}") from exc
+            if size > self.config.max_image_bytes:
+                raise ImageInputError(
+                    f"Image {path} exceeds {self.config.max_image_bytes} bytes."
+                )
+            try:
+                _format, mime_type, _width, _height = inspect_image_content(path)
+                encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+            except Exception as exc:
+                raise ImageInputError(f"Cannot encode image {path}: {exc}") from exc
             contents.append({"image": f"data:{mime_type};base64,{encoded}"})
         return self._embed(contents)
 
@@ -82,9 +108,13 @@ class DashScopeEmbeddingClient:
             if not isinstance(vector, list) or len(vector) != self.config.dimension:
                 actual = len(vector) if isinstance(vector, list) else "unknown"
                 raise DashScopeError(
-                    f"Expected vector dimension {self.config.dimension}, received {actual}."
+                    f"Expected vector dimension {self.config.dimension}, "
+                    f"received {actual}."
                 )
-            vectors.append([float(value) for value in vector])
+            converted = [float(value) for value in vector]
+            if not all(math.isfinite(value) for value in converted):
+                raise DashScopeError("Embedding contains NaN or infinite values.")
+            vectors.append(converted)
 
         return EmbeddingResponse(
             vectors=vectors,
@@ -94,9 +124,14 @@ class DashScopeEmbeddingClient:
 
     def _post_json(self, payload: dict[str, Any]) -> dict[str, Any]:
         request_data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        if len(request_data) > self.config.max_request_bytes:
+            raise ImageInputError(
+                f"Request payload exceeds {self.config.max_request_bytes} bytes."
+            )
         last_error: Exception | None = None
 
         for attempt in range(self.config.max_retries + 1):
+            retry_after: str | None = None
             request = urllib.request.Request(
                 self.config.api_url,
                 data=request_data,
@@ -115,25 +150,47 @@ class DashScopeEmbeddingClient:
                     return json.loads(response.read().decode("utf-8"))
             except urllib.error.HTTPError as exc:
                 status = exc.code
-                message = self._safe_error_message(exc)
-                last_error = DashScopeError(message, status)
+                code, message = self._safe_error_details(exc)
+                splittable = self._is_splittable_input_error(status, code, message)
+                last_error = DashScopeError(
+                    f"DashScope {code or 'HTTPError'}: {message}",
+                    status_code=status,
+                    code=code,
+                    splittable=splittable,
+                )
                 if status not in {408, 409, 429, 500, 502, 503, 504}:
                     raise last_error from exc
+                retry_after = exc.headers.get("Retry-After")
             except (urllib.error.URLError, TimeoutError, OSError) as exc:
                 last_error = DashScopeError(f"DashScope request failed: {exc}")
+                retry_after = None
 
             if attempt < self.config.max_retries:
-                time.sleep(self.config.retry_base_seconds * (2**attempt))
+                delay = self.config.retry_base_seconds * (2**attempt)
+                if retry_after:
+                    with suppress(ValueError):
+                        delay = max(delay, float(retry_after))
+                time.sleep(delay + random.uniform(0, delay * 0.2))
 
         assert last_error is not None
         raise last_error
 
     @staticmethod
-    def _safe_error_message(error: urllib.error.HTTPError) -> str:
+    def _safe_error_details(error: urllib.error.HTTPError) -> tuple[str, str]:
         try:
             body = json.loads(error.read().decode("utf-8"))
-            code = body.get("code") or "HTTPError"
-            message = body.get("message") or error.reason
-            return f"DashScope {code}: {message}"
+            code = str(body.get("code") or "")
+            message = str(body.get("message") or error.reason)
+            return code, message
         except Exception:
-            return f"DashScope HTTP {error.code}: {error.reason}"
+            return "", str(error.reason)
+
+    @staticmethod
+    def _is_splittable_input_error(status: int, code: str, message: str) -> bool:
+        if status not in {400, 413, 422}:
+            return False
+        text = f"{code} {message}".lower()
+        return any(
+            token in text
+            for token in ("image", "media", "file", "content", "base64", "format")
+        )

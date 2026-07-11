@@ -19,9 +19,12 @@ venv/
 # Zvec runtime data
 image_collection/
 image_collection.meta.json
-image_collection.state.json
+image_collection.state.json*
+image_collection.state.sqlite3*
+.image_collection.lock
 search_results/
 
 # Runtime logs
 zvec.log*
 *.log
+logs/

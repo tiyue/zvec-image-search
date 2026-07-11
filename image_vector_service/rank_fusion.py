@@ -31,7 +31,7 @@ def weighted_rrf(
             )
             hits.setdefault(hit.doc_id, hit)
 
-    ordered = sorted(scores, key=scores.get, reverse=True)
+    ordered = sorted(scores, key=lambda doc_id: scores[doc_id], reverse=True)
     return [
         replace(
             hits[doc_id],

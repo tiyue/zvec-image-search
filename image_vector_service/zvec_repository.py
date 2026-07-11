@@ -1,15 +1,15 @@
 from __future__ import annotations
 
 import json
+import uuid
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable
 
 import zvec
 
 from .config import ConfigurationError, ServiceConfig
 from .models import ImageRecord, SearchHit
-
 
 OUTPUT_FIELDS = [
     "root_path",
@@ -31,7 +31,9 @@ class ZvecImageRepository:
     def __init__(self, config: ServiceConfig):
         self.config = config
         self.config.validate()
-        self.collection = self._open_or_create()
+        self.created = False
+        self.collection, metadata = self._open_or_create()
+        self.collection_uuid = str(metadata["collection_uuid"])
 
     def _schema(self) -> zvec.CollectionSchema:
         return zvec.CollectionSchema(
@@ -72,27 +74,37 @@ class ZvecImageRepository:
             ],
         )
 
-    def _open_or_create(self) -> zvec.Collection:
+    def _open_or_create(self) -> tuple[zvec.Collection, dict]:
         path = self.config.collection_path
         meta_path = self.config.collection_meta_path
         if path.exists():
-            self._validate_metadata(meta_path)
-            return zvec.open(str(path))
+            metadata = self._validate_metadata(meta_path)
+            collection = zvec.open(str(path))
+            if not metadata.get("collection_uuid"):
+                metadata["collection_uuid"] = str(uuid.uuid4())
+                self._atomic_json_write(meta_path, metadata)
+            return collection, metadata
 
         path.parent.mkdir(parents=True, exist_ok=True)
         collection = zvec.create_and_open(str(path), self._schema())
+        self.created = True
         metadata = {
             "schema_version": 1,
+            "collection_uuid": str(uuid.uuid4()),
             "model": self.config.model,
             "mode": "independent",
             "dimension": self.config.dimension,
             "metric": self.config.metric,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
-        self._atomic_json_write(meta_path, metadata)
-        return collection
+        try:
+            self._atomic_json_write(meta_path, metadata)
+        except Exception:
+            collection.destroy()
+            raise
+        return collection, metadata
 
-    def _validate_metadata(self, meta_path: Path) -> None:
+    def _validate_metadata(self, meta_path: Path) -> dict:
         if not meta_path.is_file():
             raise ConfigurationError(
                 f"Collection metadata is missing: {meta_path}. Refusing to open it."
@@ -112,6 +124,7 @@ class ZvecImageRepository:
         }
         if mismatches:
             raise ConfigurationError(f"Collection metadata mismatch: {mismatches}")
+        return metadata
 
     @staticmethod
     def _atomic_json_write(path: Path, data: dict) -> None:
@@ -130,6 +143,13 @@ class ZvecImageRepository:
             return None
         vector = document.vectors.get("embedding")
         return list(vector) if vector is not None else None
+
+    def contains(self, doc_id: str) -> bool:
+        return bool(
+            self.collection.fetch(doc_id, output_fields=[], include_vector=False).get(
+                doc_id
+            )
+        )
 
     def upsert_records(
         self, records: list[ImageRecord], vector: list[float]
@@ -207,3 +227,7 @@ class ZvecImageRepository:
     @property
     def stats(self):
         return self.collection.stats
+
+    @property
+    def doc_count(self) -> int:
+        return int(self.collection.stats.doc_count)

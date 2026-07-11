@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zvec-image-search"
+version = "0.2.0"
+description = "Local multimodal image search with Alibaba Cloud Model Studio and Zvec"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "Pillow>=10.0",
+    "zvec==0.5.1",
+]
+
+[project.scripts]
+zvec-image-search = "image_service:main"
+
+[tool.setuptools]
+py-modules = ["image_service", "zvec_logging"]
+
+[tool.setuptools.packages.find]
+include = ["image_vector_service*"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+exclude = ["image_collection", "search_results", "logs"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+follow_imports = "skip"
+check_untyped_defs = true
+warn_unused_ignores = true
+exclude = "^(image_collection|search_results|logs)/"

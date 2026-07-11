@@ -1,15 +1,24 @@
 from __future__ import annotations
 
+import os
 from collections import defaultdict
+from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from pathlib import Path
-from typing import Callable, Iterable
 
 from zvec_logging import initialize_zvec
 
-from .config import ServiceConfig
-from .dashscope_client import DashScopeEmbeddingClient, EmbeddingResponse
+from .config import ConfigurationError, ServiceConfig
+from .dashscope_client import (
+    DashScopeEmbeddingClient,
+    DashScopeError,
+    EmbeddingResponse,
+    ImageInputError,
+)
 from .image_scanner import inspect_query_image, normalize_path, scan_folder
-from .models import FileFailure, ImageRecord, IndexReport, SearchReport
+from .models import FileFailure, ImageRecord, IndexReport, SearchHit, SearchReport
+from .process_lock import ProcessLock
 from .rank_fusion import weighted_rrf
 from .result_exporter import export_results
 from .state import IndexState
@@ -26,11 +35,27 @@ class ImageVectorService:
     ):
         self.config = config or ServiceConfig()
         self.config.validate()
-        initialize_zvec()
-        self.repository = repository or ZvecImageRepository(self.config)
-        self._embedding_client = embedding_client
-        self.state = IndexState(self.config.state_path)
         self.progress = progress or (lambda _message: None)
+        self._lock = ProcessLock(self.config.lock_path)
+        self._closed = False
+        self._lock.acquire()
+        try:
+            initialize_zvec(self.config.log_dir)
+            self.repository = repository or ZvecImageRepository(self.config)
+            self._embedding_client = embedding_client
+            self.state = IndexState(
+                self.config.state_path, legacy_path=self.config.legacy_state_path
+            )
+            self.state_reset = self.state.ensure_collection_uuid(
+                self.repository.collection_uuid,
+                reset_if_unbound=self.repository.created,
+            )
+            self.validate_documents = self.repository.doc_count != self.state.count()
+        except Exception:
+            if hasattr(self, "state"):
+                self.state.close()
+            self._lock.release()
+            raise
 
     @property
     def embedding_client(self):
@@ -39,29 +64,87 @@ class ImageVectorService:
         return self._embedding_client
 
     def index_folder(
-        self, folder_path: str, recursive: bool = True
+        self,
+        folder_path: str,
+        recursive: bool = True,
+        verify_hash: bool = False,
     ) -> IndexReport:
-        return self._index(folder_path, recursive=recursive, sync_deleted=False)
+        return self._index(
+            folder_path,
+            recursive=recursive,
+            sync_deleted=False,
+            verify_hash=verify_hash,
+            dry_run=False,
+            allow_scope_change=False,
+        )
 
     def sync_folder(
-        self, folder_path: str, recursive: bool = True
+        self,
+        folder_path: str,
+        recursive: bool = True,
+        verify_hash: bool = False,
+        dry_run: bool = False,
+        allow_scope_change: bool = False,
     ) -> IndexReport:
-        return self._index(folder_path, recursive=recursive, sync_deleted=True)
+        return self._index(
+            folder_path,
+            recursive=recursive,
+            sync_deleted=True,
+            verify_hash=verify_hash,
+            dry_run=dry_run,
+            allow_scope_change=allow_scope_change,
+        )
 
     def _index(
-        self, folder_path: str, recursive: bool, sync_deleted: bool
+        self,
+        folder_path: str,
+        recursive: bool,
+        sync_deleted: bool,
+        verify_hash: bool,
+        dry_run: bool,
+        allow_scope_change: bool,
     ) -> IndexReport:
         root = Path(folder_path).expanduser().resolve()
+        normalized_root = normalize_path(root)
+        overlap = self.state.find_overlapping_root(normalized_root)
+        if overlap:
+            raise ConfigurationError(
+                f"The folder overlaps an already indexed root: {overlap}. "
+                "Index one parent root or use a separate workspace."
+            )
+
+        previous_scope = self.state.root_scope(normalized_root)
+        if (
+            sync_deleted
+            and previous_scope is not None
+            and previous_scope != recursive
+            and not allow_scope_change
+        ):
+            raise ConfigurationError(
+                "The sync recursion scope differs from the original index. "
+                "Use the original scope or pass --allow-scope-change explicitly."
+            )
+
         self.progress(f"Scanning: {root}")
-        scan = scan_folder(root, recursive=recursive)
+        scan = scan_folder(
+            root,
+            recursive=recursive,
+            previous_lookup=self.state.get,
+            verify_hash=verify_hash,
+        )
         report = IndexReport(
-            root_path=normalize_path(root),
+            root_path=normalized_root,
             collection=str(self.config.collection_path),
             scanned=scan.scanned,
-            supported=len(scan.records) + len(scan.failures),
+            supported=scan.supported,
             skipped=scan.skipped,
             failures=list(scan.failures),
+            warnings=list(scan.warnings),
         )
+        if self.state_reset:
+            report.warnings.append(
+                "The Collection identity changed; stale incremental state was reset."
+            )
         self.progress(
             f"Found {len(scan.records)} valid images; skipped {scan.skipped}; "
             f"invalid {len(scan.failures)}."
@@ -71,7 +154,12 @@ class ImageVectorService:
         for record in scan.records:
             existing = self.state.get(record.doc_id)
             if existing == record.state_dict():
-                report.unchanged += 1
+                if self.validate_documents and not self.repository.contains(
+                    record.doc_id
+                ):
+                    groups[record.sha256].append(record)
+                else:
+                    report.unchanged += 1
                 continue
             groups[record.sha256].append(record)
 
@@ -90,33 +178,95 @@ class ImageVectorService:
         for records, vector in reusable:
             self._upsert_group(records, vector, report)
 
-        for start in range(0, len(pending), self.config.batch_size):
-            batch = pending[start : start + self.config.batch_size]
+        embeddable: list[tuple[str, list[ImageRecord]]] = []
+        for sha256, records in pending:
+            representative = records[0]
+            if representative.size_bytes > self.config.max_image_bytes:
+                message = (
+                    f"image exceeds configured limit of "
+                    f"{self.config.max_image_bytes} bytes"
+                )
+                report.failures.extend(
+                    FileFailure(record.absolute_path, message) for record in records
+                )
+            elif not _record_is_stable(representative):
+                report.failures.extend(
+                    FileFailure(
+                        record.absolute_path,
+                        "file changed after scanning; run index again",
+                    )
+                    for record in records
+                )
+            else:
+                embeddable.append((sha256, records))
+
+        processed = 0
+        for batch in self._embedding_batches(embeddable):
             self._embed_and_upsert_resilient(batch, report)
-            completed = min(start + len(batch), len(pending))
-            self.progress(f"Embedded {completed}/{len(pending)} unique images.")
+            processed += len(batch)
+            self.progress(f"Embedded {processed}/{len(embeddable)} unique images.")
 
         if sync_deleted:
-            current_ids = scan.seen_supported_ids
             stale_ids = sorted(
-                self.state.ids_for_root(normalize_path(root)) - current_ids
+                self.state.ids_for_root(normalized_root) - scan.seen_supported_ids
             )
-            for chunk in _chunks(stale_ids, 256):
-                succeeded, failures = self.repository.delete(chunk)
-                for doc_id in succeeded:
-                    self.state.remove(doc_id)
-                report.deleted += len(succeeded)
-                report.failures.extend(
-                    FileFailure(doc_id, error) for doc_id, error in failures.items()
+            report.would_delete = len(stale_ids)
+            if not scan.complete:
+                report.sync_aborted = True
+                report.warnings.append(
+                    "Deletion was skipped because one or more directories "
+                    "could not be scanned."
                 )
-                self.state.save()
+            elif dry_run:
+                report.warnings.append("Dry run: no stale records were deleted.")
+            else:
+                for chunk in _chunks(stale_ids, 256):
+                    succeeded, failures = self.repository.delete(chunk)
+                    self.state.remove_many(succeeded)
+                    report.deleted += len(succeeded)
+                    report.failures.extend(
+                        FileFailure(doc_id, error) for doc_id, error in failures.items()
+                    )
 
         if report.inserted or report.updated or report.deleted:
             self.progress("Optimizing Zvec indexes...")
             self.repository.optimize()
 
+        if previous_scope is None:
+            self.state.record_root(normalized_root, recursive)
+        elif recursive and not previous_scope:
+            self.state.record_root(normalized_root, True)
+        elif sync_deleted and allow_scope_change and scan.complete and not dry_run:
+            self.state.record_root(normalized_root, recursive)
+
         report.failed = len(report.failures)
+        if self.repository.doc_count != self.state.count():
+            report.warnings.append(
+                "Zvec and incremental-state counts differ; unchanged documents "
+                "were validated."
+            )
+        self.validate_documents = self.repository.doc_count != self.state.count()
         return report
+
+    def _embedding_batches(
+        self, pending: list[tuple[str, list[ImageRecord]]]
+    ) -> Iterable[list[tuple[str, list[ImageRecord]]]]:
+        batch: list[tuple[str, list[ImageRecord]]] = []
+        estimated_bytes = 0
+        for item in pending:
+            raw_size = item[1][0].size_bytes
+            encoded_size = 4 * ((raw_size + 2) // 3) + 256
+            if batch and (
+                len(batch) >= self.config.batch_size
+                or estimated_bytes + encoded_size > self.config.max_request_bytes
+            ):
+                yield batch
+                batch = []
+                estimated_bytes = 0
+            batch.append(item)
+            estimated_bytes += encoded_size
+        if batch:
+            yield batch
 
     def _embed_and_upsert_resilient(
         self,
@@ -131,27 +281,38 @@ class ImageVectorService:
                 [Path(records[0].absolute_path) for _sha, records in batch]
             )
             after = getattr(self.embedding_client, "request_count", before + 1)
-            report.api_requests += max(1, after - before)
-        except Exception as exc:
+            report.api_requests += max(0, after - before)
+        except (DashScopeError, ImageInputError) as exc:
             after = getattr(self.embedding_client, "request_count", before + 1)
-            report.api_requests += max(1, after - before)
-            if len(batch) > 1:
+            report.api_requests += max(0, after - before)
+            if getattr(exc, "splittable", False) and len(batch) > 1:
                 midpoint = len(batch) // 2
                 self._embed_and_upsert_resilient(batch[:midpoint], report)
                 self._embed_and_upsert_resilient(batch[midpoint:], report)
                 return
-            for record in batch[0][1]:
-                report.failures.append(FileFailure(record.absolute_path, str(exc)))
-            return
+            if getattr(exc, "splittable", False):
+                report.failures.extend(
+                    FileFailure(record.absolute_path, str(exc))
+                    for record in batch[0][1]
+                )
+                return
+            raise
 
         if response.request_id:
             report.usage.append(
                 {"request_id": response.request_id, "usage": response.usage}
             )
-        for (_sha256, records), vector in zip(
-            batch, response.vectors, strict=True
-        ):
-            self._upsert_group(records, vector, report)
+        for (_sha256, records), vector in zip(batch, response.vectors, strict=True):
+            if not _record_is_stable(records[0]):
+                report.failures.extend(
+                    FileFailure(
+                        record.absolute_path,
+                        "file changed during embedding; run index again",
+                    )
+                    for record in records
+                )
+            else:
+                self._upsert_group(records, vector, report)
 
     def _upsert_group(
         self,
@@ -160,35 +321,39 @@ class ImageVectorService:
         report: IndexReport,
     ) -> None:
         if len(vector) != self.config.dimension:
-            for record in records:
-                report.failures.append(
-                    FileFailure(
-                        record.absolute_path,
-                        f"invalid vector dimension: {len(vector)}",
-                    )
+            report.failures.extend(
+                FileFailure(
+                    record.absolute_path,
+                    f"invalid vector dimension: {len(vector)}",
                 )
+                for record in records
+            )
             return
 
         previous = {record.doc_id: self.state.get(record.doc_id) for record in records}
         succeeded, failures = self.repository.upsert_records(records, vector)
         by_id = {record.doc_id: record for record in records}
+        successful_entries = []
         for doc_id in succeeded:
             record = by_id[doc_id]
             if previous[doc_id] is None:
                 report.inserted += 1
             else:
                 report.updated += 1
-            self.state.set(doc_id, record.state_dict())
+            successful_entries.append(record.state_dict())
+        self.state.set_many(successful_entries)
         report.failures.extend(
             FileFailure(by_id[doc_id].absolute_path, error)
             for doc_id, error in failures.items()
         )
-        self.state.save()
 
     def search_by_text(self, text: str, top_k: int = 10) -> SearchReport:
         self._validate_top_k(top_k)
+        text = text.strip()
+        if not text:
+            raise ValueError("Search text cannot be empty.")
         response = self.embedding_client.embed_text(text)
-        hits = self.repository.query(response.vectors[0], self._candidate_count(top_k))
+        hits = self._query_until_sufficient(response.vectors[0], top_k)
         return export_results(
             self.config,
             query_type="text",
@@ -205,7 +370,10 @@ class ImageVectorService:
         self._validate_top_k(top_k)
         path = inspect_query_image(image_path)
         response = self.embedding_client.embed_images([path])
-        hits = self.repository.query(response.vectors[0], self._candidate_count(top_k))
+        exclude = None if include_self else str(path)
+        hits = self._query_until_sufficient(
+            response.vectors[0], top_k, exclude_path=exclude
+        )
         return export_results(
             self.config,
             query_type="image",
@@ -214,7 +382,7 @@ class ImageVectorService:
             query={"image": str(path)},
             request_ids=[response.request_id],
             usage=[response.usage],
-            exclude_path=None if include_self else str(path),
+            exclude_path=exclude,
         )
 
     def search_by_image_and_text(
@@ -227,17 +395,24 @@ class ImageVectorService:
         include_self: bool = False,
     ) -> SearchReport:
         self._validate_top_k(top_k)
+        self._validate_weights(image_weight, text_weight)
+        text = text.strip()
+        if not text:
+            raise ValueError("Search text cannot be empty.")
         path = inspect_query_image(image_path)
-        image_response = self.embedding_client.embed_images([path])
-        text_response = self.embedding_client.embed_text(text)
-        candidates = self._candidate_count(top_k)
-        image_hits = self.repository.query(image_response.vectors[0], candidates)
-        text_hits = self.repository.query(text_response.vectors[0], candidates)
-        fused_hits = weighted_rrf(
-            image_hits,
-            text_hits,
-            image_weight=image_weight,
-            text_weight=text_weight,
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            image_future = executor.submit(self.embedding_client.embed_images, [path])
+            text_future = executor.submit(self.embedding_client.embed_text, text)
+            image_response = image_future.result()
+            text_response = text_future.result()
+        exclude = None if include_self else str(path)
+        fused_hits = self._query_fused_until_sufficient(
+            image_response.vectors[0],
+            text_response.vectors[0],
+            top_k,
+            image_weight,
+            text_weight,
+            exclude,
         )
         return export_results(
             self.config,
@@ -252,34 +427,133 @@ class ImageVectorService:
             },
             request_ids=[image_response.request_id, text_response.request_id],
             usage=[image_response.usage, text_response.usage],
-            exclude_path=None if include_self else str(path),
+            exclude_path=exclude,
         )
+
+    def _query_until_sufficient(
+        self, vector: list[float], top_k: int, exclude_path: str | None = None
+    ) -> list[SearchHit]:
+        total = self.repository.doc_count
+        if total == 0:
+            return []
+        limit = min(total, max(top_k * 3, top_k + 10))
+        while True:
+            hits = self.repository.query(vector, limit)
+            if _usable_hit_count(hits, exclude_path) >= top_k or limit >= total:
+                return hits
+            limit = min(total, max(limit + 1, limit * 2))
+
+    def _query_fused_until_sufficient(
+        self,
+        image_vector: list[float],
+        text_vector: list[float],
+        top_k: int,
+        image_weight: float,
+        text_weight: float,
+        exclude_path: str | None,
+    ) -> list[SearchHit]:
+        total = self.repository.doc_count
+        if total == 0:
+            return []
+        limit = min(total, max(top_k * 3, top_k + 10))
+        while True:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                image_future = executor.submit(
+                    self.repository.query, image_vector, limit
+                )
+                text_future = executor.submit(self.repository.query, text_vector, limit)
+                image_hits = image_future.result()
+                text_hits = text_future.result()
+            fused = weighted_rrf(
+                image_hits,
+                text_hits,
+                image_weight=image_weight,
+                text_weight=text_weight,
+            )
+            if _usable_hit_count(fused, exclude_path) >= top_k or limit >= total:
+                return fused
+            limit = min(total, max(limit + 1, limit * 2))
 
     def stats(self) -> dict:
         collection_stats = self.repository.stats
         return {
+            "workspace": str(self.config.workspace),
             "collection": str(self.config.collection_path),
+            "collection_uuid": self.repository.collection_uuid,
             "collection_stats": {
                 "doc_count": int(collection_stats.doc_count),
                 "index_completeness": dict(collection_stats.index_completeness),
             },
-            "tracked_files": len(self.state.entries),
+            "tracked_files": self.state.count(),
             "model": self.config.model,
             "mode": "independent",
             "dimension": self.config.dimension,
             "metric": self.config.metric,
         }
 
-    @staticmethod
-    def _validate_top_k(top_k: int) -> None:
-        if top_k < 1:
-            raise ValueError("top_k must be at least 1.")
+    def _validate_top_k(self, top_k: int) -> None:
+        if not 1 <= top_k <= self.config.max_top_k:
+            raise ValueError(f"top_k must be between 1 and {self.config.max_top_k}.")
 
     @staticmethod
-    def _candidate_count(top_k: int) -> int:
-        return max(top_k * 3, top_k + 10)
+    def _validate_weights(image_weight: float, text_weight: float) -> None:
+        if image_weight < 0 or text_weight < 0 or image_weight + text_weight <= 0:
+            raise ValueError("Search weights must be non-negative and not both zero.")
+
+    def close(self) -> None:
+        if getattr(self, "_closed", True):
+            return
+        if hasattr(self, "state"):
+            self.state.close()
+        if hasattr(self, "_lock"):
+            self._lock.release()
+        self._closed = True
+
+    def __del__(self):
+        with suppress(Exception):
+            self.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _exc_type, _exc, _traceback):
+        self.close()
 
 
 def _chunks(values: list[str], size: int) -> Iterable[list[str]]:
     for start in range(0, len(values), size):
         yield values[start : start + size]
+
+
+def _record_is_stable(record: ImageRecord) -> bool:
+    try:
+        stat = Path(record.absolute_path).stat()
+    except OSError:
+        return False
+    return (stat.st_size, stat.st_mtime_ns) == (
+        record.size_bytes,
+        record.mtime_ns,
+    )
+
+
+def _usable_hit_count(hits: list[SearchHit], exclude_path: str | None) -> int:
+    normalized_exclude = (
+        os.path.normcase(str(Path(exclude_path).resolve())) if exclude_path else None
+    )
+    hashes: set[str] = set()
+    count = 0
+    for hit in hits:
+        source = Path(str(hit.fields.get("absolute_path") or ""))
+        if not source.is_file():
+            continue
+        if (
+            normalized_exclude
+            and os.path.normcase(str(source.resolve())) == normalized_exclude
+        ):
+            continue
+        sha256 = str(hit.fields.get("sha256") or "")
+        if sha256 and sha256 in hashes:
+            continue
+        hashes.add(sha256)
+        count += 1
+    return count

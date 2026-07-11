@@ -3,15 +3,23 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
 
 from image_vector_service import ImageVectorService
-from image_vector_service.config import ConfigurationError
+from image_vector_service.config import ConfigurationError, ServiceConfig
 from image_vector_service.dashscope_client import DashScopeError
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Local image vectorization and search with DashScope and Zvec."
+    )
+    parser.add_argument(
+        "--workspace",
+        help=(
+            "Runtime workspace. Defaults to the project directory or "
+            "ZVEC_IMAGE_WORKSPACE."
+        ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -26,6 +34,25 @@ def build_parser() -> argparse.ArgumentParser:
             action="store_true",
             help="Do not scan subfolders.",
         )
+        subparser.add_argument(
+            "--verify-hash",
+            action="store_true",
+            help=(
+                "Recompute SHA-256 even when size and modification time are unchanged."
+            ),
+        )
+
+    sync_parser = subparsers.choices["sync"]
+    sync_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report stale records without deleting them.",
+    )
+    sync_parser.add_argument(
+        "--allow-scope-change",
+        action="store_true",
+        help="Allow changing the recursive scope recorded for this root.",
+    )
 
     search = subparsers.add_parser("search", help="Search by text, image, or both.")
     search.add_argument("--text", help="Text query.")
@@ -41,15 +68,34 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    service = None
     try:
-        service = ImageVectorService(progress=lambda message: print(message, flush=True))
+        config = (
+            ServiceConfig(workspace=Path(args.workspace).expanduser().resolve())
+            if args.workspace
+            else ServiceConfig()
+        )
+        service = ImageVectorService(
+            config=config,
+            progress=lambda message: print(message, flush=True),
+        )
         if args.command in {"index", "sync"}:
-            method = (
-                service.index_folder if args.command == "index" else service.sync_folder
-            )
-            report = method(args.folder, recursive=not args.no_recursive)
-            print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
-            return 4 if report.failed else 0
+            if args.command == "index":
+                index_report = service.index_folder(
+                    args.folder,
+                    recursive=not args.no_recursive,
+                    verify_hash=args.verify_hash,
+                )
+            else:
+                index_report = service.sync_folder(
+                    args.folder,
+                    recursive=not args.no_recursive,
+                    verify_hash=args.verify_hash,
+                    dry_run=args.dry_run,
+                    allow_scope_change=args.allow_scope_change,
+                )
+            print(json.dumps(index_report.to_dict(), ensure_ascii=False, indent=2))
+            return 4 if index_report.failed else 0
 
         if args.command == "stats":
             print(json.dumps(service.stats(), ensure_ascii=False, indent=2))
@@ -58,7 +104,7 @@ def main(argv: list[str] | None = None) -> int:
         if not args.text and not args.image:
             raise ValueError("search requires --text, --image, or both.")
         if args.text and args.image:
-            report = service.search_by_image_and_text(
+            search_report = service.search_by_image_and_text(
                 image_path=args.image,
                 text=args.text,
                 top_k=args.top_k,
@@ -67,14 +113,14 @@ def main(argv: list[str] | None = None) -> int:
                 include_self=args.include_self,
             )
         elif args.image:
-            report = service.search_by_image(
+            search_report = service.search_by_image(
                 image_path=args.image,
                 top_k=args.top_k,
                 include_self=args.include_self,
             )
         else:
-            report = service.search_by_text(args.text, top_k=args.top_k)
-        print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
+            search_report = service.search_by_text(args.text, top_k=args.top_k)
+        print(json.dumps(search_report.to_dict(), ensure_ascii=False, indent=2))
         return 0
     except KeyboardInterrupt:
         print("Interrupted. Completed records remain indexed.", file=sys.stderr)
@@ -88,6 +134,12 @@ def main(argv: list[str] | None = None) -> int:
     except (FileNotFoundError, NotADirectoryError, PermissionError) as exc:
         print(f"Path error: {exc}", file=sys.stderr)
         return 3
+    except Exception as exc:
+        print(f"Unexpected error: {exc}", file=sys.stderr)
+        return 5
+    finally:
+        if service is not None:
+            service.close()
 
 
 if __name__ == "__main__":

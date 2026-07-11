@@ -109,7 +109,10 @@ def export_results(
         "created_at": datetime.now().astimezone().isoformat(),
         **report.to_dict(),
     }
-    (output_dir / "results.json").write_text(
+    manifest_path = output_dir / "results.json"
+    temporary_manifest = manifest_path.with_suffix(".json.tmp")
+    temporary_manifest.write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+    temporary_manifest.replace(manifest_path)
     return report
