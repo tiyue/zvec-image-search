@@ -7,7 +7,7 @@ from typing import Any
 @dataclass(frozen=True)
 class ImageRecord:
     doc_id: str
-    root_path: str
+    root_id: str
     relative_path: str
     absolute_path: str
     file_name: str
@@ -20,7 +20,9 @@ class ImageRecord:
     height: int
 
     def state_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        values = asdict(self)
+        values.pop("absolute_path")
+        return values
 
 
 @dataclass
@@ -78,8 +80,9 @@ class SearchHit:
 class ExportedHit:
     rank: int
     distance: float
-    source_path: str
-    copied_path: str
+    root_id: str
+    relative_path: str
+    copied_file: str
     doc_id: str
     fused_score: float | None = None
 

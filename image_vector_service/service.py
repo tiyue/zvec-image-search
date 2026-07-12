@@ -19,16 +19,16 @@ from .dashscope_client import (
     ImageInputError,
 )
 from .image_scanner import (
-    document_id,
     file_sha256,
     inspect_query_image,
-    normalize_path,
     scan_folder,
 )
+from .logical_paths import normalize_path
 from .models import FileFailure, ImageRecord, IndexReport, SearchHit, SearchReport
 from .process_lock import ProcessLock
 from .rank_fusion import weighted_rrf
 from .result_exporter import clean_result_directories, export_results
+from .source_resolver import SourcePathResolver
 from .state import IndexState
 from .zvec_repository import ZvecImageRepository
 
@@ -59,6 +59,7 @@ class ImageVectorService:
                 self.repository.collection_uuid,
                 reset_if_unbound=self.repository.created,
             )
+            self.source_resolver = SourcePathResolver(self.state)
             self.validate_documents = self.repository.doc_count != self.state.count()
         except Exception:
             if hasattr(self, "state"):
@@ -117,14 +118,16 @@ class ImageVectorService:
     ) -> IndexReport:
         root = Path(folder_path).expanduser().resolve()
         normalized_root = normalize_path(root)
+        root_info = self.state.root_for_path(normalized_root)
         overlap = self.state.find_overlapping_root(normalized_root)
-        if overlap:
+        if root_info is None and overlap:
             raise ConfigurationError(
-                f"The folder overlaps an already indexed root: {overlap}. "
+                "The folder overlaps an already indexed root: "
+                f"{overlap['current_path']}. "
                 "Index one parent root or use a separate workspace."
             )
 
-        previous_scope = self.state.root_scope(normalized_root)
+        previous_scope = bool(root_info["recursive"]) if root_info else None
         if (
             sync_deleted
             and previous_scope is not None
@@ -135,6 +138,11 @@ class ImageVectorService:
                 "The sync recursion scope differs from the original index. "
                 "Use the original scope or pass --allow-scope-change explicitly."
             )
+        root_id = (
+            str(root_info["root_id"])
+            if root_info
+            else self.state.ensure_root(normalized_root, recursive)
+        )
 
         self.progress(f"Scanning: {root}")
         self.logger.info(
@@ -145,6 +153,7 @@ class ImageVectorService:
         )
         scan = scan_folder(
             root,
+            root_id,
             recursive=recursive,
             previous_lookup=self.state.get,
             verify_hash=verify_hash,
@@ -225,7 +234,7 @@ class ImageVectorService:
 
         if sync_deleted:
             stale_ids = sorted(
-                self.state.ids_for_root(normalized_root) - scan.seen_supported_ids
+                self.state.ids_for_root(root_id) - scan.seen_supported_ids
             )
             report.would_delete = len(stale_ids)
             if not scan.complete:
@@ -250,11 +259,11 @@ class ImageVectorService:
             self.repository.optimize()
 
         if previous_scope is None:
-            self.state.record_root(normalized_root, recursive)
+            self.state.record_root(root_id, normalized_root, recursive)
         elif recursive and not previous_scope:
-            self.state.record_root(normalized_root, True)
+            self.state.record_root(root_id, normalized_root, True)
         elif sync_deleted and allow_scope_change and scan.complete and not dry_run:
-            self.state.record_root(normalized_root, recursive)
+            self.state.record_root(root_id, normalized_root, recursive)
 
         report.failed = len(report.failures)
         if self.repository.doc_count != self.state.count():
@@ -390,6 +399,7 @@ class ImageVectorService:
             query={"text": text},
             request_ids=[request_id],
             usage=[usage] if usage else [],
+            resolve_source=self.source_resolver.resolve_hit,
             embedding_sources={"text": source},
         )
         self._log_search(report)
@@ -408,9 +418,10 @@ class ImageVectorService:
             query_type="image",
             hits=hits,
             top_k=top_k,
-            query={"image": str(path)},
+            query={"image": path.name},
             request_ids=[request_id],
             usage=[usage] if usage else [],
+            resolve_source=self.source_resolver.resolve_hit,
             embedding_sources={"image": source},
             exclude_path=exclude,
         )
@@ -480,13 +491,14 @@ class ImageVectorService:
             hits=fused_hits,
             top_k=top_k,
             query={
-                "image": str(path),
+                "image": path.name,
                 "text": text,
                 "image_weight": image_weight,
                 "text_weight": text_weight,
             },
             request_ids=[response.request_id for response in responses.values()],
             usage=[response.usage for response in responses.values()],
+            resolve_source=self.source_resolver.resolve_hit,
             embedding_sources={
                 "image": image_source or "unknown",
                 "text": text_source or "unknown",
@@ -527,13 +539,12 @@ class ImageVectorService:
         self, path: Path
     ) -> tuple[str, list[float] | None, str | None, str]:
         stat = path.stat()
-        doc_id = document_id(path)
-        entry = self.state.get(doc_id)
+        entry = self.state.find_entry_for_path(path)
         if entry and (entry["size_bytes"], entry["mtime_ns"]) == (
             stat.st_size,
             stat.st_mtime_ns,
         ):
-            vector = self.repository.fetch_vector(doc_id)
+            vector = self.repository.fetch_vector(str(entry["doc_id"]))
             if vector is not None:
                 return "", vector, "index", str(entry["sha256"])
 
@@ -583,7 +594,11 @@ class ImageVectorService:
         limit = min(total, max(top_k * 3, top_k + 10))
         while True:
             hits = self.repository.query(vector, limit)
-            if _usable_hit_count(hits, exclude_path) >= top_k or limit >= total:
+            if (
+                _usable_hit_count(hits, exclude_path, self.source_resolver.resolve_hit)
+                >= top_k
+                or limit >= total
+            ):
                 return hits
             limit = min(total, max(limit + 1, limit * 2))
 
@@ -614,7 +629,11 @@ class ImageVectorService:
                 image_weight=image_weight,
                 text_weight=text_weight,
             )
-            if _usable_hit_count(fused, exclude_path) >= top_k or limit >= total:
+            if (
+                _usable_hit_count(fused, exclude_path, self.source_resolver.resolve_hit)
+                >= top_k
+                or limit >= total
+            ):
                 return fused
             limit = min(total, max(limit + 1, limit * 2))
 
@@ -629,6 +648,7 @@ class ImageVectorService:
                 "index_completeness": dict(collection_stats.index_completeness),
             },
             "tracked_files": self.state.count(),
+            "roots": self.state.list_roots(),
             "embedding_cache": self.state.cache_stats(),
             "model": self.config.model,
             "mode": "independent",
@@ -640,6 +660,20 @@ class ImageVectorService:
         deleted = self.state.clear_cache()
         self.logger.info("cache_clear deleted=%d", deleted)
         return {"deleted": deleted}
+
+    def list_roots(self) -> list[dict]:
+        return self.state.list_roots()
+
+    def rebind_root(self, root_id: str, new_path: str) -> dict[str, object]:
+        report = self.state.rebind_root(root_id, new_path)
+        missing = 0
+        for entry in self.state.entries_for_root(root_id):
+            source = self.source_resolver.resolve_fields(entry)
+            if not source.is_file():
+                missing += 1
+        report["missing_files"] = missing
+        self.logger.info("root_rebind missing_files=%d", missing)
+        return report
 
     def clean_results(
         self, older_than_days: int, dry_run: bool = False
@@ -708,14 +742,21 @@ def _record_is_stable(record: ImageRecord) -> bool:
     )
 
 
-def _usable_hit_count(hits: list[SearchHit], exclude_path: str | None) -> int:
+def _usable_hit_count(
+    hits: list[SearchHit],
+    exclude_path: str | None,
+    resolve_source: Callable[[SearchHit], Path],
+) -> int:
     normalized_exclude = (
         os.path.normcase(str(Path(exclude_path).resolve())) if exclude_path else None
     )
     hashes: set[str] = set()
     count = 0
     for hit in hits:
-        source = Path(str(hit.fields.get("absolute_path") or ""))
+        try:
+            source = resolve_source(hit)
+        except (OSError, ValueError, ConfigurationError):
+            continue
         if not source.is_file():
             continue
         if (

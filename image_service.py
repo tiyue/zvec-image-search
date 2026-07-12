@@ -8,6 +8,7 @@ from pathlib import Path
 from image_vector_service import ImageVectorService
 from image_vector_service.config import ConfigurationError, ServiceConfig
 from image_vector_service.dashscope_client import DashScopeError
+from image_vector_service.path_migration import migrate_path_schema
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -63,6 +64,21 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("--include-self", action="store_true")
 
     subparsers.add_parser("stats", help="Show collection statistics.")
+    subparsers.add_parser("roots", help="List registered image roots.")
+    rebind = subparsers.add_parser(
+        "rebind-root", help="Bind an indexed root to a new local folder."
+    )
+    rebind.add_argument("root_id", help="Stable root identifier shown by roots.")
+    rebind.add_argument("folder", help="New local folder path.")
+    migrate = subparsers.add_parser(
+        "migrate-path-schema",
+        help="Migrate absolute-path V1 records to portable V2 records.",
+    )
+    migrate.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate and preview the migration without changing data.",
+    )
     subparsers.add_parser("cache-clear", help="Delete cached query embeddings.")
     clean = subparsers.add_parser(
         "clean-results", help="Delete old search result directories."
@@ -90,6 +106,15 @@ def main(argv: list[str] | None = None) -> int:
             if args.workspace
             else ServiceConfig()
         )
+        if args.command == "migrate-path-schema":
+            print(
+                json.dumps(
+                    migrate_path_schema(config, dry_run=args.dry_run),
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return 0
         service = ImageVectorService(
             config=config,
             progress=lambda message: print(message, flush=True),
@@ -114,6 +139,20 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "stats":
             print(json.dumps(service.stats(), ensure_ascii=False, indent=2))
+            return 0
+
+        if args.command == "roots":
+            print(json.dumps(service.list_roots(), ensure_ascii=False, indent=2))
+            return 0
+
+        if args.command == "rebind-root":
+            print(
+                json.dumps(
+                    service.rebind_root(args.root_id, args.folder),
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
             return 0
 
         if args.command == "cache-clear":

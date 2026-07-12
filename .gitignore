@@ -21,6 +21,12 @@ image_collection/
 image_collection.meta.json
 image_collection.state.json*
 image_collection.state.sqlite3*
+.image_collection.v2.*
+.image_collection.state.v2.*
+.image_collection.meta.v2.*
+image_collection.v1.backup_*
+image_collection.state.v1.backup_*
+image_collection.meta.v1.backup_*
 .image_collection.lock
 search_results/
 

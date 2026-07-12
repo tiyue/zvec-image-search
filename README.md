@@ -62,6 +62,14 @@ python .\image_service.py search --image "D:\Queries\car.jpg" --text "red sports
 并生成 `results.json`。Zvec 返回的是 COSINE 距离，`distance` 越小表示越相似；
 图文联合检索的 `fused_score` 是 RRF 分数，越大越好。
 
+搜索结果目录使用北京时间命名：
+
+- 文字搜图：`搜索提示词_20260712_083015_123`
+- 图片搜图：`图片搜索_20260712_083015_123`
+- 图文搜图：`搜索提示词_图文搜索_20260712_083015_123`
+
+提示词中的 Windows 非法字符会自动替换，过长提示词会截断；同名时追加数字序号。
+
 查询向量会自动复用：已入库图片直接读取 Zvec 中的向量，相同的文本或未入库图片查询会读取本地 SQLite 缓存，避免重复消耗百炼额度。`results.json` 的 `embedding_sources` 会标明每个向量来自 `index`、`cache` 还是 `api`。
 
 查看 Collection 状态：
@@ -82,6 +90,31 @@ python .\image_service.py cache-clear
 python .\image_service.py clean-results --days 7 --dry-run
 python .\image_service.py clean-results --days 7
 ```
+
+## 可移动图片根目录
+
+Collection 使用 `root_id + relative_path` 保存图片逻辑位置，不在每条 Zvec 记录中保存绝对路径。SQLite 只为每个图片根目录保存一次当前本地路径。
+
+查看已经注册的图片根目录：
+
+```powershell
+python .\image_service.py roots
+```
+
+图片文件夹移动或盘符变化后，更新根目录绑定即可继续使用原有向量，不会调用百炼：
+
+```powershell
+python .\image_service.py rebind-root "roots 命令显示的 root_id" "E:\NewPictures"
+```
+
+从 0.2.x 的绝对路径 Collection 升级时，先预演再迁移：
+
+```powershell
+python .\image_service.py migrate-path-schema --dry-run
+python .\image_service.py migrate-path-schema
+```
+
+迁移会直接复制现有向量，不调用百炼。只有新 Collection、SQLite 状态和文档数量全部校验成功后才会切换；原 V1 Collection、状态库和元数据会保留为带时间戳的备份。
 
 ## 工作目录与日志
 

@@ -133,6 +133,7 @@ class ImageVectorServiceTest(unittest.TestCase):
         manifest = json.loads((output_dir / "results.json").read_text("utf-8"))
         self.assertEqual(manifest["query_type"], "text")
         self.assertEqual(len(manifest["results"]), 2)
+        self.assertRegex(output_dir.name, r"^red image_\d{8}_\d{6}_\d{3}$")
         self.assertEqual(report.embedding_sources, {"text": "api"})
         self.assertEqual(self.fake_client.request_count, request_count + 1)
 
@@ -146,8 +147,12 @@ class ImageVectorServiceTest(unittest.TestCase):
         image_report = self.service.search_by_image(query_image, top_k=2)
         self.assertEqual(image_report.result_count, 2)
         self.assertNotIn(
-            str((self.images_dir / "red.png").resolve()),
-            [item.source_path for item in image_report.results],
+            "red.png",
+            [item.relative_path for item in image_report.results],
+        )
+        self.assertRegex(
+            Path(image_report.output_dir).name,
+            r"^图片搜索_\d{8}_\d{6}_\d{3}$",
         )
         self.assertEqual(image_report.embedding_sources, {"image": "index"})
         self.assertEqual(self.fake_client.request_count, request_count)
@@ -161,6 +166,10 @@ class ImageVectorServiceTest(unittest.TestCase):
         )
         self.assertEqual(combined.result_count, 2)
         self.assertTrue(all(item.fused_score is not None for item in combined.results))
+        self.assertRegex(
+            Path(combined.output_dir).name,
+            r"^red_图文搜索_\d{8}_\d{6}_\d{3}$",
+        )
         self.assertEqual(combined.embedding_sources, {"image": "index", "text": "api"})
 
         external = self.temp_dir / "query-only.png"

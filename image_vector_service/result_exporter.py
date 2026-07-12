@@ -5,18 +5,50 @@ import os
 import re
 import shutil
 import time
-import uuid
-from datetime import datetime
+from collections.abc import Callable
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from .config import ServiceConfig
+from .config import ConfigurationError, ServiceConfig
 from .models import ExportedHit, FileFailure, SearchHit, SearchReport
+
+WINDOWS_RESERVED_NAMES = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    *(f"COM{index}" for index in range(1, 10)),
+    *(f"LPT{index}" for index in range(1, 10)),
+}
+BEIJING_TIMEZONE = timezone(timedelta(hours=8))
 
 
 def _safe_name(value: str, limit: int = 60) -> str:
     value = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", value).strip(" ._")
-    return (value or "query")[:limit]
+    value = (value or "搜索")[:limit].rstrip(" .")
+    if value.upper() in WINDOWS_RESERVED_NAMES:
+        value = f"_{value}"
+    return value
+
+
+def _result_directory_name(query_type: str, query: dict[str, Any]) -> str:
+    now = datetime.now(BEIJING_TIMEZONE)
+    timestamp = now.strftime("%Y%m%d_%H%M%S_") + f"{now.microsecond // 1000:03d}"
+    if query_type == "text":
+        return f"{_safe_name(str(query.get('text') or '搜索'))}_{timestamp}"
+    if query_type == "image_text":
+        return f"{_safe_name(str(query.get('text') or '搜索'))}_图文搜索_{timestamp}"
+    return f"图片搜索_{timestamp}"
+
+
+def _unique_result_directory(results_path: Path, base_name: str) -> Path:
+    candidate = results_path / base_name
+    suffix = 2
+    while candidate.exists():
+        candidate = results_path / f"{base_name}_{suffix:02d}"
+        suffix += 1
+    return candidate
 
 
 def export_results(
@@ -27,16 +59,13 @@ def export_results(
     query: dict[str, Any],
     request_ids: list[str],
     usage: list[dict[str, Any]],
+    resolve_source: Callable[[SearchHit], Path],
     embedding_sources: dict[str, str] | None = None,
     exclude_path: str | None = None,
 ) -> SearchReport:
     config.results_path.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    query_label = str(query.get("text") or Path(query.get("image") or "query").stem)
-    directory_name = (
-        f"{timestamp}_{query_type}_{_safe_name(query_label)}_{uuid.uuid4().hex[:6]}"
-    )
-    output_dir = config.results_path / directory_name
+    directory_name = _result_directory_name(query_type, query)
+    output_dir = _unique_result_directory(config.results_path, directory_name)
     output_dir.mkdir(parents=False, exist_ok=False)
 
     normalized_exclude = (
@@ -49,7 +78,13 @@ def export_results(
     for hit in hits:
         if len(exported) >= top_k:
             break
-        source = Path(str(hit.fields.get("absolute_path") or ""))
+        root_id = str(hit.fields.get("root_id") or "")
+        relative_path = str(hit.fields.get("relative_path") or "")
+        try:
+            source = resolve_source(hit)
+        except (OSError, ValueError, ConfigurationError) as exc:
+            failures.append(FileFailure(relative_path, str(exc)))
+            continue
         normalized_source = os.path.normcase(str(source.resolve())) if source else ""
         if normalized_exclude and normalized_source == normalized_exclude:
             continue
@@ -57,7 +92,7 @@ def export_results(
         if sha256 and sha256 in seen_hashes:
             continue
         if not source.is_file():
-            failures.append(FileFailure(str(source), "source image no longer exists"))
+            failures.append(FileFailure(relative_path, "source image no longer exists"))
             continue
 
         display_score = hit.fused_score if hit.fused_score is not None else hit.distance
@@ -84,8 +119,9 @@ def export_results(
                 rank=rank,
                 distance=hit.distance,
                 fused_score=hit.fused_score,
-                source_path=str(source),
-                copied_path=str(destination),
+                root_id=root_id,
+                relative_path=relative_path,
+                copied_file=destination.name,
                 doc_id=hit.doc_id,
             )
         )

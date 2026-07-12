@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import os
 from collections.abc import Callable
 from pathlib import Path
@@ -8,6 +7,7 @@ from typing import Any
 
 from PIL import Image
 
+from .logical_paths import logical_document_id
 from .models import FileFailure, ImageRecord, ScanResult
 
 SUPPORTED_EXTENSIONS = {
@@ -47,16 +47,9 @@ PIL_FORMAT_MIME = {
 }
 
 
-def normalize_path(path: Path) -> str:
-    return os.path.normcase(str(path.resolve()))
-
-
-def document_id(path: Path) -> str:
-    normalized = normalize_path(path)
-    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
-
-
 def file_sha256(path: Path) -> str:
+    import hashlib
+
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
@@ -110,7 +103,7 @@ def _iter_files(root: Path, recursive: bool, result: ScanResult):
                 result.failures.append(FileFailure(entry.path, str(exc)))
 
 
-def inspect_image(path: Path, root: Path) -> ImageRecord:
+def inspect_image(path: Path, root: Path, root_id: str) -> ImageRecord:
     extension = path.suffix.lower()
     if extension not in SUPPORTED_EXTENSIONS:
         raise ValueError(f"unsupported extension: {extension or '<none>'}")
@@ -125,10 +118,11 @@ def inspect_image(path: Path, root: Path) -> ImageRecord:
     ):
         raise RuntimeError("file changed while it was being scanned; run index again")
     resolved = path.resolve()
+    relative_path = str(resolved.relative_to(root.resolve()))
     return ImageRecord(
-        doc_id=document_id(resolved),
-        root_path=normalize_path(root),
-        relative_path=str(resolved.relative_to(root.resolve())),
+        doc_id=logical_document_id(root_id, relative_path),
+        root_id=root_id,
+        relative_path=relative_path,
         absolute_path=str(resolved),
         file_name=resolved.name,
         extension=extension.lstrip("."),
@@ -143,6 +137,7 @@ def inspect_image(path: Path, root: Path) -> ImageRecord:
 
 def scan_folder(
     folder_path: str | Path,
+    root_id: str,
     recursive: bool = True,
     previous_lookup: Callable[[str], dict[str, Any] | None] | None = None,
     verify_hash: bool = False,
@@ -158,7 +153,8 @@ def scan_folder(
             result.skipped += 1
             continue
         result.supported += 1
-        doc_id = document_id(path)
+        relative_path = str(path.resolve().relative_to(root))
+        doc_id = logical_document_id(root_id, relative_path)
         result.seen_supported_ids.add(doc_id)
         try:
             previous = previous_lookup(doc_id) if previous_lookup else None
@@ -168,16 +164,19 @@ def scan_folder(
                 and not verify_hash
                 and int(previous["size_bytes"]) == stat.st_size
                 and int(previous["mtime_ns"]) == stat.st_mtime_ns
-                and previous["root_path"] == normalize_path(root)
-                and previous["absolute_path"] == str(path.resolve())
+                and previous["root_id"] == root_id
+                and previous["relative_path"] == relative_path
             ):
-                record = ImageRecord(
-                    **{key: previous[key] for key in ImageRecord.__dataclass_fields__}
-                )
+                values = {
+                    key: previous[key]
+                    for key in ImageRecord.__dataclass_fields__
+                    if key != "absolute_path"
+                }
+                record = ImageRecord(absolute_path=str(path.resolve()), **values)
                 result.records.append(record)
                 result.fast_unchanged_ids.add(doc_id)
             else:
-                result.records.append(inspect_image(path, root))
+                result.records.append(inspect_image(path, root, root_id))
         except Exception as exc:
             result.failures.append(FileFailure(str(path), str(exc)))
     return result

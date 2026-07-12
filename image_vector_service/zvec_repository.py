@@ -12,9 +12,8 @@ from .config import ConfigurationError, ServiceConfig
 from .models import ImageRecord, SearchHit
 
 OUTPUT_FIELDS = [
-    "root_path",
+    "root_id",
     "relative_path",
-    "absolute_path",
     "file_name",
     "extension",
     "mime_type",
@@ -36,43 +35,7 @@ class ZvecImageRepository:
         self.collection_uuid = str(metadata["collection_uuid"])
 
     def _schema(self) -> zvec.CollectionSchema:
-        return zvec.CollectionSchema(
-            name="image_collection",
-            fields=[
-                zvec.FieldSchema(
-                    "root_path",
-                    zvec.DataType.STRING,
-                    index_param=zvec.InvertIndexParam(),
-                ),
-                zvec.FieldSchema("relative_path", zvec.DataType.STRING),
-                zvec.FieldSchema("absolute_path", zvec.DataType.STRING),
-                zvec.FieldSchema("file_name", zvec.DataType.STRING),
-                zvec.FieldSchema(
-                    "extension",
-                    zvec.DataType.STRING,
-                    index_param=zvec.InvertIndexParam(),
-                ),
-                zvec.FieldSchema("mime_type", zvec.DataType.STRING),
-                zvec.FieldSchema(
-                    "sha256",
-                    zvec.DataType.STRING,
-                    index_param=zvec.InvertIndexParam(),
-                ),
-                zvec.FieldSchema("size_bytes", zvec.DataType.INT64),
-                zvec.FieldSchema("mtime_ns", zvec.DataType.INT64),
-                zvec.FieldSchema("width", zvec.DataType.INT32),
-                zvec.FieldSchema("height", zvec.DataType.INT32),
-                zvec.FieldSchema("model", zvec.DataType.STRING),
-            ],
-            vectors=[
-                zvec.VectorSchema(
-                    "embedding",
-                    zvec.DataType.VECTOR_FP32,
-                    dimension=self.config.dimension,
-                    index_param=zvec.HnswIndexParam(metric_type=zvec.MetricType.COSINE),
-                )
-            ],
-        )
+        return collection_schema(self.config)
 
     def _open_or_create(self) -> tuple[zvec.Collection, dict]:
         path = self.config.collection_path
@@ -89,7 +52,7 @@ class ZvecImageRepository:
         collection = zvec.create_and_open(str(path), self._schema())
         self.created = True
         metadata = {
-            "schema_version": 1,
+            "schema_version": 2,
             "collection_uuid": str(uuid.uuid4()),
             "model": self.config.model,
             "mode": "independent",
@@ -111,7 +74,7 @@ class ZvecImageRepository:
             )
         metadata = json.loads(meta_path.read_text(encoding="utf-8"))
         expected = {
-            "schema_version": 1,
+            "schema_version": 2,
             "model": self.config.model,
             "mode": "independent",
             "dimension": self.config.dimension,
@@ -123,6 +86,11 @@ class ZvecImageRepository:
             if metadata.get(key) != value
         }
         if mismatches:
+            if metadata.get("schema_version") == 1:
+                raise ConfigurationError(
+                    "Collection path schema V1 requires migration. Run "
+                    "'image_service.py migrate-path-schema --dry-run' first."
+                )
             raise ConfigurationError(f"Collection metadata mismatch: {mismatches}")
         return metadata
 
@@ -172,9 +140,8 @@ class ZvecImageRepository:
         return zvec.Doc(
             id=record.doc_id,
             fields={
-                "root_path": record.root_path,
+                "root_id": record.root_id,
                 "relative_path": record.relative_path,
-                "absolute_path": record.absolute_path,
                 "file_name": record.file_name,
                 "extension": record.extension,
                 "mime_type": record.mime_type,
@@ -231,3 +198,42 @@ class ZvecImageRepository:
     @property
     def doc_count(self) -> int:
         return int(self.collection.stats.doc_count)
+
+
+def collection_schema(config: ServiceConfig) -> zvec.CollectionSchema:
+    return zvec.CollectionSchema(
+        name="image_collection",
+        fields=[
+            zvec.FieldSchema(
+                "root_id",
+                zvec.DataType.STRING,
+                index_param=zvec.InvertIndexParam(),
+            ),
+            zvec.FieldSchema("relative_path", zvec.DataType.STRING),
+            zvec.FieldSchema("file_name", zvec.DataType.STRING),
+            zvec.FieldSchema(
+                "extension",
+                zvec.DataType.STRING,
+                index_param=zvec.InvertIndexParam(),
+            ),
+            zvec.FieldSchema("mime_type", zvec.DataType.STRING),
+            zvec.FieldSchema(
+                "sha256",
+                zvec.DataType.STRING,
+                index_param=zvec.InvertIndexParam(),
+            ),
+            zvec.FieldSchema("size_bytes", zvec.DataType.INT64),
+            zvec.FieldSchema("mtime_ns", zvec.DataType.INT64),
+            zvec.FieldSchema("width", zvec.DataType.INT32),
+            zvec.FieldSchema("height", zvec.DataType.INT32),
+            zvec.FieldSchema("model", zvec.DataType.STRING),
+        ],
+        vectors=[
+            zvec.VectorSchema(
+                "embedding",
+                zvec.DataType.VECTOR_FP32,
+                dimension=config.dimension,
+                index_param=zvec.HnswIndexParam(metric_type=zvec.MetricType.COSINE),
+            )
+        ],
+    )
