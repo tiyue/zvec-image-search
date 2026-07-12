@@ -93,6 +93,7 @@ class SearchReport:
     copy_failures: list[FileFailure] = field(default_factory=list)
     request_ids: list[str] = field(default_factory=list)
     usage: list[dict[str, Any]] = field(default_factory=list)
+    embedding_sources: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

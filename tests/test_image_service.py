@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import gc
 import json
+import os
 import shutil
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -122,6 +124,7 @@ class ImageVectorServiceTest(unittest.TestCase):
         self.assertEqual(fast.unchanged, 3)
 
     def test_02_text_search_exports_new_directory(self):
+        request_count = self.fake_client.request_count
         report = self.service.search_by_text("red image", top_k=2)
         output_dir = Path(report.output_dir)
         self.assertTrue(output_dir.is_dir())
@@ -130,15 +133,24 @@ class ImageVectorServiceTest(unittest.TestCase):
         manifest = json.loads((output_dir / "results.json").read_text("utf-8"))
         self.assertEqual(manifest["query_type"], "text")
         self.assertEqual(len(manifest["results"]), 2)
+        self.assertEqual(report.embedding_sources, {"text": "api"})
+        self.assertEqual(self.fake_client.request_count, request_count + 1)
+
+        cached = self.service.search_by_text("red image", top_k=1)
+        self.assertEqual(cached.embedding_sources, {"text": "cache"})
+        self.assertEqual(self.fake_client.request_count, request_count + 1)
 
     def test_03_image_and_combined_search(self):
         query_image = str(self.images_dir / "red.png")
+        request_count = self.fake_client.request_count
         image_report = self.service.search_by_image(query_image, top_k=2)
         self.assertEqual(image_report.result_count, 2)
         self.assertNotIn(
             str((self.images_dir / "red.png").resolve()),
             [item.source_path for item in image_report.results],
         )
+        self.assertEqual(image_report.embedding_sources, {"image": "index"})
+        self.assertEqual(self.fake_client.request_count, request_count)
 
         combined = self.service.search_by_image_and_text(
             query_image,
@@ -149,8 +161,41 @@ class ImageVectorServiceTest(unittest.TestCase):
         )
         self.assertEqual(combined.result_count, 2)
         self.assertTrue(all(item.fused_score is not None for item in combined.results))
+        self.assertEqual(combined.embedding_sources, {"image": "index", "text": "api"})
 
-    def test_04_global_api_error_is_not_split(self):
+        external = self.temp_dir / "query-only.png"
+        Image.new("RGB", (16, 16), (200, 10, 10)).save(external)
+        first = self.service.search_by_image(str(external), top_k=1)
+        request_count = self.fake_client.request_count
+        second = self.service.search_by_image(str(external), top_k=1)
+        self.assertEqual(first.embedding_sources, {"image": "api"})
+        self.assertEqual(second.embedding_sources, {"image": "cache"})
+        self.assertEqual(self.fake_client.request_count, request_count)
+
+    def test_04_cache_management_cleanup_and_application_log(self):
+        stats = self.service.stats()
+        self.assertGreaterEqual(stats["embedding_cache"]["entries"], 3)
+
+        old_result = self.config.results_path / "old-result"
+        old_result.mkdir()
+        old_time = time.time() - 8 * 86400
+        os.utime(old_result, (old_time, old_time))
+        preview = self.service.clean_results(7, dry_run=True)
+        self.assertEqual(preview["matched"], 1)
+        self.assertTrue(old_result.is_dir())
+        cleaned = self.service.clean_results(7)
+        self.assertEqual(cleaned["deleted"], 1)
+        self.assertFalse(old_result.exists())
+
+        log_path = self.config.log_dir / "image-service.log"
+        self.assertTrue(log_path.is_file())
+        self.assertNotIn("red image", log_path.read_text(encoding="utf-8"))
+
+        cleared = self.service.clear_embedding_cache()
+        self.assertGreaterEqual(cleared["deleted"], 3)
+        self.assertEqual(self.service.stats()["embedding_cache"]["entries"], 0)
+
+    def test_05_global_api_error_is_not_split(self):
         Image.new("RGB", (20, 20), (0, 255, 0)).save(self.images_dir / "green.png")
         Image.new("RGB", (20, 20), (255, 255, 0)).save(self.images_dir / "yellow.png")
         error_client = GlobalErrorClient()
@@ -165,7 +210,7 @@ class ImageVectorServiceTest(unittest.TestCase):
             (self.images_dir / "green.png").unlink()
             (self.images_dir / "yellow.png").unlink()
 
-    def test_05_sync_is_fail_closed_and_supports_dry_run(self):
+    def test_06_sync_is_fail_closed_and_supports_dry_run(self):
         incomplete = ScanResult(
             complete=False,
             failures=[FileFailure(str(self.images_dir), "permission denied")],
@@ -187,7 +232,7 @@ class ImageVectorServiceTest(unittest.TestCase):
         self.assertEqual(report.deleted, 1)
         self.assertEqual(self.service.stats()["tracked_files"], 2)
 
-    def test_06_scope_change_and_concurrent_service_are_rejected(self):
+    def test_07_scope_change_and_concurrent_service_are_rejected(self):
         with self.assertRaises(ConfigurationError):
             self.service.sync_folder(str(self.images_dir), recursive=False)
         with self.assertRaises(ConfigurationError):
@@ -196,7 +241,7 @@ class ImageVectorServiceTest(unittest.TestCase):
                 embedding_client=FakeEmbeddingClient(self.config.dimension),
             )
 
-    def test_07_new_collection_resets_stale_state(self):
+    def test_08_new_collection_resets_stale_state(self):
         self.service.repository.collection.destroy()
         self.service.close()
         replacement = ImageVectorService(
@@ -208,7 +253,7 @@ class ImageVectorServiceTest(unittest.TestCase):
         self.assertTrue(replacement.state_reset)
         self.assertEqual(replacement.stats()["tracked_files"], 0)
 
-    def test_08_limits_and_error_classification(self):
+    def test_09_limits_and_error_classification(self):
         with self.assertRaises(ValueError):
             self.service.search_by_text("red", top_k=self.config.max_top_k + 1)
         self.assertTrue(

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+from array import array
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
@@ -68,6 +69,17 @@ class IndexState:
                 root_path TEXT PRIMARY KEY,
                 recursive INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS embedding_cache (
+                cache_key TEXT PRIMARY KEY,
+                modality TEXT NOT NULL,
+                embedding BLOB NOT NULL,
+                dimension INTEGER NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                hit_count INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_embedding_cache_modality
+                ON embedding_cache(modality);
             """
         )
         self.connection.commit()
@@ -112,6 +124,7 @@ class IndexState:
         with self.connection:
             self.connection.execute("DELETE FROM entries")
             self.connection.execute("DELETE FROM roots")
+            self.connection.execute("DELETE FROM embedding_cache")
             self.connection.execute(
                 "INSERT INTO metadata(key, value) VALUES('collection_uuid', ?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -167,6 +180,63 @@ class IndexState:
             "SELECT doc_id FROM entries WHERE sha256 = ? LIMIT 1", (sha256,)
         ).fetchone()
         return str(row["doc_id"]) if row else None
+
+    def get_cached_vector(self, cache_key: str, dimension: int) -> list[float] | None:
+        row = self.connection.execute(
+            "SELECT embedding, dimension FROM embedding_cache WHERE cache_key = ?",
+            (cache_key,),
+        ).fetchone()
+        if not row or int(row["dimension"]) != dimension:
+            return None
+        values = array("f")
+        values.frombytes(bytes(row["embedding"]))
+        if len(values) != dimension:
+            self.connection.execute(
+                "DELETE FROM embedding_cache WHERE cache_key = ?", (cache_key,)
+            )
+            self.connection.commit()
+            return None
+        with self.connection:
+            self.connection.execute(
+                "UPDATE embedding_cache SET hit_count = hit_count + 1, "
+                "last_used_at = CURRENT_TIMESTAMP WHERE cache_key = ?",
+                (cache_key,),
+            )
+        return list(values)
+
+    def set_cached_vector(
+        self,
+        cache_key: str,
+        modality: str,
+        vector: list[float],
+    ) -> None:
+        payload = array("f", vector).tobytes()
+        with self.connection:
+            self.connection.execute(
+                "INSERT INTO embedding_cache"
+                "(cache_key, modality, embedding, dimension) "
+                "VALUES(?, ?, ?, ?) ON CONFLICT(cache_key) DO UPDATE SET "
+                "modality=excluded.modality, embedding=excluded.embedding, "
+                "dimension=excluded.dimension, last_used_at=CURRENT_TIMESTAMP",
+                (cache_key, modality, payload, len(vector)),
+            )
+
+    def cache_stats(self) -> dict[str, int]:
+        row = self.connection.execute(
+            "SELECT COUNT(*) AS entries, COALESCE(SUM(LENGTH(embedding)), 0) AS bytes, "
+            "COALESCE(SUM(hit_count), 0) AS hits FROM embedding_cache"
+        ).fetchone()
+        return {
+            "entries": int(row["entries"]),
+            "bytes": int(row["bytes"]),
+            "hits": int(row["hits"]),
+        }
+
+    def clear_cache(self) -> int:
+        count = self.cache_stats()["entries"]
+        with self.connection:
+            self.connection.execute("DELETE FROM embedding_cache")
+        return count
 
     def count(self) -> int:
         row = self.connection.execute(

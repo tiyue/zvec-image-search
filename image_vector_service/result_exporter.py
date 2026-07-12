@@ -4,6 +4,7 @@ import json
 import os
 import re
 import shutil
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -26,6 +27,7 @@ def export_results(
     query: dict[str, Any],
     request_ids: list[str],
     usage: list[dict[str, Any]],
+    embedding_sources: dict[str, str] | None = None,
     exclude_path: str | None = None,
 ) -> SearchReport:
     config.results_path.mkdir(parents=True, exist_ok=True)
@@ -96,6 +98,7 @@ def export_results(
         copy_failures=failures,
         request_ids=[item for item in request_ids if item],
         usage=usage,
+        embedding_sources=embedding_sources or {},
     )
     manifest = {
         "query_type": query_type,
@@ -116,3 +119,42 @@ def export_results(
     )
     temporary_manifest.replace(manifest_path)
     return report
+
+
+def clean_result_directories(
+    results_path: Path, older_than_days: int, dry_run: bool
+) -> dict[str, object]:
+    if older_than_days < 0:
+        raise ValueError("older_than_days cannot be negative.")
+    results_path.mkdir(parents=True, exist_ok=True)
+    cutoff = time.time() - older_than_days * 86400
+    candidates = [
+        path
+        for path in results_path.iterdir()
+        if path.is_dir() and path.stat().st_mtime < cutoff
+    ]
+    deleted: list[str] = []
+    failures: list[dict[str, str]] = []
+    if not dry_run:
+        root = results_path.resolve()
+        for path in candidates:
+            resolved = path.resolve()
+            if resolved.parent != root:
+                failures.append(
+                    {"path": str(path), "error": "path escaped results directory"}
+                )
+                continue
+            try:
+                shutil.rmtree(resolved)
+                deleted.append(str(resolved))
+            except OSError as exc:
+                failures.append({"path": str(resolved), "error": str(exc)})
+    return {
+        "results_path": str(results_path),
+        "older_than_days": older_than_days,
+        "dry_run": dry_run,
+        "matched": len(candidates),
+        "deleted": len(deleted),
+        "deleted_paths": deleted,
+        "failures": failures,
+    }

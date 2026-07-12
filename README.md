@@ -62,10 +62,25 @@ python .\image_service.py search --image "D:\Queries\car.jpg" --text "red sports
 并生成 `results.json`。Zvec 返回的是 COSINE 距离，`distance` 越小表示越相似；
 图文联合检索的 `fused_score` 是 RRF 分数，越大越好。
 
+查询向量会自动复用：已入库图片直接读取 Zvec 中的向量，相同的文本或未入库图片查询会读取本地 SQLite 缓存，避免重复消耗百炼额度。`results.json` 的 `embedding_sources` 会标明每个向量来自 `index`、`cache` 还是 `api`。
+
 查看 Collection 状态：
 
 ```powershell
 python .\image_service.py stats
+```
+
+`stats` 会同时显示查询向量缓存的条目数、占用字节数和累计命中数。需要清空缓存时：
+
+```powershell
+python .\image_service.py cache-clear
+```
+
+预览或删除 7 天前的搜索结果目录：
+
+```powershell
+python .\image_service.py clean-results --days 7 --dry-run
+python .\image_service.py clean-results --days 7
 ```
 
 ## 工作目录与日志
@@ -77,7 +92,7 @@ python .\image_service.py --workspace "D:\ImageSearch" index "D:\Pictures"
 ```
 
 或者设置环境变量 `ZVEC_IMAGE_WORKSPACE`。Collection、SQLite 状态和搜索结果保存在工作区；
-所有 Zvec 日志统一保存在工作区的 `logs` 文件夹，单文件上限 1 GB，保留 7 天。
+所有 Zvec 和应用日志统一保存在工作区的 `logs` 文件夹，单文件上限 1 GB，保留 7 天。应用日志只记录操作类型、数量和状态，不记录搜索文本、图片路径或 API Key。
 
 ## 支持的图片格式
 

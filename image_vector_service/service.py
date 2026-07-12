@@ -5,10 +5,12 @@ from collections import defaultdict
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
+from hashlib import sha256
 from pathlib import Path
 
 from zvec_logging import initialize_zvec
 
+from .app_logging import close_app_logger, get_app_logger
 from .config import ConfigurationError, ServiceConfig
 from .dashscope_client import (
     DashScopeEmbeddingClient,
@@ -16,11 +18,17 @@ from .dashscope_client import (
     EmbeddingResponse,
     ImageInputError,
 )
-from .image_scanner import inspect_query_image, normalize_path, scan_folder
+from .image_scanner import (
+    document_id,
+    file_sha256,
+    inspect_query_image,
+    normalize_path,
+    scan_folder,
+)
 from .models import FileFailure, ImageRecord, IndexReport, SearchHit, SearchReport
 from .process_lock import ProcessLock
 from .rank_fusion import weighted_rrf
-from .result_exporter import export_results
+from .result_exporter import clean_result_directories, export_results
 from .state import IndexState
 from .zvec_repository import ZvecImageRepository
 
@@ -41,6 +49,7 @@ class ImageVectorService:
         self._lock.acquire()
         try:
             initialize_zvec(self.config.log_dir)
+            self.logger = get_app_logger(self.config.log_dir)
             self.repository = repository or ZvecImageRepository(self.config)
             self._embedding_client = embedding_client
             self.state = IndexState(
@@ -54,6 +63,8 @@ class ImageVectorService:
         except Exception:
             if hasattr(self, "state"):
                 self.state.close()
+            if hasattr(self, "logger"):
+                close_app_logger(self.logger)
             self._lock.release()
             raise
 
@@ -126,6 +137,12 @@ class ImageVectorService:
             )
 
         self.progress(f"Scanning: {root}")
+        self.logger.info(
+            "index_start recursive=%s sync=%s verify_hash=%s",
+            recursive,
+            sync_deleted,
+            verify_hash,
+        )
         scan = scan_folder(
             root,
             recursive=recursive,
@@ -165,21 +182,21 @@ class ImageVectorService:
 
         reusable: list[tuple[list[ImageRecord], list[float]]] = []
         pending: list[tuple[str, list[ImageRecord]]] = []
-        for sha256, records in groups.items():
-            cached_doc_id = self.state.find_doc_id_by_sha(sha256)
+        for content_hash, records in groups.items():
+            cached_doc_id = self.state.find_doc_id_by_sha(content_hash)
             cached_vector = (
                 self.repository.fetch_vector(cached_doc_id) if cached_doc_id else None
             )
             if cached_vector is not None:
                 reusable.append((records, cached_vector))
             else:
-                pending.append((sha256, records))
+                pending.append((content_hash, records))
 
         for records, vector in reusable:
             self._upsert_group(records, vector, report)
 
         embeddable: list[tuple[str, list[ImageRecord]]] = []
-        for sha256, records in pending:
+        for content_hash, records in pending:
             representative = records[0]
             if representative.size_bytes > self.config.max_image_bytes:
                 message = (
@@ -198,7 +215,7 @@ class ImageVectorService:
                     for record in records
                 )
             else:
-                embeddable.append((sha256, records))
+                embeddable.append((content_hash, records))
 
         processed = 0
         for batch in self._embedding_batches(embeddable):
@@ -246,6 +263,17 @@ class ImageVectorService:
                 "were validated."
             )
         self.validate_documents = self.repository.doc_count != self.state.count()
+        self.logger.info(
+            "index_complete scanned=%d inserted=%d updated=%d unchanged=%d "
+            "deleted=%d failed=%d api_requests=%d",
+            report.scanned,
+            report.inserted,
+            report.updated,
+            report.unchanged,
+            report.deleted,
+            report.failed,
+            report.api_requests,
+        )
         return report
 
     def _embedding_batches(
@@ -352,38 +380,42 @@ class ImageVectorService:
         text = text.strip()
         if not text:
             raise ValueError("Search text cannot be empty.")
-        response = self.embedding_client.embed_text(text)
-        hits = self._query_until_sufficient(response.vectors[0], top_k)
-        return export_results(
+        vector, source, request_id, usage = self._text_embedding(text)
+        hits = self._query_until_sufficient(vector, top_k)
+        report = export_results(
             self.config,
             query_type="text",
             hits=hits,
             top_k=top_k,
             query={"text": text},
-            request_ids=[response.request_id],
-            usage=[response.usage],
+            request_ids=[request_id],
+            usage=[usage] if usage else [],
+            embedding_sources={"text": source},
         )
+        self._log_search(report)
+        return report
 
     def search_by_image(
         self, image_path: str, top_k: int = 10, include_self: bool = False
     ) -> SearchReport:
         self._validate_top_k(top_k)
         path = inspect_query_image(image_path)
-        response = self.embedding_client.embed_images([path])
+        vector, source, request_id, usage = self._image_embedding(path)
         exclude = None if include_self else str(path)
-        hits = self._query_until_sufficient(
-            response.vectors[0], top_k, exclude_path=exclude
-        )
-        return export_results(
+        hits = self._query_until_sufficient(vector, top_k, exclude_path=exclude)
+        report = export_results(
             self.config,
             query_type="image",
             hits=hits,
             top_k=top_k,
             query={"image": str(path)},
-            request_ids=[response.request_id],
-            usage=[response.usage],
+            request_ids=[request_id],
+            usage=[usage] if usage else [],
+            embedding_sources={"image": source},
             exclude_path=exclude,
         )
+        self._log_search(report)
+        return report
 
     def search_by_image_and_text(
         self,
@@ -400,21 +432,49 @@ class ImageVectorService:
         if not text:
             raise ValueError("Search text cannot be empty.")
         path = inspect_query_image(image_path)
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            image_future = executor.submit(self.embedding_client.embed_images, [path])
-            text_future = executor.submit(self.embedding_client.embed_text, text)
-            image_response = image_future.result()
-            text_response = text_future.result()
+        image_key, image_vector, image_source, image_hash = self._cached_image(path)
+        text_key = self._cache_key("text", text)
+        text_vector = self.state.get_cached_vector(text_key, self.config.dimension)
+        text_source = "cache" if text_vector is not None else None
+        responses: dict[str, EmbeddingResponse] = {}
+        missing = []
+        if image_vector is None:
+            missing.append("image")
+        if text_vector is None:
+            missing.append("text")
+        if len(missing) == 2:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                image_future = executor.submit(
+                    self.embedding_client.embed_images, [path]
+                )
+                text_future = executor.submit(self.embedding_client.embed_text, text)
+                responses["image"] = image_future.result()
+                responses["text"] = text_future.result()
+        elif missing == ["image"]:
+            responses["image"] = self.embedding_client.embed_images([path])
+        elif missing == ["text"]:
+            responses["text"] = self.embedding_client.embed_text(text)
+
+        if "image" in responses:
+            self._ensure_query_image_unchanged(path, image_hash)
+            image_vector = responses["image"].vectors[0]
+            self._cache_vector(image_key, "image", image_vector)
+            image_source = "api"
+        if "text" in responses:
+            text_vector = responses["text"].vectors[0]
+            self._cache_vector(text_key, "text", text_vector)
+            text_source = "api"
+        assert image_vector is not None and text_vector is not None
         exclude = None if include_self else str(path)
         fused_hits = self._query_fused_until_sufficient(
-            image_response.vectors[0],
-            text_response.vectors[0],
+            image_vector,
+            text_vector,
             top_k,
             image_weight,
             text_weight,
             exclude,
         )
-        return export_results(
+        report = export_results(
             self.config,
             query_type="image_text",
             hits=fused_hits,
@@ -425,9 +485,93 @@ class ImageVectorService:
                 "image_weight": image_weight,
                 "text_weight": text_weight,
             },
-            request_ids=[image_response.request_id, text_response.request_id],
-            usage=[image_response.usage, text_response.usage],
+            request_ids=[response.request_id for response in responses.values()],
+            usage=[response.usage for response in responses.values()],
+            embedding_sources={
+                "image": image_source or "unknown",
+                "text": text_source or "unknown",
+            },
             exclude_path=exclude,
+        )
+        self._log_search(report)
+        return report
+
+    def _cache_key(self, modality: str, value: str) -> str:
+        identity = "\0".join(
+            (
+                self.repository.collection_uuid,
+                self.config.model,
+                str(self.config.dimension),
+                modality,
+                value,
+            )
+        )
+        return sha256(identity.encode("utf-8")).hexdigest()
+
+    def _cache_vector(self, cache_key: str, modality: str, vector: list[float]) -> None:
+        if len(vector) != self.config.dimension:
+            raise ValueError(f"Invalid vector dimension: {len(vector)}")
+        self.state.set_cached_vector(cache_key, modality, vector)
+
+    def _text_embedding(self, text: str) -> tuple[list[float], str, str, dict]:
+        cache_key = self._cache_key("text", text)
+        vector = self.state.get_cached_vector(cache_key, self.config.dimension)
+        if vector is not None:
+            return vector, "cache", "", {}
+        response = self.embedding_client.embed_text(text)
+        vector = response.vectors[0]
+        self._cache_vector(cache_key, "text", vector)
+        return vector, "api", response.request_id, response.usage
+
+    def _cached_image(
+        self, path: Path
+    ) -> tuple[str, list[float] | None, str | None, str]:
+        stat = path.stat()
+        doc_id = document_id(path)
+        entry = self.state.get(doc_id)
+        if entry and (entry["size_bytes"], entry["mtime_ns"]) == (
+            stat.st_size,
+            stat.st_mtime_ns,
+        ):
+            vector = self.repository.fetch_vector(doc_id)
+            if vector is not None:
+                return "", vector, "index", str(entry["sha256"])
+
+        image_hash = file_sha256(path)
+        cached_doc_id = self.state.find_doc_id_by_sha(image_hash)
+        if cached_doc_id:
+            vector = self.repository.fetch_vector(cached_doc_id)
+            if vector is not None:
+                return "", vector, "index", image_hash
+        cache_key = self._cache_key("image", image_hash)
+        vector = self.state.get_cached_vector(cache_key, self.config.dimension)
+        return cache_key, vector, "cache" if vector is not None else None, image_hash
+
+    def _image_embedding(self, path: Path) -> tuple[list[float], str, str, dict]:
+        cache_key, vector, source, image_hash = self._cached_image(path)
+        if vector is not None:
+            return vector, source or "cache", "", {}
+        response = self.embedding_client.embed_images([path])
+        self._ensure_query_image_unchanged(path, image_hash)
+        vector = response.vectors[0]
+        self._cache_vector(cache_key, "image", vector)
+        return vector, "api", response.request_id, response.usage
+
+    @staticmethod
+    def _ensure_query_image_unchanged(path: Path, expected_hash: str) -> None:
+        if file_sha256(path) != expected_hash:
+            raise ImageInputError("Query image changed during embedding; try again.")
+
+    def _log_search(self, report: SearchReport) -> None:
+        self.logger.info(
+            "search_complete type=%s results=%d sources=%s api_requests=%d",
+            report.query_type,
+            report.result_count,
+            ",".join(
+                f"{key}:{value}"
+                for key, value in sorted(report.embedding_sources.items())
+            ),
+            len(report.request_ids),
         )
 
     def _query_until_sufficient(
@@ -485,11 +629,37 @@ class ImageVectorService:
                 "index_completeness": dict(collection_stats.index_completeness),
             },
             "tracked_files": self.state.count(),
+            "embedding_cache": self.state.cache_stats(),
             "model": self.config.model,
             "mode": "independent",
             "dimension": self.config.dimension,
             "metric": self.config.metric,
         }
+
+    def clear_embedding_cache(self) -> dict[str, int]:
+        deleted = self.state.clear_cache()
+        self.logger.info("cache_clear deleted=%d", deleted)
+        return {"deleted": deleted}
+
+    def clean_results(
+        self, older_than_days: int, dry_run: bool = False
+    ) -> dict[str, object]:
+        report = clean_result_directories(
+            self.config.results_path,
+            older_than_days=older_than_days,
+            dry_run=dry_run,
+        )
+        failures = report["failures"]
+        failure_count = len(failures) if isinstance(failures, list) else 0
+        self.logger.info(
+            "results_clean days=%d dry_run=%s matched=%d deleted=%d failures=%d",
+            older_than_days,
+            dry_run,
+            report["matched"],
+            report["deleted"],
+            failure_count,
+        )
+        return report
 
     def _validate_top_k(self, top_k: int) -> None:
         if not 1 <= top_k <= self.config.max_top_k:
@@ -505,6 +675,8 @@ class ImageVectorService:
             return
         if hasattr(self, "state"):
             self.state.close()
+        if hasattr(self, "logger"):
+            close_app_logger(self.logger)
         if hasattr(self, "_lock"):
             self._lock.release()
         self._closed = True

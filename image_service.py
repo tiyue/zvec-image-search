@@ -63,6 +63,21 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("--include-self", action="store_true")
 
     subparsers.add_parser("stats", help="Show collection statistics.")
+    subparsers.add_parser("cache-clear", help="Delete cached query embeddings.")
+    clean = subparsers.add_parser(
+        "clean-results", help="Delete old search result directories."
+    )
+    clean.add_argument(
+        "--days",
+        type=int,
+        default=7,
+        help="Delete result directories older than this many days (default: 7).",
+    )
+    clean.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Only report matching directories.",
+    )
     return parser
 
 
@@ -99,6 +114,24 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "stats":
             print(json.dumps(service.stats(), ensure_ascii=False, indent=2))
+            return 0
+
+        if args.command == "cache-clear":
+            print(
+                json.dumps(
+                    service.clear_embedding_cache(), ensure_ascii=False, indent=2
+                )
+            )
+            return 0
+
+        if args.command == "clean-results":
+            print(
+                json.dumps(
+                    service.clean_results(args.days, dry_run=args.dry_run),
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
             return 0
 
         if not args.text and not args.image:
