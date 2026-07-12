@@ -53,7 +53,12 @@ class ServiceConfig:
 
     @property
     def results_path(self) -> Path:
-        return self.workspace / "search_results"
+        configured = os.getenv("ZVEC_IMAGE_RESULTS_DIR")
+        return (
+            Path(configured).expanduser().resolve()
+            if configured
+            else self.workspace / "search_results"
+        )
 
     @property
     def log_dir(self) -> Path:

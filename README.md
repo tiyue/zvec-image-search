@@ -5,6 +5,99 @@
 
 > 隐私提示：图片来自本地、向量和检索数据保存在本地，但向量计算会将图片内容发送到阿里云百炼。
 
+## Docker 快速使用
+
+Docker Desktop 4.81 需要支持 `wsl --version` 的 Microsoft Store 版 WSL。若
+`zvec doctor` 提示检测到旧版 Inbox WSL，请先在管理员 PowerShell 中执行：
+
+```powershell
+wsl --update --web-download
+wsl --version
+```
+
+Docker 还要求固件虚拟化已开启。AMD 主机请在 BIOS/UEFI 中启用 `SVM Mode`，
+Intel 主机启用 `Intel VT-x`。`zvec doctor` 会区分 WSL 版本问题和固件虚拟化问题。
+
+Windows 用户只需安装一次全局 `zvec` 启动命令：
+
+```powershell
+.\scripts\install-zvec-command.cmd
+zvec init "D:\Pictures"
+```
+
+`zvec init` 会检查 Docker Desktop、构建镜像，并以隐藏输入方式询问
+`DASHSCOPE_API_KEY`。配置和 Key 保存在当前用户的
+`%LOCALAPPDATA%\zvec-image-search`，不会写入镜像或 Git 仓库。
+
+如果安装脚本提示需要打开新终端，请重新打开 PowerShell 后再执行 `zvec init`。
+初始化完成后，日常不需要再输入 Docker 命令：
+
+```powershell
+zvec index
+zvec sync
+zvec search "海边日落" --top-k 10
+zvec search-image "D:\Queries\example.jpg"
+zvec search-mix "D:\Queries\car.jpg" "红色跑车"
+zvec stats
+zvec roots
+zvec results
+zvec clean 7
+zvec doctor
+```
+
+更新代码后直接重建镜像；需要排除全部构建缓存时使用 `--clean`：
+
+```powershell
+zvec build
+zvec build --clean
+```
+
+两种构建方式都会在完成后自动检查容器 UID 和 CLI 入口。
+
+默认情况下，每个图片库使用独立的 Docker workspace volume，搜索结果保存在
+Windows 用户目录中。需要把 workspace 或结果放到指定位置时：
+
+```powershell
+zvec init "D:\Pictures" `
+  --workspace "D:\ImageSearchDocker" `
+  --results "D:\ImageSearchResults"
+```
+
+启动器始终把已配置的图片库挂载到容器内的 `/data/roots/main`，因此宿主机盘符
+变化不会改变 Collection 中的逻辑图片路径。图片库搬家后可重新初始化配置，并用：
+
+```powershell
+zvec roots
+zvec rebind-root "roots 命令显示的 root_id" "E:\NewPictures"
+```
+
+高级用户也可以直接使用 Compose。先从 `.env.example` 创建 `.env`，填写图片目录、
+结果目录和 API Key，并先创建结果目录，然后执行：
+
+```powershell
+New-Item -ItemType Directory -Force ".\docker-data\search_results"
+docker compose build
+docker compose run --rm workspace-init
+docker compose run --rm app index /data/roots/main
+docker compose run --rm app search --text "海边日落" --top-k 10
+docker compose run --rm app stats
+```
+
+镜像使用 `python:3.12-slim-bookworm`，最终进程以固定的非 root 用户运行。图片目录
+只读挂载；Collection、SQLite 状态和日志保存在 workspace；搜索结果通过独立目录
+写回宿主机。不要把 workspace 放在 SMB/NFS 等网络文件系统上。
+
+Dockerfile 默认从 AWS ECR Public 获取 Docker Library 的官方 Python 镜像，避免部分网络
+环境无法访问 Docker Hub。需要改回其他镜像源时可传入：
+
+```powershell
+docker build --build-arg PYTHON_IMAGE=python:3.12-slim-bookworm `
+  -t zvec-image-search:local .
+```
+
+已有 Windows 原生 workspace 建议先复制一份再交给 Docker 使用。首次进入容器后通过
+`zvec rebind-root` 把根目录绑定到 `/data/roots/main`，不需要重新生成向量。
+
 安装依赖：
 
 ```powershell
