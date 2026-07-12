@@ -15,7 +15,11 @@ from .config import ConfigurationError, ServiceConfig
 from .logical_paths import logical_document_id, normalize_path
 from .process_lock import ProcessLock
 from .state import IndexState
-from .zvec_repository import collection_schema
+from .zvec_repository import (
+    COLLECTION_SCHEMA_VERSION,
+    OUTPUT_FIELDS,
+    collection_schema,
+)
 
 LEGACY_FIELDS = (
     "file_name",
@@ -29,7 +33,7 @@ LEGACY_FIELDS = (
 )
 
 
-def migrate_path_schema(config: ServiceConfig, dry_run: bool = False) -> dict[str, Any]:
+def migrate_schema(config: ServiceConfig, dry_run: bool = False) -> dict[str, Any]:
     config.validate()
     lock = ProcessLock(config.lock_path)
     lock.acquire()
@@ -39,16 +43,22 @@ def migrate_path_schema(config: ServiceConfig, dry_run: bool = False) -> dict[st
         lock.release()
 
 
+def migrate_path_schema(config: ServiceConfig, dry_run: bool = False) -> dict[str, Any]:
+    return migrate_schema(config, dry_run=dry_run)
+
+
 def _migrate_locked(config: ServiceConfig, dry_run: bool) -> dict[str, Any]:
     metadata = _read_metadata(config.collection_meta_path)
     schema_version = int(metadata.get("schema_version", 0))
-    if schema_version == 2:
+    if schema_version == COLLECTION_SCHEMA_VERSION:
         return {
-            "status": "already_v2",
+            "status": f"already_v{COLLECTION_SCHEMA_VERSION}",
             "dry_run": dry_run,
             "documents": _state_count(config.state_path),
             "api_requests": 0,
         }
+    if schema_version == 2:
+        return _migrate_v2_to_current(config, metadata, dry_run)
     if schema_version != 1:
         raise ConfigurationError(f"Unsupported Collection schema: {schema_version}")
     expected_metadata = {
@@ -99,7 +109,7 @@ def _migrate_locked(config: ServiceConfig, dry_run: bool) -> dict[str, Any]:
     preview = {
         "status": "ready",
         "from_schema": 1,
-        "to_schema": 2,
+        "to_schema": COLLECTION_SCHEMA_VERSION,
         "dry_run": dry_run,
         "documents": len(entries),
         "roots": [
@@ -117,9 +127,15 @@ def _migrate_locked(config: ServiceConfig, dry_run: bool) -> dict[str, Any]:
         return preview
 
     token = uuid.uuid4().hex
-    temp_collection = config.workspace / f".image_collection.v2.{token}.tmp"
-    temp_state = config.workspace / f".image_collection.state.v2.{token}.tmp.sqlite3"
-    temp_meta = config.workspace / f".image_collection.meta.v2.{token}.tmp.json"
+    temp_collection = config.workspace / (
+        f".image_collection.v{COLLECTION_SCHEMA_VERSION}.{token}.tmp"
+    )
+    temp_state = config.workspace / (
+        f".image_collection.state.v{COLLECTION_SCHEMA_VERSION}.{token}.tmp.sqlite3"
+    )
+    temp_meta = config.workspace / (
+        f".image_collection.meta.v{COLLECTION_SCHEMA_VERSION}.{token}.tmp.json"
+    )
     old_collection = zvec.open(str(config.collection_path))
     old_count = int(old_collection.stats.doc_count)
     if old_count != len(entries):
@@ -153,6 +169,7 @@ def _migrate_locked(config: ServiceConfig, dry_run: bool) -> dict[str, Any]:
                     "root_id": root["root_id"],
                     "relative_path": str(entry["relative_path"]),
                     "model": config.model,
+                    "tags": [],
                     **{field: entry[field] for field in LEGACY_FIELDS},
                 }
                 new_documents.append(
@@ -177,10 +194,15 @@ def _migrate_locked(config: ServiceConfig, dry_run: bool) -> dict[str, Any]:
                 statuses = [statuses]
             failures = [str(status) for status in statuses if not status.ok()]
             if failures:
-                raise ConfigurationError(f"V2 Collection upsert failed: {failures}")
+                raise ConfigurationError(
+                    f"V{COLLECTION_SCHEMA_VERSION} Collection upsert failed: {failures}"
+                )
         new_collection.optimize()
         if int(new_collection.stats.doc_count) != len(entries):
-            raise ConfigurationError("V2 Collection document-count validation failed.")
+            raise ConfigurationError(
+                f"V{COLLECTION_SCHEMA_VERSION} Collection document-count "
+                "validation failed."
+            )
 
         new_state = IndexState(temp_state)
         try:
@@ -201,7 +223,7 @@ def _migrate_locked(config: ServiceConfig, dry_run: bool) -> dict[str, Any]:
 
         migrated_metadata = {
             **metadata,
-            "schema_version": 2,
+            "schema_version": COLLECTION_SCHEMA_VERSION,
             "migrated_from_schema": 1,
             "migrated_at": datetime.now(timezone.utc).isoformat(),
         }
@@ -250,6 +272,167 @@ def _migrate_locked(config: ServiceConfig, dry_run: bool) -> dict[str, Any]:
         "status": "migrated",
         "backup_collection": str(backup_collection),
         "backup_state": str(backup_state),
+        "backup_metadata": str(backup_meta),
+    }
+
+
+def _migrate_v2_to_current(
+    config: ServiceConfig,
+    metadata: dict[str, Any],
+    dry_run: bool,
+) -> dict[str, Any]:
+    expected_metadata = {
+        "model": config.model,
+        "mode": "independent",
+        "dimension": config.dimension,
+        "metric": config.metric,
+    }
+    mismatches = {
+        key: (metadata.get(key), expected)
+        for key, expected in expected_metadata.items()
+        if metadata.get(key) != expected
+    }
+    if mismatches:
+        raise ConfigurationError(f"V2 Collection metadata mismatch: {mismatches}")
+    if not config.collection_path.is_dir() or not config.state_path.is_file():
+        raise ConfigurationError("The V2 Collection or state database is missing.")
+
+    state = sqlite3.connect(config.state_path, timeout=5)
+    try:
+        state_version = _state_version(state)
+        if state_version != "2":
+            raise ConfigurationError(
+                f"Expected V2 state database, found version {state_version!r}."
+            )
+        state_collection_uuid = state.execute(
+            "SELECT value FROM metadata WHERE key='collection_uuid'"
+        ).fetchone()
+        if not state_collection_uuid or str(state_collection_uuid[0]) != str(
+            metadata["collection_uuid"]
+        ):
+            raise ConfigurationError("V2 Collection/state identity mismatch.")
+        doc_ids = [str(row[0]) for row in state.execute("SELECT doc_id FROM entries")]
+    finally:
+        state.close()
+
+    preview = {
+        "status": "ready",
+        "from_schema": 2,
+        "to_schema": COLLECTION_SCHEMA_VERSION,
+        "dry_run": dry_run,
+        "documents": len(doc_ids),
+        "api_requests": 0,
+    }
+    if dry_run:
+        return preview
+
+    token = uuid.uuid4().hex
+    temp_collection = config.workspace / (
+        f".image_collection.v{COLLECTION_SCHEMA_VERSION}.{token}.tmp"
+    )
+    temp_meta = config.workspace / (
+        f".image_collection.meta.v{COLLECTION_SCHEMA_VERSION}.{token}.tmp.json"
+    )
+    old_collection = zvec.open(str(config.collection_path))
+    old_count = int(old_collection.stats.doc_count)
+    if old_count != len(doc_ids):
+        raise ConfigurationError(
+            f"V2 Collection/state count mismatch: {old_count} != {len(doc_ids)}."
+        )
+
+    new_collection = zvec.create_and_open(
+        str(temp_collection), collection_schema(config)
+    )
+    v2_fields = [field for field in OUTPUT_FIELDS if field != "tags"]
+    try:
+        for batch in _chunks(doc_ids, 128):
+            old_documents = old_collection.fetch(
+                batch, output_fields=v2_fields, include_vector=True
+            )
+            new_documents = []
+            for doc_id in batch:
+                old_doc = old_documents.get(doc_id)
+                vector = old_doc.vectors.get("embedding") if old_doc else None
+                if vector is None or len(vector) != config.dimension:
+                    raise ConfigurationError(
+                        f"Missing or invalid vector for V2 document {doc_id}."
+                    )
+                fields = dict(old_doc.fields)
+                missing_fields = set(v2_fields) - fields.keys()
+                if missing_fields:
+                    raise ConfigurationError(
+                        f"Missing V2 fields for document {doc_id}: "
+                        f"{sorted(missing_fields)}"
+                    )
+                fields["tags"] = []
+                new_documents.append(
+                    zvec.Doc(
+                        id=doc_id,
+                        fields=fields,
+                        vectors={"embedding": list(vector)},
+                    )
+                )
+            statuses = new_collection.upsert(new_documents)
+            if not isinstance(statuses, list):
+                statuses = [statuses]
+            failures = [str(status) for status in statuses if not status.ok()]
+            if failures:
+                raise ConfigurationError(
+                    f"V{COLLECTION_SCHEMA_VERSION} Collection upsert failed: {failures}"
+                )
+        new_collection.optimize()
+        if int(new_collection.stats.doc_count) != len(doc_ids):
+            raise ConfigurationError(
+                f"V{COLLECTION_SCHEMA_VERSION} Collection document-count "
+                "validation failed."
+            )
+        migrated_metadata = {
+            **metadata,
+            "schema_version": COLLECTION_SCHEMA_VERSION,
+            "migrated_from_schema": 2,
+            "migrated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        temp_meta.write_text(
+            json.dumps(migrated_metadata, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        del new_collection
+        del old_collection
+        gc.collect()
+        _remove_migration_artifacts(temp_collection, temp_meta)
+        raise
+
+    del new_collection
+    del old_collection
+    gc.collect()
+    backup_suffix = datetime.now().strftime("%Y%m%d_%H%M%S") + f"_{token[:8]}"
+    backup_collection = config.workspace / (
+        f"image_collection.v2.backup_{backup_suffix}"
+    )
+    backup_meta = config.workspace / (
+        f"image_collection.meta.v2.backup_{backup_suffix}.json"
+    )
+    moved: list[tuple[Path, Path]] = []
+    try:
+        for source, destination in (
+            (config.collection_path, backup_collection),
+            (config.collection_meta_path, backup_meta),
+            (temp_collection, config.collection_path),
+            (temp_meta, config.collection_meta_path),
+        ):
+            source.replace(destination)
+            moved.append((destination, source))
+    except Exception:
+        for source, destination in reversed(moved):
+            if source.exists() and not destination.exists():
+                source.replace(destination)
+        raise
+
+    return {
+        **preview,
+        "status": "migrated",
+        "backup_collection": str(backup_collection),
         "backup_metadata": str(backup_meta),
     }
 
@@ -309,7 +492,7 @@ def _legacy_roots(
     }
 
 
-def _chunks(values: list[dict[str, Any]], size: int):
+def _chunks(values: list[Any], size: int):
     for start in range(0, len(values), size):
         yield values[start : start + size]
 

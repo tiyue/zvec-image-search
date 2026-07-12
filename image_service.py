@@ -8,7 +8,7 @@ from pathlib import Path
 from image_vector_service import ImageVectorService
 from image_vector_service.config import ConfigurationError, ServiceConfig
 from image_vector_service.dashscope_client import DashScopeError
-from image_vector_service.path_migration import migrate_path_schema
+from image_vector_service.path_migration import migrate_schema
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -44,6 +44,17 @@ def build_parser() -> argparse.ArgumentParser:
         )
 
     sync_parser = subparsers.choices["sync"]
+    index_parser = subparsers.choices["index"]
+    index_parser.add_argument(
+        "tags",
+        nargs="*",
+        help="Tags applied to every indexed image in this root.",
+    )
+    index_parser.add_argument(
+        "--clear-tags",
+        action="store_true",
+        help="Remove all tags from this indexed root.",
+    )
     sync_parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -58,7 +69,25 @@ def build_parser() -> argparse.ArgumentParser:
     search = subparsers.add_parser("search", help="Search by text, image, or both.")
     search.add_argument("--text", help="Text query.")
     search.add_argument("--image", help="Local query image path.")
-    search.add_argument("--top-k", type=int, default=10, help="Number of images.")
+    search.set_defaults(tk=10)
+    search.add_argument("--tk", dest="tk", type=int, help="Number of images.")
+    search.add_argument(
+        "--top-k",
+        dest="tk",
+        type=int,
+        help=argparse.SUPPRESS,
+    )
+    search.add_argument(
+        "--tags",
+        nargs="+",
+        help="Only return documents matching these tags.",
+    )
+    search.add_argument(
+        "--tag-mode",
+        choices=("all", "any"),
+        default="all",
+        help="Require all tags or any tag (default: all).",
+    )
     search.add_argument("--image-weight", type=float, default=0.5)
     search.add_argument("--text-weight", type=float, default=0.5)
     search.add_argument("--include-self", action="store_true")
@@ -70,15 +99,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     rebind.add_argument("root_id", help="Stable root identifier shown by roots.")
     rebind.add_argument("folder", help="New local folder path.")
-    migrate = subparsers.add_parser(
-        "migrate-path-schema",
-        help="Migrate absolute-path V1 records to portable V2 records.",
-    )
-    migrate.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Validate and preview the migration without changing data.",
-    )
+    for command in ("migrate-schema", "migrate-path-schema"):
+        migrate = subparsers.add_parser(
+            command,
+            help=(
+                "Migrate the Collection without regenerating embeddings."
+                if command == "migrate-schema"
+                else argparse.SUPPRESS
+            ),
+        )
+        migrate.add_argument(
+            "--dry-run",
+            action="store_true",
+            help="Validate and preview the migration without changing data.",
+        )
     subparsers.add_parser("cache-clear", help="Delete cached query embeddings.")
     clean = subparsers.add_parser(
         "clean-results", help="Delete old search result directories."
@@ -106,10 +140,10 @@ def main(argv: list[str] | None = None) -> int:
             if args.workspace
             else ServiceConfig()
         )
-        if args.command == "migrate-path-schema":
+        if args.command in {"migrate-schema", "migrate-path-schema"}:
             print(
                 json.dumps(
-                    migrate_path_schema(config, dry_run=args.dry_run),
+                    migrate_schema(config, dry_run=args.dry_run),
                     ensure_ascii=False,
                     indent=2,
                 )
@@ -121,10 +155,13 @@ def main(argv: list[str] | None = None) -> int:
         )
         if args.command in {"index", "sync"}:
             if args.command == "index":
+                if args.clear_tags and args.tags:
+                    raise ValueError("Tags cannot be combined with --clear-tags.")
                 index_report = service.index_folder(
                     args.folder,
                     recursive=not args.no_recursive,
                     verify_hash=args.verify_hash,
+                    tags=[] if args.clear_tags else (args.tags or None),
                 )
             else:
                 index_report = service.sync_folder(
@@ -179,19 +216,28 @@ def main(argv: list[str] | None = None) -> int:
             search_report = service.search_by_image_and_text(
                 image_path=args.image,
                 text=args.text,
-                top_k=args.top_k,
+                top_k=args.tk,
                 image_weight=args.image_weight,
                 text_weight=args.text_weight,
                 include_self=args.include_self,
+                tags=args.tags,
+                tag_mode=args.tag_mode,
             )
         elif args.image:
             search_report = service.search_by_image(
                 image_path=args.image,
-                top_k=args.top_k,
+                top_k=args.tk,
                 include_self=args.include_self,
+                tags=args.tags,
+                tag_mode=args.tag_mode,
             )
         else:
-            search_report = service.search_by_text(args.text, top_k=args.top_k)
+            search_report = service.search_by_text(
+                args.text,
+                top_k=args.tk,
+                tags=args.tags,
+                tag_mode=args.tag_mode,
+            )
         print(json.dumps(search_report.to_dict(), ensure_ascii=False, indent=2))
         return 0
     except KeyboardInterrupt:

@@ -277,5 +277,73 @@ class ImageVectorServiceTest(unittest.TestCase):
         )
 
 
+class ImageTagSearchTest(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = Path(tempfile.mkdtemp(prefix="zvec_image_tag_test_"))
+        self.warm_dir = self.temp_dir / "warm-images"
+        self.cool_dir = self.temp_dir / "cool-images"
+        self.warm_dir.mkdir()
+        self.cool_dir.mkdir()
+        Image.new("RGB", (16, 16), (255, 0, 0)).save(self.warm_dir / "red.png")
+        Image.new("RGB", (16, 16), (0, 0, 255)).save(self.cool_dir / "blue.png")
+        self.config = ServiceConfig(workspace=self.temp_dir / "workspace")
+        self.client = FakeEmbeddingClient(self.config.dimension)
+        self.service = ImageVectorService(
+            config=self.config,
+            embedding_client=self.client,
+        )
+
+    def tearDown(self):
+        self.service.close()
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_index_tags_filter_search_and_retag_without_embedding(self):
+        warm = self.service.index_folder(
+            str(self.warm_dir), tags=["warm", "O'Reilly", "warm"]
+        )
+        cool = self.service.index_folder(str(self.cool_dir), tags=["cool"])
+        self.assertEqual(warm.inserted, 1)
+        self.assertEqual(cool.inserted, 1)
+        roots = self.service.list_roots()
+        self.assertEqual(
+            {tuple(root["tags"]) for root in roots},
+            {("warm", "O'Reilly"), ("cool",)},
+        )
+
+        request_count = self.client.request_count
+        retagged = self.service.index_folder(
+            str(self.warm_dir), tags=["featured", "O'Reilly"]
+        )
+        self.assertEqual(retagged.updated, 1)
+        self.assertEqual(self.client.request_count, request_count)
+
+        all_tags = self.service.search_by_text(
+            "red",
+            top_k=10,
+            tags=["featured", "O'Reilly"],
+        )
+        self.assertEqual(all_tags.result_count, 1)
+        self.assertEqual(all_tags.results[0].tags, ["featured", "O'Reilly"])
+
+        missing_combination = self.service.search_by_text(
+            "red",
+            top_k=10,
+            tags=["featured", "cool"],
+        )
+        self.assertEqual(missing_combination.result_count, 0)
+
+        any_tag = self.service.search_by_text(
+            "red",
+            top_k=10,
+            tags=["featured", "cool"],
+            tag_mode="any",
+        )
+        self.assertEqual(any_tag.result_count, 2)
+        self.assertEqual(
+            {tuple(result.tags) for result in any_tag.results},
+            {("featured", "O'Reilly"), ("cool",)},
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

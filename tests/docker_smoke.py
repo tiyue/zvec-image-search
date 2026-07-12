@@ -245,7 +245,9 @@ class DockerSmoke:
         raise SmokeFailure("Mock DashScope server did not become ready.")
 
     def verify_image(self) -> dict[str, Any]:
-        inspect = _json_output(_docker("image", "inspect", self.image).stdout)[0]
+        inspect = _json_output(
+            _docker("inspect", "--type", "image", self.image).stdout
+        )[0]
         size = int(inspect["Size"])
         _require(
             size <= self.max_size_bytes,
@@ -283,12 +285,51 @@ class DockerSmoke:
             ).stdout
         )
         expected = {
-            "zvec-image-search": "0.3.0",
+            "zvec-image-search": "0.4.0",
             "zvec": "0.5.1",
             "numpy": "2.5.1",
             "Pillow": "12.3.0",
         }
         _require(versions == expected, f"Unexpected package versions: {versions}")
+
+        formats_code = """
+from pathlib import Path
+from PIL import Image
+
+root = Path("/tmp/formats")
+root.mkdir()
+specs = [
+    ("jpg", "JPEG", (32, 32)),
+    ("png", "PNG", (32, 32)),
+    ("webp", "WEBP", (32, 32)),
+    ("bmp", "BMP", (32, 32)),
+    ("tiff", "TIFF", (32, 32)),
+    ("ico", "ICO", (64, 64)),
+    ("dib", "DIB", (32, 32)),
+    ("icns", "ICNS", (512, 512)),
+    ("sgi", "SGI", (32, 32)),
+]
+for extension, image_format, size in specs:
+    path = root / f"test.{extension}"
+    Image.new("RGB", size, (120, 30, 220)).save(path, format=image_format)
+    with Image.open(path) as image:
+        image.load()
+        print(image.format)
+"""
+        formats = _docker(
+            "run",
+            "--rm",
+            "--entrypoint",
+            "python",
+            self.image,
+            "-c",
+            formats_code,
+        ).stdout.splitlines()
+        _require(
+            formats
+            == ["JPEG", "PNG", "WEBP", "BMP", "TIFF", "ICO", "DIB", "ICNS", "SGI"],
+            f"Supported image format check failed: {formats}",
+        )
 
         content_code = (
             "from pathlib import Path; "
@@ -296,7 +337,10 @@ class DockerSmoke:
             "print(sum(1 for _ in root.rglob('*.pyc'))); "
             "print(int(Path('/wheels').exists())); "
             "print(sum(1 for base in [Path('/data/workspace'), Path('/data/results')] "
-            "for path in base.rglob('*') if path.is_file()))"
+            "for path in base.rglob('*') if path.is_file())); "
+            "print(int((root / 'pip').exists())); "
+            "print(int((root / 'zvec' / 'data').exists())); "
+            "print(int(any((root / 'pillow.libs').glob('libavif-*.so*'))))"
         )
         content_lines = _docker(
             "run",
@@ -307,7 +351,10 @@ class DockerSmoke:
             "-c",
             content_code,
         ).stdout.splitlines()
-        _require(content_lines == ["0", "0", "0"], "Unexpected image build data.")
+        _require(
+            content_lines == ["0", "0", "0", "0", "0", "0"],
+            "Unexpected image build data.",
+        )
         env_files = _docker(
             "run",
             "--rm",
@@ -351,7 +398,9 @@ class DockerSmoke:
             "New collection is not empty.",
         )
 
-        indexed = _json_output(self.run_app("index", "/data/roots/main").stdout)
+        indexed = _json_output(
+            self.run_app("index", "/data/roots/main", "library", "primary").stdout
+        )
         _require(indexed["inserted"] == 2, f"Unexpected index report: {indexed}")
         _require(indexed["failed"] == 0, f"Index failures: {indexed['failures']}")
 
@@ -362,22 +411,51 @@ class DockerSmoke:
         )
         _require(second_stats["tracked_files"] == 2, "Tracked file count is not 2.")
         _require(
+            second_stats["roots"][0]["tags"] == ["library", "primary"],
+            "Indexed root tags did not persist.",
+        )
+        _require(
             second_stats["collection_uuid"] == third_stats["collection_uuid"],
             "Collection did not persist across containers.",
         )
 
         text_report = _json_output(
-            self.run_app("search", "--text", "red image", "--top-k", "1").stdout
+            self.run_app(
+                "search",
+                "--text",
+                "red image",
+                "--tk",
+                "1",
+                "--tags",
+                "library",
+                "primary",
+            ).stdout
         )
         _require(text_report["result_count"] == 1, "Text search returned no result.")
         _require(
             text_report["embedding_sources"]["text"] == "api",
             "Text search did not use API.",
         )
+        _require(
+            text_report["results"][0]["tags"] == ["library", "primary"],
+            "Search result did not include tags.",
+        )
+        no_tag_match = _json_output(
+            self.run_app(
+                "search",
+                "--text",
+                "red image",
+                "--tk",
+                "1",
+                "--tags",
+                "missing",
+            ).stdout
+        )
+        _require(no_tag_match["result_count"] == 0, "Tag filter was not applied.")
 
         image_report = _json_output(
             self.run_app(
-                "search", "--image", "/data/roots/main/red.png", "--top-k", "1"
+                "search", "--image", "/data/roots/main/red.png", "--tk", "1"
             ).stdout
         )
         _require(image_report["result_count"] == 1, "Image search returned no result.")
@@ -392,7 +470,7 @@ class DockerSmoke:
                 "search",
                 "--image",
                 "/data/query/external.png",
-                "--top-k",
+                "--tk",
                 "1",
                 extra_mounts=query_mount,
             ).stdout
@@ -413,7 +491,7 @@ class DockerSmoke:
                 "/data/query/external.png",
                 "--text",
                 "green image",
-                "--top-k",
+                "--tk",
                 "1",
                 extra_mounts=query_mount,
             ).stdout
@@ -424,14 +502,22 @@ class DockerSmoke:
             "Mixed text did not use API.",
         )
 
-        for report in (text_report, image_report, external_report, mixed_report):
+        for report in (
+            text_report,
+            no_tag_match,
+            image_report,
+            external_report,
+            mixed_report,
+        ):
             output_dir = self.results / Path(report["output_dir"]).name
             _require(
                 (output_dir / "results.json").is_file(), "Missing search manifest."
             )
-            _require(
-                any(output_dir.glob("*.png")), "Search result image was not copied."
-            )
+            if report["result_count"]:
+                _require(
+                    any(output_dir.glob("*.png")),
+                    "Search result image was not copied.",
+                )
 
         clean_report = _json_output(
             self.run_app("clean-results", "--days", "7", "--dry-run").stdout
@@ -528,7 +614,7 @@ class DockerSmoke:
 
     def verify_interrupt(self) -> None:
         command = self.app_command(
-            ["search", "--text", "__slow__", "--top-k", "1"],
+            ["search", "--text", "__slow__", "--tk", "1"],
             remove=False,
             detach=True,
             name=self.interrupt_name,
@@ -559,7 +645,7 @@ class DockerSmoke:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run real Docker smoke tests.")
     parser.add_argument("image", nargs="?", default="zvec-image-search:local")
-    parser.add_argument("--max-size-mib", type=float, default=100.0)
+    parser.add_argument("--max-size-mib", type=float, default=80.0)
     return parser.parse_args()
 
 

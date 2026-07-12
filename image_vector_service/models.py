@@ -84,6 +84,7 @@ class ExportedHit:
     relative_path: str
     copied_file: str
     doc_id: str
+    tags: list[str] = field(default_factory=list)
     fused_score: float | None = None
 
 

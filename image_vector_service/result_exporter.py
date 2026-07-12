@@ -123,6 +123,7 @@ def export_results(
                 relative_path=relative_path,
                 copied_file=destination.name,
                 doc_id=hit.doc_id,
+                tags=[str(tag) for tag in (hit.fields.get("tags") or [])],
             )
         )
 

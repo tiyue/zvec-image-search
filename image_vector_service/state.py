@@ -11,6 +11,7 @@ from typing import Any
 
 from .config import ConfigurationError
 from .logical_paths import logical_document_id, normalize_path, resolve_under_root
+from .tags import normalize_tags
 
 ENTRY_COLUMNS = (
     "doc_id",
@@ -24,6 +25,7 @@ ENTRY_COLUMNS = (
     "mtime_ns",
     "width",
     "height",
+    "tags_json",
 )
 
 
@@ -40,7 +42,7 @@ class IndexState:
             if version == "1":
                 raise ConfigurationError(
                     "Path schema V1 requires migration. Run "
-                    "'image_service.py migrate-path-schema --dry-run' first."
+                    "'image_service.py migrate-schema --dry-run' first."
                 )
             self._create_schema()
             self._validate_schema_version()
@@ -73,14 +75,16 @@ class IndexState:
                 size_bytes INTEGER NOT NULL,
                 mtime_ns INTEGER NOT NULL,
                 width INTEGER NOT NULL,
-                height INTEGER NOT NULL
+                height INTEGER NOT NULL,
+                tags_json TEXT NOT NULL DEFAULT '[]'
             );
             CREATE INDEX IF NOT EXISTS idx_entries_sha256 ON entries(sha256);
             CREATE INDEX IF NOT EXISTS idx_entries_root_id ON entries(root_id);
             CREATE TABLE IF NOT EXISTS roots (
                 root_id TEXT PRIMARY KEY,
                 current_path TEXT NOT NULL UNIQUE,
-                recursive INTEGER NOT NULL
+                recursive INTEGER NOT NULL,
+                tags_json TEXT NOT NULL DEFAULT '[]'
             );
             CREATE TABLE IF NOT EXISTS embedding_cache (
                 cache_key TEXT PRIMARY KEY,
@@ -95,6 +99,20 @@ class IndexState:
                 ON embedding_cache(modality);
             """
         )
+        root_columns = {
+            str(row[1]) for row in self.connection.execute("PRAGMA table_info(roots)")
+        }
+        entry_columns = {
+            str(row[1]) for row in self.connection.execute("PRAGMA table_info(entries)")
+        }
+        if "tags_json" not in entry_columns:
+            self.connection.execute(
+                "ALTER TABLE entries ADD COLUMN tags_json TEXT NOT NULL DEFAULT '[]'"
+            )
+        if "tags_json" not in root_columns:
+            self.connection.execute(
+                "ALTER TABLE roots ADD COLUMN tags_json TEXT NOT NULL DEFAULT '[]'"
+            )
         self.connection.commit()
 
     def _existing_schema_version(self) -> str | None:
@@ -163,10 +181,10 @@ class IndexState:
         row = self.connection.execute(
             "SELECT * FROM entries WHERE doc_id = ?", (doc_id,)
         ).fetchone()
-        return dict(row) if row else None
+        return self._entry_from_row(row) if row else None
 
     def set_many(self, entries: Iterable[dict[str, Any]]) -> None:
-        values = [tuple(entry[column] for column in ENTRY_COLUMNS) for entry in entries]
+        values = [self._entry_values(entry) for entry in entries]
         if not values:
             return
         placeholders = ", ".join("?" for _ in ENTRY_COLUMNS)
@@ -201,7 +219,7 @@ class IndexState:
             "SELECT * FROM entries WHERE root_id = ? ORDER BY relative_path",
             (root_id,),
         )
-        return [dict(row) for row in rows]
+        return [self._entry_from_row(row) for row in rows]
 
     def find_doc_id_by_sha(self, sha256: str) -> str | None:
         row = self.connection.execute(
@@ -336,6 +354,7 @@ class IndexState:
     def list_roots(self) -> list[dict[str, Any]]:
         rows = self.connection.execute(
             "SELECT roots.root_id, roots.current_path, roots.recursive, "
+            "roots.tags_json, "
             "COUNT(entries.doc_id) AS document_count FROM roots "
             "LEFT JOIN entries ON entries.root_id = roots.root_id "
             "GROUP BY roots.root_id ORDER BY roots.current_path"
@@ -345,10 +364,57 @@ class IndexState:
                 "root_id": str(row["root_id"]),
                 "current_path": str(row["current_path"]),
                 "recursive": bool(row["recursive"]),
+                "tags": self._decode_tags(str(row["tags_json"])),
                 "document_count": int(row["document_count"]),
             }
             for row in rows
         ]
+
+    def tags_for_root(self, root_id: str) -> list[str]:
+        row = self.connection.execute(
+            "SELECT tags_json FROM roots WHERE root_id = ?", (root_id,)
+        ).fetchone()
+        if not row:
+            raise ConfigurationError(f"Unknown root_id: {root_id}")
+        return self._decode_tags(str(row["tags_json"]))
+
+    def set_root_tags(self, root_id: str, tags: Iterable[str]) -> None:
+        values = list(normalize_tags(tags))
+        with self.connection:
+            cursor = self.connection.execute(
+                "UPDATE roots SET tags_json = ? WHERE root_id = ?",
+                (json.dumps(values, ensure_ascii=False), root_id),
+            )
+        if cursor.rowcount != 1:
+            raise ConfigurationError(f"Unknown root_id: {root_id}")
+
+    @staticmethod
+    def _decode_tags(value: str) -> list[str]:
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ConfigurationError("Invalid root tags in state database.") from exc
+        if not isinstance(decoded, list) or not all(
+            isinstance(tag, str) for tag in decoded
+        ):
+            raise ConfigurationError("Invalid root tags in state database.")
+        return list(normalize_tags(decoded))
+
+    @classmethod
+    def _entry_from_row(cls, row: sqlite3.Row) -> dict[str, Any]:
+        entry = dict(row)
+        entry["tags"] = cls._decode_tags(str(entry.pop("tags_json")))
+        return entry
+
+    @staticmethod
+    def _entry_values(entry: dict[str, Any]) -> tuple[Any, ...]:
+        tags_json = json.dumps(
+            list(normalize_tags(entry.get("tags", ()))), ensure_ascii=False
+        )
+        return tuple(
+            tags_json if column == "tags_json" else entry[column]
+            for column in ENTRY_COLUMNS
+        )
 
     def rebind_root(self, root_id: str, new_path: str) -> dict[str, Any]:
         path = Path(new_path).expanduser().resolve()

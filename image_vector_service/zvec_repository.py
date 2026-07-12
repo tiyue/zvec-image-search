@@ -10,6 +10,9 @@ import zvec
 
 from .config import ConfigurationError, ServiceConfig
 from .models import ImageRecord, SearchHit
+from .tags import build_tags_filter, normalize_tags
+
+COLLECTION_SCHEMA_VERSION = 3
 
 OUTPUT_FIELDS = [
     "root_id",
@@ -23,6 +26,7 @@ OUTPUT_FIELDS = [
     "width",
     "height",
     "model",
+    "tags",
 ]
 
 
@@ -43,6 +47,7 @@ class ZvecImageRepository:
         if path.exists():
             metadata = self._validate_metadata(meta_path)
             collection = zvec.open(str(path))
+            self._validate_collection_schema(collection)
             if not metadata.get("collection_uuid"):
                 metadata["collection_uuid"] = str(uuid.uuid4())
                 self._atomic_json_write(meta_path, metadata)
@@ -52,7 +57,7 @@ class ZvecImageRepository:
         collection = zvec.create_and_open(str(path), self._schema())
         self.created = True
         metadata = {
-            "schema_version": 2,
+            "schema_version": COLLECTION_SCHEMA_VERSION,
             "collection_uuid": str(uuid.uuid4()),
             "model": self.config.model,
             "mode": "independent",
@@ -74,7 +79,7 @@ class ZvecImageRepository:
             )
         metadata = json.loads(meta_path.read_text(encoding="utf-8"))
         expected = {
-            "schema_version": 2,
+            "schema_version": COLLECTION_SCHEMA_VERSION,
             "model": self.config.model,
             "mode": "independent",
             "dimension": self.config.dimension,
@@ -86,13 +91,22 @@ class ZvecImageRepository:
             if metadata.get(key) != value
         }
         if mismatches:
-            if metadata.get("schema_version") == 1:
+            if metadata.get("schema_version") in {1, 2}:
                 raise ConfigurationError(
-                    "Collection path schema V1 requires migration. Run "
-                    "'image_service.py migrate-path-schema --dry-run' first."
+                    "Collection schema requires migration. Run "
+                    "'image_service.py migrate-schema --dry-run' first."
                 )
             raise ConfigurationError(f"Collection metadata mismatch: {mismatches}")
         return metadata
+
+    @staticmethod
+    def _validate_collection_schema(collection: zvec.Collection) -> None:
+        tags = [field for field in collection.schema.fields if field.name == "tags"]
+        if len(tags) != 1 or tags[0].data_type != zvec.DataType.ARRAY_STRING:
+            raise ConfigurationError(
+                "Collection tags field is missing or invalid. Run "
+                "'image_service.py migrate-schema --dry-run' first."
+            )
 
     @staticmethod
     def _atomic_json_write(path: Path, data: dict) -> None:
@@ -120,9 +134,15 @@ class ZvecImageRepository:
         )
 
     def upsert_records(
-        self, records: list[ImageRecord], vector: list[float]
+        self,
+        records: list[ImageRecord],
+        vector: list[float],
+        tags: Iterable[str] = (),
     ) -> tuple[list[str], dict[str, str]]:
-        documents = [self._to_doc(record, vector) for record in records]
+        normalized_tags = list(normalize_tags(tags))
+        documents = [
+            self._to_doc(record, vector, normalized_tags) for record in records
+        ]
         statuses = self.collection.upsert(documents)
         if not isinstance(statuses, list):
             statuses = [statuses]
@@ -136,7 +156,9 @@ class ZvecImageRepository:
                 failed[record.doc_id] = str(status)
         return succeeded, failed
 
-    def _to_doc(self, record: ImageRecord, vector: list[float]) -> zvec.Doc:
+    def _to_doc(
+        self, record: ImageRecord, vector: list[float], tags: list[str]
+    ) -> zvec.Doc:
         return zvec.Doc(
             id=record.doc_id,
             fields={
@@ -151,14 +173,22 @@ class ZvecImageRepository:
                 "width": record.width,
                 "height": record.height,
                 "model": self.config.model,
+                "tags": tags,
             },
             vectors={"embedding": vector},
         )
 
-    def query(self, vector: list[float], top_k: int) -> list[SearchHit]:
+    def query(
+        self,
+        vector: list[float],
+        top_k: int,
+        tags: Iterable[str] = (),
+        tag_mode: str = "all",
+    ) -> list[SearchHit]:
         documents = self.collection.query(
             queries=zvec.Query(field_name="embedding", vector=vector),
             topk=top_k,
+            filter=build_tags_filter(tags, tag_mode),
             include_vector=False,
             output_fields=OUTPUT_FIELDS,
         )
@@ -227,6 +257,11 @@ def collection_schema(config: ServiceConfig) -> zvec.CollectionSchema:
             zvec.FieldSchema("width", zvec.DataType.INT32),
             zvec.FieldSchema("height", zvec.DataType.INT32),
             zvec.FieldSchema("model", zvec.DataType.STRING),
+            zvec.FieldSchema(
+                "tags",
+                zvec.DataType.ARRAY_STRING,
+                index_param=zvec.InvertIndexParam(),
+            ),
         ],
         vectors=[
             zvec.VectorSchema(

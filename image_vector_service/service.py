@@ -30,6 +30,7 @@ from .rank_fusion import weighted_rrf
 from .result_exporter import clean_result_directories, export_results
 from .source_resolver import SourcePathResolver
 from .state import IndexState
+from .tags import normalize_tags
 from .zvec_repository import ZvecImageRepository
 
 
@@ -80,6 +81,7 @@ class ImageVectorService:
         folder_path: str,
         recursive: bool = True,
         verify_hash: bool = False,
+        tags: Iterable[str] | None = None,
     ) -> IndexReport:
         return self._index(
             folder_path,
@@ -88,6 +90,7 @@ class ImageVectorService:
             verify_hash=verify_hash,
             dry_run=False,
             allow_scope_change=False,
+            tags=tags,
         )
 
     def sync_folder(
@@ -105,6 +108,7 @@ class ImageVectorService:
             verify_hash=verify_hash,
             dry_run=dry_run,
             allow_scope_change=allow_scope_change,
+            tags=None,
         )
 
     def _index(
@@ -115,6 +119,7 @@ class ImageVectorService:
         verify_hash: bool,
         dry_run: bool,
         allow_scope_change: bool,
+        tags: Iterable[str] | None,
     ) -> IndexReport:
         root = Path(folder_path).expanduser().resolve()
         normalized_root = normalize_path(root)
@@ -143,13 +148,20 @@ class ImageVectorService:
             if root_info
             else self.state.ensure_root(normalized_root, recursive)
         )
+        requested_tags = normalize_tags(tags) if tags is not None else None
+        effective_tags = (
+            requested_tags
+            if requested_tags is not None
+            else tuple(self.state.tags_for_root(root_id))
+        )
 
         self.progress(f"Scanning: {root}")
         self.logger.info(
-            "index_start recursive=%s sync=%s verify_hash=%s",
+            "index_start recursive=%s sync=%s verify_hash=%s tags=%d",
             recursive,
             sync_deleted,
             verify_hash,
+            len(effective_tags),
         )
         scan = scan_folder(
             root,
@@ -179,7 +191,15 @@ class ImageVectorService:
         groups: dict[str, list[ImageRecord]] = defaultdict(list)
         for record in scan.records:
             existing = self.state.get(record.doc_id)
-            if existing == record.state_dict():
+            record_state = record.state_dict()
+            file_unchanged = existing is not None and all(
+                existing.get(key) == value for key, value in record_state.items()
+            )
+            tags_unchanged = (
+                existing is not None
+                and tuple(existing.get("tags", ())) == effective_tags
+            )
+            if file_unchanged and tags_unchanged:
                 if self.validate_documents and not self.repository.contains(
                     record.doc_id
                 ):
@@ -202,7 +222,7 @@ class ImageVectorService:
                 pending.append((content_hash, records))
 
         for records, vector in reusable:
-            self._upsert_group(records, vector, report)
+            self._upsert_group(records, vector, effective_tags, report)
 
         embeddable: list[tuple[str, list[ImageRecord]]] = []
         for content_hash, records in pending:
@@ -228,7 +248,7 @@ class ImageVectorService:
 
         processed = 0
         for batch in self._embedding_batches(embeddable):
-            self._embed_and_upsert_resilient(batch, report)
+            self._embed_and_upsert_resilient(batch, effective_tags, report)
             processed += len(batch)
             self.progress(f"Embedded {processed}/{len(embeddable)} unique images.")
 
@@ -264,6 +284,8 @@ class ImageVectorService:
             self.state.record_root(root_id, normalized_root, True)
         elif sync_deleted and allow_scope_change and scan.complete and not dry_run:
             self.state.record_root(root_id, normalized_root, recursive)
+        if requested_tags is not None:
+            self.state.set_root_tags(root_id, requested_tags)
 
         report.failed = len(report.failures)
         if self.repository.doc_count != self.state.count():
@@ -308,6 +330,7 @@ class ImageVectorService:
     def _embed_and_upsert_resilient(
         self,
         batch: list[tuple[str, list[ImageRecord]]],
+        tags: tuple[str, ...],
         report: IndexReport,
     ) -> None:
         if not batch:
@@ -324,8 +347,8 @@ class ImageVectorService:
             report.api_requests += max(0, after - before)
             if getattr(exc, "splittable", False) and len(batch) > 1:
                 midpoint = len(batch) // 2
-                self._embed_and_upsert_resilient(batch[:midpoint], report)
-                self._embed_and_upsert_resilient(batch[midpoint:], report)
+                self._embed_and_upsert_resilient(batch[:midpoint], tags, report)
+                self._embed_and_upsert_resilient(batch[midpoint:], tags, report)
                 return
             if getattr(exc, "splittable", False):
                 report.failures.extend(
@@ -349,12 +372,13 @@ class ImageVectorService:
                     for record in records
                 )
             else:
-                self._upsert_group(records, vector, report)
+                self._upsert_group(records, vector, tags, report)
 
     def _upsert_group(
         self,
         records: list[ImageRecord],
         vector: list[float],
+        tags: tuple[str, ...],
         report: IndexReport,
     ) -> None:
         if len(vector) != self.config.dimension:
@@ -368,7 +392,7 @@ class ImageVectorService:
             return
 
         previous = {record.doc_id: self.state.get(record.doc_id) for record in records}
-        succeeded, failures = self.repository.upsert_records(records, vector)
+        succeeded, failures = self.repository.upsert_records(records, vector, tags)
         by_id = {record.doc_id: record for record in records}
         successful_entries = []
         for doc_id in succeeded:
@@ -377,26 +401,39 @@ class ImageVectorService:
                 report.inserted += 1
             else:
                 report.updated += 1
-            successful_entries.append(record.state_dict())
+            successful_entries.append({**record.state_dict(), "tags": list(tags)})
         self.state.set_many(successful_entries)
         report.failures.extend(
             FileFailure(by_id[doc_id].absolute_path, error)
             for doc_id, error in failures.items()
         )
 
-    def search_by_text(self, text: str, top_k: int = 10) -> SearchReport:
+    def search_by_text(
+        self,
+        text: str,
+        top_k: int = 10,
+        tags: Iterable[str] | None = None,
+        tag_mode: str = "all",
+    ) -> SearchReport:
         self._validate_top_k(top_k)
+        normalized_tags = self._validate_search_tags(tags, tag_mode)
         text = text.strip()
         if not text:
             raise ValueError("Search text cannot be empty.")
         vector, source, request_id, usage = self._text_embedding(text)
-        hits = self._query_until_sufficient(vector, top_k)
+        hits = self._query_until_sufficient(
+            vector, top_k, tags=normalized_tags, tag_mode=tag_mode
+        )
         report = export_results(
             self.config,
             query_type="text",
             hits=hits,
             top_k=top_k,
-            query={"text": text},
+            query={
+                "text": text,
+                "tags": list(normalized_tags),
+                "tag_mode": tag_mode,
+            },
             request_ids=[request_id],
             usage=[usage] if usage else [],
             resolve_source=self.source_resolver.resolve_hit,
@@ -406,19 +443,35 @@ class ImageVectorService:
         return report
 
     def search_by_image(
-        self, image_path: str, top_k: int = 10, include_self: bool = False
+        self,
+        image_path: str,
+        top_k: int = 10,
+        include_self: bool = False,
+        tags: Iterable[str] | None = None,
+        tag_mode: str = "all",
     ) -> SearchReport:
         self._validate_top_k(top_k)
+        normalized_tags = self._validate_search_tags(tags, tag_mode)
         path = inspect_query_image(image_path)
         vector, source, request_id, usage = self._image_embedding(path)
         exclude = None if include_self else str(path)
-        hits = self._query_until_sufficient(vector, top_k, exclude_path=exclude)
+        hits = self._query_until_sufficient(
+            vector,
+            top_k,
+            exclude_path=exclude,
+            tags=normalized_tags,
+            tag_mode=tag_mode,
+        )
         report = export_results(
             self.config,
             query_type="image",
             hits=hits,
             top_k=top_k,
-            query={"image": path.name},
+            query={
+                "image": path.name,
+                "tags": list(normalized_tags),
+                "tag_mode": tag_mode,
+            },
             request_ids=[request_id],
             usage=[usage] if usage else [],
             resolve_source=self.source_resolver.resolve_hit,
@@ -436,9 +489,12 @@ class ImageVectorService:
         image_weight: float = 0.5,
         text_weight: float = 0.5,
         include_self: bool = False,
+        tags: Iterable[str] | None = None,
+        tag_mode: str = "all",
     ) -> SearchReport:
         self._validate_top_k(top_k)
         self._validate_weights(image_weight, text_weight)
+        normalized_tags = self._validate_search_tags(tags, tag_mode)
         text = text.strip()
         if not text:
             raise ValueError("Search text cannot be empty.")
@@ -484,6 +540,8 @@ class ImageVectorService:
             image_weight,
             text_weight,
             exclude,
+            normalized_tags,
+            tag_mode,
         )
         report = export_results(
             self.config,
@@ -495,6 +553,8 @@ class ImageVectorService:
                 "text": text,
                 "image_weight": image_weight,
                 "text_weight": text_weight,
+                "tags": list(normalized_tags),
+                "tag_mode": tag_mode,
             },
             request_ids=[response.request_id for response in responses.values()],
             usage=[response.usage for response in responses.values()],
@@ -586,14 +646,19 @@ class ImageVectorService:
         )
 
     def _query_until_sufficient(
-        self, vector: list[float], top_k: int, exclude_path: str | None = None
+        self,
+        vector: list[float],
+        top_k: int,
+        exclude_path: str | None = None,
+        tags: tuple[str, ...] = (),
+        tag_mode: str = "all",
     ) -> list[SearchHit]:
         total = self.repository.doc_count
         if total == 0:
             return []
         limit = min(total, max(top_k * 3, top_k + 10))
         while True:
-            hits = self.repository.query(vector, limit)
+            hits = self.repository.query(vector, limit, tags, tag_mode)
             if (
                 _usable_hit_count(hits, exclude_path, self.source_resolver.resolve_hit)
                 >= top_k
@@ -610,6 +675,8 @@ class ImageVectorService:
         image_weight: float,
         text_weight: float,
         exclude_path: str | None,
+        tags: tuple[str, ...],
+        tag_mode: str,
     ) -> list[SearchHit]:
         total = self.repository.doc_count
         if total == 0:
@@ -618,9 +685,19 @@ class ImageVectorService:
         while True:
             with ThreadPoolExecutor(max_workers=2) as executor:
                 image_future = executor.submit(
-                    self.repository.query, image_vector, limit
+                    self.repository.query,
+                    image_vector,
+                    limit,
+                    tags,
+                    tag_mode,
                 )
-                text_future = executor.submit(self.repository.query, text_vector, limit)
+                text_future = executor.submit(
+                    self.repository.query,
+                    text_vector,
+                    limit,
+                    tags,
+                    tag_mode,
+                )
                 image_hits = image_future.result()
                 text_hits = text_future.result()
             fused = weighted_rrf(
@@ -698,6 +775,14 @@ class ImageVectorService:
     def _validate_top_k(self, top_k: int) -> None:
         if not 1 <= top_k <= self.config.max_top_k:
             raise ValueError(f"top_k must be between 1 and {self.config.max_top_k}.")
+
+    @staticmethod
+    def _validate_search_tags(
+        tags: Iterable[str] | None, tag_mode: str
+    ) -> tuple[str, ...]:
+        if tag_mode not in {"all", "any"}:
+            raise ValueError("tag_mode must be 'all' or 'any'.")
+        return normalize_tags(tags)
 
     @staticmethod
     def _validate_weights(image_weight: float, text_weight: float) -> None:

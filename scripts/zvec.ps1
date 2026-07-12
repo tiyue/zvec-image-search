@@ -29,11 +29,11 @@ One-time setup:
   zvec init <image-folder> [--workspace <folder>] [--results <folder>]
 
 Daily commands:
-  zvec index [options]
+  zvec index [tags...] [options]
   zvec sync [options]
-  zvec search <text> [--top-k N]
-  zvec search-image <image-file> [--top-k N]
-  zvec search-mix <image-file> <text> [--top-k N]
+  zvec search <text> [--tk N] [--tags <tag...>]
+  zvec search-image <image-file> [--tk N] [--tags <tag...>]
+  zvec search-mix <image-file> <text> [--tk N] [--tags <tag...>]
   zvec stats
   zvec roots
   zvec results
@@ -44,7 +44,7 @@ Daily commands:
 
 Maintenance:
   zvec rebind-root <root-id> [new-image-folder]
-  zvec migrate-path-schema [--dry-run]
+  zvec migrate-schema [--dry-run]
   zvec raw <original zvec-image-search arguments>
 "@ | Write-Host
 }
@@ -434,18 +434,42 @@ function Assert-DockerReady {
     return $serverVersion
 }
 
+function Invoke-DockerQuietly {
+    param([Parameter(Mandatory = $true)][object[]]$Arguments)
+
+    $previousErrorAction = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        & docker @Arguments *> $null
+        return $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorAction
+    }
+}
+
 function Test-DockerImage {
     param([Parameter(Mandatory = $true)][string]$ImageName)
 
-    & docker image inspect $ImageName *> $null
-    return $LASTEXITCODE -eq 0
+    $exitCode = Invoke-DockerQuietly -Arguments @(
+        "inspect", "--type", "image", $ImageName
+    )
+    return $exitCode -eq 0
 }
 
 function Get-DockerImageUid {
     param([Parameter(Mandatory = $true)][string]$ImageName)
 
-    $output = & docker run --rm --entrypoint id $ImageName -u 2>&1
-    if ($LASTEXITCODE -ne 0) {
+    $previousErrorAction = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $output = & docker run --rm --entrypoint id $ImageName -u 2>&1
+        $exitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorAction
+    }
+    if ($exitCode -ne 0) {
         throw "Could not verify the runtime user for '$ImageName'."
     }
     return ([string]($output -join "`n")).Trim()
@@ -461,6 +485,7 @@ function Build-DockerImage {
     Write-Host "Building $ImageName ..."
     $dockerArguments = @(
         "build",
+        "--provenance=false",
         "--file", (Join-Path $script:RepoRoot "Dockerfile"),
         "--tag", $ImageName
     )
@@ -477,8 +502,10 @@ function Build-DockerImage {
     if ($uid -ne [string]$script:AppUid) {
         throw "Built image uses UID $uid; expected $script:AppUid."
     }
-    & docker run --rm $ImageName --help *> $null
-    if ($LASTEXITCODE -ne 0) {
+    $helpExitCode = Invoke-DockerQuietly -Arguments @(
+        "run", "--rm", $ImageName, "--help"
+    )
+    if ($helpExitCode -ne 0) {
         throw "Built image CLI verification failed."
     }
     Write-Host "Verified $ImageName (UID $uid, CLI ready)."
@@ -567,8 +594,8 @@ function Test-ContainerMounts {
         "-c",
         $permissionCheck
     )
-    & docker @dockerArguments *> $null
-    return $LASTEXITCODE -eq 0
+    $exitCode = Invoke-DockerQuietly -Arguments $dockerArguments
+    return $exitCode -eq 0
 }
 
 function Invoke-ZvecContainer {
@@ -922,7 +949,7 @@ try {
         }
         "search" {
             if ($Arguments.Count -lt 1) {
-                throw "Usage: zvec search <text> [--top-k N]"
+                throw "Usage: zvec search <text> [--tk N] [--tags <tag...>]"
             }
             $config = Read-Config
             if ($Arguments[0] -eq "--text") {
@@ -938,7 +965,7 @@ try {
         }
         "search-image" {
             if ($Arguments.Count -lt 1) {
-                throw "Usage: zvec search-image <image-file> [--top-k N]"
+                throw "Usage: zvec search-image <image-file> [--tk N] [--tags <tag...>]"
             }
             $config = Read-Config
             $query = Get-QueryMount $Arguments[0]
@@ -951,7 +978,7 @@ try {
         }
         "search-mix" {
             if ($Arguments.Count -lt 2) {
-                throw "Usage: zvec search-mix <image-file> <text> [--top-k N]"
+                throw "Usage: zvec search-mix <image-file> <text> [--tk N] [--tags <tag...>]"
             }
             $config = Read-Config
             $query = Get-QueryMount $Arguments[0]
@@ -1020,6 +1047,12 @@ try {
             $config = Read-Config
             Invoke-ZvecContainer -Config $config -CliArguments (
                 @("migrate-path-schema") + $Arguments
+            )
+        }
+        "migrate-schema" {
+            $config = Read-Config
+            Invoke-ZvecContainer -Config $config -CliArguments (
+                @("migrate-schema") + $Arguments
             )
         }
         "raw" {

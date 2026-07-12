@@ -11,7 +11,9 @@ $fakeBin = Join-Path $testRoot "bin"
 $configRoot = Join-Path $testRoot "config"
 $installRoot = Join-Path $testRoot "installed"
 $imageFolderName = ([char]0x56FE).ToString() + [char]0x5E93 + " space"
-$queryFolderName = ([char]0x67E5).ToString() + [char]0x8BE2 + " space"
+$queryFolderName = (
+    ([char]0x67E5).ToString() + [char]0x8BE2 + [char]0x26 + " space"
+)
 $queryFileName = ([char]0x6837).ToString() + [char]0x4F8B + ".jpg"
 $queryText = ([char]0x6D77).ToString() + [char]0x8FB9 + [char]0x65E5 + [char]0x843D
 $imageRoot = Join-Path $testRoot $imageFolderName
@@ -46,7 +48,7 @@ public static class Program {
             Console.WriteLine("99.0.0");
             return 0;
         }
-        if (args.Length > 1 && args[0] == "image" && args[1] == "inspect") {
+        if (args.Length > 0 && args[0] == "inspect") {
             return 0;
         }
         if (args.Length > 0 && args[0] == "run" &&
@@ -76,8 +78,10 @@ public static class Program {
     $null = Invoke-Launcher init $imageRoot --no-build
     $doctorOutput = Invoke-Launcher doctor
     $buildOutput = Invoke-Launcher build --clean
-    $searchOutput = Invoke-Launcher search $queryText --top-k 3
-    $imageOutput = Invoke-Launcher search-image $queryFile --top-k 2
+    $indexOutput = Invoke-Launcher index tag-one tag-two
+    $searchOutput = Invoke-Launcher search $queryText --tk 3 --tags tag-one tag-two
+    $imageOutput = Invoke-Launcher search-image $queryFile --tk 2 --tags tag-one
+    $migrationOutput = Invoke-Launcher migrate-schema --dry-run
 
     if (($doctorOutput -join "`n") -notmatch "Container mounts have the expected permissions") {
         throw "Doctor did not verify container mount permissions."
@@ -88,14 +92,29 @@ public static class Program {
     if (($buildOutput -join "`n") -notmatch "build[|].*--no-cache") {
         throw "Clean build arguments were not translated."
     }
+    if (($buildOutput -join "`n") -notmatch "build[|]--provenance=false") {
+        throw "Build did not disable provenance for the local image."
+    }
     if (($buildOutput -join "`n") -notmatch "Verified .*UID 10001") {
         throw "Build did not verify the image contract."
+    }
+    if (
+        ($indexOutput -join "`n") -notmatch
+        "index[|]/data/roots/main[|]tag-one[|]tag-two"
+    ) {
+        throw "Index tags were not translated."
     }
     if (($searchOutput -join "`n") -notmatch "search[|]--text[|]$queryText") {
         throw "Text search arguments were not translated."
     }
+    if (($searchOutput -join "`n") -notmatch "--tk[|]3[|]--tags[|]tag-one[|]tag-two") {
+        throw "Search tag arguments were not translated."
+    }
     if (($imageOutput -join "`n") -notmatch "--image[|]/data/query/") {
         throw "Query image arguments were not translated."
+    }
+    if (($migrationOutput -join "`n") -notmatch "migrate-schema[|]--dry-run") {
+        throw "Schema migration arguments were not translated."
     }
 
     $previousErrorAction = $ErrorActionPreference
@@ -116,10 +135,17 @@ public static class Program {
     if ($LASTEXITCODE -ne 0) {
         throw "Command installer failed."
     }
-    $installedCommand = Join-Path $installRoot "zvec.cmd"
-    $helpOutput = & cmd.exe /d /c $installedCommand help 2>&1
+    $installedCommand = Join-Path $installRoot "zvec.exe"
+    $helpOutput = & $installedCommand help 2>&1
     if ($LASTEXITCODE -ne 0 -or ($helpOutput -join "`n") -notmatch "Zvec Docker launcher") {
         throw "Installed zvec command did not run."
+    }
+    $installedImageOutput = & $installedCommand search-image $queryFile --tk 1 2>&1
+    if (
+        $LASTEXITCODE -ne 0 -or
+        ($installedImageOutput -join "`n") -notmatch "--image[|]/data/query/"
+    ) {
+        throw "Installed command did not preserve a path containing ampersand."
     }
 
     Write-Host "Launcher tests passed."

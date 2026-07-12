@@ -6,6 +6,7 @@ $ErrorActionPreference = "Stop"
 
 $repoRoot = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
 $launcherPath = Join-Path $repoRoot "scripts\zvec.ps1"
+$commandSourcePath = Join-Path $repoRoot "bin\zvec-command.cs"
 $windowsApps = if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
     Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps"
 }
@@ -30,27 +31,44 @@ else {
     ).FullName
 }
 
-$escapedCmdPath = $launcherPath.Replace("%", "%%")
-$cmdContent = @"
-@echo off
-rem Managed by zvec-image-search
-setlocal
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$escapedCmdPath" %*
-exit /b %ERRORLEVEL%
-"@
-$encoding = New-Object System.Text.UTF8Encoding($false)
-$commandPath = Join-Path $installDirectory "zvec.cmd"
-if (Test-Path -LiteralPath $commandPath) {
-    $existingContent = [System.IO.File]::ReadAllText($commandPath)
+$legacyCommandPath = Join-Path $installDirectory "zvec.cmd"
+if (Test-Path -LiteralPath $legacyCommandPath) {
+    $existingContent = [System.IO.File]::ReadAllText($legacyCommandPath)
     if (-not $existingContent.Contains("Managed by zvec-image-search")) {
+        throw "Refusing to replace an existing command: $legacyCommandPath"
+    }
+}
+
+$commandPath = Join-Path $installDirectory "zvec.exe"
+if (Test-Path -LiteralPath $commandPath) {
+    $productName = [System.Diagnostics.FileVersionInfo]::GetVersionInfo(
+        $commandPath
+    ).ProductName
+    if ($productName -ne "zvec-image-search command launcher") {
         throw "Refusing to replace an existing command: $commandPath"
     }
 }
-[System.IO.File]::WriteAllText(
-    $commandPath,
-    $cmdContent,
-    $encoding
+
+$source = [System.IO.File]::ReadAllText($commandSourcePath)
+$escapedLauncherPath = $launcherPath.Replace("\", "\\").Replace('"', '\"')
+$source = $source.Replace("__ZVEC_LAUNCHER_PATH__", $escapedLauncherPath)
+$temporaryCommand = Join-Path $installDirectory (
+    "zvec-" + [guid]::NewGuid().ToString("N") + ".exe"
 )
+try {
+    Add-Type -TypeDefinition $source -OutputAssembly $temporaryCommand `
+        -OutputType ConsoleApplication
+    Move-Item -LiteralPath $temporaryCommand -Destination $commandPath -Force
+}
+finally {
+    if (Test-Path -LiteralPath $temporaryCommand) {
+        Remove-Item -LiteralPath $temporaryCommand -Force
+    }
+}
+
+if (Test-Path -LiteralPath $legacyCommandPath) {
+    Remove-Item -LiteralPath $legacyCommandPath -Force
+}
 
 $pathEntries = @($env:Path -split ";")
 $onCurrentPath = $false
