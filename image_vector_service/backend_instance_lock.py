@@ -163,7 +163,7 @@ class BackendInstanceLock:
     @staticmethod
     def _lock_handle(handle: BinaryIO) -> None:
         if os.name == "nt":
-            import msvcrt
+            msvcrt = cast(Any, __import__("msvcrt"))
 
             msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
             return
@@ -174,7 +174,7 @@ class BackendInstanceLock:
     @staticmethod
     def _unlock_handle(handle: BinaryIO) -> None:
         if os.name == "nt":
-            import msvcrt
+            msvcrt = cast(Any, __import__("msvcrt"))
 
             msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
             return

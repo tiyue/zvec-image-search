@@ -878,7 +878,10 @@ def _open_results(path: Path) -> int:
         return 0
     try:
         if os.name == "nt":
-            os.startfile(path)
+            startfile = getattr(os, "startfile", None)
+            if startfile is None:
+                raise OSError("os.startfile is unavailable on this Windows runtime.")
+            startfile(path)
         elif sys.platform == "darwin":
             subprocess.Popen(["open", str(path)])
         else:
