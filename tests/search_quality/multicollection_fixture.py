@@ -19,7 +19,7 @@ from contextlib import closing, contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, cast
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 repository_root_text = str(REPOSITORY_ROOT)
@@ -137,16 +137,16 @@ class _ReadOnlyWorkspaceLock:
         handle = self.path.open("rb")
         try:
             if os.name == "nt":
-                import msvcrt
+                msvcrt = cast(Any, __import__("msvcrt"))
 
                 handle.seek(0)
                 msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
             else:
-                import fcntl
+                fcntl = cast(Any, __import__("fcntl"))
 
-                fcntl.flock(  # type: ignore[attr-defined]
+                fcntl.flock(
                     handle.fileno(),
-                    fcntl.LOCK_EX | fcntl.LOCK_NB,  # type: ignore[attr-defined]
+                    fcntl.LOCK_EX | fcntl.LOCK_NB,
                 )
         except OSError as exc:
             handle.close()
@@ -161,15 +161,15 @@ class _ReadOnlyWorkspaceLock:
         try:
             self._handle.seek(0)
             if os.name == "nt":
-                import msvcrt
+                msvcrt = cast(Any, __import__("msvcrt"))
 
                 msvcrt.locking(self._handle.fileno(), msvcrt.LK_UNLCK, 1)
             else:
-                import fcntl
+                fcntl = cast(Any, __import__("fcntl"))
 
-                fcntl.flock(  # type: ignore[attr-defined]
+                fcntl.flock(
                     self._handle.fileno(),
-                    fcntl.LOCK_UN,  # type: ignore[attr-defined]
+                    fcntl.LOCK_UN,
                 )
         finally:
             self._handle.close()
