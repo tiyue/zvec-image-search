@@ -24,16 +24,36 @@ $previousInstallDirectory = $env:ZVEC_COMMAND_INSTALL_DIR
 $previousSourceMode = $env:ZVEC_NATIVE_USE_SOURCE
 $previousNoOpen = $env:ZVEC_NO_OPEN
 $previousUtf8Output = $env:ZVEC_UTF8_OUTPUT
+$previousPythonUtf8 = $env:PYTHONUTF8
+$previousPythonIoEncoding = $env:PYTHONIOENCODING
 
 function Invoke-Launcher {
     param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Values)
 
-    $output = & powershell.exe -NoProfile -ExecutionPolicy Bypass `
-        -File $launcher @Values 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        throw "Launcher failed: $($output -join [Environment]::NewLine)"
+    $output = @()
+    $exitCode = 1
+    $previousErrorAction = $ErrorActionPreference
+    try {
+        # Windows PowerShell wraps redirected native stderr in ErrorRecord objects.
+        # Capture all diagnostic lines before applying the script-wide Stop policy.
+        $ErrorActionPreference = "Continue"
+        $output = @(
+            & powershell.exe -NoProfile -ExecutionPolicy Bypass `
+                -File $launcher @Values 2>&1
+        )
+        $exitCode = $LASTEXITCODE
     }
-    return $output
+    finally {
+        $ErrorActionPreference = $previousErrorAction
+    }
+    $outputText = @($output | ForEach-Object { [string]$_ })
+    if ($exitCode -ne 0) {
+        throw (
+            "Launcher failed with exit code $exitCode`n" +
+            ($outputText -join [Environment]::NewLine)
+        )
+    }
+    return $outputText
 }
 
 try {
@@ -48,6 +68,10 @@ try {
     $env:ZVEC_NATIVE_USE_SOURCE = "1"
     $env:ZVEC_NO_OPEN = "1"
     $env:ZVEC_UTF8_OUTPUT = "1"
+    # Simulate an English Windows host whose inherited Python stream encoding cannot
+    # represent the Unicode image path. The launcher must override both settings.
+    $env:PYTHONUTF8 = "0"
+    $env:PYTHONIOENCODING = "cp1252"
 
     $initOutput = Invoke-Launcher init $imageRoot --workspace $workspace `
         --results $results --skip-key
@@ -143,6 +167,8 @@ finally {
     $env:ZVEC_NATIVE_USE_SOURCE = $previousSourceMode
     $env:ZVEC_NO_OPEN = $previousNoOpen
     $env:ZVEC_UTF8_OUTPUT = $previousUtf8Output
+    $env:PYTHONUTF8 = $previousPythonUtf8
+    $env:PYTHONIOENCODING = $previousPythonIoEncoding
     if (Test-Path -LiteralPath $testRoot) {
         $resolved = (Resolve-Path -LiteralPath $testRoot).Path
         $tempRoot = (Resolve-Path -LiteralPath $env:TEMP).Path

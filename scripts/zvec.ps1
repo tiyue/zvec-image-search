@@ -14,6 +14,11 @@ if ($env:ZVEC_UTF8_OUTPUT -eq "1") {
     $utf8Output = New-Object System.Text.UTF8Encoding($false)
     [Console]::OutputEncoding = $utf8Output
     $OutputEncoding = $utf8Output
+    # PowerShell's console encoding does not control Python when stdout is redirected
+    # to a pipe. Force deterministic UTF-8 so non-ASCII paths cannot make Python fail
+    # with UnicodeEncodeError on English Windows installations.
+    $env:PYTHONUTF8 = "1"
+    $env:PYTHONIOENCODING = "utf-8"
 }
 
 $scriptRoot = Split-Path -Parent $PSCommandPath
