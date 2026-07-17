@@ -1,4 +1,4 @@
-[CmdletBinding(PositionalBinding = $false)]
+﻿[CmdletBinding(PositionalBinding = $false)]
 param(
     [Parameter(Position = 0)]
     [string]$Command = "help",
@@ -10,46 +10,208 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$script:ConfigSchemaVersion = 1
-$script:ContainerImageRoot = "/data/roots/main"
-$script:ContainerQueryRoot = "/data/query"
-$script:ContainerWorkspace = "/data/workspace"
-$script:ContainerResults = "/data/results"
-$script:DefaultImageName = "zvec-image-search:local"
-$script:AppUid = 10001
-$script:AppGid = 10001
-$script:ScriptRoot = Split-Path -Parent $PSCommandPath
-$script:RepoRoot = Split-Path -Parent $script:ScriptRoot
+if ($env:ZVEC_UTF8_OUTPUT -eq "1") {
+    $utf8Output = New-Object System.Text.UTF8Encoding($false)
+    [Console]::OutputEncoding = $utf8Output
+    $OutputEncoding = $utf8Output
+}
 
-function Write-Usage {
-    @"
-Zvec Docker launcher
+$scriptRoot = Split-Path -Parent $PSCommandPath
+$repoRoot = Split-Path -Parent $scriptRoot
+$packagedBackendRoot = Join-Path $repoRoot "backend"
+$sourceRoot = if (
+    Test-Path -LiteralPath (Join-Path $packagedBackendRoot "pyproject.toml") `
+        -PathType Leaf
+) {
+    [System.IO.Path]::GetFullPath($packagedBackendRoot)
+}
+else {
+    [System.IO.Path]::GetFullPath($repoRoot)
+}
+$runtimeResultPrefix = "@@ZVEC_RUNTIME_RESULT@@"
+$runtimeCommand = $Command -in @("runtime-bootstrap", "runtime-doctor")
+$script:RuntimeWasCreated = $false
+$script:RuntimeWasUpdated = $false
 
-One-time setup:
-  zvec init <image-folder> [--workspace <folder>] [--results <folder>]
+function Test-PythonCommand {
+    param([Parameter(Mandatory = $true)]$Python)
 
-Daily commands:
-  zvec index [tags...] [options]
-  zvec sync [options]
-  zvec search <text> [--tk N] [--tags <tag...>]
-  zvec search-image <image-file> [--tk N] [--tags <tag...>]
-  zvec search-mix <image-file> <text> [--tk N] [--tags <tag...>]
-  zvec stats
-  zvec roots
-  zvec results
-  zvec clean [days] [--dry-run]
-  zvec cache-clear
-  zvec doctor
-  zvec build [--clean]
+    try {
+        & $Python.File @($Python.Prefix) -c (
+            "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)"
+        ) *> $null
+        return $LASTEXITCODE -eq 0
+    }
+    catch {
+        return $false
+    }
+}
 
-Maintenance:
-  zvec rebind-root <root-id> [new-image-folder]
-  zvec migrate-schema [--dry-run]
-  zvec raw <original zvec-image-search arguments>
-"@ | Write-Host
+function Get-PythonArchitectureState {
+    param([Parameter(Mandatory = $true)]$Python)
+
+    try {
+        $probe = @(
+            & $Python.File @($Python.Prefix) -c `
+                "import platform; print(platform.system(),platform.machine(),sep=chr(124))" `
+                2>$null
+        )
+        if ($LASTEXITCODE -ne 0) {
+            return "probe_failed"
+        }
+        $parts = (($probe -join "").Trim() -split "\|", 2)
+        if ($parts.Count -ne 2) {
+            return "probe_failed"
+        }
+        if (
+            $parts[0] -ieq "Windows" -and
+            $parts[1] -in @("ARM64", "AArch64")
+        ) {
+            return "windows_arm64"
+        }
+        return "supported"
+    }
+    catch {
+        return "probe_failed"
+    }
+}
+
+function Throw-WindowsArm64PythonUnsupported {
+    Throw-RuntimeError -Code "windows_arm64_python_unsupported" `
+        -Message (
+            "zvec 0.5.1 暂无 Windows ARM64 Python wheel，原生 ARM64 " +
+            "解释器无法运行此后端。"
+        ) `
+        -RecommendedAction (
+            "请安装 x64 CPython 3.10 或更高版本，选择其 python.exe 后重试；" +
+            "Windows ARM64 会通过 x64 仿真运行后端。"
+        )
+}
+
+function Test-PythonPip {
+    param([Parameter(Mandatory = $true)]$Python)
+
+    try {
+        & $Python.File @($Python.Prefix) -m pip --version *> $null
+        return $LASTEXITCODE -eq 0
+    }
+    catch {
+        return $false
+    }
+}
+
+function Resolve-RecoveryPythonCommand {
+    param(
+        [Parameter(Mandatory = $true)][string]$ExcludedPython,
+        $PreferredPython
+    )
+
+    $excluded = [System.IO.Path]::GetFullPath($ExcludedPython)
+    $candidates = New-Object System.Collections.Generic.List[object]
+    if ($null -ne $PreferredPython) {
+        $candidates.Add($PreferredPython)
+    }
+    foreach ($name in @("python", "python3")) {
+        foreach ($candidate in @(
+            Get-Command $name -All -ErrorAction SilentlyContinue
+        )) {
+            $candidates.Add([pscustomobject]@{
+                File = $candidate.Source
+                Prefix = @()
+            })
+        }
+    }
+    foreach ($py in @(Get-Command "py" -All -ErrorAction SilentlyContinue)) {
+        # Prefer the classic launcher's x64 selector on Windows ARM64, then fall back
+        # to its default Python 3 selection for launcher versions without that selector.
+        $candidates.Add([pscustomobject]@{
+            File = $py.Source
+            Prefix = @("-3-64")
+        })
+        $candidates.Add([pscustomobject]@{ File = $py.Source; Prefix = @("-3") })
+    }
+
+    $arm64CandidateFound = $false
+    foreach ($candidate in $candidates) {
+        $candidatePath = $candidate.File
+        if ([System.IO.Path]::IsPathRooted($candidatePath)) {
+            $candidatePath = [System.IO.Path]::GetFullPath($candidatePath)
+            if ($candidatePath -ieq $excluded) {
+                continue
+            }
+        }
+        if (-not (Test-PythonCommand -Python $candidate)) {
+            continue
+        }
+        $architectureState = Get-PythonArchitectureState -Python $candidate
+        if ($architectureState -eq "windows_arm64") {
+            $arm64CandidateFound = $true
+            continue
+        }
+        if (
+            $architectureState -eq "supported" -and
+            (Test-PythonPip -Python $candidate)
+        ) {
+            return $candidate
+        }
+    }
+    if ($arm64CandidateFound) {
+        Throw-WindowsArm64PythonUnsupported
+    }
+    return $null
+}
+
+function Throw-RuntimeError {
+    param(
+        [Parameter(Mandatory = $true)][string]$Code,
+        [Parameter(Mandatory = $true)][string]$Message,
+        [Parameter(Mandatory = $true)][string]$RecommendedAction
+    )
+
+    $exception = New-Object System.InvalidOperationException($Message)
+    $exception.Data["ZvecRuntimeCode"] = $Code
+    $exception.Data["ZvecRecommendedAction"] = $RecommendedAction
+    throw $exception
+}
+
+function Write-RuntimeResult {
+    param(
+        [Parameter(Mandatory = $true)][bool]$Success,
+        [Parameter(Mandatory = $true)][string]$Status,
+        [Parameter(Mandatory = $true)][string]$Code,
+        [Parameter(Mandatory = $true)][string]$Message,
+        [string]$RecommendedAction,
+        [string]$PythonExecutable,
+        [string]$PythonVersion,
+        [string]$PythonArchitecture,
+        [string]$RuntimeDirectory,
+        [object[]]$Dependencies = @(),
+        [bool]$Changed = $false
+    )
+
+    $payload = [ordered]@{
+        schema_version = 1
+        success = $Success
+        status = $Status
+        changed = $Changed
+        code = $Code
+        message = $Message
+        recommended_action = $RecommendedAction
+        python_executable = $PythonExecutable
+        python_version = $PythonVersion
+        python_architecture = $PythonArchitecture
+        runtime_directory = $RuntimeDirectory
+        dependencies = @($Dependencies)
+    }
+    $json = $payload | ConvertTo-Json -Compress -Depth 5
+    [Console]::Out.WriteLine($runtimeResultPrefix + $json)
 }
 
 function Get-ConfigHome {
+    if (-not [string]::IsNullOrWhiteSpace($env:ZVEC_CONFIG_HOME)) {
+        return [System.IO.Path]::GetFullPath($env:ZVEC_CONFIG_HOME)
+    }
+    # Retain the old variable while existing installations migrate to schema v3.
     if (-not [string]::IsNullOrWhiteSpace($env:ZVEC_DOCKER_CONFIG_HOME)) {
         return [System.IO.Path]::GetFullPath($env:ZVEC_DOCKER_CONFIG_HOME)
     }
@@ -59,1017 +221,821 @@ function Get-ConfigHome {
     return Join-Path $HOME ".zvec-image-search"
 }
 
-function Get-ConfigPath {
-    return Join-Path (Get-ConfigHome) "config.json"
-}
-
-function Get-EnvPath {
-    return Join-Path (Get-ConfigHome) ".env"
-}
-
-function Ensure-Directory {
-    param([Parameter(Mandatory = $true)][string]$Path)
-
-    return [System.IO.Directory]::CreateDirectory(
-        [System.IO.Path]::GetFullPath($Path)
-    ).FullName
-}
-
-function Test-DirectoryWritable {
-    param([Parameter(Mandatory = $true)][string]$Path)
-
-    $directory = Ensure-Directory $Path
-    $probe = Join-Path $directory (
-        ".zvec-write-test-$PID-$([guid]::NewGuid().ToString('N')).tmp"
-    )
-    try {
-        [System.IO.File]::WriteAllText($probe, "")
-        return $true
+function Resolve-PythonCommand {
+    $arm64CandidateFound = $false
+    if (-not [string]::IsNullOrWhiteSpace($env:ZVEC_PYTHON)) {
+        $configured = Get-Command $env:ZVEC_PYTHON -ErrorAction SilentlyContinue
+        if ($null -eq $configured) {
+            Throw-RuntimeError -Code "configured_python_not_found" `
+                -Message "找不到已配置的 Python：$($env:ZVEC_PYTHON)" `
+                -RecommendedAction (
+                    "请选择现有的 x64 Python 3.10 或更高版本；也可以清除无效的 " +
+                    "Python 路径后重试。"
+                )
+        }
+        $configuredCommand = [pscustomobject]@{
+            File = $configured.Source
+            Prefix = @()
+        }
+        if (Test-PythonCommand -Python $configuredCommand) {
+            $architectureState = Get-PythonArchitectureState -Python $configuredCommand
+            if ($architectureState -eq "windows_arm64") {
+                # An explicit interpreter choice must never silently fall back.
+                Throw-WindowsArm64PythonUnsupported
+            }
+            if ($architectureState -eq "probe_failed") {
+                Throw-RuntimeError -Code "python_probe_failed" `
+                    -Message "无法检查已配置 Python 的系统和 CPU 架构。" `
+                    -RecommendedAction "请选择可用的 x64 Python 3.10 或更高版本。"
+            }
+            return $configuredCommand
+        }
+        if ($Command -ine "runtime-bootstrap") {
+            Throw-RuntimeError -Code "configured_python_invalid" `
+                -Message "已配置的 Python 无法运行或版本低于 3.10：$($configured.Source)" `
+                -RecommendedAction "请选择可用的 x64 Python 3.10 或更高版本，然后重试。"
+        }
+        # Automatic repair may recover from a stale saved interpreter by using the
+        # healthy app venv or another valid system Python below.
     }
-    catch {
-        return $false
-    }
-    finally {
-        if (Test-Path -LiteralPath $probe) {
-            Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue
+    # Prefer the app-owned interpreter once it exists. It is the environment that will
+    # actually run the launcher and it remains usable if a system Python is later removed.
+    $runtimePython = (Get-NativeRuntimePaths).Python
+    if (Test-Path -LiteralPath $runtimePython -PathType Leaf) {
+        $runtimeCommandValue = [pscustomobject]@{ File = $runtimePython; Prefix = @() }
+        if (Test-PythonCommand -Python $runtimeCommandValue) {
+            $architectureState = Get-PythonArchitectureState -Python $runtimeCommandValue
+            if ($architectureState -eq "supported") {
+                return $runtimeCommandValue
+            }
+            if ($architectureState -eq "windows_arm64") {
+                $arm64CandidateFound = $true
+            }
         }
     }
-}
-
-function Resolve-Directory {
-    param([Parameter(Mandatory = $true)][string]$Path)
-
-    $item = Get-Item -LiteralPath $Path -ErrorAction Stop
-    if (-not $item.PSIsContainer) {
-        throw "Directory does not exist: $Path"
+    foreach ($name in @("python", "python3")) {
+        foreach ($candidate in @(
+            Get-Command $name -All -ErrorAction SilentlyContinue
+        )) {
+            $candidateCommand = [pscustomobject]@{
+                File = $candidate.Source
+                Prefix = @()
+            }
+            if (Test-PythonCommand -Python $candidateCommand) {
+                $architectureState = Get-PythonArchitectureState -Python $candidateCommand
+                if ($architectureState -eq "supported") {
+                    return $candidateCommand
+                }
+                if ($architectureState -eq "windows_arm64") {
+                    $arm64CandidateFound = $true
+                }
+            }
+        }
     }
-    return $item.FullName
-}
-
-function Resolve-File {
-    param([Parameter(Mandatory = $true)][string]$Path)
-
-    $item = Get-Item -LiteralPath $Path -ErrorAction Stop
-    if ($item.PSIsContainer) {
-        throw "Expected a file, but received a directory: $Path"
+    foreach ($py in @(Get-Command "py" -All -ErrorAction SilentlyContinue)) {
+        foreach ($selector in @("-3-64", "-3")) {
+            $pyCommand = [pscustomobject]@{
+                File = $py.Source
+                Prefix = @($selector)
+            }
+            if (Test-PythonCommand -Python $pyCommand) {
+                $architectureState = Get-PythonArchitectureState -Python $pyCommand
+                if ($architectureState -eq "supported") {
+                    return $pyCommand
+                }
+                if ($architectureState -eq "windows_arm64") {
+                    $arm64CandidateFound = $true
+                }
+            }
+        }
     }
-    return $item.FullName
+    if ($arm64CandidateFound) {
+        Throw-WindowsArm64PythonUnsupported
+    }
+    Throw-RuntimeError -Code "python_not_found" `
+        -Message "找不到 Python 3.10 或更高版本。" `
+        -RecommendedAction (
+            "请从 python.org 安装 x64 CPython 3.10 或更高版本，勾选 Add Python " +
+            "to PATH；如 Windows Store 的 App Execution Alias 拦截 python.exe，" +
+            "请关闭该别名，然后点击【修复运行环境】。"
+        )
 }
 
-function Get-TextHash {
-    param([Parameter(Mandatory = $true)][string]$Value)
+function Invoke-Python {
+    param(
+        [Parameter(Mandatory = $true)]$Python,
+        [Parameter(Mandatory = $true)][string[]]$PythonArguments
+    )
+    & $Python.File @($Python.Prefix) @PythonArguments | Out-Host
+    $exitCode = $LASTEXITCODE
+    return $exitCode
+}
 
+function Invoke-PythonCaptured {
+    param(
+        [Parameter(Mandatory = $true)]$Python,
+        [Parameter(Mandatory = $true)][string[]]$PythonArguments
+    )
+
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        # Windows PowerShell promotes redirected native stderr to ErrorRecord. Keep it
+        # as diagnostic text instead of letting the script-wide Stop preference abort
+        # before the structured recovery code can be selected.
+        $ErrorActionPreference = "Continue"
+        $output = @(
+            & $Python.File @($Python.Prefix) @PythonArguments 2>&1
+        )
+        $exitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    $outputText = @($output | ForEach-Object { [string]$_ })
+    foreach ($line in $outputText) {
+        # Redirected native stderr arrives as ErrorRecord objects in Windows
+        # PowerShell. Writing plain text avoids rethrowing it under ErrorAction=Stop.
+        [Console]::Out.WriteLine($line)
+    }
+    return [pscustomobject]@{
+        ExitCode = $exitCode
+        Output = $outputText
+    }
+}
+
+function Throw-RuntimeCommandFailure {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [AllowEmptyCollection()]
+        [object[]]$Output,
+        [Parameter(Mandatory = $true)][string]$DefaultCode,
+        [Parameter(Mandatory = $true)][string]$DefaultMessage,
+        [Parameter(Mandatory = $true)][string]$DefaultRecommendedAction
+    )
+
+    $details = (@($Output) | ForEach-Object { [string]$_ }) -join "`n"
+    if ($details -match (
+        '(?i)(no space left on device|there is not enough space|' +
+        'not enough space (?:on|available)|disk (?:is )?full|' +
+        'winerror\s*112|errno\s*28)'
+    )) {
+        Throw-RuntimeError -Code "runtime_disk_space_insufficient" `
+            -Message "磁盘空间不足，运行环境未能安装完成。" `
+            -RecommendedAction (
+                "请释放 ZVEC_CONFIG_HOME 所在磁盘空间（建议至少 1 GB），再点击" +
+                "【修复运行环境】。未完成的临时文件会在重试时自动清理。"
+            )
+    }
+    if ($details -match (
+        '(?i)(temporary failure in name resolution|nameresolutionerror|' +
+        'getaddrinfo failed|failed to establish a new connection|' +
+        'network is unreachable|connection (?:aborted|refused|reset)|' +
+        'proxyerror|readtimeout|connecttimeout|max retries exceeded|' +
+        'could not resolve host)'
+    )) {
+        Throw-RuntimeError -Code "runtime_network_unavailable" `
+            -Message "无法连接 Python 软件包源，运行环境未能安装完成。" `
+            -RecommendedAction (
+                "请连接网络或检查 Python 软件包源和代理设置，再点击" +
+                "【修复运行环境】；已有图库和索引不会被修改。"
+            )
+    }
+    Throw-RuntimeError -Code $DefaultCode `
+        -Message $DefaultMessage `
+        -RecommendedAction $DefaultRecommendedAction
+}
+
+function Get-SourceFingerprint {
+    $files = @(
+        (Join-Path $sourceRoot "pyproject.toml"),
+        (Join-Path $sourceRoot "requirements.txt"),
+        (Join-Path $sourceRoot "requirements-lock.txt"),
+        (Join-Path $sourceRoot "model-catalog.default.json"),
+        (Join-Path $sourceRoot "README.md"),
+        (Join-Path $sourceRoot "image_service.py"),
+        (Join-Path $sourceRoot "zvec_launcher.py"),
+        (Join-Path $sourceRoot "zvec_logging.py")
+    )
+    $files += @(
+        Get-ChildItem -LiteralPath (Join-Path $sourceRoot "image_vector_service") `
+            -Filter "*.py" -File -Recurse |
+            Sort-Object FullName |
+            ForEach-Object FullName
+    )
+    $builder = New-Object System.Text.StringBuilder
+    foreach ($file in $files) {
+        if (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
+            Throw-RuntimeError -Code "runtime_source_missing" `
+                -Message "原生运行环境文件缺失：$file" `
+                -RecommendedAction (
+                    "请修复或重新安装包含完整 backend 目录的桌面应用，然后重试。"
+                )
+        }
+        $hash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash
+        [void]$builder.Append($file).Append(":").Append($hash).Append("`n")
+    }
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($builder.ToString())
     $sha256 = [System.Security.Cryptography.SHA256]::Create()
     try {
-        $bytes = [System.Text.Encoding]::UTF8.GetBytes($Value)
-        $hash = $sha256.ComputeHash($bytes)
-        return ([System.BitConverter]::ToString($hash)).Replace("-", "").ToLowerInvariant()
+        return ([System.BitConverter]::ToString(
+            $sha256.ComputeHash($bytes)
+        )).Replace("-", "").ToLowerInvariant()
     }
     finally {
         $sha256.Dispose()
     }
 }
 
-function Write-Utf8File {
-    param(
-        [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)][string]$Content
-    )
+function Get-NativeRuntimePaths {
+    param([switch]$DoNotCreate)
 
-    $encoding = New-Object System.Text.UTF8Encoding($false)
-    [System.IO.File]::WriteAllText($Path, $Content, $encoding)
-}
-
-function Protect-SecretFile {
-    param([Parameter(Mandatory = $true)][string]$Path)
-
-    if ($env:OS -ne "Windows_NT") {
-        return
-    }
     try {
-        $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
-        $security = New-Object System.Security.AccessControl.FileSecurity
-        $security.SetOwner($identity.User)
-        $security.SetAccessRuleProtection($true, $false)
-        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-            $identity.User,
-            [System.Security.AccessControl.FileSystemRights]::FullControl,
-            [System.Security.AccessControl.AccessControlType]::Allow
-        )
-        $security.AddAccessRule($rule)
-        [System.IO.File]::SetAccessControl($Path, $security)
-    }
-    catch {
-        Write-Warning "Could not restrict the secret file ACL: $($_.Exception.Message)"
-    }
-}
-
-function ConvertTo-PlainText {
-    param(
-        [Parameter(Mandatory = $true)]
-        [System.Security.SecureString]$SecureString
-    )
-
-    $pointer = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecureString)
-    try {
-        return [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($pointer)
-    }
-    finally {
-        [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pointer)
-    }
-}
-
-function Save-ApiEnvironment {
-    param([switch]$SkipPrompt)
-
-    $configHome = Ensure-Directory (Get-ConfigHome)
-    $envPath = Join-Path $configHome ".env"
-    $apiKey = $env:DASHSCOPE_API_KEY
-
-    if ([string]::IsNullOrWhiteSpace($apiKey) -and (Test-Path -LiteralPath $envPath)) {
-        return
-    }
-    if ([string]::IsNullOrWhiteSpace($apiKey)) {
-        if ($SkipPrompt) {
-            return
+        $configHomePath = [System.IO.Path]::GetFullPath((Get-ConfigHome))
+        $configHome = if ($DoNotCreate) {
+            $configHomePath
         }
-        $secureKey = Read-Host "DASHSCOPE_API_KEY" -AsSecureString
-        $apiKey = ConvertTo-PlainText $secureKey
-    }
-    if ([string]::IsNullOrWhiteSpace($apiKey)) {
-        throw "DASHSCOPE_API_KEY cannot be empty."
-    }
-    if ($apiKey.Contains("`r") -or $apiKey.Contains("`n")) {
-        throw "DASHSCOPE_API_KEY cannot contain a newline."
-    }
-
-    $lines = @("DASHSCOPE_API_KEY=$apiKey")
-    if (-not [string]::IsNullOrWhiteSpace($env:DASHSCOPE_API_URL)) {
-        $lines += "DASHSCOPE_API_URL=$($env:DASHSCOPE_API_URL)"
-    }
-    Write-Utf8File -Path $envPath -Content (($lines -join "`n") + "`n")
-    Protect-SecretFile -Path $envPath
-}
-
-function Save-Config {
-    param([Parameter(Mandatory = $true)]$Config)
-
-    $configHome = Ensure-Directory (Get-ConfigHome)
-    $configPath = Join-Path $configHome "config.json"
-    $temporaryPath = "$configPath.tmp"
-    $json = $Config | ConvertTo-Json -Depth 5
-    Write-Utf8File -Path $temporaryPath -Content ($json + "`n")
-    Move-Item -LiteralPath $temporaryPath -Destination $configPath -Force
-}
-
-function Assert-ConfigProperty {
-    param(
-        [Parameter(Mandatory = $true)]$Config,
-        [Parameter(Mandatory = $true)][string]$Name
-    )
-
-    if ($Config.PSObject.Properties.Name -notcontains $Name) {
-        throw "Invalid launcher config: missing '$Name'. Run 'zvec init' again."
-    }
-}
-
-function Read-Config {
-    param([switch]$Optional)
-
-    $configPath = Get-ConfigPath
-    if (-not (Test-Path -LiteralPath $configPath)) {
-        if ($Optional) {
-            return $null
+        else {
+            [System.IO.Directory]::CreateDirectory($configHomePath).FullName
         }
-        throw "Launcher is not configured. Run 'zvec init <image-folder>' first."
-    }
-    try {
-        $config = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
-    }
-    catch {
-        throw "Invalid launcher config at ${configPath}: $($_.Exception.Message)"
-    }
-
-    foreach ($name in @(
-        "schema_version",
-        "image_name",
-        "image_root",
-        "workspace_type",
-        "workspace_source",
-        "results_directory"
-    )) {
-        Assert-ConfigProperty -Config $config -Name $name
-    }
-    if ([int]$config.schema_version -ne $script:ConfigSchemaVersion) {
-        throw "Unsupported launcher config version: $($config.schema_version)"
-    }
-    if ($config.workspace_type -notin @("volume", "bind")) {
-        throw "Invalid workspace_type: $($config.workspace_type)"
-    }
-    return $config
-}
-
-function Test-ModernWsl {
-    if ($env:OS -ne "Windows_NT") {
-        return $true
-    }
-    if ($null -eq (Get-Command wsl.exe -ErrorAction SilentlyContinue)) {
-        return $false
-    }
-
-    $processInfo = New-Object System.Diagnostics.ProcessStartInfo
-    $processInfo.FileName = "wsl.exe"
-    $processInfo.Arguments = "--version"
-    $processInfo.UseShellExecute = $false
-    $processInfo.CreateNoWindow = $true
-    $processInfo.RedirectStandardOutput = $true
-    $processInfo.RedirectStandardError = $true
-    $processInfo.StandardOutputEncoding = [System.Text.Encoding]::Unicode
-    $processInfo.StandardErrorEncoding = [System.Text.Encoding]::Unicode
-    $process = $null
-    try {
-        $process = [System.Diagnostics.Process]::Start($processInfo)
-        $null = $process.StandardOutput.ReadToEnd()
-        $null = $process.StandardError.ReadToEnd()
-        $process.WaitForExit()
-        return $process.ExitCode -eq 0
-    }
-    catch {
-        return $false
-    }
-    finally {
-        if ($null -ne $process) {
-            $process.Dispose()
+        $runtimeRootPath = Join-Path $configHome "runtime"
+        $runtimeRoot = if ($DoNotCreate) {
+            [System.IO.Path]::GetFullPath($runtimeRootPath)
         }
-    }
-}
-
-function Get-VirtualizationStatus {
-    if ($env:OS -ne "Windows_NT") {
-        return "enabled"
-    }
-    try {
-        $computer = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop
-        $processor = Get-CimInstance Win32_Processor -ErrorAction Stop |
-            Select-Object -First 1
-        if (
-            $computer.HypervisorPresent -eq $true -or
-            $processor.VirtualizationFirmwareEnabled -eq $true
-        ) {
-            return "enabled"
-        }
-        if (
-            $processor.VMMonitorModeExtensions -eq $true -and
-            $processor.SecondLevelAddressTranslationExtensions -eq $true -and
-            $processor.VirtualizationFirmwareEnabled -eq $false
-        ) {
-            return "disabled"
+        else {
+            [System.IO.Directory]::CreateDirectory($runtimeRootPath).FullName
         }
     }
     catch {
-        return "unknown"
-    }
-    return "unknown"
-}
-
-function Get-DockerServerVersion {
-    $dockerCommand = Get-Command docker -ErrorAction SilentlyContinue
-    if ($null -eq $dockerCommand) {
-        return $null
-    }
-
-    $processInfo = New-Object System.Diagnostics.ProcessStartInfo
-    $processInfo.FileName = $dockerCommand.Source
-    $processInfo.Arguments = 'version --format "{{.Server.Version}}"'
-    $processInfo.UseShellExecute = $false
-    $processInfo.CreateNoWindow = $true
-    $processInfo.RedirectStandardOutput = $true
-    $processInfo.RedirectStandardError = $true
-    $process = $null
-    try {
-        $process = [System.Diagnostics.Process]::Start($processInfo)
-        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
-        $stderrTask = $process.StandardError.ReadToEndAsync()
-        if (-not $process.WaitForExit(5000)) {
-            $process.Kill()
-            $process.WaitForExit()
-            return $null
+        if ($DoNotCreate) {
+            throw
         }
-        $null = $stderrTask.Result
-        if ($process.ExitCode -ne 0) {
-            return $null
-        }
-        $version = $stdoutTask.Result.Trim()
-        return $(if ([string]::IsNullOrWhiteSpace($version)) { $null } else { $version })
+        Throw-RuntimeError -Code "config_directory_unavailable" `
+            -Message "无法创建或访问用户运行环境目录：$($_.Exception.Message)" `
+            -RecommendedAction (
+                "请确认 ZVEC_CONFIG_HOME 指向可写目录，并检查磁盘空间与目录权限后重试。"
+            )
     }
-    catch {
-        return $null
+    $venvRoot = Join-Path $runtimeRoot "venv"
+    $venvPython = if ($env:OS -eq "Windows_NT") {
+        Join-Path $venvRoot "Scripts\python.exe"
     }
-    finally {
-        if ($null -ne $process) {
-            $process.Dispose()
-        }
+    else {
+        Join-Path $venvRoot "bin/python"
     }
-}
-
-function Start-DockerDesktop {
-    if ($env:OS -ne "Windows_NT") {
-        return $false
-    }
-    $desktopPath = Join-Path $env:ProgramFiles "Docker\Docker\Docker Desktop.exe"
-    if (-not (Test-Path -LiteralPath $desktopPath -PathType Leaf)) {
-        return $false
-    }
-    if ($null -eq (Get-Process -Name "Docker Desktop" -ErrorAction SilentlyContinue)) {
-        Start-Process -FilePath $desktopPath -WindowStyle Hidden
-    }
-    return $true
-}
-
-function Wait-DockerServerVersion {
-    param([int]$TimeoutSeconds = 180)
-
-    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-    do {
-        $version = Get-DockerServerVersion
-        if (-not [string]::IsNullOrWhiteSpace($version)) {
-            return $version
-        }
-        Start-Sleep -Seconds 3
-    } while ((Get-Date) -lt $deadline)
-    return $null
-}
-
-function Assert-DockerReady {
-    param([switch]$StartIfStopped)
-
-    if ($null -eq (Get-Command docker -ErrorAction SilentlyContinue)) {
-        throw "Docker CLI was not found. Install Docker Desktop first."
-    }
-    $serverVersion = Get-DockerServerVersion
-    $modernWsl = Test-ModernWsl
-    $virtualizationStatus = Get-VirtualizationStatus
-    if (
-        [string]::IsNullOrWhiteSpace($serverVersion) -and
-        $StartIfStopped -and
-        $modernWsl -and
-        $virtualizationStatus -ne "disabled" -and
-        (Start-DockerDesktop)
-    ) {
-        Write-Host "Starting Docker Desktop ..."
-        $serverVersion = Wait-DockerServerVersion
-    }
-    if ([string]::IsNullOrWhiteSpace($serverVersion)) {
-        $message = "Docker Desktop is not running or the Docker engine is unavailable."
-        if (-not $modernWsl) {
-            $message += " Legacy Inbox WSL was detected. Open an administrator " +
-                "PowerShell and run: wsl --update --web-download"
-        }
-        elseif ($virtualizationStatus -eq "disabled") {
-            $message += " Firmware virtualization is disabled. Enable SVM Mode " +
-                "(AMD) or Intel VT-x in BIOS/UEFI, then restart Windows."
-        }
-        throw $message
-    }
-    return $serverVersion
-}
-
-function Invoke-DockerQuietly {
-    param([Parameter(Mandatory = $true)][object[]]$Arguments)
-
-    $previousErrorAction = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = "Continue"
-        & docker @Arguments *> $null
-        return $LASTEXITCODE
-    }
-    finally {
-        $ErrorActionPreference = $previousErrorAction
-    }
-}
-
-function Test-DockerImage {
-    param([Parameter(Mandatory = $true)][string]$ImageName)
-
-    $exitCode = Invoke-DockerQuietly -Arguments @(
-        "inspect", "--type", "image", $ImageName
-    )
-    return $exitCode -eq 0
-}
-
-function Get-DockerImageUid {
-    param([Parameter(Mandatory = $true)][string]$ImageName)
-
-    $previousErrorAction = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = "Continue"
-        $output = & docker run --rm --entrypoint id $ImageName -u 2>&1
-        $exitCode = $LASTEXITCODE
-    }
-    finally {
-        $ErrorActionPreference = $previousErrorAction
-    }
-    if ($exitCode -ne 0) {
-        throw "Could not verify the runtime user for '$ImageName'."
-    }
-    return ([string]($output -join "`n")).Trim()
-}
-
-function Build-DockerImage {
-    param(
-        [Parameter(Mandatory = $true)][string]$ImageName,
-        [switch]$NoCache
-    )
-
-    $null = Assert-DockerReady -StartIfStopped
-    Write-Host "Building $ImageName ..."
-    $dockerArguments = @(
-        "build",
-        "--provenance=false",
-        "--file", (Join-Path $script:RepoRoot "Dockerfile"),
-        "--tag", $ImageName
-    )
-    if ($NoCache) {
-        $dockerArguments += "--no-cache"
-    }
-    $dockerArguments += $script:RepoRoot
-    & docker @dockerArguments
-    if ($LASTEXITCODE -ne 0) {
-        exit $LASTEXITCODE
-    }
-
-    $uid = Get-DockerImageUid -ImageName $ImageName
-    if ($uid -ne [string]$script:AppUid) {
-        throw "Built image uses UID $uid; expected $script:AppUid."
-    }
-    $helpExitCode = Invoke-DockerQuietly -Arguments @(
-        "run", "--rm", $ImageName, "--help"
-    )
-    if ($helpExitCode -ne 0) {
-        throw "Built image CLI verification failed."
-    }
-    Write-Host "Verified $ImageName (UID $uid, CLI ready)."
-}
-
-function Initialize-WorkspaceVolume {
-    param([Parameter(Mandatory = $true)]$Config)
-
-    if ($Config.workspace_type -ne "volume") {
-        return
-    }
-    & docker volume create $Config.workspace_source *> $null
-    if ($LASTEXITCODE -ne 0) {
-        throw "Could not create Docker volume: $($Config.workspace_source)"
-    }
-
-    $mount = "type=volume,source=$($Config.workspace_source),target=$script:ContainerWorkspace"
-    & docker run --rm --user "0:0" --entrypoint /bin/sh `
-        --mount $mount $Config.image_name `
-        -c "chown $script:AppUid`:$script:AppGid $script:ContainerWorkspace"
-    if ($LASTEXITCODE -ne 0) {
-        throw "Could not initialize Docker volume permissions."
-    }
-}
-
-function New-BindMount {
-    param(
-        [Parameter(Mandatory = $true)][string]$Source,
-        [Parameter(Mandatory = $true)][string]$Target,
-        [switch]$ReadOnly
-    )
-
-    if ($Source.Contains(",")) {
-        throw "Docker bind mount paths cannot contain a comma: $Source"
-    }
-    $mount = "type=bind,source=$Source,target=$Target"
-    if ($ReadOnly) {
-        $mount += ",readonly"
-    }
-    return $mount
-}
-
-function Get-WorkspaceMount {
-    param([Parameter(Mandatory = $true)]$Config)
-
-    if ($Config.workspace_type -eq "volume") {
-        return "type=volume,source=$($Config.workspace_source),target=$script:ContainerWorkspace"
-    }
-    $workspace = Ensure-Directory ([string]$Config.workspace_source)
-    return New-BindMount -Source $workspace -Target $script:ContainerWorkspace
-}
-
-function Get-QueryMount {
-    param([Parameter(Mandatory = $true)][string]$ImagePath)
-
-    $resolved = Resolve-File $ImagePath
-    $file = Get-Item -LiteralPath $resolved
     return [pscustomobject]@{
-        HostDirectory = $file.Directory.FullName
-        ContainerPath = "$script:ContainerQueryRoot/$($file.Name)"
+        ConfigHome = $configHome
+        RuntimeRoot = $runtimeRoot
+        VenvRoot = $venvRoot
+        Python = $venvPython
+        Stamp = Join-Path $runtimeRoot "source.sha256"
+        Lock = Join-Path $runtimeRoot "bootstrap.lock"
     }
 }
 
-function Test-ContainerMounts {
-    param([Parameter(Mandatory = $true)]$Config)
-
-    $imageRoot = Resolve-Directory ([string]$Config.image_root)
-    $resultsDirectory = Ensure-Directory ([string]$Config.results_directory)
-    $permissionCheck = (
-        "test -r $script:ContainerImageRoot && " +
-        "test ! -w $script:ContainerImageRoot && " +
-        "test -w $script:ContainerWorkspace && " +
-        "test -w $script:ContainerResults"
-    )
-    $dockerArguments = @(
-        "run",
-        "--rm",
-        "--read-only",
-        "--cap-drop", "ALL",
-        "--security-opt", "no-new-privileges=true",
-        "--mount", (New-BindMount -Source $imageRoot -Target $script:ContainerImageRoot -ReadOnly),
-        "--mount", (Get-WorkspaceMount -Config $Config),
-        "--mount", (New-BindMount -Source $resultsDirectory -Target $script:ContainerResults),
-        "--entrypoint", "/bin/sh",
-        $Config.image_name,
-        "-c",
-        $permissionCheck
-    )
-    $exitCode = Invoke-DockerQuietly -Arguments $dockerArguments
-    return $exitCode -eq 0
-}
-
-function Invoke-ZvecContainer {
-    param(
-        [Parameter(Mandatory = $true)]$Config,
-        [Parameter(Mandatory = $true)][object[]]$CliArguments,
-        [string]$QueryDirectory
-    )
-
-    $null = Assert-DockerReady -StartIfStopped
-    if (-not (Test-DockerImage -ImageName $Config.image_name)) {
-        throw "Docker image '$($Config.image_name)' was not found. Run 'zvec build'."
-    }
-
-    $imageRoot = Resolve-Directory ([string]$Config.image_root)
-    $resultsDirectory = Ensure-Directory ([string]$Config.results_directory)
-    $dockerArguments = @(
-        "run",
-        "--rm",
-        "--init",
-        "--read-only",
-        "--tmpfs", "/tmp:rw,nosuid,nodev,size=256m",
-        "--cap-drop", "ALL",
-        "--security-opt", "no-new-privileges=true",
-        "--mount", (New-BindMount -Source $imageRoot -Target $script:ContainerImageRoot -ReadOnly),
-        "--mount", (Get-WorkspaceMount -Config $Config),
-        "--mount", (New-BindMount -Source $resultsDirectory -Target $script:ContainerResults)
-    )
-
-    if (-not [string]::IsNullOrWhiteSpace($QueryDirectory)) {
-        $dockerArguments += @(
-            "--mount",
-            (New-BindMount -Source $QueryDirectory -Target $script:ContainerQueryRoot -ReadOnly)
-        )
-    }
-
-    $envPath = Get-EnvPath
-    if (Test-Path -LiteralPath $envPath) {
-        $dockerArguments += @("--env-file", $envPath)
-    }
-    if (-not [string]::IsNullOrWhiteSpace($env:DASHSCOPE_API_KEY)) {
-        $dockerArguments += @("--env", "DASHSCOPE_API_KEY")
-    }
-    if (-not [string]::IsNullOrWhiteSpace($env:DASHSCOPE_API_URL)) {
-        $dockerArguments += @("--env", "DASHSCOPE_API_URL")
-    }
-
-    $dockerArguments += @($Config.image_name)
-    $dockerArguments += $CliArguments
-    & docker @dockerArguments
-    if ($LASTEXITCODE -ne 0) {
-        exit $LASTEXITCODE
-    }
-}
-
-function Invoke-Init {
-    param([string[]]$InitArguments)
-
-    $imageRootArgument = $null
-    $workspaceArgument = $null
-    $workspaceVolume = $null
-    $resultsArgument = $null
-    $imageNameArgument = $null
-    $noBuild = $false
-    $skipKey = $false
-
-    for ($index = 0; $index -lt $InitArguments.Count; $index++) {
-        $value = $InitArguments[$index]
-        switch ($value) {
-            "--workspace" {
-                if (++$index -ge $InitArguments.Count) {
-                    throw "--workspace requires a directory."
-                }
-                $workspaceArgument = $InitArguments[$index]
-            }
-            "--workspace-volume" {
-                if (++$index -ge $InitArguments.Count) {
-                    throw "--workspace-volume requires a volume name."
-                }
-                $workspaceVolume = $InitArguments[$index]
-            }
-            "--results" {
-                if (++$index -ge $InitArguments.Count) {
-                    throw "--results requires a directory."
-                }
-                $resultsArgument = $InitArguments[$index]
-            }
-            "--image-name" {
-                if (++$index -ge $InitArguments.Count) {
-                    throw "--image-name requires a Docker image name."
-                }
-                $imageNameArgument = $InitArguments[$index]
-            }
-            "--no-build" {
-                $noBuild = $true
-            }
-            "--skip-key" {
-                $skipKey = $true
-            }
-            default {
-                if ($value.StartsWith("--")) {
-                    throw "Unknown init option: $value"
-                }
-                if ($null -ne $imageRootArgument) {
-                    throw "init accepts one image folder."
-                }
-                $imageRootArgument = $value
-            }
-        }
-    }
-
-    if ([string]::IsNullOrWhiteSpace($imageRootArgument)) {
-        throw "Usage: zvec init <image-folder> [--workspace <folder>]"
-    }
-    if ($null -ne $workspaceArgument -and $null -ne $workspaceVolume) {
-        throw "Use either --workspace or --workspace-volume, not both."
-    }
-
-    $imageRoot = Resolve-Directory $imageRootArgument
-    $rootHash = (Get-TextHash $imageRoot.ToLowerInvariant()).Substring(0, 12)
-    $existingConfig = Read-Config -Optional
-    $sameRoot = $null -ne $existingConfig -and (
-        [string]$existingConfig.image_root -eq $imageRoot
-    )
-
-    $imageName = if ($null -ne $imageNameArgument) {
-        $imageNameArgument
-    }
-    elseif ($sameRoot) {
-        [string]$existingConfig.image_name
-    }
-    else {
-        $script:DefaultImageName
-    }
-
-    if ($null -ne $workspaceArgument) {
-        $workspaceType = "bind"
-        $workspaceSource = Ensure-Directory $workspaceArgument
-    }
-    elseif ($null -ne $workspaceVolume) {
-        $workspaceType = "volume"
-        $workspaceSource = $workspaceVolume
-    }
-    elseif ($sameRoot) {
-        $workspaceType = [string]$existingConfig.workspace_type
-        $workspaceSource = [string]$existingConfig.workspace_source
-    }
-    else {
-        $workspaceType = "volume"
-        $workspaceSource = "zvec-image-workspace-$rootHash"
-    }
-
-    if ($null -ne $resultsArgument) {
-        $resultsDirectory = Ensure-Directory $resultsArgument
-    }
-    elseif ($sameRoot) {
-        $resultsDirectory = Ensure-Directory ([string]$existingConfig.results_directory)
-    }
-    else {
-        $resultsDirectory = Ensure-Directory (
-            Join-Path (Get-ConfigHome) (Join-Path "results" $rootHash)
-        )
-    }
-
-    $config = [ordered]@{
-        schema_version = $script:ConfigSchemaVersion
-        image_name = $imageName
-        image_root = $imageRoot
-        workspace_type = $workspaceType
-        workspace_source = $workspaceSource
-        results_directory = $resultsDirectory
-    }
-
-    Save-Config -Config $config
-    Save-ApiEnvironment -SkipPrompt:$skipKey
-
-    if (-not $noBuild) {
-        Build-DockerImage -ImageName $imageName
-        Initialize-WorkspaceVolume -Config ([pscustomobject]$config)
-    }
-
-    Write-Host "Configured image root: $imageRoot"
-    Write-Host "Configured results:    $resultsDirectory"
-    Write-Host "Docker image:          $imageName"
-    Write-Host "Run 'zvec index' to build the image index."
-}
-
-function Write-DoctorResult {
-    param(
-        [Parameter(Mandatory = $true)][string]$Status,
-        [Parameter(Mandatory = $true)][string]$Message
-    )
-    Write-Host ("[{0}] {1}" -f $Status, $Message)
-}
-
-function Invoke-Doctor {
-    $failures = 0
-    $config = $null
-
+function Get-RuntimeDirectoryForFailure {
     try {
-        $config = Read-Config
-        Write-DoctorResult -Status "OK" -Message "Launcher config: $(Get-ConfigPath)"
+        return (Get-NativeRuntimePaths -DoNotCreate).RuntimeRoot
     }
     catch {
-        Write-DoctorResult -Status "FAIL" -Message $_.Exception.Message
-        $failures++
+        return ""
     }
+}
 
-    if ($null -ne (Get-Command docker -ErrorAction SilentlyContinue)) {
-        Write-DoctorResult -Status "OK" -Message "Docker CLI found"
-    }
-    else {
-        Write-DoctorResult -Status "FAIL" -Message "Docker CLI not found"
-        $failures++
-    }
+function Enter-NativeRuntimeLock {
+    param([Parameter(Mandatory = $true)]$Paths)
 
-    $dockerReady = $false
-    if ($null -ne (Get-Command docker -ErrorAction SilentlyContinue)) {
+    $timeoutSeconds = 120
+    if (-not [string]::IsNullOrWhiteSpace($env:ZVEC_RUNTIME_LOCK_TIMEOUT_SECONDS)) {
+        $parsedTimeout = 0
+        if (
+            [int]::TryParse(
+                $env:ZVEC_RUNTIME_LOCK_TIMEOUT_SECONDS,
+                [ref]$parsedTimeout
+            ) -and
+            $parsedTimeout -ge 1 -and
+            $parsedTimeout -le 600
+        ) {
+            $timeoutSeconds = $parsedTimeout
+        }
+    }
+    $deadline = [DateTime]::UtcNow.AddSeconds($timeoutSeconds)
+    while ($true) {
+        $stream = $null
         try {
-            $serverVersion = Assert-DockerReady
-            Write-DoctorResult -Status "OK" -Message "Docker engine $serverVersion"
-            $dockerReady = $true
+            $stream = [System.IO.File]::Open(
+                $Paths.Lock,
+                [System.IO.FileMode]::OpenOrCreate,
+                [System.IO.FileAccess]::ReadWrite,
+                [System.IO.FileShare]::None
+            )
+            $owner = [System.Text.Encoding]::UTF8.GetBytes(
+                "pid=$PID started=$([DateTime]::UtcNow.ToString('O'))`n"
+            )
+            $stream.SetLength(0)
+            $stream.Write($owner, 0, $owner.Length)
+            $stream.Flush()
+            return $stream
+        }
+        catch [System.IO.IOException] {
+            if ($null -ne $stream) {
+                $stream.Dispose()
+            }
+            if ([DateTime]::UtcNow -ge $deadline) {
+                Throw-RuntimeError -Code "runtime_lock_timeout" `
+                    -Message "另一个窗口或进程正在准备 Python 运行环境，等待已超时。" `
+                    -RecommendedAction (
+                        "请等待另一个 Zvec 窗口完成；若确认没有任务在运行，请关闭其他 " +
+                        "Zvec 实例后重试。"
+                    )
+            }
+            [System.Threading.Thread]::Sleep(200)
         }
         catch {
-            Write-DoctorResult -Status "FAIL" -Message $_.Exception.Message
-            $failures++
+            if ($null -ne $stream) {
+                $stream.Dispose()
+            }
+            throw
         }
     }
+}
 
-    if ($null -ne $config) {
-        if (Test-Path -LiteralPath $config.image_root -PathType Container) {
-            Write-DoctorResult -Status "OK" -Message "Image root: $($config.image_root)"
-        }
-        else {
-            Write-DoctorResult -Status "FAIL" -Message "Image root is unavailable"
-            $failures++
-        }
-        if (Test-DirectoryWritable ([string]$config.results_directory)) {
-            Write-DoctorResult -Status "OK" -Message "Results directory is writable"
-        }
-        else {
-            Write-DoctorResult -Status "FAIL" -Message "Results directory is not writable"
-            $failures++
-        }
+function Reset-NativeRuntimeVenv {
+    param([Parameter(Mandatory = $true)]$Paths)
 
-        if ($dockerReady) {
-            if (Test-DockerImage -ImageName $config.image_name) {
-                Write-DoctorResult -Status "OK" -Message "Docker image: $($config.image_name)"
-                try {
-                    $uid = Get-DockerImageUid -ImageName $config.image_name
-                    if ($uid -eq [string]$script:AppUid) {
-                        Write-DoctorResult -Status "OK" -Message (
-                            "Container runtime UID: $uid"
-                        )
-                    }
-                    else {
-                        Write-DoctorResult -Status "FAIL" -Message (
-                            "Container runtime UID is $uid; expected $script:AppUid"
-                        )
-                        $failures++
-                    }
-                }
-                catch {
-                    Write-DoctorResult -Status "FAIL" -Message $_.Exception.Message
-                    $failures++
-                }
-                if (Test-ContainerMounts -Config $config) {
-                    Write-DoctorResult -Status "OK" -Message (
-                        "Container mounts have the expected permissions"
-                    )
-                }
-                else {
-                    Write-DoctorResult -Status "FAIL" -Message (
-                        "Container mount permission check failed"
-                    )
-                    $failures++
-                }
+    $runtimeRoot = [System.IO.Path]::GetFullPath($Paths.RuntimeRoot).TrimEnd(
+        [System.IO.Path]::DirectorySeparatorChar,
+        [System.IO.Path]::AltDirectorySeparatorChar
+    )
+    $venvRoot = [System.IO.Path]::GetFullPath($Paths.VenvRoot)
+    $expectedPrefix = $runtimeRoot + [System.IO.Path]::DirectorySeparatorChar
+    if (-not $venvRoot.StartsWith(
+        $expectedPrefix,
+        [System.StringComparison]::OrdinalIgnoreCase
+    )) {
+        Throw-RuntimeError -Code "unsafe_runtime_path" `
+            -Message "拒绝重建配置目录之外的 Python 环境：$venvRoot" `
+            -RecommendedAction "请检查 ZVEC_CONFIG_HOME 配置后重试。"
+    }
+    try {
+        if (Test-Path -LiteralPath $venvRoot) {
+            Remove-Item -LiteralPath $venvRoot -Recurse -Force
+        }
+        if (Test-Path -LiteralPath $Paths.Stamp -PathType Leaf) {
+            Remove-Item -LiteralPath $Paths.Stamp -Force
+        }
+    }
+    catch {
+        Throw-RuntimeError -Code "venv_reset_failed" `
+            -Message "损坏的 Python 隔离环境无法安全重建：$($_.Exception.Message)" `
+            -RecommendedAction "请关闭占用该目录的程序，确认配置目录可写，然后重试。"
+    }
+}
+
+function Remove-StaleNativeRuntimeWheels {
+    param([Parameter(Mandatory = $true)]$Paths)
+
+    $runtimeRoot = [System.IO.Path]::GetFullPath($Paths.RuntimeRoot).TrimEnd(
+        [System.IO.Path]::DirectorySeparatorChar,
+        [System.IO.Path]::AltDirectorySeparatorChar
+    )
+    foreach ($directory in @(
+        Get-ChildItem -LiteralPath $runtimeRoot -Directory -Filter "wheel-*" `
+            -ErrorAction Stop
+    )) {
+        # The launcher creates only wheel-<32 lowercase hex> directories. Ignore every
+        # other name and every reparse point so cleanup cannot cross the owned runtime root.
+        if (
+            $directory.Name -notmatch '^wheel-[0-9a-f]{32}$' -or
+            ($directory.Attributes -band [System.IO.FileAttributes]::ReparsePoint)
+        ) {
+            continue
+        }
+        $fullPath = [System.IO.Path]::GetFullPath($directory.FullName)
+        $expectedPrefix = $runtimeRoot + [System.IO.Path]::DirectorySeparatorChar
+        if (-not $fullPath.StartsWith(
+            $expectedPrefix,
+            [System.StringComparison]::OrdinalIgnoreCase
+        )) {
+            continue
+        }
+        try {
+            Remove-Item -LiteralPath $fullPath -Recurse -Force
+        }
+        catch {
+            Throw-RuntimeError -Code "runtime_cleanup_failed" `
+                -Message "无法清理上次取消后遗留的临时 wheel 目录：$fullPath" `
+                -RecommendedAction "请关闭占用该目录的程序，然后重新点击【修复运行环境】。"
+        }
+    }
+}
+
+function Get-NativeRuntimeProbe {
+    param([Parameter(Mandatory = $true)][string]$RuntimePython)
+
+    if (-not (Test-Path -LiteralPath $RuntimePython -PathType Leaf)) {
+        Throw-RuntimeError -Code "runtime_not_installed" `
+            -Message "尚未安装隔离的 Python 运行环境。" `
+            -RecommendedAction "请点击【修复运行环境】创建隔离环境。"
+    }
+
+    $probeCode = @"
+import importlib.metadata as metadata
+import json
+import platform
+import sys
+import zvec
+import PIL
+import numpy
+payload = {
+    "python_executable": sys.executable,
+    "python_version": platform.python_version(),
+    "python_architecture": platform.machine(),
+    "dependencies": [
+        {"name": "zvec", "version": metadata.version("zvec"), "imported": True},
+        {"name": "Pillow", "version": metadata.version("Pillow"), "imported": True},
+        {"name": "numpy", "version": metadata.version("numpy"), "imported": True},
+    ],
+}
+print("@@ZVEC_PYTHON_PROBE@@" + json.dumps(payload, ensure_ascii=False))
+"@
+    # Base64 keeps quotes and non-ASCII source intact across Windows PowerShell's native
+    # command-line quoting rules.
+    $encodedProbe = [Convert]::ToBase64String(
+        [System.Text.Encoding]::UTF8.GetBytes($probeCode)
+    )
+    $probeOutput = @(
+        & $RuntimePython -c `
+            "import base64,sys;exec(base64.b64decode(sys.argv[1]))" `
+            $encodedProbe 2>&1
+    )
+    if ($LASTEXITCODE -ne 0) {
+        $details = ($probeOutput -join [Environment]::NewLine).Trim()
+        Throw-RuntimeError -Code "dependency_import_failed" `
+            -Message ("隔离环境中的 Python 依赖无法导入。" + $details) `
+            -RecommendedAction (
+                "请点击【修复运行环境】。若仍失败，请检查 Python 软件包源的网络连接，" +
+                "并打开安装日志查看详情。"
+            )
+    }
+    $probeLine = $probeOutput |
+        Where-Object { $_ -is [string] -and $_.StartsWith("@@ZVEC_PYTHON_PROBE@@") } |
+        Select-Object -Last 1
+    if ([string]::IsNullOrWhiteSpace($probeLine)) {
+        Throw-RuntimeError -Code "dependency_probe_invalid" `
+            -Message "隔离环境依赖检查返回了无效结果。" `
+            -RecommendedAction "请点击【修复运行环境】，然后重新检查。"
+    }
+    try {
+        return $probeLine.Substring("@@ZVEC_PYTHON_PROBE@@".Length) |
+            ConvertFrom-Json
+    }
+    catch {
+        Throw-RuntimeError -Code "dependency_probe_invalid" `
+            -Message "隔离环境依赖检查返回的 JSON 格式错误。" `
+            -RecommendedAction "请点击【修复运行环境】，然后重新检查。"
+    }
+}
+
+function Initialize-NativeRuntime {
+    param([Parameter(Mandatory = $true)]$BootstrapPython)
+
+    $paths = Get-NativeRuntimePaths
+    $runtimeLock = Enter-NativeRuntimeLock -Paths $paths
+    try {
+    Remove-StaleNativeRuntimeWheels -Paths $paths
+    $runtimeRoot = $paths.RuntimeRoot
+    $venvRoot = $paths.VenvRoot
+    $venvPython = $paths.Python
+    $stampPath = $paths.Stamp
+    $requirementsLock = Join-Path $sourceRoot "requirements-lock.txt"
+    $fingerprint = Get-SourceFingerprint
+    $installedFingerprint = if (Test-Path -LiteralPath $stampPath -PathType Leaf) {
+        [System.IO.File]::ReadAllText($stampPath).Trim()
+    }
+    else {
+        ""
+    }
+
+    if (Test-Path -LiteralPath $venvPython -PathType Leaf) {
+        $venvCommand = [pscustomobject]@{ File = $venvPython; Prefix = @() }
+        if (-not (Test-PythonCommand -Python $venvCommand)) {
+            Reset-NativeRuntimeVenv -Paths $paths
+            $installedFingerprint = ""
+            $script:RuntimeWasUpdated = $true
+        }
+        elseif ((Get-PythonArchitectureState -Python $venvCommand) -eq "windows_arm64") {
+            $recoveryPython = Resolve-RecoveryPythonCommand `
+                -ExcludedPython $venvPython -PreferredPython $BootstrapPython
+            if ($null -eq $recoveryPython) {
+                Throw-WindowsArm64PythonUnsupported
             }
-            else {
-                Write-DoctorResult -Status "FAIL" -Message "Docker image is missing"
-                $failures++
+            Reset-NativeRuntimeVenv -Paths $paths
+            $BootstrapPython = $recoveryPython
+            $installedFingerprint = ""
+            $script:RuntimeWasUpdated = $true
+        }
+        elseif (-not (Test-PythonPip -Python $venvCommand)) {
+            $recoveryPython = Resolve-RecoveryPythonCommand `
+                -ExcludedPython $venvPython -PreferredPython $BootstrapPython
+            if ($null -eq $recoveryPython) {
+                Throw-RuntimeError -Code "venv_pip_unusable" `
+                    -Message "隔离环境中的 pip 已损坏，且找不到可用于重建的系统 Python。" `
+                    -RecommendedAction (
+                        "请安装带 pip 的 x64 Python 3.10 或更高版本，然后点击" +
+                        "【修复运行环境】。"
+                    )
             }
+            Reset-NativeRuntimeVenv -Paths $paths
+            $BootstrapPython = $recoveryPython
+            $installedFingerprint = ""
+            $script:RuntimeWasUpdated = $true
         }
     }
 
     if (
-        -not [string]::IsNullOrWhiteSpace($env:DASHSCOPE_API_KEY) -or
-        (Test-Path -LiteralPath (Get-EnvPath))
+        (Test-Path -LiteralPath $venvRoot) -and
+        -not (Test-Path -LiteralPath $venvPython -PathType Leaf)
     ) {
-        Write-DoctorResult -Status "OK" -Message "DashScope API key is configured"
-    }
-    else {
-        Write-DoctorResult -Status "WARN" -Message "DashScope API key is not configured"
+        # A cancelled installer can leave a directory without a runnable interpreter.
+        # Reusing it may preserve a partially installed site-packages tree, so rebuild it
+        # under the runtime lock before the next attempt.
+        Reset-NativeRuntimeVenv -Paths $paths
+        $installedFingerprint = ""
+        $script:RuntimeWasUpdated = $true
     }
 
-    if ($failures -gt 0) {
-        exit 1
+    if (-not (Test-Path -LiteralPath $venvPython -PathType Leaf)) {
+        $venvCreation = Invoke-PythonCaptured -Python $BootstrapPython `
+            -PythonArguments @("-m", "venv", $venvRoot)
+        if ($venvCreation.ExitCode -ne 0) {
+            # Never retain a half-created venv. A later retry starts from a known state.
+            Reset-NativeRuntimeVenv -Paths $paths
+            Throw-RuntimeCommandFailure -Output $venvCreation.Output `
+                -DefaultCode "venv_create_failed" `
+                -DefaultMessage "无法创建隔离的 Python 运行环境。" `
+                -DefaultRecommendedAction (
+                    "请确认所选 Python 包含 venv 模块，并且配置目录可写，然后重试。"
+                )
+        }
+        $script:RuntimeWasCreated = $true
+        $installedFingerprint = ""
     }
+
+    if ($installedFingerprint -eq $fingerprint) {
+        try {
+            $null = Get-NativeRuntimeProbe -RuntimePython $venvPython
+        }
+        catch {
+            # A matching source stamp is not sufficient if the venv was partially removed or
+            # corrupted. Force the locked wheel installation to repair it in place.
+            $installedFingerprint = ""
+        }
+    }
+
+    if ($installedFingerprint -ne $fingerprint) {
+        $wheelRoot = [System.IO.Directory]::CreateDirectory(
+            (Join-Path $runtimeRoot ("wheel-" + [guid]::NewGuid().ToString("N")))
+        ).FullName
+        try {
+            $wheelBuild = Invoke-PythonCaptured -Python $BootstrapPython `
+                -PythonArguments @(
+                "-m", "pip", "wheel", "--disable-pip-version-check", "--no-deps",
+                "--wheel-dir", $wheelRoot, $sourceRoot
+            )
+            if ($wheelBuild.ExitCode -ne 0) {
+                Throw-RuntimeCommandFailure -Output $wheelBuild.Output `
+                    -DefaultCode "wheel_build_failed" `
+                    -DefaultMessage "无法构建原生 zvec wheel。" `
+                    -DefaultRecommendedAction (
+                        "请确认 pip 可用且应用的 backend 文件完整，然后重试。"
+                    )
+            }
+            $wheel = Get-ChildItem -LiteralPath $wheelRoot -Filter "*.whl" -File |
+                Select-Object -First 1
+            if ($null -eq $wheel) {
+                Throw-RuntimeError -Code "wheel_build_failed" `
+                    -Message "原生 zvec 构建没有生成 wheel。" `
+                    -RecommendedAction "请修复或重新安装应用，然后重试。"
+            }
+            $installPython = [pscustomobject]@{ File = $venvPython; Prefix = @() }
+            $dependencyInstall = Invoke-PythonCaptured -Python $installPython `
+                -PythonArguments @(
+                    "-m", "pip", "install", "--disable-pip-version-check",
+                    "--upgrade", "--force-reinstall", "--only-binary=:all:",
+                    "--constraint", $requirementsLock, $wheel.FullName
+                )
+            if ($dependencyInstall.ExitCode -ne 0) {
+                Throw-RuntimeCommandFailure -Output $dependencyInstall.Output `
+                    -DefaultCode "dependency_install_failed" `
+                    -DefaultMessage "无法安装原生 zvec 运行依赖。" `
+                    -DefaultRecommendedAction (
+                        "请检查网络或软件包源代理，确认磁盘空间充足，然后再次点击" +
+                        "【修复运行环境】。"
+                    )
+            }
+            [System.IO.File]::WriteAllText($stampPath, $fingerprint + "`n")
+            $script:RuntimeWasUpdated = $true
+        }
+        finally {
+            $resolvedRuntime = [System.IO.Path]::GetFullPath($runtimeRoot)
+            $resolvedWheel = [System.IO.Path]::GetFullPath($wheelRoot)
+            if (
+                $resolvedWheel.StartsWith(
+                    $resolvedRuntime + [System.IO.Path]::DirectorySeparatorChar,
+                    [System.StringComparison]::OrdinalIgnoreCase
+                ) -and
+                (Test-Path -LiteralPath $resolvedWheel)
+            ) {
+                Remove-Item -LiteralPath $resolvedWheel -Recurse -Force
+            }
+        }
+    }
+    return $venvPython
+    }
+    finally {
+        $runtimeLock.Dispose()
+    }
+}
+
+function Assert-SupportedPythonRuntime {
+    param([Parameter(Mandatory = $true)]$Python)
+
+    $architectureState = Get-PythonArchitectureState -Python $Python
+    if ($architectureState -eq "probe_failed") {
+        Throw-RuntimeError -Code "python_probe_failed" `
+            -Message "无法检查 Python 解释器。" `
+            -RecommendedAction "请选择可用的 x64 Python 3.10 或更高版本。"
+    }
+    if ($architectureState -eq "windows_arm64") {
+        Throw-WindowsArm64PythonUnsupported
+    }
+}
+
+function Write-SuccessfulRuntimeResult {
+    param(
+        [Parameter(Mandatory = $true)]$Probe,
+        [Parameter(Mandatory = $true)]$Paths,
+        [Parameter(Mandatory = $true)][bool]$Changed
+    )
+
+    $status = if ($Changed) { "repaired" } else { "ready" }
+    $message = if ($Changed) {
+        "隔离的 Python 运行环境已准备并验证完成。"
+    }
+    else {
+        "隔离的 Python 运行环境已就绪。"
+    }
+    Write-RuntimeResult -Success $true -Status $status -Code $status `
+        -Message $message -PythonExecutable $Probe.python_executable `
+        -PythonVersion $Probe.python_version `
+        -PythonArchitecture $Probe.python_architecture `
+        -RuntimeDirectory $Paths.RuntimeRoot `
+        -Dependencies @($Probe.dependencies) -Changed $Changed
+}
+
+function Invoke-RuntimeDoctor {
+    $paths = Get-NativeRuntimePaths
+    $runtimeLock = Enter-NativeRuntimeLock -Paths $paths
+    try {
+    if (-not (Test-Path -LiteralPath $paths.Stamp -PathType Leaf)) {
+        Throw-RuntimeError -Code "runtime_not_installed" `
+            -Message "隔离的 Python 运行环境尚未初始化。" `
+            -RecommendedAction "请点击【修复运行环境】安装所需依赖。"
+    }
+    $expectedFingerprint = Get-SourceFingerprint
+    $installedFingerprint = [System.IO.File]::ReadAllText($paths.Stamp).Trim()
+    if ($installedFingerprint -ne $expectedFingerprint) {
+        Throw-RuntimeError -Code "runtime_outdated" `
+            -Message "隔离的 Python 运行环境与当前应用版本不匹配。" `
+            -RecommendedAction "请点击【修复运行环境】安装当前版本的后端。"
+    }
+    $runtimePython = [pscustomobject]@{ File = $paths.Python; Prefix = @() }
+    if (-not (Test-PythonCommand -Python $runtimePython)) {
+        Throw-RuntimeError -Code "venv_unusable" `
+            -Message "隔离的 Python 环境已损坏、无法执行或版本低于 3.10。" `
+            -RecommendedAction (
+                "请点击【修复运行环境】；程序会使用可用的 x64 Python 安全重建 venv。"
+            )
+    }
+    if (-not (Test-PythonPip -Python $runtimePython)) {
+        Throw-RuntimeError -Code "venv_pip_unusable" `
+            -Message "隔离环境中的 pip 已损坏，无法安装或更新锁定依赖。" `
+            -RecommendedAction (
+                "请安装带 pip 的 x64 Python 3.10 或更高版本，然后点击" +
+                "【修复运行环境】。"
+            )
+    }
+    Assert-SupportedPythonRuntime -Python $runtimePython
+    $probe = Get-NativeRuntimeProbe -RuntimePython $paths.Python
+    Write-SuccessfulRuntimeResult -Probe $probe -Paths $paths -Changed $false
+    }
+    finally {
+        $runtimeLock.Dispose()
+    }
+}
+
+function Get-RuntimeFailureData {
+    param([Parameter(Mandatory = $true)]$ErrorRecord)
+
+    $code = [string]$ErrorRecord.Exception.Data["ZvecRuntimeCode"]
+    if ([string]::IsNullOrWhiteSpace($code)) {
+        $messages = New-Object System.Collections.Generic.List[string]
+        $isDiskFull = $false
+        $currentException = $ErrorRecord.Exception
+        while ($null -ne $currentException) {
+            $messages.Add([string]$currentException.Message)
+            $nativeCode = $currentException.HResult -band 0xFFFF
+            if ($nativeCode -in @(39, 112)) {
+                $isDiskFull = $true
+            }
+            $currentException = $currentException.InnerException
+        }
+        $failureText = $messages -join "`n"
+        if (
+            $isDiskFull -or
+            $failureText -match (
+                '(?i)(no space left on device|there is not enough space|' +
+                'not enough space (?:on|available)|disk (?:is )?full|' +
+                'winerror\s*112|errno\s*28)'
+            )
+        ) {
+            return [pscustomobject]@{
+                Code = "runtime_disk_space_insufficient"
+                Action = (
+                    "请释放 ZVEC_CONFIG_HOME 所在磁盘空间（建议至少 1 GB），再点击" +
+                    "【修复运行环境】。未完成的临时文件会在重试时自动清理。"
+                )
+            }
+        }
+        $code = "runtime_bootstrap_failed"
+    }
+    $action = [string]$ErrorRecord.Exception.Data["ZvecRecommendedAction"]
+    if ([string]::IsNullOrWhiteSpace($action)) {
+        $action = "请打开安装日志，修复运行环境后重试。"
+    }
+    return [pscustomobject]@{ Code = $code; Action = $action }
 }
 
 try {
-    $normalizedCommand = $Command.ToLowerInvariant()
-    switch ($normalizedCommand) {
-        { $_ -in @("help", "--help", "-h") } {
-            Write-Usage
-        }
-        "init" {
-            Invoke-Init -InitArguments $Arguments
-        }
-        "build" {
-            $cleanBuild = $false
-            foreach ($argument in $Arguments) {
-                if ($argument -in @("--clean", "--no-cache")) {
-                    $cleanBuild = $true
-                }
-                else {
-                    throw "Usage: zvec build [--clean]"
-                }
-            }
-            $config = Read-Config -Optional
-            $imageName = if ($null -ne $config) {
-                [string]$config.image_name
-            }
-            else {
-                $script:DefaultImageName
-            }
-            Build-DockerImage -ImageName $imageName -NoCache:$cleanBuild
-            if ($null -ne $config) {
-                Initialize-WorkspaceVolume -Config $config
-            }
-        }
-        "doctor" {
-            Invoke-Doctor
-        }
-        "results" {
-            $config = Read-Config
-            $resultsDirectory = Ensure-Directory ([string]$config.results_directory)
-            Start-Process explorer.exe -ArgumentList $resultsDirectory
-        }
-        "index" {
-            $config = Read-Config
-            Invoke-ZvecContainer -Config $config -CliArguments (
-                @("index", $script:ContainerImageRoot) + $Arguments
-            )
-        }
-        "sync" {
-            $config = Read-Config
-            Invoke-ZvecContainer -Config $config -CliArguments (
-                @("sync", $script:ContainerImageRoot) + $Arguments
-            )
-        }
-        "search" {
-            if ($Arguments.Count -lt 1) {
-                throw "Usage: zvec search <text> [--tk N] [--tags <tag...>]"
-            }
-            $config = Read-Config
-            if ($Arguments[0] -eq "--text") {
-                $cliArguments = @("search") + $Arguments
-            }
-            else {
-                $cliArguments = @("search", "--text", $Arguments[0])
-                if ($Arguments.Count -gt 1) {
-                    $cliArguments += $Arguments[1..($Arguments.Count - 1)]
-                }
-            }
-            Invoke-ZvecContainer -Config $config -CliArguments $cliArguments
-        }
-        "search-image" {
-            if ($Arguments.Count -lt 1) {
-                throw "Usage: zvec search-image <image-file> [--tk N] [--tags <tag...>]"
-            }
-            $config = Read-Config
-            $query = Get-QueryMount $Arguments[0]
-            $cliArguments = @("search", "--image", $query.ContainerPath)
-            if ($Arguments.Count -gt 1) {
-                $cliArguments += $Arguments[1..($Arguments.Count - 1)]
-            }
-            Invoke-ZvecContainer -Config $config -CliArguments $cliArguments `
-                -QueryDirectory $query.HostDirectory
-        }
-        "search-mix" {
-            if ($Arguments.Count -lt 2) {
-                throw "Usage: zvec search-mix <image-file> <text> [--tk N] [--tags <tag...>]"
-            }
-            $config = Read-Config
-            $query = Get-QueryMount $Arguments[0]
-            $cliArguments = @(
-                "search",
-                "--image", $query.ContainerPath,
-                "--text", $Arguments[1]
-            )
-            if ($Arguments.Count -gt 2) {
-                $cliArguments += $Arguments[2..($Arguments.Count - 1)]
-            }
-            Invoke-ZvecContainer -Config $config -CliArguments $cliArguments `
-                -QueryDirectory $query.HostDirectory
-        }
-        "stats" {
-            $config = Read-Config
-            Invoke-ZvecContainer -Config $config -CliArguments @("stats")
-        }
-        "roots" {
-            $config = Read-Config
-            Invoke-ZvecContainer -Config $config -CliArguments @("roots")
-        }
-        "cache-clear" {
-            $config = Read-Config
-            Invoke-ZvecContainer -Config $config -CliArguments @("cache-clear")
-        }
-        "clean" {
-            $config = Read-Config
-            $days = 7
-            $remaining = @()
-            if ($Arguments.Count -gt 0) {
-                $parsedDays = 0
-                if ([int]::TryParse($Arguments[0], [ref]$parsedDays)) {
-                    if ($parsedDays -lt 0) {
-                        throw "days cannot be negative."
-                    }
-                    $days = $parsedDays
-                    if ($Arguments.Count -gt 1) {
-                        $remaining = $Arguments[1..($Arguments.Count - 1)]
-                    }
-                }
-                else {
-                    $remaining = $Arguments
-                }
-            }
-            Invoke-ZvecContainer -Config $config -CliArguments (
-                @("clean-results", "--days", [string]$days) + $remaining
-            )
-        }
-        "rebind-root" {
-            if ($Arguments.Count -lt 1 -or $Arguments.Count -gt 2) {
-                throw "Usage: zvec rebind-root <root-id> [new-image-folder]"
-            }
-            $config = Read-Config
-            if ($Arguments.Count -eq 2) {
-                $config.image_root = Resolve-Directory $Arguments[1]
-            }
-            Invoke-ZvecContainer -Config $config -CliArguments @(
-                "rebind-root", $Arguments[0], $script:ContainerImageRoot
-            )
-            if ($Arguments.Count -eq 2) {
-                Save-Config -Config $config
-            }
-        }
-        "migrate-path-schema" {
-            $config = Read-Config
-            Invoke-ZvecContainer -Config $config -CliArguments (
-                @("migrate-path-schema") + $Arguments
-            )
-        }
-        "migrate-schema" {
-            $config = Read-Config
-            Invoke-ZvecContainer -Config $config -CliArguments (
-                @("migrate-schema") + $Arguments
-            )
-        }
-        "raw" {
-            if ($Arguments.Count -lt 1) {
-                throw "Usage: zvec raw <original zvec-image-search arguments>"
-            }
-            $config = Read-Config
-            Invoke-ZvecContainer -Config $config -CliArguments $Arguments
-        }
-        default {
-            throw "Unknown command '$Command'. Run 'zvec help'."
-        }
+    if ($Command -ieq "runtime-doctor") {
+        Invoke-RuntimeDoctor
+        exit 0
     }
+
+    $bootstrapPython = Resolve-PythonCommand
+    $versionExit = Invoke-Python -Python $bootstrapPython -PythonArguments @(
+        "-c",
+        "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)"
+    )
+    if ($versionExit -ne 0) {
+        Throw-RuntimeError -Code "python_version_unsupported" `
+            -Message "需要 Python 3.10 或更高版本。" `
+            -RecommendedAction "请安装 x64 CPython 3.10 或更高版本，然后重试。"
+    }
+    Assert-SupportedPythonRuntime -Python $bootstrapPython
+
+    if (
+        $env:ZVEC_NATIVE_USE_SOURCE -eq "1" -and
+        $Command -ine "runtime-bootstrap"
+    ) {
+        $previousPythonPath = $env:PYTHONPATH
+        $env:PYTHONPATH = if ([string]::IsNullOrWhiteSpace($previousPythonPath)) {
+            $sourceRoot
+        }
+        else {
+            "$sourceRoot$([System.IO.Path]::PathSeparator)$previousPythonPath"
+        }
+        try {
+            $pythonArguments = @("-m", "zvec_launcher", $Command) + $Arguments
+            $exitCode = Invoke-Python -Python $bootstrapPython `
+                -PythonArguments $pythonArguments
+        }
+        finally {
+            $env:PYTHONPATH = $previousPythonPath
+        }
+        exit $exitCode
+    }
+
+    $runtimePython = Initialize-NativeRuntime -BootstrapPython $bootstrapPython
+    if ($Command -ieq "runtime-bootstrap") {
+        $paths = Get-NativeRuntimePaths
+        $probe = Get-NativeRuntimeProbe -RuntimePython $runtimePython
+        Write-SuccessfulRuntimeResult -Probe $probe -Paths $paths `
+            -Changed ($script:RuntimeWasCreated -or $script:RuntimeWasUpdated)
+        exit 0
+    }
+    & $runtimePython -m zvec_launcher $Command @Arguments
+    exit $LASTEXITCODE
 }
 catch {
+    if ($runtimeCommand) {
+        $failure = Get-RuntimeFailureData -ErrorRecord $_
+        Write-RuntimeResult -Success $false -Status "failed" `
+            -Code $failure.Code -Message $_.Exception.Message `
+            -RecommendedAction $failure.Action `
+            -RuntimeDirectory (Get-RuntimeDirectoryForFailure)
+    }
     Write-Error $_.Exception.Message
     exit 1
 }
-
-exit 0

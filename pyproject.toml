@@ -15,9 +15,10 @@ dependencies = [
 
 [project.scripts]
 zvec-image-search = "image_service:main"
+zvec = "zvec_launcher:main"
 
 [tool.setuptools]
-py-modules = ["image_service", "zvec_logging"]
+py-modules = ["image_service", "zvec_launcher", "zvec_logging"]
 
 [tool.setuptools.packages.find]
 include = ["image_vector_service*"]

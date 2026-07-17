@@ -5,14 +5,22 @@ import uuid
 from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import cast
 
 import zvec
 
 from .config import ConfigurationError, ServiceConfig
-from .models import ImageRecord, SearchHit
+from .models import ImageRecord, RankSource, SearchHit
+from .tag_aliases import TagAliasDictionary
+from .tag_search import TagCatalog, TagMatchMode, TagSearchPlan, matched_tags_for_result
 from .tags import build_tags_filter, normalize_tags
 
-COLLECTION_SCHEMA_VERSION = 3
+COLLECTION_SCHEMA_VERSION = 4
+
+METADATA_FIELDS = [
+    "metadata_text",
+    "metadata_text_hash",
+]
 
 OUTPUT_FIELDS = [
     "root_id",
@@ -37,6 +45,16 @@ class ZvecImageRepository:
         self.created = False
         self.collection, metadata = self._open_or_create()
         self.collection_uuid = str(metadata["collection_uuid"])
+        self._tag_catalog: TagCatalog | None = None
+
+    def set_tag_catalog(
+        self,
+        tags: Iterable[str],
+        aliases: TagAliasDictionary | None = None,
+    ) -> None:
+        """Replace the immutable catalog used for partial tag expansion."""
+
+        self._tag_catalog = TagCatalog(tags, aliases=aliases)
 
     def _schema(self) -> zvec.CollectionSchema:
         return collection_schema(self.config)
@@ -91,7 +109,7 @@ class ZvecImageRepository:
             if metadata.get(key) != value
         }
         if mismatches:
-            if metadata.get("schema_version") in {1, 2}:
+            if metadata.get("schema_version") in {1, 2, 3}:
                 raise ConfigurationError(
                     "Collection schema requires migration. Run "
                     "'image_service.py migrate-schema --dry-run' first."
@@ -99,12 +117,29 @@ class ZvecImageRepository:
             raise ConfigurationError(f"Collection metadata mismatch: {mismatches}")
         return metadata
 
-    @staticmethod
-    def _validate_collection_schema(collection: zvec.Collection) -> None:
-        tags = [field for field in collection.schema.fields if field.name == "tags"]
-        if len(tags) != 1 or tags[0].data_type != zvec.DataType.ARRAY_STRING:
+    def _validate_collection_schema(self, collection: zvec.Collection) -> None:
+        fields = {field.name: field for field in collection.schema.fields}
+        expected_fields = {
+            "tags": zvec.DataType.ARRAY_STRING,
+            "metadata_text": zvec.DataType.STRING,
+            "metadata_text_hash": zvec.DataType.STRING,
+        }
+        invalid_fields = {
+            name
+            for name, data_type in expected_fields.items()
+            if name not in fields or fields[name].data_type != data_type
+        }
+        vectors = {vector.name: vector for vector in collection.schema.vectors}
+        invalid_vectors = {
+            name
+            for name in ("embedding", "metadata_embedding")
+            if name not in vectors
+            or vectors[name].data_type != zvec.DataType.VECTOR_FP32
+            or vectors[name].dimension != self.config.dimension
+        }
+        if invalid_fields or invalid_vectors:
             raise ConfigurationError(
-                "Collection tags field is missing or invalid. Run "
+                "Collection schema is missing required metadata fields or vectors. Run "
                 "'image_service.py migrate-schema --dry-run' first."
             )
 
@@ -125,6 +160,79 @@ class ZvecImageRepository:
             return None
         vector = document.vectors.get("embedding")
         return list(vector) if vector is not None else None
+
+    def fetch_metadata(self, doc_id: str) -> dict[str, object] | None:
+        """Return the persisted metadata text, hash, and vector for one document."""
+
+        documents = self.collection.fetch(
+            doc_id,
+            output_fields=METADATA_FIELDS,
+            include_vector=True,
+        )
+        document = documents.get(doc_id)
+        if not document:
+            return None
+        vector = document.vectors.get("metadata_embedding")
+        return {
+            "metadata_text": str(document.fields.get("metadata_text", "")),
+            "metadata_text_hash": str(document.fields.get("metadata_text_hash", "")),
+            "metadata_embedding": list(vector) if vector is not None else [],
+        }
+
+    def upsert_metadata_embedding(
+        self,
+        doc_id: str,
+        metadata_text: str,
+        metadata_text_hash: str,
+        vector: list[float],
+    ) -> None:
+        """Update one metadata vector without changing image fields or tags."""
+
+        normalized_text = str(metadata_text).strip()
+        normalized_hash = str(metadata_text_hash).strip().lower()
+        if not normalized_text:
+            raise ValueError("metadata_text must not be empty.")
+        if len(normalized_hash) != 64 or any(
+            character not in "0123456789abcdef" for character in normalized_hash
+        ):
+            raise ValueError("metadata_text_hash must be a SHA-256 hex digest.")
+        if len(vector) != self.config.dimension:
+            raise ValueError(
+                "metadata_embedding dimension mismatch: "
+                f"{len(vector)} != {self.config.dimension}."
+            )
+
+        documents = self.collection.fetch(
+            doc_id,
+            output_fields=[*OUTPUT_FIELDS, *METADATA_FIELDS],
+            include_vector=True,
+        )
+        document = documents.get(doc_id)
+        if not document:
+            raise ConfigurationError(f"Unknown Collection document: {doc_id}")
+        image_vector = document.vectors.get("embedding")
+        if image_vector is None or len(image_vector) != self.config.dimension:
+            raise ConfigurationError(
+                f"Missing or invalid image vector for document {doc_id}."
+            )
+
+        fields = dict(document.fields)
+        fields["metadata_text"] = normalized_text
+        fields["metadata_text_hash"] = normalized_hash
+        status = self.collection.upsert(
+            zvec.Doc(
+                id=doc_id,
+                fields=fields,
+                vectors={
+                    "embedding": list(image_vector),
+                    "metadata_embedding": list(vector),
+                },
+            )
+        )
+        if not status.ok():
+            raise ConfigurationError(
+                f"Metadata embedding upsert failed for document {doc_id}: {status}"
+            )
 
     def contains(self, doc_id: str) -> bool:
         return bool(
@@ -174,8 +282,15 @@ class ZvecImageRepository:
                 "height": record.height,
                 "model": self.config.model,
                 "tags": tags,
+                # Image or accepted-tag changes make any previous metadata
+                # embedding stale. Empty values explicitly mark it for backfill.
+                "metadata_text": "",
+                "metadata_text_hash": "",
             },
-            vectors={"embedding": vector},
+            vectors={
+                "embedding": vector,
+                "metadata_embedding": empty_metadata_embedding(self.config.dimension),
+            },
         )
 
     def query(
@@ -184,23 +299,101 @@ class ZvecImageRepository:
         top_k: int,
         tags: Iterable[str] = (),
         tag_mode: str = "all",
+        rank_source: RankSource = "text",
     ) -> list[SearchHit]:
+        tag_plan: TagSearchPlan | None = None
+        if self._tag_catalog is None:
+            tag_filter = build_tags_filter(tags, tag_mode)
+        else:
+            tag_plan = self._tag_catalog.resolve(
+                tags, mode=cast(TagMatchMode, tag_mode)
+            )
+            if tag_plan.matches_nothing:
+                return []
+            tag_filter = tag_plan.zvec_filter
         documents = self.collection.query(
             queries=zvec.Query(field_name="embedding", vector=vector),
             topk=top_k,
-            filter=build_tags_filter(tags, tag_mode),
+            filter=tag_filter,
             include_vector=False,
             output_fields=OUTPUT_FIELDS,
         )
-        return [
-            SearchHit(
-                doc_id=document.id,
-                distance=float(document.score or 0.0),
-                fields=dict(document.fields),
-                rank=index,
+        hits = []
+        for index, document in enumerate(documents, start=1):
+            # zvec COSINE reports cosine distance (1 - cosine similarity), not a
+            # relevance score. A perfect match is 0 and lower values rank first.
+            raw_score = float(document.score) if document.score is not None else 0.0
+            fields = dict(document.fields)
+            hits.append(
+                SearchHit(
+                    doc_id=document.id,
+                    distance=raw_score,
+                    raw_score=raw_score,
+                    fields=fields,
+                    rank=index,
+                    rank_source=rank_source,
+                    matched_tags=(
+                        matched_tags_for_result(fields.get("tags"), tag_plan)
+                        if tag_plan is not None
+                        else ()
+                    ),
+                )
             )
-            for index, document in enumerate(documents, start=1)
-        ]
+        return hits
+
+    def query_metadata(
+        self,
+        vector: list[float],
+        top_k: int,
+        tags: Iterable[str] = (),
+        tag_mode: str = "all",
+        rank_source: RankSource = "metadata",
+    ) -> list[SearchHit]:
+        """Query only completed metadata embeddings, with optional tag filtering."""
+
+        tag_plan: TagSearchPlan | None = None
+        if self._tag_catalog is None:
+            tag_filter = build_tags_filter(tags, tag_mode)
+        else:
+            tag_plan = self._tag_catalog.resolve(
+                tags, mode=cast(TagMatchMode, tag_mode)
+            )
+            if tag_plan.matches_nothing:
+                return []
+            tag_filter = tag_plan.zvec_filter
+        completed_filter = "metadata_text_hash != ''"
+        query_filter = (
+            f"({completed_filter}) AND ({tag_filter})"
+            if tag_filter is not None
+            else completed_filter
+        )
+        documents = self.collection.query(
+            queries=zvec.Query(field_name="metadata_embedding", vector=vector),
+            topk=top_k,
+            filter=query_filter,
+            include_vector=False,
+            output_fields=OUTPUT_FIELDS,
+        )
+        hits = []
+        for index, document in enumerate(documents, start=1):
+            raw_score = float(document.score) if document.score is not None else 0.0
+            fields = dict(document.fields)
+            hits.append(
+                SearchHit(
+                    doc_id=document.id,
+                    distance=raw_score,
+                    raw_score=raw_score,
+                    fields=fields,
+                    rank=index,
+                    rank_source=rank_source,
+                    matched_tags=(
+                        matched_tags_for_result(fields.get("tags"), tag_plan)
+                        if tag_plan is not None
+                        else ()
+                    ),
+                )
+            )
+        return hits
 
     def delete(self, doc_ids: Iterable[str]) -> tuple[list[str], dict[str, str]]:
         ids = list(doc_ids)
@@ -262,6 +455,12 @@ def collection_schema(config: ServiceConfig) -> zvec.CollectionSchema:
                 zvec.DataType.ARRAY_STRING,
                 index_param=zvec.InvertIndexParam(),
             ),
+            zvec.FieldSchema("metadata_text", zvec.DataType.STRING),
+            zvec.FieldSchema(
+                "metadata_text_hash",
+                zvec.DataType.STRING,
+                index_param=zvec.InvertIndexParam(),
+            ),
         ],
         vectors=[
             zvec.VectorSchema(
@@ -269,6 +468,20 @@ def collection_schema(config: ServiceConfig) -> zvec.CollectionSchema:
                 zvec.DataType.VECTOR_FP32,
                 dimension=config.dimension,
                 index_param=zvec.HnswIndexParam(metric_type=zvec.MetricType.COSINE),
-            )
+            ),
+            zvec.VectorSchema(
+                "metadata_embedding",
+                zvec.DataType.VECTOR_FP32,
+                dimension=config.dimension,
+                index_param=zvec.HnswIndexParam(metric_type=zvec.MetricType.COSINE),
+            ),
         ],
     )
+
+
+def empty_metadata_embedding(dimension: int) -> list[float]:
+    """Return the required zero-vector placeholder for pending metadata."""
+
+    if dimension < 1:
+        raise ValueError("Embedding dimension must be positive.")
+    return [0.0] * dimension

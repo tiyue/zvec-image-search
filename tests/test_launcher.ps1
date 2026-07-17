@@ -5,30 +5,29 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 $launcher = Join-Path $repoRoot "scripts\zvec.ps1"
 $installer = Join-Path $repoRoot "scripts\install-zvec-command.cmd"
 $testRoot = Join-Path $env:TEMP (
-    "zvec-launcher-test-" + [guid]::NewGuid().ToString("N")
+    "zvec-native-launcher-test-" + [guid]::NewGuid().ToString("N")
 )
-$fakeBin = Join-Path $testRoot "bin"
 $configRoot = Join-Path $testRoot "config"
 $installRoot = Join-Path $testRoot "installed"
-$imageFolderName = ([char]0x56FE).ToString() + [char]0x5E93 + " space"
-$queryFolderName = (
-    ([char]0x67E5).ToString() + [char]0x8BE2 + [char]0x26 + " space"
-)
-$queryFileName = ([char]0x6837).ToString() + [char]0x4F8B + ".jpg"
-$queryText = ([char]0x6D77).ToString() + [char]0x8FB9 + [char]0x65E5 + [char]0x843D
-$imageRoot = Join-Path $testRoot $imageFolderName
-$queryRoot = Join-Path $testRoot $queryFolderName
-$queryFile = Join-Path $queryRoot $queryFileName
-$previousPath = $env:PATH
-$previousConfigHome = $env:ZVEC_DOCKER_CONFIG_HOME
+$imageRoot = Join-Path $testRoot "图库 space"
+$workspace = Join-Path $testRoot "workspace"
+$results = Join-Path $testRoot "results"
+$secondImageRoot = Join-Path $testRoot "archive-images"
+$secondWorkspace = Join-Path $testRoot "archive-workspace"
+
+$previousConfigHome = $env:ZVEC_CONFIG_HOME
+$previousLegacyConfigHome = $env:ZVEC_DOCKER_CONFIG_HOME
 $previousApiKey = $env:DASHSCOPE_API_KEY
 $previousInstallDirectory = $env:ZVEC_COMMAND_INSTALL_DIR
+$previousSourceMode = $env:ZVEC_NATIVE_USE_SOURCE
+$previousNoOpen = $env:ZVEC_NO_OPEN
+$previousUtf8Output = $env:ZVEC_UTF8_OUTPUT
 
 function Invoke-Launcher {
-    param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments)
+    param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Values)
 
     $output = & powershell.exe -NoProfile -ExecutionPolicy Bypass `
-        -File $launcher @Arguments 2>&1
+        -File $launcher @Values 2>&1
     if ($LASTEXITCODE -ne 0) {
         throw "Launcher failed: $($output -join [Environment]::NewLine)"
     }
@@ -37,99 +36,87 @@ function Invoke-Launcher {
 
 try {
     New-Item -ItemType Directory -Path `
-        $fakeBin,$configRoot,$installRoot,$imageRoot,$queryRoot -Force | Out-Null
-    [System.IO.File]::WriteAllBytes($queryFile, [byte[]]@(0))
+        $configRoot,$installRoot,$imageRoot,$workspace,$results,`
+        $secondImageRoot,$secondWorkspace -Force | Out-Null
 
-    $source = @'
-using System;
-public static class Program {
-    public static int Main(string[] args) {
-        if (args.Length > 0 && args[0] == "version") {
-            Console.WriteLine("99.0.0");
-            return 0;
-        }
-        if (args.Length > 0 && args[0] == "inspect") {
-            return 0;
-        }
-        if (args.Length > 0 && args[0] == "run" &&
-            Array.IndexOf(args, "--entrypoint") >= 0 &&
-            Array.IndexOf(args, "id") >= 0) {
-            Console.WriteLine("10001");
-            return 0;
-        }
-        if (Array.IndexOf(args, "force-fail") >= 0) {
-            Console.Error.WriteLine("forced failure");
-            return 23;
-        }
-        Console.WriteLine("DOCKER_ARGS: " + string.Join("|", args));
-        return 0;
-    }
-}
-'@
-    Add-Type -TypeDefinition $source `
-        -OutputAssembly (Join-Path $fakeBin "docker.exe") `
-        -OutputType ConsoleApplication
-
-    $env:PATH = "$fakeBin;$previousPath"
-    $env:ZVEC_DOCKER_CONFIG_HOME = $configRoot
+    $env:ZVEC_CONFIG_HOME = $configRoot
+    $env:ZVEC_DOCKER_CONFIG_HOME = $null
     $env:DASHSCOPE_API_KEY = "test-key-not-real"
     $env:ZVEC_COMMAND_INSTALL_DIR = $installRoot
+    $env:ZVEC_NATIVE_USE_SOURCE = "1"
+    $env:ZVEC_NO_OPEN = "1"
+    $env:ZVEC_UTF8_OUTPUT = "1"
 
-    $null = Invoke-Launcher init $imageRoot --no-build
-    $doctorOutput = Invoke-Launcher doctor
-    $buildOutput = Invoke-Launcher build --clean
-    $indexOutput = Invoke-Launcher index tag-one tag-two
-    $searchOutput = Invoke-Launcher search $queryText --tk 3 --tags tag-one tag-two
-    $imageOutput = Invoke-Launcher search-image $queryFile --tk 2 --tags tag-one
-    $migrationOutput = Invoke-Launcher migrate-schema --dry-run
-
-    if (($doctorOutput -join "`n") -notmatch "Container mounts have the expected permissions") {
-        throw "Doctor did not verify container mount permissions."
+    $initOutput = Invoke-Launcher init $imageRoot --workspace $workspace `
+        --results $results --skip-key
+    if (($initOutput -join "`n") -notmatch "native Python") {
+        throw "init did not report the native runtime."
     }
-    if (($doctorOutput -join "`n") -notmatch "Container runtime UID: 10001") {
-        throw "Doctor did not verify the runtime UID."
-    }
-    if (($buildOutput -join "`n") -notmatch "build[|].*--no-cache") {
-        throw "Clean build arguments were not translated."
-    }
-    if (($buildOutput -join "`n") -notmatch "build[|]--provenance=false") {
-        throw "Build did not disable provenance for the local image."
-    }
-    if (($buildOutput -join "`n") -notmatch "Verified .*UID 10001") {
-        throw "Build did not verify the image contract."
-    }
+    $savedConfig = Get-Content -LiteralPath (Join-Path $configRoot "config.json") `
+        -Raw -Encoding UTF8 | ConvertFrom-Json
+    $savedLibrary = @($savedConfig.libraries)[0]
     if (
-        ($indexOutput -join "`n") -notmatch
-        "index[|]/data/roots/main[|]tag-one[|]tag-two"
+        [int]$savedConfig.schema_version -ne 3 -or
+        [string]::IsNullOrWhiteSpace([string]$savedLibrary.workspace_directory) -or
+        $savedLibrary.PSObject.Properties.Name -contains "workspace_type" -or
+        $savedLibrary.PSObject.Properties.Name -contains "workspace_source" -or
+        $savedConfig.PSObject.Properties.Name -contains "image_name"
     ) {
-        throw "Index tags were not translated."
-    }
-    if (($searchOutput -join "`n") -notmatch "search[|]--text[|]$queryText") {
-        throw "Text search arguments were not translated."
-    }
-    if (($searchOutput -join "`n") -notmatch "--tk[|]3[|]--tags[|]tag-one[|]tag-two") {
-        throw "Search tag arguments were not translated."
-    }
-    if (($imageOutput -join "`n") -notmatch "--image[|]/data/query/") {
-        throw "Query image arguments were not translated."
-    }
-    if (($migrationOutput -join "`n") -notmatch "migrate-schema[|]--dry-run") {
-        throw "Schema migration arguments were not translated."
+        throw "init did not create the native schema v3 configuration."
     }
 
-    $previousErrorAction = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = "Continue"
-        $failureOutput = & powershell.exe -NoProfile -ExecutionPolicy Bypass `
-            -File $launcher raw force-fail 2>&1
-        $failureExitCode = $LASTEXITCODE
+    $doctorOutput = Invoke-Launcher doctor
+    if (($doctorOutput -join "`n") -notmatch "Docker Desktop.*not required") {
+        throw "doctor did not confirm that Docker is unnecessary."
     }
-    finally {
-        $ErrorActionPreference = $previousErrorAction
+    if (($doctorOutput -join "`n") -match "Docker CLI not found") {
+        throw "doctor still treats Docker as a runtime dependency."
     }
-    if ($failureExitCode -ne 23) {
-        throw "Launcher did not preserve Docker exit code 23: $failureOutput"
+
+    $statsOutput = Invoke-Launcher stats
+    $statsText = $statsOutput -join "`n"
+    $statsJsonStart = $statsText.IndexOf("{")
+    if ($statsJsonStart -lt 0) {
+        throw "stats did not return JSON: $statsText"
     }
+    $stats = $statsText.Substring($statsJsonStart) | ConvertFrom-Json
+    if ([int]$stats.collection_stats.doc_count -ne 0) {
+        throw "A new native workspace should start with zero documents."
+    }
+    $null = Invoke-Launcher roots
+    $migrationOutput = Invoke-Launcher migrate-schema --dry-run
+    if (($migrationOutput -join "`n") -notmatch '"api_requests": 0') {
+        throw "Schema migration did not preserve the zero-API contract."
+    }
+    $buildOutput = Invoke-Launcher build --clean
+    if (($buildOutput -join "`n") -notmatch "Docker.*no longer required") {
+        throw "The compatibility build command did not describe native behavior."
+    }
+    $ensureOutput = Invoke-Launcher ensure-docker
+    if (($ensureOutput -join "`n") -notmatch "Docker.*no longer required") {
+        throw "ensure-docker compatibility command still requires an engine."
+    }
+    $openedResults = Invoke-Launcher results
+    if (($openedResults -join "`n") -notmatch [regex]::Escape($results)) {
+        throw "results did not resolve the configured host directory."
+    }
+
+    $null = Invoke-Launcher library-add Archive $secondImageRoot `
+        --workspace $secondWorkspace
+    $libraryState = (Invoke-Launcher library-list) -join "`n" | ConvertFrom-Json
+    if (@($libraryState.libraries).Count -ne 2) {
+        throw "library-add did not persist a second native library."
+    }
+    $archive = @($libraryState.libraries) | Where-Object { $_.name -eq "Archive" }
+    if ($null -eq $archive) {
+        throw "library-list did not return the added library."
+    }
+    if ([string]$archive.workspace_directory -ne $secondWorkspace) {
+        throw "library-add did not preserve the host workspace directory."
+    }
+    $null = Invoke-Launcher library-rename $archive.id RenamedArchive
+    $null = Invoke-Launcher library-disable $archive.id
+    $null = Invoke-Launcher library-remove $archive.id
 
     & cmd.exe /d /c $installer *> $null
     if ($LASTEXITCODE -ne 0) {
@@ -137,28 +124,32 @@ public static class Program {
     }
     $installedCommand = Join-Path $installRoot "zvec.exe"
     $helpOutput = & $installedCommand help 2>&1
-    if ($LASTEXITCODE -ne 0 -or ($helpOutput -join "`n") -notmatch "Zvec Docker launcher") {
-        throw "Installed zvec command did not run."
-    }
-    $installedImageOutput = & $installedCommand search-image $queryFile --tk 1 2>&1
     if (
         $LASTEXITCODE -ne 0 -or
-        ($installedImageOutput -join "`n") -notmatch "--image[|]/data/query/"
+        ($helpOutput -join "`n") -notmatch "Zvec native launcher"
     ) {
-        throw "Installed command did not preserve a path containing ampersand."
+        throw "Installed native zvec command did not run."
     }
 
-    Write-Host "Launcher tests passed."
+    Write-Host "Native launcher tests passed."
 }
 finally {
-    $env:PATH = $previousPath
-    $env:ZVEC_DOCKER_CONFIG_HOME = $previousConfigHome
+    $env:ZVEC_CONFIG_HOME = $previousConfigHome
+    $env:ZVEC_DOCKER_CONFIG_HOME = $previousLegacyConfigHome
     $env:DASHSCOPE_API_KEY = $previousApiKey
     $env:ZVEC_COMMAND_INSTALL_DIR = $previousInstallDirectory
+    $env:ZVEC_NATIVE_USE_SOURCE = $previousSourceMode
+    $env:ZVEC_NO_OPEN = $previousNoOpen
+    $env:ZVEC_UTF8_OUTPUT = $previousUtf8Output
     if (Test-Path -LiteralPath $testRoot) {
         $resolved = (Resolve-Path -LiteralPath $testRoot).Path
         $tempRoot = (Resolve-Path -LiteralPath $env:TEMP).Path
-        if ($resolved.StartsWith($tempRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+        if (
+            $resolved.StartsWith(
+                $tempRoot + [System.IO.Path]::DirectorySeparatorChar,
+                [System.StringComparison]::OrdinalIgnoreCase
+            )
+        ) {
             Remove-Item -LiteralPath $resolved -Recurse -Force
         }
     }

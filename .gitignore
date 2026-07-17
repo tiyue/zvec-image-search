@@ -14,6 +14,11 @@ dist/
 !.env.example
 .venv/
 venv/
+*.pfx
+*.p12
+*.pvk
+*.key
+*.snk
 
 # IDE settings
 .idea/
@@ -38,5 +43,14 @@ zvec.log*
 *.log
 logs/
 
-# Docker launcher output
-docker-data/
+# WPF desktop build output
+/desktop/**/bin/
+/desktop/**/obj/
+
+# Private search-quality annotations and local baselines
+/tests/search_quality/*.local.json
+/tests/search_quality/*.local.md
+/tests/search_quality/search-quality.json
+
+# Local build, validation, and review artifacts
+/artifacts/

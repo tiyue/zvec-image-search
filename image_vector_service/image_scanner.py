@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Any
 
@@ -57,50 +58,87 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _iter_files(root: Path, recursive: bool, result: ScanResult):
+def _iter_files(
+    root: Path,
+    recursive: bool,
+    result: ScanResult,
+    *,
+    excluded_roots: tuple[Path, ...],
+    failure_handler: Callable[[FileFailure], None] | None,
+):
     if not recursive:
         try:
-            entries = list(os.scandir(root))
+            entries = os.scandir(root)
         except OSError as exc:
             result.complete = False
-            result.failures.append(
-                FileFailure(str(root), f"directory scan failed: {exc}")
+            _record_scan_failure(
+                result,
+                FileFailure(
+                    str(root),
+                    f"directory scan failed: {exc}",
+                    stage="scan_directory",
+                ),
+                failure_handler,
             )
             return
-        for entry in entries:
-            try:
-                if entry.is_symlink():
-                    result.skipped += 1
-                elif entry.is_file(follow_symlinks=False):
-                    yield Path(entry.path)
-            except OSError as exc:
-                result.complete = False
-                result.failures.append(FileFailure(entry.path, str(exc)))
+        with entries:
+            for entry in entries:
+                try:
+                    path = Path(entry.path)
+                    if _is_excluded(path, excluded_roots) or entry.is_symlink():
+                        result.skipped += 1
+                    elif entry.is_file(follow_symlinks=False):
+                        yield path
+                except OSError as exc:
+                    result.complete = False
+                    _record_scan_failure(
+                        result,
+                        FileFailure(entry.path, str(exc), stage="scan_entry"),
+                        failure_handler,
+                    )
         return
 
     pending = [root]
     while pending:
         directory = pending.pop()
+        if _is_excluded(directory, excluded_roots):
+            result.skipped += 1
+            continue
         try:
-            entries = list(os.scandir(directory))
+            entries = os.scandir(directory)
         except OSError as exc:
             result.complete = False
-            result.failures.append(
-                FileFailure(str(directory), f"directory scan failed: {exc}")
+            _record_scan_failure(
+                result,
+                FileFailure(
+                    str(directory),
+                    f"directory scan failed: {exc}",
+                    stage="scan_directory",
+                ),
+                failure_handler,
             )
             continue
-        for entry in entries:
-            try:
-                if entry.is_symlink():
-                    result.skipped += 1
-                    continue
-                if entry.is_dir(follow_symlinks=False):
-                    pending.append(Path(entry.path))
-                elif entry.is_file(follow_symlinks=False):
-                    yield Path(entry.path)
-            except OSError as exc:
-                result.complete = False
-                result.failures.append(FileFailure(entry.path, str(exc)))
+        with entries:
+            for entry in entries:
+                try:
+                    path = Path(entry.path)
+                    if _is_excluded(path, excluded_roots):
+                        result.skipped += 1
+                        continue
+                    if entry.is_symlink():
+                        result.skipped += 1
+                        continue
+                    if entry.is_dir(follow_symlinks=False):
+                        pending.append(path)
+                    elif entry.is_file(follow_symlinks=False):
+                        yield path
+                except OSError as exc:
+                    result.complete = False
+                    _record_scan_failure(
+                        result,
+                        FileFailure(entry.path, str(exc), stage="scan_entry"),
+                        failure_handler,
+                    )
 
 
 def inspect_image(path: Path, root: Path, root_id: str) -> ImageRecord:
@@ -141,45 +179,161 @@ def scan_folder(
     recursive: bool = True,
     previous_lookup: Callable[[str], dict[str, Any] | None] | None = None,
     verify_hash: bool = False,
+    cancel_check: Callable[[], None] | None = None,
+    max_workers: int = 4,
+    max_in_flight: int | None = None,
+    excluded_roots: Iterable[str | Path] = (),
+    failure_handler: Callable[[FileFailure], None] | None = None,
 ) -> ScanResult:
     root = Path(folder_path).expanduser().resolve()
     if not root.is_dir():
         raise NotADirectoryError(root)
 
+    if max_workers < 1:
+        raise ValueError("max_workers must be positive.")
+    in_flight_limit = max_in_flight or max_workers * 2
+    if in_flight_limit < max_workers:
+        raise ValueError("max_in_flight must be at least max_workers.")
+    exclusions = tuple(Path(value).expanduser().resolve() for value in excluded_roots)
+
     result = ScanResult()
-    for path in _iter_files(root, recursive, result):
-        result.scanned += 1
-        if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
-            result.skipped += 1
-            continue
-        result.supported += 1
-        relative_path = str(path.resolve().relative_to(root))
-        doc_id = logical_document_id(root_id, relative_path)
-        result.seen_supported_ids.add(doc_id)
-        try:
-            previous = previous_lookup(doc_id) if previous_lookup else None
-            stat = path.stat()
-            if (
-                previous
-                and not verify_hash
-                and int(previous["size_bytes"]) == stat.st_size
-                and int(previous["mtime_ns"]) == stat.st_mtime_ns
-                and previous["root_id"] == root_id
-                and previous["relative_path"] == relative_path
-            ):
-                values = {
-                    key: previous[key]
-                    for key in ImageRecord.__dataclass_fields__
-                    if key != "absolute_path"
-                }
-                record = ImageRecord(absolute_path=str(path.resolve()), **values)
-                result.records.append(record)
-                result.fast_unchanged_ids.add(doc_id)
-            else:
-                result.records.append(inspect_image(path, root, root_id))
-        except Exception as exc:
-            result.failures.append(FileFailure(str(path), str(exc)))
+    if _is_excluded(root, exclusions):
+        result.warnings.append(f"Skipped excluded scan root: {root}")
+        return result
+
+    completed_records: list[tuple[int, ImageRecord]] = []
+    futures: dict[Future[ImageRecord], tuple[int, Path]] = {}
+
+    def collect(*, drain_all: bool = False) -> None:
+        while futures:
+            done, _pending = wait(
+                futures,
+                return_when=FIRST_COMPLETED,
+            )
+            for future in done:
+                sequence, source_path = futures.pop(future)
+                try:
+                    completed_records.append((sequence, future.result()))
+                except Exception as exc:
+                    _record_scan_failure(
+                        result,
+                        FileFailure(
+                            str(source_path),
+                            str(exc) or exc.__class__.__name__,
+                            stage="inspect_image",
+                        ),
+                        failure_handler,
+                    )
+            if not drain_all:
+                return
+
+    executor = ThreadPoolExecutor(
+        max_workers=max_workers,
+        thread_name_prefix="zvec-image-scan",
+    )
+    try:
+        for sequence, path in enumerate(
+            _iter_files(
+                root,
+                recursive,
+                result,
+                excluded_roots=exclusions,
+                failure_handler=failure_handler,
+            )
+        ):
+            if cancel_check is not None:
+                cancel_check()
+            result.scanned += 1
+            if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+                result.skipped += 1
+                continue
+            result.supported += 1
+            try:
+                resolved = path.resolve()
+                relative_path = str(resolved.relative_to(root))
+                doc_id = logical_document_id(root_id, relative_path)
+                result.seen_supported_ids.add(doc_id)
+                previous = previous_lookup(doc_id) if previous_lookup else None
+                stat = path.stat()
+                if (
+                    previous
+                    and not verify_hash
+                    and int(previous["size_bytes"]) == stat.st_size
+                    and int(previous["mtime_ns"]) == stat.st_mtime_ns
+                    and previous["root_id"] == root_id
+                    and previous["relative_path"] == relative_path
+                ):
+                    values = {
+                        key: previous[key]
+                        for key in ImageRecord.__dataclass_fields__
+                        if key != "absolute_path"
+                    }
+                    completed_records.append(
+                        (
+                            sequence,
+                            ImageRecord(absolute_path=str(resolved), **values),
+                        )
+                    )
+                    result.fast_unchanged_ids.add(doc_id)
+                else:
+                    futures[executor.submit(inspect_image, path, root, root_id)] = (
+                        sequence,
+                        path,
+                    )
+                    result.peak_in_flight = max(
+                        result.peak_in_flight,
+                        len(futures),
+                    )
+                    if len(futures) >= in_flight_limit:
+                        collect()
+            except Exception as exc:
+                _record_scan_failure(
+                    result,
+                    FileFailure(
+                        str(path),
+                        str(exc) or exc.__class__.__name__,
+                        stage="scan_metadata",
+                    ),
+                    failure_handler,
+                )
+        collect(drain_all=True)
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+
+    result.records.extend(
+        record
+        for _sequence, record in sorted(
+            completed_records,
+            key=lambda item: item[0],
+        )
+    )
     return result
+
+
+def _record_scan_failure(
+    result: ScanResult,
+    failure: FileFailure,
+    failure_handler: Callable[[FileFailure], None] | None,
+) -> None:
+    result.add_failure(failure)
+    if failure_handler is not None:
+        try:
+            failure_handler(failure)
+        except Exception as exc:
+            result.warnings.append(
+                "Could not persist one scan failure: "
+                f"{str(exc) or exc.__class__.__name__}"
+            )
+
+
+def _is_excluded(path: Path, excluded_roots: tuple[Path, ...]) -> bool:
+    if not excluded_roots:
+        return False
+    try:
+        resolved = path.resolve()
+    except OSError:
+        resolved = path.absolute()
+    return any(resolved == root or root in resolved.parents for root in excluded_roots)
 
 
 def inspect_query_image(image_path: str | Path) -> Path:

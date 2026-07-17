@@ -3,47 +3,172 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_call:
 
 jobs:
   test:
+    name: Full tests (${{ matrix.os }}, Python 3.12)
     strategy:
+      fail-fast: false
       matrix:
         os:
           - windows-latest
           - ubuntu-latest
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Validate GitHub Actions workflows
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/actionlint.tar.gz"
+          curl --fail --silent --show-error --location \
+            "https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz" \
+            --output "$archive"
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  $archive" \
+            | sha256sum --check --strict
+          tar -xzf "$archive" -C "$RUNNER_TEMP" actionlint
+          "$RUNNER_TEMP/actionlint" -color
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
           cache: pip
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        if: runner.os == 'Windows'
+        with:
+          dotnet-version: "8.0.422"
       - name: Install dependencies
-        run: python -m pip install -e . -r requirements-dev.txt
+        run: >-
+          python -m pip install
+          --constraint requirements-lock.txt
+          --editable .
+          --requirement requirements-dev.txt
       - name: Ruff
         run: python -m ruff check .
+      - name: Ruff format
+        run: python -m ruff format --check .
       - name: Mypy
-        run: python -m mypy image_vector_service image_service.py zvec_logging.py
+        run: >-
+          python -m mypy
+          image_vector_service
+          image_service.py
+          zvec_launcher.py
+          zvec_logging.py
+      - name: Mypy search-quality tools
+        run: python -m mypy tests/search_quality scripts/verify_search_quality_gate.py
       - name: Tests
         run: python -m unittest discover -s tests -v
+      - name: Native CLI and legacy-workspace migration smoke
+        run: >-
+          python -m unittest
+          tests.test_native_launcher
+          tests.test_native_cli_smoke
+          tests.test_native_package
+          -v
       - name: Windows launcher tests
         if: runner.os == 'Windows'
         shell: powershell
         run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\test_launcher.ps1
+      - name: Windows desktop publish contract tests
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\test_publish_desktop.ps1
+      - name: GitHub release workflow contract tests
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\test_release_workflow.ps1
+      - name: Persistent backend installer guard contract tests
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\test_persistent_backend_installer_guard.ps1
+      - name: Windows desktop build
+        if: runner.os == 'Windows'
+        run: dotnet build .\desktop\Zvec.Desktop\Zvec.Desktop.csproj --configuration Release --warnaserror
+      - name: Windows desktop contract tests
+        if: runner.os == 'Windows'
+        run: dotnet run --project .\desktop\Zvec.Desktop.ContractTests\Zvec.Desktop.ContractTests.csproj --configuration Release
+      - name: Windows desktop format
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          dotnet format .\desktop\Zvec.Desktop\Zvec.Desktop.csproj --verify-no-changes --no-restore
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          dotnet format .\desktop\Zvec.Desktop.ContractTests\Zvec.Desktop.ContractTests.csproj --verify-no-changes --no-restore
 
-  docker:
-    runs-on: ubuntu-latest
+  native-python-compatibility:
+    name: Native Python ${{ matrix.python-version }} on ${{ matrix.os }}
+    strategy:
+      matrix:
+        os:
+          - windows-latest
+          - ubuntu-latest
+        python-version:
+          - "3.10"
+          - "3.14"
+    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - name: Build image
-        uses: docker/build-push-action@v6
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
-          context: .
-          load: true
-          tags: zvec-image-search:ci
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          provenance: false
-      - name: Docker end-to-end smoke test
-        run: python tests/docker_smoke.py zvec-image-search:ci --max-size-mib 100
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install exact native runtime closure
+        run: >-
+          python -m pip install
+          --constraint requirements-lock.txt
+          --editable .
+      - name: Verify native launcher and built wheel entry point
+        run: >-
+          python -m unittest
+          tests.test_native_launcher
+          tests.test_native_cli_smoke
+          tests.test_native_package
+          -v
+      - name: Smoke installed command
+        run: zvec help
+
+  desktop-package:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        with:
+          dotnet-version: "8.0.422"
+      - name: Install NSIS
+        shell: powershell
+        run: choco install nsis --version=3.12.0 --yes --no-progress
+      - name: Build unsigned x64 and ARM64 desktop release
+        shell: powershell
+        run: >-
+          powershell.exe -NoProfile -ExecutionPolicy Bypass
+          -File .\scripts\publish-desktop.ps1
+          -OutputDirectory "$env:RUNNER_TEMP\zvec-desktop-release"
+          -AllowUncertifiedSearchQualityPreview
+          -RequireInstaller
+      - name: Smoke test desktop install, upgrade, and uninstall
+        shell: powershell
+        run: |
+          $project = [System.IO.File]::ReadAllText("pyproject.toml")
+          $version = [regex]::Match(
+            $project,
+            '(?m)^\s*version\s*=\s*"(?<version>[^"]+)"\s*$'
+          ).Groups["version"].Value
+          $source = Join-Path $env:RUNNER_TEMP "zvec-desktop-smoke-source"
+          dotnet publish .\desktop\Zvec.Desktop\Zvec.Desktop.csproj `
+            --configuration Release `
+            --runtime win-x64 `
+            --self-contained true `
+            --output $source `
+            --nologo `
+            "-p:Version=$version"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $makeNsis = Join-Path ${env:ProgramFiles(x86)} "NSIS\makensis.exe"
+          powershell.exe -NoProfile -ExecutionPolicy Bypass `
+            -File .\tests\test_desktop_installer.ps1 `
+            -MakeNsisPath $makeNsis `
+            -SourceDirectory $source `
+            -RuntimeIdentifier win-x64 `
+            -Version $version `
+            -RollbackVersion 0.3.0
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

@@ -1,0 +1,743 @@
+name: Release candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: SemVer from pyproject.toml (for example 0.4.0 or 0.5.0-rc.1)
+        required: true
+        type: string
+      prerelease:
+        description: Must exactly match whether version has a prerelease suffix
+        required: true
+        default: false
+        type: boolean
+      search_quality_gate_path:
+        description: Repository-relative formal validation comparison.json
+        required: false
+        default: ""
+        type: string
+      allow_uncertified_search_quality_preview:
+        description: Explicitly build a Preview without formal search certification
+        required: true
+        default: false
+        type: boolean
+      require_authenticode:
+        description: Fail unless an exact version tag can use signing secrets
+        required: true
+        default: false
+        type: boolean
+      create_draft_release:
+        description: Create an approved draft Release after every gate passes
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-candidate-${{ github.repository }}-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Validate release request
+    runs-on: ubuntu-latest
+    outputs:
+      exact_tag_ref: ${{ steps.policy.outputs.exact_tag_ref }}
+      license_present: ${{ steps.policy.outputs.license_present }}
+      search_quality_certified: ${{ steps.policy.outputs.search_quality_certified }}
+      search_quality_gate_path: ${{ steps.policy.outputs.search_quality_gate_path }}
+      version_prerelease: ${{ steps.policy.outputs.version_prerelease }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Validate version, tag, and license policy
+        id: policy
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+          REQUESTED_PRERELEASE: ${{ inputs.prerelease }}
+          SEARCH_QUALITY_GATE_PATH: ${{ inputs.search_quality_gate_path }}
+          ALLOW_UNCERTIFIED_SEARCH_QUALITY_PREVIEW: ${{ inputs.allow_uncertified_search_quality_preview }}
+          REQUIRE_AUTHENTICODE: ${{ inputs.require_authenticode }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $pythonPath = (
+            Get-Command python -CommandType Application | Select-Object -First 1
+          ).Source
+          $versionPattern = (
+            '^(?<major>0|[1-9][0-9]*)\.(?<minor>0|[1-9][0-9]*)\.' +
+            '(?<patch>0|[1-9][0-9]*)' +
+            '(?<prerelease>-(?:[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$'
+          )
+          $match = [regex]::Match($env:RELEASE_VERSION, $versionPattern)
+          if (-not $match.Success) {
+            throw "version must be SemVer without build metadata."
+          }
+          $suffix = $match.Groups["prerelease"].Value.TrimStart("-")
+          if (-not [string]::IsNullOrWhiteSpace($suffix)) {
+            foreach ($identifier in $suffix.Split(".")) {
+              if (
+                $identifier -match '^[0-9]+$' -and
+                $identifier.Length -gt 1 -and
+                $identifier.StartsWith("0", [StringComparison]::Ordinal)
+              ) {
+                throw "Numeric prerelease identifiers cannot contain leading zeroes."
+              }
+            }
+          }
+          $versionPrerelease = -not [string]::IsNullOrWhiteSpace($suffix)
+          $requestedPrerelease = $env:REQUESTED_PRERELEASE -ceq "true"
+          if ($versionPrerelease -ne $requestedPrerelease) {
+            throw "prerelease must exactly match the SemVer prerelease suffix."
+          }
+
+          $project = [IO.File]::ReadAllText("pyproject.toml")
+          $projectMatch = [regex]::Match(
+            $project,
+            '(?m)^\s*version\s*=\s*"(?<version>[^"]+)"\s*$'
+          )
+          if (
+            -not $projectMatch.Success -or
+            $projectMatch.Groups["version"].Value -cne $env:RELEASE_VERSION
+          ) {
+            throw "version must exactly match pyproject.toml."
+          }
+
+          $licensePresent = @(
+            Get-ChildItem -LiteralPath . -File |
+              Where-Object { $_.Name -match '^(?i:licen[cs]e)(?:\.|$)' }
+          ).Count -gt 0
+          $expectedRef = "refs/tags/v$($env:RELEASE_VERSION)"
+          $exactTagRef = $env:GITHUB_REF -ceq $expectedRef
+          if ($exactTagRef) {
+            $tagCommit = (& git rev-list -n 1 "$expectedRef^{commit}").Trim()
+            if ($LASTEXITCODE -ne 0 -or $tagCommit -cne $env:GITHUB_SHA) {
+              throw "The release tag does not resolve to the workflow commit."
+            }
+          }
+          if (
+            $env:REQUIRE_AUTHENTICODE -ceq "true" -and
+            -not $exactTagRef
+          ) {
+            throw "Authenticode can only be required from the exact version tag."
+          }
+
+          $qualityPath = $env:SEARCH_QUALITY_GATE_PATH.Trim()
+          $allowUncertified = (
+            $env:ALLOW_UNCERTIFIED_SEARCH_QUALITY_PREVIEW -ceq "true"
+          )
+          if (-not [string]::IsNullOrWhiteSpace($qualityPath) -and $allowUncertified) {
+            throw (
+              "Use either search_quality_gate_path or " +
+              "allow_uncertified_search_quality_preview, not both."
+            )
+          }
+          if ([string]::IsNullOrWhiteSpace($qualityPath) -and -not $allowUncertified) {
+            throw (
+              "A formal run-bound validation search-quality gate is required. " +
+              "Preview runs must explicitly enable " +
+              "allow_uncertified_search_quality_preview."
+            )
+          }
+          $qualityCertified = $false
+          $normalizedQualityPath = ""
+          if (-not [string]::IsNullOrWhiteSpace($qualityPath)) {
+            $workspace = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE).TrimEnd(
+              [IO.Path]::DirectorySeparatorChar,
+              [IO.Path]::AltDirectorySeparatorChar
+            )
+            $resolvedQualityPath = [IO.Path]::GetFullPath(
+              (Join-Path $workspace $qualityPath)
+            )
+            if (-not $resolvedQualityPath.StartsWith(
+              $workspace + [IO.Path]::DirectorySeparatorChar,
+              [StringComparison]::OrdinalIgnoreCase
+            )) {
+              throw "search_quality_gate_path must stay inside the repository."
+            }
+            if (-not (Test-Path -LiteralPath $resolvedQualityPath -PathType Leaf)) {
+              throw "Search-quality gate was not found: $qualityPath"
+            }
+            ./scripts/validate-search-quality-gate.ps1 `
+              -Path $resolvedQualityPath `
+              -RepositoryRoot $workspace `
+              -PythonPath $pythonPath `
+              -Quiet
+            $normalizedQualityPath = [IO.Path]::GetRelativePath(
+              $workspace,
+              $resolvedQualityPath
+            ).Replace("\", "/")
+            $qualityCertified = $true
+          }
+
+          "exact_tag_ref=$($exactTagRef.ToString().ToLowerInvariant())" >>
+            $env:GITHUB_OUTPUT
+          "license_present=$($licensePresent.ToString().ToLowerInvariant())" >>
+            $env:GITHUB_OUTPUT
+          "search_quality_certified=$($qualityCertified.ToString().ToLowerInvariant())" >>
+            $env:GITHUB_OUTPUT
+          "search_quality_gate_path=$normalizedQualityPath" >> $env:GITHUB_OUTPUT
+          "version_prerelease=$($versionPrerelease.ToString().ToLowerInvariant())" >>
+            $env:GITHUB_OUTPUT
+          @(
+            "### Release request",
+            "",
+            "- Version: ``$($env:RELEASE_VERSION)``",
+            "- Exact ``v<version>`` tag: ``$exactTagRef``",
+            "- Repository license present: ``$licensePresent``",
+            "- SemVer prerelease: ``$versionPrerelease``",
+            "- Search quality certified: ``$qualityCertified``",
+            "- Search quality gate: ``$normalizedQualityPath``"
+          ) | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8
+          if (-not $qualityCertified) {
+            Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8 `
+              -Value (
+                "`n> UNCERTIFIED SEARCH QUALITY PREVIEW: no passing formal " +
+                "validation gate was supplied."
+              )
+          }
+
+  quality-gates:
+    name: Full test and build gates
+    needs: prepare
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  desktop-unsigned:
+    name: Build unsigned desktop preview
+    needs:
+      - prepare
+      - quality-gates
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        with:
+          dotnet-version: "8.0.422"
+      - name: Install pinned NSIS
+        shell: powershell
+        run: choco install nsis --version=3.12.0 --yes --no-progress
+      - name: Build and verify unsigned x64 and ARM64 artifacts
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+          SEARCH_QUALITY_CERTIFIED: ${{ needs.prepare.outputs.search_quality_certified }}
+          SEARCH_QUALITY_GATE_PATH: ${{ needs.prepare.outputs.search_quality_gate_path }}
+        run: |
+          $arguments = @{
+            Version = $env:RELEASE_VERSION
+            OutputDirectory = "$env:RUNNER_TEMP\zvec-desktop-unsigned"
+            ExpectedRevision = $env:GITHUB_SHA
+            SigningStatus = "unsigned"
+          }
+          if ($env:SEARCH_QUALITY_CERTIFIED -eq "true") {
+            $arguments.SearchQualityGatePath = $env:SEARCH_QUALITY_GATE_PATH
+          }
+          else {
+            $arguments.AllowUncertifiedSearchQualityPreview = $true
+          }
+          ./scripts/build-desktop-candidate.ps1 @arguments
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: desktop-${{ inputs.version }}-unsigned
+          path: ${{ runner.temp }}\zvec-desktop-unsigned\*
+          if-no-files-found: error
+          retention-days: 30
+
+  desktop-signing:
+    name: Select or build protected desktop candidate
+    if: needs.prepare.outputs.exact_tag_ref == 'true'
+    needs:
+      - prepare
+      - quality-gates
+      - desktop-unsigned
+    runs-on: windows-latest
+    environment: authenticode-signing
+    outputs:
+      artifact_name: ${{ steps.signing.outputs.artifact_name }}
+      signing_status: ${{ steps.signing.outputs.status }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+      - name: Resolve protected Authenticode policy
+        id: signing
+        shell: pwsh
+        env:
+          CERTIFICATE_BASE64: ${{ secrets.ZVEC_AUTHENTICODE_PFX_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.ZVEC_AUTHENTICODE_PFX_PASSWORD }}
+          RELEASE_VERSION: ${{ inputs.version }}
+          REQUIRE_AUTHENTICODE: ${{ inputs.require_authenticode }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $hasCertificate = -not [string]::IsNullOrWhiteSpace(
+            $env:CERTIFICATE_BASE64
+          )
+          $hasPassword = -not [string]::IsNullOrWhiteSpace(
+            $env:CERTIFICATE_PASSWORD
+          )
+          if ($hasCertificate -xor $hasPassword) {
+            throw (
+              "Authenticode environment secrets are incomplete. Configure both " +
+              "ZVEC_AUTHENTICODE_PFX_BASE64 and " +
+              "ZVEC_AUTHENTICODE_PFX_PASSWORD, or neither."
+            )
+          }
+          if (
+            $env:REQUIRE_AUTHENTICODE -ceq "true" -and
+            -not $hasCertificate
+          ) {
+            throw "Authenticode was required, but protected secrets are absent."
+          }
+          $status = if ($hasCertificate) { "authenticode" } else { "unsigned" }
+          "status=$status" >> $env:GITHUB_OUTPUT
+          "artifact_name=desktop-$($env:RELEASE_VERSION)-$status" >>
+            $env:GITHUB_OUTPUT
+          if ($status -eq "unsigned") {
+            Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Value (
+              "### UNSIGNED PREVIEW`n`nThe protected signing environment has " +
+              "no Authenticode secrets. The prebuilt unsigned artifact is retained."
+            )
+          }
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        if: steps.signing.outputs.status == 'authenticode'
+        with:
+          dotnet-version: "8.0.422"
+      - name: Install pinned NSIS
+        if: steps.signing.outputs.status == 'authenticode'
+        shell: powershell
+        run: choco install nsis --version=3.12.0 --yes --no-progress
+      - name: Import certificate into CurrentUser store
+        id: certificate
+        if: steps.signing.outputs.status == 'authenticode'
+        shell: pwsh
+        env:
+          CERTIFICATE_BASE64: ${{ secrets.ZVEC_AUTHENTICODE_PFX_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.ZVEC_AUTHENTICODE_PFX_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $pfxPath = Join-Path $env:RUNNER_TEMP "zvec-authenticode.pfx"
+          $recordPath = Join-Path $env:RUNNER_TEMP "zvec-imported-certificates.json"
+          $before = @(
+            Get-ChildItem Cert:\CurrentUser\My |
+              ForEach-Object { $_.Thumbprint }
+          )
+          $newCertificates = @()
+          try {
+            [IO.File]::WriteAllBytes(
+              $pfxPath,
+              [Convert]::FromBase64String($env:CERTIFICATE_BASE64)
+            )
+            $password = ConvertTo-SecureString $env:CERTIFICATE_PASSWORD `
+              -AsPlainText -Force
+            $null = Import-PfxCertificate `
+              -FilePath $pfxPath `
+              -CertStoreLocation Cert:\CurrentUser\My `
+              -Password $password `
+              -Exportable:$false
+            $newCertificates = @(
+              Get-ChildItem Cert:\CurrentUser\My |
+                Where-Object { $_.Thumbprint -notin $before }
+            )
+            $candidates = @(
+              $newCertificates |
+                Where-Object {
+                  $_.HasPrivateKey -and
+                  $_.NotBefore.ToUniversalTime() -le [DateTime]::UtcNow -and
+                  $_.NotAfter.ToUniversalTime() -gt [DateTime]::UtcNow -and
+                  @($_.EnhancedKeyUsageList).ObjectId.Value -contains
+                    "1.3.6.1.5.5.7.3.3"
+                }
+            )
+            if ($candidates.Count -ne 1) {
+              throw "PFX must contain exactly one valid code-signing certificate."
+            }
+            "thumbprint=$($candidates[0].Thumbprint)" >> $env:GITHUB_OUTPUT
+          }
+          finally {
+            $newCertificates = @(
+              Get-ChildItem Cert:\CurrentUser\My |
+                Where-Object { $_.Thumbprint -notin $before }
+            )
+            @($newCertificates.Thumbprint) | ConvertTo-Json |
+              Set-Content -LiteralPath $recordPath -Encoding utf8
+            if (Test-Path -LiteralPath $pfxPath) {
+              Remove-Item -LiteralPath $pfxPath -Force
+            }
+          }
+      - name: Build and verify signed x64 and ARM64 artifacts
+        if: steps.signing.outputs.status == 'authenticode'
+        shell: pwsh
+        env:
+          CERTIFICATE_THUMBPRINT: ${{ steps.certificate.outputs.thumbprint }}
+          RELEASE_VERSION: ${{ inputs.version }}
+          SEARCH_QUALITY_CERTIFIED: ${{ needs.prepare.outputs.search_quality_certified }}
+          SEARCH_QUALITY_GATE_PATH: ${{ needs.prepare.outputs.search_quality_gate_path }}
+        run: |
+          $arguments = @{
+            Version = $env:RELEASE_VERSION
+            OutputDirectory = "$env:RUNNER_TEMP\zvec-desktop-authenticode"
+            ExpectedRevision = $env:GITHUB_SHA
+            SigningStatus = "authenticode"
+            CertificateThumbprint = $env:CERTIFICATE_THUMBPRINT
+          }
+          if ($env:SEARCH_QUALITY_CERTIFIED -eq "true") {
+            $arguments.SearchQualityGatePath = $env:SEARCH_QUALITY_GATE_PATH
+          }
+          else {
+            $arguments.AllowUncertifiedSearchQualityPreview = $true
+          }
+          ./scripts/build-desktop-candidate.ps1 @arguments
+      - name: Remove imported signing certificates
+        if: always() && steps.signing.outputs.status == 'authenticode'
+        shell: pwsh
+        run: |
+          $recordPath = Join-Path $env:RUNNER_TEMP "zvec-imported-certificates.json"
+          if (Test-Path -LiteralPath $recordPath) {
+            foreach ($thumbprint in @(
+              Get-Content -LiteralPath $recordPath -Raw | ConvertFrom-Json
+            )) {
+              $path = "Cert:\CurrentUser\My\$thumbprint"
+              if (Test-Path -LiteralPath $path) {
+                Remove-Item -LiteralPath $path -Force
+              }
+            }
+            Remove-Item -LiteralPath $recordPath -Force
+          }
+          $pfxPath = Join-Path $env:RUNNER_TEMP "zvec-authenticode.pfx"
+          if (Test-Path -LiteralPath $pfxPath) {
+            Remove-Item -LiteralPath $pfxPath -Force
+          }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: steps.signing.outputs.status == 'authenticode'
+        with:
+          name: desktop-${{ inputs.version }}-authenticode
+          path: ${{ runner.temp }}\zvec-desktop-authenticode\*
+          if-no-files-found: error
+          retention-days: 30
+
+  desktop-selection:
+    name: Select desktop artifact without exposing secrets
+    if: >-
+      always() &&
+      needs.desktop-unsigned.result == 'success' &&
+      (
+        (needs.prepare.outputs.exact_tag_ref == 'true' &&
+         needs.desktop-signing.result == 'success') ||
+        (needs.prepare.outputs.exact_tag_ref != 'true' &&
+         needs.desktop-signing.result == 'skipped')
+      )
+    needs:
+      - prepare
+      - desktop-unsigned
+      - desktop-signing
+    runs-on: ubuntu-latest
+    outputs:
+      artifact_name: ${{ steps.select.outputs.artifact_name }}
+      signing_status: ${{ steps.select.outputs.signing_status }}
+    steps:
+      - name: Select protected tag result or unsigned preview
+        id: select
+        shell: pwsh
+        env:
+          EXACT_TAG_REF: ${{ needs.prepare.outputs.exact_tag_ref }}
+          TAGGED_ARTIFACT: ${{ needs.desktop-signing.outputs.artifact_name }}
+          TAGGED_STATUS: ${{ needs.desktop-signing.outputs.signing_status }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          if ($env:EXACT_TAG_REF -eq "true") {
+            $artifact = $env:TAGGED_ARTIFACT
+            $status = $env:TAGGED_STATUS
+          }
+          else {
+            $artifact = "desktop-$($env:RELEASE_VERSION)-unsigned"
+            $status = "unsigned"
+          }
+          if (
+            [string]::IsNullOrWhiteSpace($artifact) -or
+            $status -notin @("unsigned", "authenticode")
+          ) {
+            throw "Desktop candidate selection produced invalid outputs."
+          }
+          "artifact_name=$artifact" >> $env:GITHUB_OUTPUT
+          "signing_status=$status" >> $env:GITHUB_OUTPUT
+
+  native-package:
+    name: Build and verify native Python wheel
+    needs:
+      - prepare
+      - quality-gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Build, install, and smoke test wheel in an isolated environment
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $output = Join-Path $env:RUNNER_TEMP "zvec-native-package"
+          $null = New-Item -ItemType Directory -Path $output -Force
+          python -m pip wheel `
+            --disable-pip-version-check `
+            --no-deps `
+            --wheel-dir $output `
+            .
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $wheels = @(Get-ChildItem -LiteralPath $output -Filter "*.whl" -File)
+          if ($wheels.Count -ne 1) {
+            throw "Native package build must produce exactly one wheel."
+          }
+          $venv = Join-Path $env:RUNNER_TEMP "zvec-native-release-venv"
+          python -m venv $venv
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $venvPython = Join-Path $venv "bin/python"
+          & $venvPython -m pip install `
+            --disable-pip-version-check `
+            --constraint requirements-lock.txt `
+            $wheels[0].FullName
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $help = & (Join-Path $venv "bin/zvec") help 2>&1
+          if ($LASTEXITCODE -ne 0 -or ($help -join "`n") -notmatch "Docker is not required") {
+            throw "Installed native zvec command failed its smoke test."
+          }
+          Copy-Item requirements-lock.txt (Join-Path $output "requirements-lock.txt")
+          $checksumLines = @(
+            Get-ChildItem -LiteralPath $output -File |
+              Sort-Object Name |
+              ForEach-Object {
+                $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash
+                "$($hash.ToLowerInvariant())  $($_.Name)"
+              }
+          )
+          $checksumLines | Set-Content `
+            -LiteralPath (Join-Path $output "SHA256SUMS.txt") `
+            -Encoding utf8
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: native-${{ inputs.version }}-wheel
+          path: ${{ runner.temp }}/zvec-native-package/*
+          if-no-files-found: error
+          retention-days: 30
+
+  assemble:
+    name: Assemble release candidate
+    needs:
+      - prepare
+      - desktop-selection
+      - native-package
+    runs-on: ubuntu-latest
+    outputs:
+      effective_prerelease: ${{ steps.policy.outputs.effective_prerelease }}
+      release_title: ${{ steps.policy.outputs.release_title }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ needs.desktop-selection.outputs.artifact_name }}
+          path: candidate/desktop
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: native-${{ inputs.version }}-wheel
+          path: candidate/native
+      - name: Apply stable-channel policy and flatten unique release assets
+        id: policy
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+          SIGNING_STATUS: ${{ needs.desktop-selection.outputs.signing_status }}
+          VERSION_PRERELEASE: ${{ needs.prepare.outputs.version_prerelease }}
+          EXACT_TAG_REF: ${{ needs.prepare.outputs.exact_tag_ref }}
+          LICENSE_PRESENT: ${{ needs.prepare.outputs.license_present }}
+          SEARCH_QUALITY_CERTIFIED: ${{ needs.prepare.outputs.search_quality_certified }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $reasons = [Collections.Generic.List[string]]::new()
+          if ($env:VERSION_PRERELEASE -eq "true") {
+            $reasons.Add("the version has a SemVer prerelease suffix")
+          }
+          if ($env:SIGNING_STATUS -ne "authenticode") {
+            $reasons.Add("desktop artifacts are explicitly unsigned")
+          }
+          if ($env:LICENSE_PRESENT -ne "true") {
+            $reasons.Add("the repository has no LICENSE file")
+          }
+          if ($env:EXACT_TAG_REF -ne "true") {
+            $reasons.Add("the workflow ref is not the exact v<version> tag")
+          }
+          if ($env:SEARCH_QUALITY_CERTIFIED -ne "true") {
+            $reasons.Add("search quality is explicitly uncertified")
+          }
+          $effectivePrerelease = $reasons.Count -gt 0
+          if (
+            $env:SIGNING_STATUS -ne "authenticode" -and
+            -not $effectivePrerelease
+          ) {
+            throw "Unsigned artifacts cannot enter the stable channel."
+          }
+          $qualifier = if ($env:SIGNING_STATUS -eq "unsigned") {
+            "UNSIGNED PREVIEW"
+          }
+          elseif ($effectivePrerelease) {
+            "PRERELEASE"
+          }
+          else {
+            "SIGNED STABLE CANDIDATE"
+          }
+          $title = "Zvec $($env:RELEASE_VERSION) - $qualifier"
+          $effectiveValue = $effectivePrerelease.ToString().ToLowerInvariant()
+          "effective_prerelease=$effectiveValue" >> $env:GITHUB_OUTPUT
+          "release_title=$title" >> $env:GITHUB_OUTPUT
+
+          $assets = New-Item -ItemType Directory -Path candidate/release-assets
+          $policy = [ordered]@{
+            schema_version = 1
+            version = $env:RELEASE_VERSION
+            git_revision = $env:GITHUB_SHA
+            draft = $true
+            prerelease = $effectivePrerelease
+            signing_status = $env:SIGNING_STATUS
+            exact_tag_ref = $env:EXACT_TAG_REF -eq "true"
+            license_present = $env:LICENSE_PRESENT -eq "true"
+            search_quality_certified = $env:SEARCH_QUALITY_CERTIFIED -eq "true"
+            stable_channel_eligible = -not $effectivePrerelease
+            preview_reasons = @($reasons)
+          }
+          $policy | ConvertTo-Json -Depth 4 |
+            Set-Content -LiteralPath "$($assets.FullName)/RELEASE-POLICY.json" `
+              -Encoding utf8
+          Copy-Item candidate/desktop/SHA256SUMS.txt `
+            "$($assets.FullName)/DESKTOP-SHA256SUMS.txt"
+          Copy-Item candidate/native/SHA256SUMS.txt `
+            "$($assets.FullName)/NATIVE-SHA256SUMS.txt"
+          foreach ($source in @("candidate/desktop", "candidate/native")) {
+            foreach ($file in Get-ChildItem -LiteralPath $source -File) {
+              if ($file.Name -ceq "SHA256SUMS.txt") { continue }
+              $target = Join-Path $assets.FullName $file.Name
+              if (Test-Path -LiteralPath $target) {
+                throw "Duplicate GitHub Release asset basename: $($file.Name)"
+              }
+              Copy-Item -LiteralPath $file.FullName -Destination $target
+            }
+          }
+          $checksumLines = @(
+            Get-ChildItem -LiteralPath $assets.FullName -File |
+              Sort-Object Name |
+              ForEach-Object {
+                $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash
+                "$($hash.ToLowerInvariant())  $($_.Name)"
+              }
+          )
+          $checksumLines | Set-Content `
+            -LiteralPath "$($assets.FullName)/RELEASE-ASSETS-SHA256SUMS.txt" `
+            -Encoding utf8
+
+          $warning = if ($effectivePrerelease) {
+            "This is a draft prerelease/preview and must not be represented as " +
+              "a stable signed release."
+          }
+          else {
+            "This is a signed stable candidate, but the GitHub Release remains draft."
+          }
+          @(
+            "# $title",
+            "",
+            $warning,
+            "",
+            "Git revision: ``$($env:GITHUB_SHA)``",
+            "Desktop signing status: ``$($env:SIGNING_STATUS)``",
+            "Search quality certified: ``$($env:SEARCH_QUALITY_CERTIFIED)``",
+            "Native CLI: isolated Python 3.12 wheel install and command smoke passed"
+          ) | Set-Content -LiteralPath candidate/RELEASE-NOTES.md -Encoding utf8
+          if ($reasons.Count -gt 0) {
+            Add-Content -LiteralPath candidate/RELEASE-NOTES.md -Encoding utf8 `
+              -Value ("`nPreview reasons:`n`n" + (
+                @($reasons | ForEach-Object { "- $_" }) -join "`n"
+              ))
+          }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-candidate-${{ inputs.version }}
+          path: candidate
+          if-no-files-found: error
+          retention-days: 30
+
+  create-draft-release:
+    name: Create approved draft GitHub Release
+    if: inputs.create_draft_release
+    needs:
+      - prepare
+      - assemble
+    runs-on: ubuntu-latest
+    environment: github-release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-candidate-${{ inputs.version }}
+          path: candidate
+      - name: Create draft release from the existing version tag
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ inputs.version }}
+          RELEASE_TITLE: ${{ needs.assemble.outputs.release_title }}
+          EFFECTIVE_PRERELEASE: ${{ needs.assemble.outputs.effective_prerelease }}
+          VERSION_PRERELEASE: ${{ needs.prepare.outputs.version_prerelease }}
+          EXACT_TAG_REF: ${{ needs.prepare.outputs.exact_tag_ref }}
+        run: |
+          set -euo pipefail
+          tag="v${RELEASE_VERSION}"
+          if [[ "${EXACT_TAG_REF}" != "true" || "${GITHUB_REF}" != "refs/tags/${tag}" ]]; then
+            echo "Draft Releases require workflow dispatch from exact ${tag}." >&2
+            exit 1
+          fi
+          if [[ "${VERSION_PRERELEASE}" == "false" && "${EFFECTIVE_PRERELEASE}" == "true" ]]; then
+            echo "A stable SemVer tag cannot be consumed by a preview Release." >&2
+            exit 1
+          fi
+          tag_commit="$(git rev-list -n 1 "refs/tags/${tag}^{commit}")"
+          if [[ "${tag_commit}" != "${GITHUB_SHA}" ]]; then
+            echo "Release tag does not point to the workflow commit." >&2
+            exit 1
+          fi
+          if gh release view "${tag}" >/dev/null 2>&1; then
+            echo "A Release already exists for ${tag}; refusing to overwrite it." >&2
+            exit 1
+          fi
+          pushd candidate/release-assets >/dev/null
+          sha256sum --check --strict RELEASE-ASSETS-SHA256SUMS.txt
+          mapfile -d '' assets < <(find . -maxdepth 1 -type f -print0 | sort -z)
+          popd >/dev/null
+          for index in "${!assets[@]}"; do
+            assets[$index]="candidate/release-assets/${assets[$index]#./}"
+          done
+          arguments=(
+            release create "${tag}"
+            --verify-tag
+            --draft
+            --title "${RELEASE_TITLE}"
+            --notes-file candidate/RELEASE-NOTES.md
+          )
+          if [[ "${EFFECTIVE_PRERELEASE}" == "true" ]]; then
+            arguments+=(--prerelease)
+          fi
+          gh "${arguments[@]}" "${assets[@]}"

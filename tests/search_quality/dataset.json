@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "name": "zvec-search-quality-pending-template",
+  "description": "Commit-safe pending templates only. Copy to dataset.local.json before adding private paths or human relevance labels.",
+  "items": [],
+  "pending_templates": [
+    {
+      "id_prefix": "text",
+      "query_type": "text",
+      "mode": "text",
+      "count": 25,
+      "library_scope": {"mode": "all_enabled", "library_ids": []}
+    },
+    {
+      "id_prefix": "image",
+      "query_type": "image",
+      "mode": "image",
+      "count": 10,
+      "library_scope": {"mode": "all_enabled", "library_ids": []}
+    },
+    {
+      "id_prefix": "combined",
+      "query_type": "combined",
+      "mode": "combined",
+      "count": 10,
+      "library_scope": {"mode": "all_enabled", "library_ids": []}
+    },
+    {
+      "id_prefix": "no-answer",
+      "query_type": "no-answer",
+      "modes": ["text", "image", "combined"],
+      "count": 15,
+      "library_scope": {"mode": "all_enabled", "library_ids": []}
+    }
+  ]
+}
