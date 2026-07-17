@@ -800,7 +800,13 @@ try {
         $backendLockStream.Flush()
     }
     $backendLockStream.Lock(0, 1)
-    $activeBackendUninstallExit = Invoke-InstallerProcess -FilePath $uninstaller
+    # NSIS normally starts a temporary uninstaller copy and lets the original
+    # bootstrap process return 0.  _?= runs the installed uninstaller directly,
+    # so this boundary test observes the guard's real exit code without racing
+    # the temporary child process.  It must be the final command-line argument.
+    $activeBackendUninstallExit = Invoke-InstallerProcess `
+        -FilePath $uninstaller `
+        -Arguments ("/S _?=" + $installDirectory)
     if ($activeBackendUninstallExit -ne 35) {
         throw (
             "Active persistent backend guard returned " +

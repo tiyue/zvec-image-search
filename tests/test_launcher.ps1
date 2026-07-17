@@ -9,7 +9,9 @@ $testRoot = Join-Path $env:TEMP (
 )
 $configRoot = Join-Path $testRoot "config"
 $installRoot = Join-Path $testRoot "installed"
-$imageRoot = Join-Path $testRoot "图库 space"
+# Construct the Unicode path from code points so Windows PowerShell 5.1 can parse
+# this BOM-less test script under any active ANSI code page.
+$imageRoot = Join-Path $testRoot "$([char]0x56FE)$([char]0x5E93) space"
 $workspace = Join-Path $testRoot "workspace"
 $results = Join-Path $testRoot "results"
 $secondImageRoot = Join-Path $testRoot "archive-images"
