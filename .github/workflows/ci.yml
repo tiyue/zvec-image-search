@@ -84,9 +84,11 @@ jobs:
         run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\test_persistent_backend_installer_guard.ps1
       - name: Windows desktop build
         if: runner.os == 'Windows'
+        shell: powershell
         run: dotnet build .\desktop\Zvec.Desktop\Zvec.Desktop.csproj --configuration Release --warnaserror
       - name: Windows desktop contract tests
         if: runner.os == 'Windows'
+        shell: powershell
         run: dotnet run --project .\desktop\Zvec.Desktop.ContractTests\Zvec.Desktop.ContractTests.csproj --configuration Release
       - name: Windows desktop format
         if: runner.os == 'Windows'
