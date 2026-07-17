@@ -81,6 +81,10 @@ try {
     $savedConfig = Get-Content -LiteralPath (Join-Path $configRoot "config.json") `
         -Raw -Encoding UTF8 | ConvertFrom-Json
     $savedLibrary = @($savedConfig.libraries)[0]
+    $inputResultsPath = (Get-Item -LiteralPath $results).FullName
+    $savedResultsPath = (
+        Get-Item -LiteralPath ([string]$savedConfig.results_directory)
+    ).FullName
     if (
         [int]$savedConfig.schema_version -ne 3 -or
         [string]::IsNullOrWhiteSpace([string]$savedLibrary.workspace_directory) -or
@@ -89,6 +93,13 @@ try {
         $savedConfig.PSObject.Properties.Name -contains "image_name"
     ) {
         throw "init did not create the native schema v3 configuration."
+    }
+    if (-not [string]::Equals(
+        $inputResultsPath,
+        $savedResultsPath,
+        [System.StringComparison]::OrdinalIgnoreCase
+    )) {
+        throw "init did not preserve the requested results directory."
     }
 
     $doctorOutput = Invoke-Launcher doctor
@@ -123,8 +134,13 @@ try {
         throw "ensure-docker compatibility command still requires an engine."
     }
     $openedResults = Invoke-Launcher results
-    if (($openedResults -join "`n") -notmatch [regex]::Escape($results)) {
-        throw "results did not resolve the configured host directory."
+    $openedResultsText = $openedResults -join "`n"
+    $expectedResults = [string]$savedConfig.results_directory
+    if ($openedResultsText -notmatch [regex]::Escape($expectedResults)) {
+        throw (
+            "results did not report the configured host directory.`n" +
+            "Expected: $expectedResults`nOutput: $openedResultsText"
+        )
     }
 
     $null = Invoke-Launcher library-add Archive $secondImageRoot `
@@ -137,8 +153,17 @@ try {
     if ($null -eq $archive) {
         throw "library-list did not return the added library."
     }
-    if ([string]$archive.workspace_directory -ne $secondWorkspace) {
-        throw "library-add did not preserve the host workspace directory."
+    $expectedSecondWorkspace = (Get-Item -LiteralPath $secondWorkspace).FullName
+    if (-not [string]::Equals(
+        [string]$archive.workspace_directory,
+        $expectedSecondWorkspace,
+        [System.StringComparison]::OrdinalIgnoreCase
+    )) {
+        throw (
+            "library-add did not preserve the host workspace directory.`n" +
+            "Expected: $expectedSecondWorkspace`n" +
+            "Actual: $($archive.workspace_directory)"
+        )
     }
     $null = Invoke-Launcher library-rename $archive.id RenamedArchive
     $null = Invoke-Launcher library-disable $archive.id
