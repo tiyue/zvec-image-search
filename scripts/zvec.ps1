@@ -406,6 +406,31 @@ function Throw-RuntimeCommandFailure {
         -RecommendedAction $DefaultRecommendedAction
 }
 
+function Get-Sha256FileHash {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    # Get-FileHash is exported by a PowerShell module and may not be discoverable
+    # when a managed host intentionally supplies a minimal process environment.
+    # Hash through .NET so bootstrap depends only on the runtime already executing it.
+    $stream = $null
+    $sha256 = $null
+    try {
+        $stream = [System.IO.File]::OpenRead($Path)
+        $sha256 = [System.Security.Cryptography.SHA256]::Create()
+        return ([System.BitConverter]::ToString(
+            $sha256.ComputeHash($stream)
+        )).Replace("-", "")
+    }
+    finally {
+        if ($null -ne $sha256) {
+            $sha256.Dispose()
+        }
+        if ($null -ne $stream) {
+            $stream.Dispose()
+        }
+    }
+}
+
 function Get-SourceFingerprint {
     $files = @(
         (Join-Path $sourceRoot "pyproject.toml"),
@@ -432,7 +457,7 @@ function Get-SourceFingerprint {
                     "请修复或重新安装包含完整 backend 目录的桌面应用，然后重试。"
                 )
         }
-        $hash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash
+        $hash = Get-Sha256FileHash -Path $file
         [void]$builder.Append($file).Append(":").Append($hash).Append("`n")
     }
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($builder.ToString())

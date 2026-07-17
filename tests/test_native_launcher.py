@@ -185,8 +185,14 @@ class NativeLauncherTest(unittest.TestCase):
         query = self.root / "query.jpg"
         query.write_bytes(b"routing-only")
         cases = (
-            (["index", "new", "featured"], ["index", str(self.images), "new"]),
-            (["sync", "--dry-run"], ["sync", str(self.images), "--dry-run"]),
+            (
+                ["index", "new", "featured"],
+                ["index", str(self.images.resolve()), "new"],
+            ),
+            (
+                ["sync", "--dry-run"],
+                ["sync", str(self.images.resolve()), "--dry-run"],
+            ),
             (["search", "sunset", "--tk", "3"], ["search", "--text", "sunset"]),
             (
                 ["search-image", str(query), "--tk", "2"],
@@ -228,7 +234,10 @@ class NativeLauncherTest(unittest.TestCase):
         with redirect_stderr(StringIO()):
             config = load_config()
         assert config is not None
-        self.assertEqual(config.libraries[0].workspace_directory, self.workspace)
+        self.assertEqual(
+            config.libraries[0].workspace_directory,
+            self.workspace.resolve(),
+        )
         migrated = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(migrated["schema_version"], 3)
         self.assertEqual(migrated["python_executable"], "custom-python.exe")
@@ -371,9 +380,12 @@ class NativeLauncherTest(unittest.TestCase):
             "Get-PythonArchitectureState",
             "Get-Command $name -All",
             "Throw-WindowsArm64PythonUnsupported",
+            "function Get-Sha256FileHash",
+            "$hash = Get-Sha256FileHash -Path $file",
         ):
             with self.subTest(required=required):
                 self.assertIn(required, text)
+        self.assertNotIn("(Get-FileHash -", text)
         resolve_start = text.index("function Resolve-PythonCommand")
         self.assertLess(
             text.index(

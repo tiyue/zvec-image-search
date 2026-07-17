@@ -16,7 +16,11 @@ from image_vector_service.failure_sink import FailureSink
 
 class FailureSinkTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.temporary = Path(tempfile.mkdtemp(prefix="zvec_failure_sink_"))
+        # GitHub's Windows runners can return an 8.3 TEMP path while pathlib
+        # resolves files beneath it to the long form.  Keep one canonical root so
+        # path assertions and copy-failure injection test filesystem identity,
+        # not the spelling chosen by Windows.
+        self.temporary = Path(tempfile.mkdtemp(prefix="zvec_failure_sink_")).resolve()
         self.root = self.temporary / "library"
         self.results = self.temporary / "results"
         self.root.mkdir()

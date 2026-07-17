@@ -465,6 +465,7 @@ $shortcutPath = Join-Path (
 ) $shortcutFileName
 $launchedProcess = $null
 $backendProbeProcess = $null
+$backendLockStream = $null
 $previousConfigHome = $env:ZVEC_CONFIG_HOME
 $previousLegacyConfigHome = $env:ZVEC_DOCKER_CONFIG_HOME
 $previousRepoRoot = $env:ZVEC_REPO_ROOT
@@ -781,12 +782,24 @@ try {
     }
 
     $uninstaller = Join-Path $installDirectory "Uninstall.exe"
-    $backendProbeProcess = Start-TestBackendGuardProcess
-    $staleUninstallProbePort = Get-TestLoopbackPort
-    $null = Write-TestBackendInstanceDescriptor `
-        -ConfigHome $isolatedConfigHome `
-        -Process $backendProbeProcess `
-        -Port $staleUninstallProbePort
+    # A real persistent backend always owns backend.lock.  Exercise that primary
+    # uninstall boundary here instead of relying on PID/start-time formatting,
+    # which can vary between Windows runner images.  Live-descriptor fallback is
+    # already covered above during install and by the focused guard contract.
+    $backendDirectory = Join-Path $isolatedConfigHome "backend"
+    New-Item -ItemType Directory -Path $backendDirectory -Force | Out-Null
+    $backendLockPath = Join-Path $backendDirectory "backend.lock"
+    $backendLockStream = [IO.File]::Open(
+        $backendLockPath,
+        [IO.FileMode]::OpenOrCreate,
+        [IO.FileAccess]::ReadWrite,
+        [IO.FileShare]::ReadWrite
+    )
+    if ($backendLockStream.Length -eq 0) {
+        $backendLockStream.WriteByte(0)
+        $backendLockStream.Flush()
+    }
+    $backendLockStream.Lock(0, 1)
     $activeBackendUninstallExit = Invoke-InstallerProcess -FilePath $uninstaller
     if ($activeBackendUninstallExit -ne 35) {
         throw (
@@ -796,14 +809,15 @@ try {
     }
     if (
         -not (Test-Path -LiteralPath $installedExe -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $markerPath -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $shortcutPath -PathType Leaf) -or
         -not (Test-Path "Registry::HKEY_CURRENT_USER\$uninstallRegistryKey")
     ) {
         throw "Blocked uninstall modified the installed application."
     }
-    Stop-TestOwnedProcess -Process $backendProbeProcess
-    $backendProbeProcess.Dispose()
-    $backendProbeProcess = $null
-    Remove-Item -LiteralPath $instancePath -Force
+    $backendLockStream.Unlock(0, 1)
+    $backendLockStream.Dispose()
+    $backendLockStream = $null
 
     $uninstallExit = Invoke-InstallerProcess -FilePath $uninstaller
     if ($uninstallExit -ne 0) {
@@ -832,6 +846,11 @@ try {
     )
 }
 finally {
+    if ($null -ne $backendLockStream) {
+        try { $backendLockStream.Unlock(0, 1) }
+        catch { }
+        $backendLockStream.Dispose()
+    }
     if ($null -ne $backendProbeProcess) {
         try {
             Stop-TestOwnedProcess -Process $backendProbeProcess

@@ -239,7 +239,7 @@ class MultiCollectionFixtureTest(unittest.TestCase):
 
     def test_builds_two_lineage_collections_and_runs_zero_api_smoke(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
+            root = Path(raw).resolve()
             source, image_root, dataset = self._source_fixture(root)
             before = fixture_builder._tree_fingerprint(source)
             output = root / "generated"
@@ -342,7 +342,7 @@ class MultiCollectionFixtureTest(unittest.TestCase):
 
     def test_rejects_source_overlap_and_nonempty_destination(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
+            root = Path(raw).resolve()
             source, image_root, dataset = self._source_fixture(root)
             with self.assertRaisesRegex(
                 fixture_builder.FixtureBuildError, "must not overlap"
@@ -404,7 +404,7 @@ class MultiCollectionFixtureTest(unittest.TestCase):
 
     def test_invalid_mapping_is_atomic_and_preserves_source(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
+            root = Path(raw).resolve()
             source, image_root, dataset = self._source_fixture(root)
             payload = json.loads(dataset.read_text(encoding="utf-8"))
             payload["items"][0]["suggested_relevant_images"][0]["sha256"] = "0" * 64
@@ -435,7 +435,7 @@ class MultiCollectionFixtureTest(unittest.TestCase):
 
     def test_rejects_query_path_ambiguous_across_split_roots(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
+            root = Path(raw).resolve()
             source, image_root, dataset = self._source_fixture(root)
             Image.new("RGB", (8, 8), (1, 2, 3)).save(image_root / "alpha" / "three.png")
             with self.assertRaisesRegex(
@@ -454,7 +454,7 @@ class MultiCollectionFixtureTest(unittest.TestCase):
 
     def test_rejects_reparse_split_root(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
+            root = Path(raw).resolve()
             source, image_root, dataset = self._source_fixture(root)
             original = fixture_builder._is_reparse_point
 

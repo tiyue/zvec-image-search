@@ -157,15 +157,18 @@ class MutatingVisionClient(_VisionClientBase):
 
 class MutateFirstDuplicateVisionClient(_VisionClientBase):
     call_count = 0
+    mutated_name = ""
 
     @classmethod
     def reset(cls) -> None:
         super().reset()
         cls.call_count = 0
+        cls.mutated_name = ""
 
     def tag_image(self, path: Path, *, context: object) -> VisionTaggingResponse:
         type(self).call_count += 1
         if type(self).call_count == 1:
+            type(self).mutated_name = Path(path).name
             Image.new("RGB", (69, 41), (3, 2, 1)).save(path)
         return self._success(Path(path))
 
@@ -414,20 +417,48 @@ class IndexAndAutoTagPipelineTest(unittest.TestCase):
             self.assertEqual(report["auto_tag"]["succeeded"], 1)
             self.assertEqual(report["auto_tag"]["failed"], 1)
             self.assertEqual(report["quarantined"], 0)
-            first_entry = service.state.find_entry_for_path(first)
-            second_entry = service.state.find_entry_for_path(second)
-            assert first_entry is not None
-            assert second_entry is not None
-            first_annotation = service.state.get_document_annotation(
-                str(first_entry["doc_id"])
+            self.assertEqual(
+                set(MutateFirstDuplicateVisionClient.calls),
+                {first.name, second.name},
             )
-            second_annotation = service.state.get_document_annotation(
-                str(second_entry["doc_id"])
+            self.assertIn(
+                MutateFirstDuplicateVisionClient.mutated_name,
+                {first.name, second.name},
             )
-            assert first_annotation is not None
-            assert second_annotation is not None
-            self.assertEqual(first_annotation["status"], "failed")
-            self.assertEqual(second_annotation["status"], "pending_review")
+            # Directory enumeration order is not a cross-platform contract.
+            # Assert against the duplicate the model test double actually changed.
+            mutated = self.root / MutateFirstDuplicateVisionClient.mutated_name
+            stable = second if mutated == first else first
+            mutated_entry = service.state.find_entry_for_path(mutated)
+            stable_entry = service.state.find_entry_for_path(stable)
+            assert mutated_entry is not None
+            assert stable_entry is not None
+            mutated_annotation = service.state.get_document_annotation(
+                str(mutated_entry["doc_id"])
+            )
+            stable_annotation = service.state.get_document_annotation(
+                str(stable_entry["doc_id"])
+            )
+            assert mutated_annotation is not None
+            assert stable_annotation is not None
+            mutated_stat = mutated.stat()
+            stable_stat = stable.stat()
+            self.assertNotEqual(
+                (mutated_stat.st_size, mutated_stat.st_mtime_ns),
+                (
+                    int(mutated_entry["size_bytes"]),
+                    int(mutated_entry["mtime_ns"]),
+                ),
+            )
+            self.assertEqual(
+                (stable_stat.st_size, stable_stat.st_mtime_ns),
+                (
+                    int(stable_entry["size_bytes"]),
+                    int(stable_entry["mtime_ns"]),
+                ),
+            )
+            self.assertEqual(mutated_annotation["status"], "failed")
+            self.assertEqual(stable_annotation["status"], "pending_review")
         finally:
             service.close()
 

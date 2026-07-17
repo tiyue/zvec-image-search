@@ -30,7 +30,9 @@ class ModelCatalogTests(unittest.TestCase):
         self.temporary_directory = tempfile.TemporaryDirectory(
             prefix="zvec-model-catalog-test-"
         )
-        self.root = Path(self.temporary_directory.name)
+        # Normalize possible Windows 8.3 TEMP aliases before comparing the path
+        # returned by the catalog with the requested destination.
+        self.root = Path(self.temporary_directory.name).resolve()
         self.default_path = (
             Path(__file__).resolve().parents[1] / "model-catalog.default.json"
         )
