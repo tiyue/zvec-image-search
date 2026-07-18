@@ -163,7 +163,10 @@ class _WindowsCredentialApi:
 
     def __init__(self) -> None:
         try:
-            library = ctypes.WinDLL("Advapi32.dll", use_last_error=True)
+            loader = getattr(ctypes, "WinDLL", None)
+            if loader is None:
+                raise OSError("ctypes.WinDLL is unavailable")
+            library = loader("Advapi32.dll", use_last_error=True)
         except (AttributeError, OSError) as exc:
             raise CredentialError("无法加载 Windows 凭据管理器。") from exc
         self._library = library
@@ -188,7 +191,7 @@ class _WindowsCredentialApi:
     def read(self, target: str) -> bytes | None:
         pointer = ctypes.POINTER(_CREDENTIALW)()
         if not self._read(target, _CRED_TYPE_GENERIC, 0, ctypes.byref(pointer)):
-            error = ctypes.get_last_error()
+            error = _windows_last_error()
             if error == _ERROR_NOT_FOUND:
                 return None
             raise CredentialError(f"无法读取 Windows 凭据管理器（错误代码 {error}）。")
@@ -212,7 +215,7 @@ class _WindowsCredentialApi:
         credential.UserName = username
         try:
             if not self._write(ctypes.byref(credential), 0):
-                error = ctypes.get_last_error()
+                error = _windows_last_error()
                 raise CredentialError(
                     f"无法保存凭据到 Windows 凭据管理器（错误代码 {error}）。"
                 )
@@ -222,7 +225,7 @@ class _WindowsCredentialApi:
     def delete(self, target: str) -> None:
         if self._delete(target, _CRED_TYPE_GENERIC, 0):
             return
-        error = ctypes.get_last_error()
+        error = _windows_last_error()
         if error != _ERROR_NOT_FOUND:
             raise CredentialError(
                 f"无法删除 Windows 凭据管理器中的凭据（错误代码 {error}）。"
@@ -235,6 +238,11 @@ def default_credential_store() -> CredentialStore:
     if os.name == "nt":
         return WindowsCredentialStore()
     return SessionCredentialStore()
+
+
+def _windows_last_error() -> int:
+    getter = getattr(ctypes, "get_last_error", None)
+    return int(getter()) if getter is not None else 0
 
 
 def _validated_secret(secret: str) -> str:

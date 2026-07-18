@@ -152,13 +152,15 @@ function Read-PythonLock {
             $trimmed,
             ('^(?<name>[A-Za-z0-9][A-Za-z0-9._-]*)==' +
                 '(?<version>[^\s;#]+)(?:\s*;\s*' +
-                '(?<marker>python_version\s*(?:==|!=|<=|>=|<|>)\s*' +
-                '(?<quote>["''])[0-9]+\.[0-9]+\k<quote>))?$')
+                '(?<marker>(?:python_version\s*(?:==|!=|<=|>=|<|>)\s*' +
+                '(?<pythonQuote>["''])[0-9]+\.[0-9]+\k<pythonQuote>|' +
+                'sys_platform\s*(?:==|!=)\s*' +
+                '(?<platformQuote>["''])[A-Za-z0-9_-]+\k<platformQuote>)))?$')
         )
         if (-not $match.Success) {
             throw (
                 "Python lock '$Path' line $lineNumber is not an exact name==version " +
-                "pin with an optional python_version marker: $trimmed"
+                "pin with an optional supported environment marker: $trimmed"
             )
         }
         $name = $match.Groups["name"].Value
@@ -175,7 +177,7 @@ function Read-PythonLock {
                 throw (
                     "Python lock contains duplicate or unconditional package " +
                     "'$canonicalName'. Conditional duplicates require distinct " +
-                    "python_version markers."
+                    "environment markers."
                 )
             }
             $seen[$canonicalName] = @($existingMarkers + $marker)

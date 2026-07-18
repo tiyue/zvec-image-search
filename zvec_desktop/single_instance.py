@@ -563,7 +563,10 @@ class _WindowsNativeApi:
         if os.name != "nt":
             raise OSError("Windows named objects are only available on Windows.")
         try:
-            kernel32 = ctypes.WinDLL("Kernel32.dll", use_last_error=True)
+            loader = getattr(ctypes, "WinDLL", None)
+            if loader is None:
+                raise OSError("ctypes.WinDLL is unavailable")
+            kernel32 = loader("Kernel32.dll", use_last_error=True)
         except (AttributeError, OSError) as exc:
             raise SingleInstanceNativeError(
                 "LoadLibrary(Kernel32)", -1, str(exc)
@@ -603,35 +606,35 @@ class _WindowsNativeApi:
     def create_mutex(
         self, name: str, initially_owned: bool
     ) -> tuple[NativeHandle, bool]:
-        ctypes.set_last_error(0)
+        _set_windows_last_error(0)
         handle = self._create_mutex(None, initially_owned, name)
-        error = ctypes.get_last_error()
+        error = _windows_last_error()
         if not handle:
             raise SingleInstanceNativeError("CreateMutexW", error)
         return int(handle), error != _ERROR_ALREADY_EXISTS
 
     def release_mutex(self, handle: NativeHandle) -> None:
         if not self._release_mutex(_as_windows_handle(handle)):
-            raise SingleInstanceNativeError("ReleaseMutex", ctypes.get_last_error())
+            raise SingleInstanceNativeError("ReleaseMutex", _windows_last_error())
 
     def create_auto_reset_event(self, name: str) -> NativeHandle:
         handle = self._create_event(None, False, False, name)
         if not handle:
-            raise SingleInstanceNativeError("CreateEventW", ctypes.get_last_error())
+            raise SingleInstanceNativeError("CreateEventW", _windows_last_error())
         return int(handle)
 
     def open_event(self, name: str) -> NativeHandle | None:
         handle = self._open_event(_EVENT_MODIFY_STATE, False, name)
         if handle:
             return int(handle)
-        error = ctypes.get_last_error()
+        error = _windows_last_error()
         if error == _ERROR_FILE_NOT_FOUND:
             return None
         raise SingleInstanceNativeError("OpenEventW", error)
 
     def signal_event(self, handle: NativeHandle) -> None:
         if not self._set_event(_as_windows_handle(handle)):
-            raise SingleInstanceNativeError("SetEvent", ctypes.get_last_error())
+            raise SingleInstanceNativeError("SetEvent", _windows_last_error())
 
     def wait_any(self, handles: Sequence[NativeHandle], timeout_ms: int) -> int | None:
         if not handles:
@@ -646,7 +649,7 @@ class _WindowsNativeApi:
         if result == _WAIT_FAILED:
             raise SingleInstanceNativeError(
                 "WaitForMultipleObjects",
-                ctypes.get_last_error(),
+                _windows_last_error(),
             )
         index = result - _WAIT_OBJECT_0
         if 0 <= index < len(handles):
@@ -659,7 +662,7 @@ class _WindowsNativeApi:
 
     def close_handle(self, handle: NativeHandle) -> None:
         if not self._close(_as_windows_handle(handle)):
-            raise SingleInstanceNativeError("CloseHandle", ctypes.get_last_error())
+            raise SingleInstanceNativeError("CloseHandle", _windows_last_error())
 
 
 class PosixFileLock:
@@ -777,6 +780,17 @@ def _secure_descriptor_permissions(descriptor: int) -> None:
             "This platform cannot secure the single-instance lock permissions."
         )
     fchmod(descriptor, 0o600)
+
+
+def _set_windows_last_error(value: int) -> None:
+    setter = getattr(ctypes, "set_last_error", None)
+    if setter is not None:
+        setter(value)
+
+
+def _windows_last_error() -> int:
+    getter = getattr(ctypes, "get_last_error", None)
+    return int(getter()) if getter is not None else 0
 
 
 def _as_windows_handle(handle: NativeHandle) -> wintypes.HANDLE:

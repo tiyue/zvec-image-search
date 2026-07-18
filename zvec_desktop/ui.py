@@ -2429,7 +2429,10 @@ class ZvecDesktopWindow:
         try:
             resolved = path.expanduser().resolve(strict=True)
             if os.name == "nt":
-                os.startfile(resolved)
+                startfile = getattr(os, "startfile", None)
+                if startfile is None:
+                    raise OSError("Windows shell open is unavailable")
+                startfile(resolved)
             elif sys_platform() == "darwin":
                 subprocess.Popen(["open", str(resolved)])
             else:
