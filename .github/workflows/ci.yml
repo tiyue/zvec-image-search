@@ -52,9 +52,14 @@ jobs:
         run: >-
           python -m mypy
           image_vector_service
+          zvec_desktop
           image_service.py
           zvec_launcher.py
           zvec_logging.py
+          scripts/build_python_preview.py
+          scripts/python_preview_packaging.py
+          release/python_preview/frozen_entry.py
+          release/python_preview/runtime_hook.py
       - name: Mypy search-quality tools
         run: python -m mypy tests/search_quality scripts/verify_search_quality_gate.py
       - name: Tests

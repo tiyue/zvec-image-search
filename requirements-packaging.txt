@@ -1,0 +1,4 @@
+# Install this environment explicitly before building.  The build script never
+# downloads packages or creates an environment on the user's machine.
+-r requirements-lock.txt
+PyInstaller==6.16.0

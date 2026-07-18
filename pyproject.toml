@@ -10,18 +10,20 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "Pillow>=10.0",
+    "pystray==0.19.5; sys_platform == 'win32'",
     "zvec==0.5.1",
 ]
 
 [project.scripts]
 zvec-image-search = "image_service:main"
 zvec = "zvec_launcher:main"
+zvec-desktop = "zvec_desktop.app:main"
 
 [tool.setuptools]
 py-modules = ["image_service", "zvec_launcher", "zvec_logging"]
 
 [tool.setuptools.packages.find]
-include = ["image_vector_service*"]
+include = ["image_vector_service*", "zvec_desktop*"]
 
 [tool.ruff]
 line-length = 88

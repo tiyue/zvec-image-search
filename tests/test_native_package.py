@@ -81,6 +81,24 @@ class NativePackageTest(unittest.TestCase):
             )
             self.assertIn("Zvec native launcher", invocation.stdout)
             self.assertIn("Docker is not required", invocation.stdout)
+
+            desktop_command = environment / (
+                "Scripts/zvec-desktop.exe" if os.name == "nt" else "bin/zvec-desktop"
+            )
+            desktop_help = subprocess.run(
+                [str(desktop_command), "--help"],
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            self.assertEqual(
+                desktop_help.returncode,
+                0,
+                desktop_help.stderr or desktop_help.stdout,
+            )
+            self.assertIn("pure-Python image library desktop", desktop_help.stdout)
         finally:
             shutil.rmtree(root, ignore_errors=True)
 
