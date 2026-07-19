@@ -33,16 +33,17 @@ def calculate_gallery_layout(
     max_columns: int = DEFAULT_GALLERY_COLUMNS,
     target_rows: int = DEFAULT_GALLERY_ROWS,
     minimum_card_width: int = 104,
-    minimum_card_height: int = 128,
+    minimum_card_height: int = 112,
     compact_card_height: int = 154,
     gap: int = 8,
 ) -> GalleryLayout:
     """Fill a normal viewport with 5x3 cards and scroll compact windows.
 
     ``minimum_card_width`` determines when another column can be introduced;
-    it is deliberately not forced on a one-column viewport.  That distinction
-    keeps extremely narrow windows inside their visible horizontal bounds
-    while vertical space remains scrollable.
+    it is deliberately not forced on a one-column viewport.  The 112-pixel
+    normal card floor leaves room for two caption lines while allowing the
+    requested 5x3 grid to survive Windows 125%/150% display scaling.  Smaller
+    viewports keep the larger compact card height and become scrollable.
     """
 
     values = {

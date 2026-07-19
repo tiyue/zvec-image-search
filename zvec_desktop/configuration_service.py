@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import stat
+import threading
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -64,6 +65,10 @@ class DesktopConfigurationService:
             if supplied is not None
             else self._config_home / "config.json"
         )
+        # Gateway requests are served by a ThreadingHTTPServer.  Serialize the
+        # complete read/validate/write transaction so concurrent settings
+        # changes cannot silently overwrite one another.
+        self._mutation_lock = threading.RLock()
 
     @property
     def config_home(self) -> Path:
@@ -112,22 +117,38 @@ class DesktopConfigurationService:
         workspace_directory: str | Path | None = None,
         results_directory: str | Path | None = None,
     ) -> ConfigurationSnapshot:
+        with self._mutation_lock:
+            return self._create_initial(
+                image_root,
+                name=name,
+                workspace_directory=workspace_directory,
+                results_directory=results_directory,
+            )
+
+    def _create_initial(
+        self,
+        image_root: str | Path,
+        *,
+        name: str | None = None,
+        workspace_directory: str | Path | None = None,
+        results_directory: str | Path | None = None,
+    ) -> ConfigurationSnapshot:
         """Create the first local library and the default model JSON."""
 
         if self._path.exists():
             raise DesktopConfigurationError(
                 "config.json 已存在；如需增加图库，请使用“添加图库”。"
             )
-        image = _existing_directory(image_root, "图片文件夹")
-        workspace = _ensure_directory(
-            Path(workspace_directory).expanduser()
+        image = _existing_absolute_directory(image_root, "image_root")
+        workspace = (
+            _ensure_absolute_directory(workspace_directory, "workspace_directory")
             if workspace_directory is not None
-            else self._default_workspace_for(image)
+            else _ensure_directory(self._default_workspace_for(image))
         )
-        results = _ensure_directory(
-            Path(results_directory).expanduser()
+        results = (
+            _ensure_absolute_directory(results_directory, "results_directory")
             if results_directory is not None
-            else self._config_home / "results"
+            else _ensure_directory(self._config_home / "results")
         )
         library = NativeLibrary(
             library_id=_library_id(image, workspace),
@@ -154,17 +175,33 @@ class DesktopConfigurationService:
         workspace_directory: str | Path | None = None,
         enabled: bool = True,
     ) -> ConfigurationSnapshot:
+        with self._mutation_lock:
+            return self._add_library(
+                image_root,
+                name=name,
+                workspace_directory=workspace_directory,
+                enabled=enabled,
+            )
+
+    def _add_library(
+        self,
+        image_root: str | Path,
+        *,
+        name: str | None = None,
+        workspace_directory: str | Path | None = None,
+        enabled: bool = True,
+    ) -> ConfigurationSnapshot:
         """Add one library while preserving existing Collection directories."""
 
         if not isinstance(enabled, bool):
             raise DesktopConfigurationError("enabled 必须是布尔值。")
         snapshot = self.load()
         assert snapshot is not None
-        image = _existing_directory(image_root, "图片文件夹")
-        workspace = _ensure_directory(
-            Path(workspace_directory).expanduser()
+        image = _existing_absolute_directory(image_root, "image_root")
+        workspace = (
+            _ensure_absolute_directory(workspace_directory, "workspace_directory")
             if workspace_directory is not None
-            else self._default_workspace_for(image, unique=True)
+            else _ensure_directory(self._default_workspace_for(image, unique=True))
         )
         library = NativeLibrary(
             library_id=_library_id(image, workspace),
@@ -183,6 +220,10 @@ class DesktopConfigurationService:
         return ConfigurationSnapshot(self._path, self._config_home, config)
 
     def set_default_library(self, library_id: str) -> ConfigurationSnapshot:
+        with self._mutation_lock:
+            return self._set_default_library(library_id)
+
+    def _set_default_library(self, library_id: str) -> ConfigurationSnapshot:
         snapshot = self.load()
         assert snapshot is not None
         config = _validate_config(
@@ -195,6 +236,12 @@ class DesktopConfigurationService:
         return ConfigurationSnapshot(self._path, self._config_home, config)
 
     def set_library_enabled(
+        self, library_id: str, enabled: bool
+    ) -> ConfigurationSnapshot:
+        with self._mutation_lock:
+            return self._set_library_enabled(library_id, enabled)
+
+    def _set_library_enabled(
         self, library_id: str, enabled: bool
     ) -> ConfigurationSnapshot:
         if not isinstance(enabled, bool):
@@ -225,6 +272,138 @@ class DesktopConfigurationService:
             snapshot.configuration.results_directory,
             tuple(libraries),
             python_executable=snapshot.configuration.python_executable,
+        )
+        self._save(config)
+        return ConfigurationSnapshot(self._path, self._config_home, config)
+
+    def update_library(
+        self,
+        library_id: str,
+        *,
+        name: str | None = None,
+        image_root: str | Path | None = None,
+        workspace_directory: str | Path | None = None,
+        enabled: bool | None = None,
+        is_default: bool | None = None,
+        results_directory: str | Path | None = None,
+    ) -> ConfigurationSnapshot:
+        """Update one library without changing its stable identity.
+
+        Path changes are validated as one candidate configuration before any
+        directory is created or config.json is replaced.  This keeps the old
+        configuration usable when a requested path is unsafe or inaccessible.
+        """
+
+        with self._mutation_lock:
+            return self._update_library(
+                library_id,
+                name=name,
+                image_root=image_root,
+                workspace_directory=workspace_directory,
+                enabled=enabled,
+                is_default=is_default,
+                results_directory=results_directory,
+            )
+
+    def _update_library(
+        self,
+        library_id: str,
+        *,
+        name: str | None,
+        image_root: str | Path | None,
+        workspace_directory: str | Path | None,
+        enabled: bool | None,
+        is_default: bool | None,
+        results_directory: str | Path | None,
+    ) -> ConfigurationSnapshot:
+        if enabled is not None and not isinstance(enabled, bool):
+            raise DesktopConfigurationError("enabled must be a boolean.")
+        if is_default is not None and not isinstance(is_default, bool):
+            raise DesktopConfigurationError("is_default must be a boolean.")
+
+        snapshot = self.load()
+        assert snapshot is not None
+        requested = _required_text(library_id, "library_id")
+        existing = snapshot.configuration.by_id.get(requested)
+        if existing is None:
+            raise DesktopConfigurationError(f"Library does not exist: {requested}")
+
+        next_image_root = (
+            existing.image_root
+            if image_root is None
+            else _existing_absolute_directory(image_root, "image_root")
+        )
+        next_workspace = (
+            existing.workspace_directory
+            if workspace_directory is None
+            else _absolute_host_path(workspace_directory, "workspace_directory")
+        )
+        next_results = (
+            snapshot.configuration.results_directory
+            if results_directory is None
+            else _absolute_host_path(results_directory, "results_directory")
+        )
+        next_library = NativeLibrary(
+            # The id represents the logical library.  Editing host paths must
+            # never orphan queued jobs, result manifests, or UI selections.
+            library_id=existing.library_id,
+            name=existing.name if name is None else _required_text(name, "name"),
+            image_root=next_image_root,
+            workspace_directory=next_workspace,
+            enabled=existing.enabled if enabled is None else enabled,
+        )
+        libraries = tuple(
+            next_library if item.library_id == requested else item
+            for item in snapshot.configuration.libraries
+        )
+        default_library_id = snapshot.configuration.default_library_id
+        if is_default is True:
+            default_library_id = requested
+        elif is_default is False and default_library_id == requested:
+            raise DesktopConfigurationError(
+                "The default library cannot be cleared without selecting another one."
+            )
+
+        # Validate the complete graph before creating a requested workspace or
+        # results directory.  validate_native_config enforces all cross-library
+        # image/workspace/results overlap rules.
+        candidate = _validate_config(
+            default_library_id,
+            next_results,
+            libraries,
+            python_executable=snapshot.configuration.python_executable,
+        )
+        if workspace_directory is not None:
+            _ensure_directory(candidate.by_id[requested].workspace_directory)
+        if results_directory is not None:
+            _ensure_directory(candidate.results_directory)
+
+        # Resolve again after creation and revalidate before the atomic replace;
+        # this also catches a path redirected by the host filesystem.
+        final_libraries = tuple(
+            NativeLibrary(
+                item.library_id,
+                item.name,
+                item.image_root,
+                (
+                    item.workspace_directory.resolve(strict=True)
+                    if item.library_id == requested and workspace_directory is not None
+                    else item.workspace_directory
+                ),
+                item.enabled,
+            )
+            for item in candidate.libraries
+        )
+        final_results = (
+            candidate.results_directory.resolve(strict=True)
+            if results_directory is not None
+            else candidate.results_directory
+        )
+        config = _validate_config(
+            candidate.default_library_id,
+            final_results,
+            final_libraries,
+            python_executable=candidate.python_executable,
         )
         self._save(config)
         return ConfigurationSnapshot(self._path, self._config_home, config)
@@ -302,14 +481,40 @@ def _required_text(value: str, name: str) -> str:
     return normalized
 
 
-def _existing_directory(value: str | Path, label: str) -> Path:
+def _absolute_host_path(value: str | Path, label: str) -> Path:
+    """Return a normalized host path while rejecting relative/container paths."""
+
     try:
-        path = Path(value).expanduser().resolve(strict=True)
+        path = Path(value).expanduser()
+    except (TypeError, ValueError, OSError) as exc:
+        raise DesktopConfigurationError(
+            f"{label} must be a valid absolute host path."
+        ) from exc
+    if not path.is_absolute():
+        raise DesktopConfigurationError(
+            f"{label} must be an absolute Windows host path."
+        )
+    try:
+        return path.resolve(strict=False)
+    except (OSError, RuntimeError) as exc:
+        raise DesktopConfigurationError(f"Unable to resolve {label}.") from exc
+
+
+def _existing_absolute_directory(value: str | Path, label: str) -> Path:
+    path = _absolute_host_path(value, label)
+    try:
+        resolved = path.resolve(strict=True)
     except (FileNotFoundError, NotADirectoryError, OSError) as exc:
-        raise DesktopConfigurationError(f"{label}不存在或无法访问。") from exc
-    if not path.is_dir():
-        raise DesktopConfigurationError(f"{label}必须是文件夹。")
-    return path
+        raise DesktopConfigurationError(
+            f"{label} does not exist or is not accessible."
+        ) from exc
+    if not resolved.is_dir():
+        raise DesktopConfigurationError(f"{label} must be a directory.")
+    return resolved
+
+
+def _ensure_absolute_directory(value: str | Path, label: str) -> Path:
+    return _ensure_directory(_absolute_host_path(value, label))
 
 
 def _ensure_directory(value: Path) -> Path:

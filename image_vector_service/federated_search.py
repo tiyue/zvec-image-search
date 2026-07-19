@@ -18,14 +18,18 @@ from .models import (
     RankSource,
     ResolvedSearchHit,
     SearchHit,
+    SearchSortMode,
 )
 from .rank_fusion import (
     DEFAULT_MAX_CONFIDENCE_DROP,
     DEFAULT_MIN_CONFIDENCE,
     DEFAULT_SCORE_GAP,
     DEFAULT_SOURCE_REWARD,
-    MAX_CONFIDENCE_CANDIDATES,
+    MINIMUM_RESULT_CONFIDENCE,
     confidence_rank,
+    normalize_sort_mode,
+    sort_confidence_hits,
+    sort_mode_uses_diversity,
 )
 from .result_diversity import diversify_search_hits
 from .result_exporter import export_results
@@ -44,6 +48,8 @@ class FederatedRanking:
     candidate_count: int
     filtered_count: int
     ranking_mode: str
+    sort_mode: SearchSortMode = "confidence"
+    ranking_diagnostics: dict[str, object] = field(default_factory=dict)
     diversity: dict[str, object] = field(default_factory=dict)
 
 
@@ -107,18 +113,20 @@ def rank_federated_hits(
     score_gap: float | None = None,
     max_confidence_drop: float | None = None,
     source_reward: float = DEFAULT_SOURCE_REWARD,
-    max_candidates: int = MAX_CONFIDENCE_CANDIDATES,
+    max_candidates: int | None = None,
     show_low_confidence: bool = False,
     diversify_results: bool = True,
+    sort_mode: SearchSortMode = "confidence",
 ) -> FederatedRanking:
     if top_k < 1:
         raise ValueError("top_k must be positive.")
+    resolved_sort_mode = normalize_sort_mode(sort_mode)
     query_type = _query_type(collections)
     confidence_candidates = _confidence_candidates(collections, query_type)
     quality_configured = bool(collections) and all(
         collection.candidates.quality_configured for collection in collections
     )
-    if not quality_configured:
+    if resolved_sort_mode == "legacy" or not quality_configured:
         return _legacy_ranking(
             collections,
             confidence_candidates,
@@ -127,17 +135,34 @@ def rank_federated_hits(
             image_weight=image_weight,
             text_weight=text_weight,
             diversify_results=diversify_results,
+            sort_mode="legacy",
+            requested_sort_mode=resolved_sort_mode,
+            show_low_confidence=show_low_confidence,
         )
-    configured_minimum, configured_possible, configured_high = _quality_thresholds(
-        collections
+    configured_minimum, configured_possible, configured_high = (
+        _quality_thresholds(collections)
+        if quality_configured
+        else (
+            MINIMUM_RESULT_CONFIDENCE,
+            DEFAULT_POSSIBLE_THRESHOLD,
+            DEFAULT_HIGH_THRESHOLD,
+        )
     )
-    configured_minimum_score = _quality_minimum_score(collections, query_type)
-    fusion_mode, fusion_options = _fusion_settings(collections)
+    configured_minimum_score = (
+        _quality_minimum_score(collections, query_type) if quality_configured else None
+    )
+    fusion_mode, fusion_options = (
+        _fusion_settings(collections) if quality_configured else ("confidence_v1", {})
+    )
     collection_confidence_offsets, collection_calibration_diagnostics = (
         _collection_calibration_settings(collections)
     )
-    configured_score_gap = _quality_score_gap(collections)
-    configured_max_confidence_drop = _quality_max_confidence_drop(collections)
+    configured_score_gap = (
+        _quality_score_gap(collections) if quality_configured else 1.0
+    )
+    configured_max_confidence_drop = (
+        _quality_max_confidence_drop(collections) if quality_configured else 1.0
+    )
     confidence_ranking = confidence_rank(
         confidence_candidates,
         query_type=query_type,
@@ -167,15 +192,20 @@ def rank_federated_hits(
         show_low_confidence=show_low_confidence,
         collection_confidence_offsets=(
             collection_confidence_offsets
-            if collection_calibration_diagnostics["configured"]
+            if quality_configured and collection_calibration_diagnostics["configured"]
             else None
         ),
+        sort_mode=resolved_sort_mode,
     )
     if confidence_ranking is not None:
+        diversity_enabled = sort_mode_uses_diversity(
+            resolved_sort_mode,
+            legacy_diversity=diversify_results,
+        )
         diversity = diversify_search_hits(
             confidence_ranking.hits,
             top_k=top_k,
-            enabled=diversify_results,
+            enabled=diversity_enabled,
         )
         return FederatedRanking(
             hits=diversity.hits,
@@ -186,6 +216,13 @@ def rank_federated_hits(
             ranking_mode=(
                 "confidence_v2" if fusion_mode == "confidence_v2" else "confidence"
             ),
+            sort_mode=resolved_sort_mode,
+            ranking_diagnostics={
+                **confidence_ranking.diagnostics,
+                "quality_configured": quality_configured,
+                "requested_diversity": diversify_results,
+                "effective_diversity": diversity_enabled,
+            },
             diversity=diversity.diagnostics(),
         )
 
@@ -197,6 +234,9 @@ def rank_federated_hits(
         image_weight=image_weight,
         text_weight=text_weight,
         diversify_results=diversify_results,
+        sort_mode="legacy",
+        requested_sort_mode=resolved_sort_mode,
+        show_low_confidence=show_low_confidence,
     )
 
 
@@ -209,16 +249,35 @@ def _legacy_ranking(
     image_weight: float,
     text_weight: float,
     diversify_results: bool,
+    sort_mode: SearchSortMode = "legacy",
+    requested_sort_mode: SearchSortMode | None = None,
+    show_low_confidence: bool = False,
 ) -> FederatedRanking:
     legacy = aggregate_federated_hits(
         collections,
         image_weight=image_weight,
         text_weight=text_weight,
     )
-    diversity = diversify_search_hits(
+    filtered = sort_confidence_hits(
         legacy,
+        query_type=query_type,
         top_k=top_k,
-        enabled=diversify_results,
+        min_confidence=0.0,
+        score_gap=1.0,
+        max_confidence_drop=1.0,
+        max_candidates=max(1, len(legacy)),
+        show_low_confidence=show_low_confidence,
+        sort_mode="legacy",
+    )
+    legacy_hits = legacy if filtered is None else filtered.hits
+    diversity_enabled = sort_mode_uses_diversity(
+        sort_mode,
+        legacy_diversity=diversify_results,
+    )
+    diversity = diversify_search_hits(
+        legacy_hits,
+        top_k=top_k,
+        enabled=diversity_enabled,
     )
     selected = diversity.hits
     if query_type == "tag":
@@ -246,9 +305,18 @@ def _legacy_ranking(
     return FederatedRanking(
         hits=selected,
         status=status,
-        candidate_count=len(legacy),
+        candidate_count=(len(legacy) if filtered is None else filtered.candidate_count),
         filtered_count=max(0, len(legacy) - len(selected)),
         ranking_mode=ranking_mode,
+        sort_mode=sort_mode,
+        ranking_diagnostics={
+            **({} if filtered is None else filtered.diagnostics),
+            "fallback": True,
+            "requested_sort_mode": requested_sort_mode or sort_mode,
+            "effective_sort_mode": sort_mode,
+            "requested_diversity": diversify_results,
+            "effective_diversity": diversity_enabled,
+        },
         diversity=diversity.diagnostics(),
     )
 
@@ -369,6 +437,7 @@ def export_federated_search(
     latency_ms: float = 0.0,
     show_low_confidence: bool = False,
     diversify_results: bool = True,
+    sort_mode: SearchSortMode = "confidence",
 ) -> dict:
     ranking = rank_federated_hits(
         collections,
@@ -377,6 +446,7 @@ def export_federated_search(
         text_weight=text_weight,
         show_low_confidence=show_low_confidence,
         diversify_results=diversify_results,
+        sort_mode=sort_mode,
     )
     libraries = [collection.library for collection in collections]
     query: dict[str, object] = {
@@ -386,6 +456,7 @@ def export_federated_search(
         "tag_mode": tag_mode,
         "show_low_confidence": show_low_confidence,
         "diversify_results": diversify_results,
+        "sort_mode": ranking.sort_mode,
     }
     if prepared.text is not None:
         query["text"] = prepared.text
@@ -417,6 +488,8 @@ def export_federated_search(
         latency_ms=latency_ms,
         search_quality=quality_diagnostics,
         ranking_mode=ranking.ranking_mode,
+        sort_mode=ranking.sort_mode,
+        ranking_diagnostics=ranking.ranking_diagnostics,
         show_low_confidence=show_low_confidence,
         low_confidence_override=ranking.status == "low_confidence_override",
     )
@@ -441,6 +514,8 @@ def _quality_diagnostics(
     diagnostics: dict[str, object] = {
         "configured": configured,
         "ranking_mode": ranking.ranking_mode,
+        "sort_mode": ranking.sort_mode,
+        "sorting": dict(ranking.ranking_diagnostics),
         "score_gap": _quality_score_gap(collections),
         "max_confidence_drop": _quality_max_confidence_drop(collections),
         "source_reward": DEFAULT_SOURCE_REWARD,
@@ -475,7 +550,7 @@ def _quality_diagnostics(
         "diversity": dict(ranking.diversity),
         "fusion": {"mode": fusion_mode, **fusion_options},
         "collection_calibration": collection_calibration,
-        "max_candidates": MAX_CONFIDENCE_CANDIDATES,
+        "max_candidates": ranking.ranking_diagnostics.get("candidate_limit"),
         "candidate_k_per_library": {
             collection.library.library_id: collection.candidates.candidate_k
             for collection in collections
@@ -488,7 +563,9 @@ def _quality_diagnostics(
     if configured:
         minimum, possible, high = _quality_thresholds(collections)
         diagnostics["thresholds"] = {
-            "minimum": minimum,
+            "minimum": max(MINIMUM_RESULT_CONFIDENCE, minimum),
+            "configured_minimum": minimum,
+            "hard_minimum": MINIMUM_RESULT_CONFIDENCE,
             "minimum_score": _quality_minimum_score(
                 collections, _query_type(collections)
             ),

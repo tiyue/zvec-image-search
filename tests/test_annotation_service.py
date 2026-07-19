@@ -261,6 +261,30 @@ class SystemicVisionClient:
         )
 
 
+class FolderFallbackVisionClient(FakeVisionClient):
+    refused_names: set[str] = set()
+    technical_failure_names: set[str] = set()
+    success_payload: dict[str, Any] = annotation_payload()
+
+    def tag_image(self, path, *, context):
+        name = Path(path).name
+        if name in type(self).refused_names:
+            raise VisionTransportError(
+                "DashScope data_inspection_failed: inappropriate content.",
+                status_code=400,
+                code="DataInspectionFailed",
+            )
+        if name in type(self).technical_failure_names:
+            raise VisionTransportError(
+                "temporary visual service failure",
+                status_code=503,
+                code="ServiceUnavailable",
+            )
+        payload = type(self).success_payload
+        type(self).responses = {self.model: [payload]}
+        return super().tag_image(path, context=context)
+
+
 class AutoTaggingIntegrationTest(unittest.TestCase):
     def setUp(self):
         self.temporary = Path(tempfile.mkdtemp(prefix="zvec_auto_tag_"))
@@ -272,22 +296,47 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
         image = first / "image.png"
         Image.new("RGB", (24, 24), (120, 80, 180)).save(image)
         shutil.copy2(image, second / "copy.png")
+        self.embedding_client = FakeEmbeddingClient()
         self.service = ImageVectorService(
             config=ServiceConfig(workspace=self.temporary / "workspace"),
-            embedding_client=FakeEmbeddingClient(),
+            embedding_client=self.embedding_client,
         )
         FakeVisionClient.calls = 0
         FakeVisionClient.contexts = []
         FakeVisionClient.models = []
         FakeVisionClient.responses = {}
+        FolderFallbackVisionClient.refused_names = set()
+        FolderFallbackVisionClient.technical_failure_names = set()
+        FolderFallbackVisionClient.success_payload = annotation_payload()
 
     def tearDown(self):
         self.service.close()
         shutil.rmtree(self.temporary, ignore_errors=True)
 
+    def _index_folder_fallback_pair(
+        self,
+        folder_name: str,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        self.service.index_folder(str(self.root))
+        folder = self.root / folder_name
+        folder.mkdir()
+        Image.new("RGB", (26, 26), (20, 160, 70)).save(folder / "donor.png")
+        Image.new("RGB", (26, 26), (170, 30, 90)).save(folder / "refused.png")
+        indexed = self.service.index_folder(str(self.root))
+        self.assertEqual(indexed.inserted, 2)
+        entries = {
+            str(entry["file_name"]): entry
+            for entry in self.service.state.list_entries()
+            if str(entry["relative_path"])
+            .replace("\\", "/")
+            .startswith(f"{folder_name}/")
+        }
+        return entries["donor.png"], entries["refused.png"]
+
     def test_same_sha_is_tagged_once_and_review_preserves_tag_sources(self):
         indexed = self.service.index_folder(str(self.root), tags=["人工"])
         self.assertEqual(indexed.inserted, 2)
+        embedding_requests_before_tagging = self.embedding_client.request_count
         estimate = self.service.estimate_auto_tags(
             scope="latest_index_run", max_images=10, max_budget_cny=1.0
         )
@@ -313,6 +362,11 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
             )
 
         self.assertEqual(FakeVisionClient.calls, 1)
+        self.assertEqual(
+            self.embedding_client.request_count,
+            embedding_requests_before_tagging,
+            "Independent auto-tagging must not rebuild embeddings.",
+        )
         self.assertEqual(report["succeeded"], 2)
         self.assertEqual(len(report["proposals"]), 2)
         self.assertEqual(
@@ -323,7 +377,8 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
         self.assertEqual(report["plus_requests"], 0)
         self.assertEqual(report["proposals"][0]["model_trace"], [FLASH_MODEL])
         self.assertEqual(report["proposals"][0]["resolved_model"], FLASH_MODEL)
-        self.assertIn("Cosplay", report["proposals"][0]["proposed_tags"])
+        self.assertEqual(report["pending_count"], 0)
+        self.assertIn("Cosplay", report["proposals"][0]["auto_accepted_tags"])
         self.assertNotIn("低置信自由标签", report["proposals"][0]["proposed_tags"])
         self.assertEqual(
             report["proposals"][0]["proposal_id"], report["proposals"][0]["doc_id"]
@@ -334,22 +389,12 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
         proposal = report["proposals"][0]
         source_path = Path(proposal["source_path"])
         self.assertTrue(source_path.is_file())
-        reviewed = self.service.review_auto_tags(
-            [
-                {
-                    "doc_id": proposal["doc_id"],
-                    "action": "accept",
-                    "tags": ["Cosplay"],
-                }
-            ]
-        )
-        self.assertEqual(reviewed["accepted"], 1)
         entry = self.service.state.get(proposal["doc_id"])
         assert entry is not None
         self.assertEqual(entry["tags"], ["人工"])
         self.assertEqual(
             entry["accepted_auto_tags"],
-            ["刻晴", "原神", "Cosplay"],
+            ["Cosplay", "刻晴", "原神"],
         )
         self.assertIn(entry["folder_tags"][0], {"set-a", "set-b"})
         stored = self.service.state.get_document_annotation(proposal["doc_id"])
@@ -772,6 +817,212 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
         self.assertEqual(retryable["candidate_count"], 0)
         self.assertEqual(all_failed["candidate_count"], 1)
 
+    def test_model_refusal_inherits_stable_folder_tags_after_the_run(self):
+        donor, refused = self._index_folder_fallback_pair("same-character")
+        walking = FIELD_SPECS["action"].values[1]
+        standing = FIELD_SPECS["pose"].values[0]
+        smiling = FIELD_SPECS["expression"].values[1]
+        walking_label = FIELD_TAG_LABELS[walking]
+        standing_label = FIELD_TAG_LABELS[standing]
+        smiling_label = FIELD_TAG_LABELS[smiling]
+        self.service.state.set_many(
+            [{**donor, "tags": ["ManualCharacter", walking_label]}]
+        )
+        self.service.state.set_document_annotation(
+            doc_id=str(refused["doc_id"]),
+            source_sha256=str(refused["sha256"]),
+            cache_key="previous-user-suppression",
+            status="rejected",
+            rejected_tags=["Work-A"],
+            policy={"policy_version": 2},
+        )
+        FolderFallbackVisionClient.refused_names = {"refused.png"}
+        FolderFallbackVisionClient.success_payload = annotation_payload(
+            controlled_tags=("Cosplay",),
+            field_values={
+                "action": (walking,),
+                "pose": (standing,),
+                "expression": (smiling,),
+            },
+            character="Character-A",
+            work="Work-A",
+        )
+
+        with patch(
+            "image_vector_service.annotation_service.DashScopeVisionTaggingClient",
+            FolderFallbackVisionClient,
+        ):
+            report = self.service.auto_tag_images(
+                scope="latest_index_run",
+                max_images=10,
+                external_processing_confirmed=True,
+            )
+
+        current_donor = self.service.state.get(str(donor["doc_id"]))
+        current_refused = self.service.state.get(str(refused["doc_id"]))
+        annotation = self.service.state.get_document_annotation(str(refused["doc_id"]))
+        assert current_donor is not None
+        assert current_refused is not None
+        assert annotation is not None
+        self.assertEqual(report["succeeded"], 2)
+        self.assertEqual(report["failed"], 0)
+        self.assertEqual(report["model_failed"], 1)
+        self.assertEqual(report["folder_inheritance_recovered"], 1)
+        self.assertEqual(report["folder_inheritance_unresolved"], 0)
+        self.assertEqual(report["failures"], [])
+        self.assertEqual(report["failure_manifest"], "")
+        self.assertEqual(report["quarantined"], 0)
+        self.assertIn(walking_label, current_donor["effective_tags"])
+        self.assertIn(standing_label, current_donor["accepted_auto_tags"])
+        self.assertIn(smiling_label, current_donor["accepted_auto_tags"])
+        self.assertIn("ManualCharacter", current_refused["inherited_tags"])
+        self.assertIn("Character-A", current_refused["inherited_tags"])
+        self.assertIn("Cosplay", current_refused["inherited_tags"])
+        self.assertNotIn("Work-A", current_refused["inherited_tags"])
+        self.assertNotIn(walking_label, current_refused["inherited_tags"])
+        self.assertNotIn(standing_label, current_refused["inherited_tags"])
+        self.assertNotIn(smiling_label, current_refused["inherited_tags"])
+        self.assertEqual(current_refused["accepted_auto_tags"], [])
+        self.assertEqual(annotation["status"], "accepted")
+        self.assertEqual(annotation["error"], "")
+        audit = annotation["policy"]["folder_inheritance"]
+        self.assertEqual(audit["status"], "applied")
+        self.assertEqual(audit["source_doc_ids"], [str(donor["doc_id"])])
+        filtered_categories = {item["category"] for item in audit["filtered_tags"]}
+        self.assertTrue(
+            {"action", "pose", "expression", "user_suppressed"}.issubset(
+                filtered_categories
+            )
+        )
+        search = self.service.search_by_text(
+            "portrait",
+            tags=["Character-A"],
+            top_k=10,
+        )
+        self.assertIn(
+            str(refused["doc_id"]),
+            {result.doc_id for result in search.results},
+        )
+
+    def test_technical_failure_never_uses_folder_inheritance(self):
+        donor, failed = self._index_folder_fallback_pair("technical-failure")
+        self.service.state.set_many([{**donor, "tags": ["ManualCharacter"]}])
+        FolderFallbackVisionClient.technical_failure_names = {"refused.png"}
+        FolderFallbackVisionClient.success_payload = annotation_payload(
+            character="Character-A",
+            work="Work-A",
+        )
+
+        with patch(
+            "image_vector_service.annotation_service.DashScopeVisionTaggingClient",
+            FolderFallbackVisionClient,
+        ):
+            report = self.service.auto_tag_images(
+                scope="latest_index_run",
+                max_images=10,
+                external_processing_confirmed=True,
+            )
+
+        entry = self.service.state.get(str(failed["doc_id"]))
+        annotation = self.service.state.get_document_annotation(str(failed["doc_id"]))
+        assert entry is not None
+        assert annotation is not None
+        self.assertEqual(report["failed"], 1)
+        self.assertEqual(report["folder_inheritance_recovered"], 0)
+        self.assertEqual(report["folder_inheritance_unresolved"], 0)
+        self.assertEqual(entry["inherited_tags"], [])
+        self.assertEqual(annotation["status"], "failed")
+        self.assertNotIn("folder_inheritance", annotation["policy"])
+
+    def test_refusal_without_stable_folder_tags_keeps_explicit_failure(self):
+        donor, refused = self._index_folder_fallback_pair("transient-only")
+        self.service.state.set_many([{**donor, "tags": [], "folder_tags": []}])
+        walking = FIELD_SPECS["action"].values[1]
+        standing = FIELD_SPECS["pose"].values[0]
+        smiling = FIELD_SPECS["expression"].values[1]
+        FolderFallbackVisionClient.refused_names = {"refused.png"}
+        FolderFallbackVisionClient.success_payload = annotation_payload(
+            controlled_tags=(),
+            field_values={
+                "action": (walking,),
+                "pose": (standing,),
+                "expression": (smiling,),
+            },
+            character=None,
+            work=None,
+        )
+
+        with patch(
+            "image_vector_service.annotation_service.DashScopeVisionTaggingClient",
+            FolderFallbackVisionClient,
+        ):
+            report = self.service.auto_tag_images(
+                scope="latest_index_run",
+                max_images=10,
+                external_processing_confirmed=True,
+            )
+
+        entry = self.service.state.get(str(refused["doc_id"]))
+        annotation = self.service.state.get_document_annotation(str(refused["doc_id"]))
+        assert entry is not None
+        assert annotation is not None
+        self.assertEqual(report["failed"], 1)
+        self.assertEqual(report["folder_inheritance_recovered"], 0)
+        self.assertEqual(report["folder_inheritance_unresolved"], 1)
+        self.assertEqual(report["quarantined"], 1)
+        self.assertEqual(entry["inherited_tags"], [])
+        self.assertEqual(annotation["status"], "failed")
+        self.assertIn("no inheritable tags", annotation["error"])
+        audit = annotation["policy"]["folder_inheritance"]
+        self.assertEqual(audit["error_code"], "no_inheritable_folder_tags")
+        self.assertEqual(
+            {item["category"] for item in audit["filtered_tags"]},
+            {"action", "pose", "expression"},
+        )
+
+    def test_same_named_folder_in_another_root_is_not_an_inheritance_source(self):
+        donor_root = self.temporary / "donor-library" / "shared"
+        refused_root = self.temporary / "refused-library" / "shared"
+        donor_root.mkdir(parents=True)
+        refused_root.mkdir(parents=True)
+        Image.new("RGB", (28, 28), (10, 80, 180)).save(donor_root / "donor.png")
+        self.service.index_folder(str(donor_root.parent))
+        FolderFallbackVisionClient.success_payload = annotation_payload(
+            character="Character-A",
+            work="Work-A",
+        )
+        with patch(
+            "image_vector_service.annotation_service.DashScopeVisionTaggingClient",
+            FolderFallbackVisionClient,
+        ):
+            donor_report = self.service.auto_tag_images(
+                scope="latest_index_run",
+                external_processing_confirmed=True,
+            )
+        self.assertEqual(donor_report["failed"], 0)
+
+        Image.new("RGB", (28, 28), (180, 80, 10)).save(refused_root / "refused.png")
+        self.service.index_folder(str(refused_root.parent))
+        FolderFallbackVisionClient.refused_names = {"refused.png"}
+        with patch(
+            "image_vector_service.annotation_service.DashScopeVisionTaggingClient",
+            FolderFallbackVisionClient,
+        ):
+            refused_report = self.service.auto_tag_images(
+                scope="latest_index_run",
+                external_processing_confirmed=True,
+            )
+
+        refused_entry = next(
+            entry
+            for entry in self.service.state.list_entries()
+            if entry["file_name"] == "refused.png"
+        )
+        self.assertEqual(refused_report["failed"], 1)
+        self.assertEqual(refused_report["folder_inheritance_recovered"], 0)
+        self.assertEqual(refused_report["folder_inheritance_unresolved"], 1)
+        self.assertEqual(refused_entry["inherited_tags"], [])
+
     def test_desktop_library_scope_excludes_migrated_roots(self):
         active_root = self.temporary / "active-library"
         migrated_root = self.temporary / "migrated-library"
@@ -941,14 +1192,15 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
         self.assertEqual(proposal["model_trace"], [FLASH_MODEL, PLUS_MODEL])
         self.assertEqual(proposal["resolved_model"], PLUS_MODEL)
         self.assertTrue(proposal["escalated"])
-        self.assertIn("Cosplay", proposal["proposed_tags"])
-        self.assertIn("全身", proposal["proposed_tags"])
+        self.assertIn("Cosplay", proposal["auto_accepted_tags"])
+        self.assertIn("全身", proposal["auto_accepted_tags"])
         self.assertEqual(
             set(proposal["auto_accepted_identity_tags"]),
             {"刻晴", "原神"},
         )
-        self.assertNotIn("刻晴", proposal["proposed_tags"])
-        self.assertNotIn("原神", proposal["proposed_tags"])
+        self.assertIn("刻晴", proposal["auto_accepted_tags"])
+        self.assertIn("原神", proposal["auto_accepted_tags"])
+        self.assertEqual(proposal["proposed_tags"], [])
         self.assertEqual(
             proposal["fields"]["content_domain"]["labels"],
             ["Cosplay"],
@@ -1112,11 +1364,12 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
             )
 
         proposal = report["proposals"][0]
-        self.assertIn("刻晴", proposal["proposed_tags"])
-        self.assertIn("甘雨", proposal["proposed_tags"])
-        self.assertNotIn("原神", proposal["proposed_tags"])
+        self.assertIn("刻晴", proposal["auto_accepted_tags"])
+        self.assertIn("甘雨", proposal["auto_accepted_tags"])
+        self.assertNotIn("原神", proposal["auto_accepted_tags"])
         self.assertIn("明确人物", proposal["auto_accepted_identity_tags"])
-        self.assertNotIn("猜测Coser", proposal["proposed_tags"])
+        self.assertNotIn("猜测Coser", proposal["auto_accepted_tags"])
+        self.assertEqual(proposal["proposed_tags"], [])
         character_entities = proposal["entities"]["character"]
         self.assertEqual(
             {item["name"] for item in character_entities},
@@ -1165,19 +1418,20 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
         self.assertTrue(after_budget_exit.is_leader)
         after_budget_exit.release()
 
-    def test_pending_review_is_paginated_without_model_calls(self):
+    def test_legacy_pending_review_is_paginated_without_model_calls(self):
         self.service.index_folder(str(self.root))
-        with patch(
-            "image_vector_service.annotation_service.DashScopeVisionTaggingClient",
-            FakeVisionClient,
-        ):
-            report = self.service.auto_tag_images(
-                scope="latest_index_run",
-                max_images=10,
-                external_processing_confirmed=True,
+        structured = annotation_payload()
+        for entry in self.service.state.list_entries():
+            self.service.state.set_document_annotation(
+                doc_id=str(entry["doc_id"]),
+                source_sha256=str(entry["sha256"]),
+                cache_key="legacy-pending-page",
+                status="pending_review",
+                proposed_tags=["Cosplay"],
+                structured=structured,
+                policy={"policy_version": 2},
             )
 
-        self.assertEqual(report["pending_count"], 2)
         calls_after_tagging = FakeVisionClient.calls
         first = self.service.pending_auto_tags(offset=0, limit=1)
         second = self.service.pending_auto_tags(offset=1, limit=1)
@@ -1221,12 +1475,12 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
 
         self.assertEqual(FakeVisionClient.calls, 1)
         self.assertEqual(report["succeeded"], 103)
-        self.assertEqual(report["pending_count"], 103)
+        self.assertEqual(report["pending_count"], 0)
         self.assertEqual(len(report["proposals"]), 100)
         pending = self.service.pending_auto_tags(limit=100)
-        self.assertEqual(pending["pending_count"], 103)
-        self.assertEqual(len(pending["proposals"]), 100)
-        self.assertTrue(pending["has_more"])
+        self.assertEqual(pending["pending_count"], 0)
+        self.assertEqual(pending["proposals"], [])
+        self.assertFalse(pending["has_more"])
 
     def test_proposal_exposes_existing_sources_risk_and_identity_boundaries(self):
         self.service.index_folder(str(self.root), tags=["人工标签"])
@@ -1244,7 +1498,7 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
         self.assertTrue(source_path.is_file())
         self.assertIn("人工标签", proposal["existing_tags"])
         self.assertIn("Cosplay", proposal["low_risk_tags"])
-        self.assertEqual(proposal["identity_tags"], [])
+        self.assertIn("刻晴", proposal["identity_tags"])
         details = {item["tag"]: item for item in proposal["tag_details"]}
         self.assertEqual(details["人工标签"]["source"], "manual")
         folder_tag = proposal["folder_tags"][0]
@@ -1252,36 +1506,34 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
         self.assertEqual(details["Cosplay"]["source"], "model_field")
         self.assertEqual(details["Cosplay"]["risk"], "low")
         self.assertFalse(details["Cosplay"]["identity"])
-        self.assertEqual(details["刻晴"]["source"], "accepted_auto")
-        self.assertFalse(details["刻晴"]["identity"])
+        self.assertEqual(details["刻晴"]["source"], "model_entity")
+        self.assertTrue(details["刻晴"]["identity"])
         self.assertFalse(details["刻晴"]["requires_individual_confirmation"])
-        source_path.unlink()
-        refreshed = self.service.pending_auto_tags(limit=10)
-        stale = next(
-            item
-            for item in refreshed["proposals"]
-            if item["doc_id"] == proposal["doc_id"]
-        )
-        self.assertEqual(stale["source_path"], "")
 
     def test_pending_filters_latest_entities_fields_and_review_state(self):
         walking = FIELD_SPECS["action"].values[1]
         smiling = FIELD_SPECS["expression"].values[1]
-        FakeVisionClient.responses = {
-            FLASH_MODEL: [
-                annotation_payload(
-                    field_values={"action": (walking,), "expression": (smiling,)}
-                )
-            ]
-        }
         self.service.index_folder(str(self.root))
-        with patch(
-            "image_vector_service.annotation_service.DashScopeVisionTaggingClient",
-            FakeVisionClient,
-        ):
-            self.service.auto_tag_images(
-                scope="latest_index_run",
-                external_processing_confirmed=True,
+        first_structured = annotation_payload(
+            field_values={"action": (walking,), "expression": (smiling,)}
+        )
+        first_proposed = [
+            *first_structured["controlled_tags"],
+            *(
+                item["name"]
+                for entity_type in ("character", "work")
+                for item in first_structured["entities"][entity_type]
+            ),
+        ]
+        for entry in self.service.state.list_entries():
+            self.service.state.set_document_annotation(
+                doc_id=str(entry["doc_id"]),
+                source_sha256=str(entry["sha256"]),
+                cache_key="legacy-filter-old",
+                status="pending_review",
+                proposed_tags=first_proposed,
+                structured=first_structured,
+                policy={"policy_version": 2},
             )
 
         newest_folder = self.root / "newest"
@@ -1289,25 +1541,35 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
         Image.new("RGB", (25, 25), (10, 210, 90)).save(newest_folder / "new.png")
         running = FIELD_SPECS["action"].values[2]
         serious = FIELD_SPECS["expression"].values[3]
-        FakeVisionClient.responses = {
-            FLASH_MODEL: [
-                annotation_payload(
-                    field_values={"action": (running,), "expression": (serious,)},
-                    requires_review=True,
-                    review_reasons=("field:action:conflict",),
-                )
-            ]
-        }
+        newest_structured = annotation_payload(
+            field_values={"action": (running,), "expression": (serious,)},
+            requires_review=True,
+            review_reasons=("field:action:conflict",),
+        )
         indexed = self.service.index_folder(str(self.root))
         self.assertEqual(indexed.inserted, 1)
-        with patch(
-            "image_vector_service.annotation_service.DashScopeVisionTaggingClient",
-            FakeVisionClient,
-        ):
-            self.service.auto_tag_images(
-                scope="latest_index_run",
-                external_processing_confirmed=True,
-            )
+        newest_entry = next(
+            entry
+            for entry in self.service.state.list_entries()
+            if str(entry["relative_path"]).replace("\\", "/") == "newest/new.png"
+        )
+        newest_proposed = [
+            *newest_structured["controlled_tags"],
+            *(
+                item["name"]
+                for entity_type in ("character", "work")
+                for item in newest_structured["entities"][entity_type]
+            ),
+        ]
+        self.service.state.set_document_annotation(
+            doc_id=str(newest_entry["doc_id"]),
+            source_sha256=str(newest_entry["sha256"]),
+            cache_key="legacy-filter-new",
+            status="pending_review",
+            proposed_tags=newest_proposed,
+            structured=newest_structured,
+            policy={"policy_version": 2},
+        )
 
         latest = self.service.pending_auto_tags(
             limit=1,
@@ -1341,7 +1603,7 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
         )
         self.assertEqual(low_risk_only["pending_count"], 2)
 
-    def test_confirmed_identity_tags_are_auto_accepted_without_confirmation(self):
+    def test_all_valid_model_tags_are_auto_accepted_without_confirmation(self):
         self.service.index_folder(str(self.root))
         with patch(
             "image_vector_service.annotation_service.DashScopeVisionTaggingClient",
@@ -1354,18 +1616,48 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
         proposal = report["proposals"][0]
         entry = self.service.state.get(proposal["doc_id"])
         assert entry is not None
-        self.assertEqual(entry["accepted_auto_tags"], ["刻晴", "原神"])
-        self.assertEqual(proposal["identity_tags"], [])
-        accepted = self.service.review_auto_tags(
-            [
-                {
-                    "doc_id": proposal["doc_id"],
-                    "action": "accept",
-                    "tags": ["Cosplay"],
-                }
-            ]
+        self.assertEqual(
+            entry["accepted_auto_tags"],
+            ["Cosplay", "刻晴", "原神"],
         )
-        self.assertEqual(accepted["accepted"], 1)
+        self.assertIn("刻晴", proposal["identity_tags"])
+        self.assertEqual(proposal["proposed_tags"], [])
+        self.assertEqual(proposal["status"], "accepted")
+        self.assertEqual(report["pending_count"], 0)
+
+    def test_user_rejected_tag_is_not_automatically_reapproved(self):
+        self.service.index_folder(str(self.root))
+        target = self.service.state.list_entries()[0]
+        self.service.state.set_many([{**target, "accepted_auto_tags": ["Cosplay"]}])
+        target = self.service.state.get(str(target["doc_id"]))
+        assert target is not None
+        self.service.state.set_document_annotation(
+            doc_id=str(target["doc_id"]),
+            source_sha256=str(target["sha256"]),
+            cache_key="previous-rejection",
+            status="rejected",
+            rejected_tags=["Cosplay"],
+            policy={"policy_version": 2},
+        )
+
+        with patch(
+            "image_vector_service.annotation_service.DashScopeVisionTaggingClient",
+            FakeVisionClient,
+        ):
+            report = self.service.auto_tag_images(
+                scope="all",
+                external_processing_confirmed=True,
+            )
+
+        current = self.service.state.get(str(target["doc_id"]))
+        annotation = self.service.state.get_document_annotation(str(target["doc_id"]))
+        assert current is not None
+        assert annotation is not None
+        self.assertEqual(report["pending_count"], 0)
+        self.assertNotIn("Cosplay", current["accepted_auto_tags"])
+        self.assertIn("刻晴", current["accepted_auto_tags"])
+        self.assertEqual(annotation["rejected_tags"], ["Cosplay"])
+        self.assertEqual(annotation["policy"]["user_suppressed_tags"], ["Cosplay"])
 
     def test_legacy_pending_identities_reconcile_locally_and_idempotently(self):
         self.service.index_folder(str(self.root))
@@ -1404,7 +1696,8 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
         self.assertEqual(preview["eligible"], 2)
         self.assertEqual(preview["updated"], 0)
         self.assertEqual(preview["auto_accepted_documents"], 2)
-        self.assertEqual(preview["auto_accepted_identity_tags"], 3)
+        self.assertEqual(preview["auto_accepted_tags"], 7)
+        self.assertEqual(preview["auto_accepted_identity_tags"], 5)
         self.assertEqual(preview["conflict_documents"], 1)
         self.assertEqual(preview["conflict_identity_tags"], 2)
         self.assertEqual(preview["api_request_count"], 0)
@@ -1430,25 +1723,26 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
         assert conflict_entry is not None
         assert safe_annotation is not None
         assert conflict_annotation is not None
-        self.assertEqual(safe_entry["accepted_auto_tags"], ["刻晴", "原神"])
-        self.assertEqual(conflict_entry["accepted_auto_tags"], ["原神"])
-        self.assertEqual(safe_annotation["policy"]["policy_version"], 2)
-        self.assertTrue(safe_annotation["policy"]["identity_auto_accept_migrated"])
+        self.assertEqual(safe_entry["accepted_auto_tags"], ["Cosplay", "刻晴", "原神"])
         self.assertEqual(
-            set(conflict_annotation["proposed_tags"]),
-            {"Cosplay", "刻晴", "甘雨"},
+            set(conflict_entry["accepted_auto_tags"]),
+            {"Cosplay", "刻晴", "甘雨", "原神"},
         )
+        self.assertEqual(safe_annotation["policy"]["policy_version"], 3)
+        self.assertTrue(safe_annotation["policy"]["identity_auto_accept_migrated"])
+        self.assertEqual(conflict_annotation["proposed_tags"], [])
+        self.assertEqual(conflict_annotation["status"], "accepted")
         conflict_page = self.service.pending_auto_tags(
             filters={"review_state": "conflict"}
         )
-        self.assertEqual(conflict_page["pending_count"], 1)
+        self.assertEqual(conflict_page["pending_count"], 0)
 
         repeated = self.service.reconcile_pending_identity_tags()
         self.assertEqual(repeated["eligible"], 0)
         self.assertEqual(repeated["updated"], 0)
-        self.assertEqual(repeated["skipped_current_policy"], 2)
+        self.assertEqual(repeated["skipped_current_policy"], 0)
 
-    def test_conflicting_identity_remains_pending_and_accepts_one_choice(self):
+    def test_conflicting_identity_is_auto_accepted_and_kept_auditable(self):
         self.service.index_folder(str(self.root))
         FakeVisionClient.responses = {
             FLASH_MODEL: [annotation_payload(character="刻晴", plus_recommended=True)],
@@ -1464,37 +1758,19 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
             )
 
         proposal = report["proposals"][0]
-        self.assertEqual(set(proposal["identity_tags"]), {"刻晴", "甘雨"})
+        self.assertTrue({"刻晴", "甘雨"}.issubset(set(proposal["identity_tags"])))
         entry = self.service.state.get(proposal["doc_id"])
+        annotation = self.service.state.get_document_annotation(proposal["doc_id"])
         assert entry is not None
-        self.assertNotIn("刻晴", entry["accepted_auto_tags"])
-        self.assertNotIn("甘雨", entry["accepted_auto_tags"])
-
-        rejected = self.service.review_auto_tags(
-            [
-                {
-                    "doc_id": proposal["doc_id"],
-                    "action": "accept",
-                    "tags": ["Cosplay", "刻晴", "甘雨"],
-                    "confirmed_identity_tags": ["刻晴", "甘雨"],
-                }
-            ]
+        assert annotation is not None
+        self.assertIn("刻晴", entry["accepted_auto_tags"])
+        self.assertIn("甘雨", entry["accepted_auto_tags"])
+        self.assertEqual(annotation["status"], "accepted")
+        self.assertEqual(annotation["proposed_tags"], [])
+        self.assertIn(
+            "entity_conflict:character",
+            annotation["policy"]["review_reasons"],
         )
-        self.assertEqual(rejected["accepted"], 0)
-        self.assertEqual(rejected["failed"], 1)
-        self.assertIn("Only one conflicting identity", rejected["failures"][0]["error"])
-
-        accepted = self.service.review_auto_tags(
-            [
-                {
-                    "doc_id": proposal["doc_id"],
-                    "action": "accept",
-                    "tags": ["Cosplay", "刻晴"],
-                    "confirmed_identity_tags": ["刻晴"],
-                }
-            ]
-        )
-        self.assertEqual(accepted["accepted"], 1)
 
     def test_multiple_confirmed_characters_are_allowed_for_two_people(self):
         self.service.index_folder(str(self.root))
@@ -1525,41 +1801,132 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
 
         proposal = report["proposals"][0]
         identity_tags = ["飞鸟马时", "调月莉音"]
-        self.assertEqual(set(proposal["identity_tags"]), set(identity_tags))
-
-        accepted = self.service.review_auto_tags(
-            [
-                {
-                    "doc_id": proposal["doc_id"],
-                    "action": "accept",
-                    "tags": [*proposal["low_risk_tags"], *identity_tags],
-                    "confirmed_identity_tags": identity_tags,
-                }
-            ]
-        )
-
-        self.assertEqual(accepted["accepted"], 1)
-        self.assertEqual(accepted["failed"], 0)
+        self.assertTrue(set(identity_tags).issubset(set(proposal["identity_tags"])))
         entry = self.service.state.get(proposal["doc_id"])
         assert entry is not None
         self.assertTrue(set(identity_tags).issubset(entry["accepted_auto_tags"]))
+        self.assertEqual(report["pending_count"], 0)
 
-    def test_batch_accepts_one_hundred_low_risk_items_and_undoes_once(self):
+    def test_recommended_batch_accepts_non_conflicting_identity_and_undoes(self):
+        self.service.index_folder(str(self.root))
+        entry = self.service.state.list_entries()[0]
+        structured = annotation_payload(
+            character_state="suggested",
+            character_confidence=0.74,
+            work=None,
+        )
+        self.service.state.set_document_annotation(
+            doc_id=str(entry["doc_id"]),
+            source_sha256=str(entry["sha256"]),
+            cache_key="batch-recommended",
+            status="pending_review",
+            proposed_tags=["Cosplay", "刻晴"],
+            structured=structured,
+            policy={"policy_version": 2},
+        )
+        proposal = self.service.pending_auto_tags(limit=10)["proposals"][0]
+        self.assertEqual(proposal["identity_tags"], ["刻晴"])
+        calls_before_review = FakeVisionClient.calls
+        reviewed = self.service.review_auto_tags_batch(
+            proposal_ids=[proposal["doc_id"]],
+            accepted_tags_by_proposal={
+                proposal["doc_id"]: ["Cosplay", "刻晴"],
+            },
+            exclude_identity_tags=False,
+            acceptance_mode="recommended",
+            batch_confirmation=True,
+        )
+
+        self.assertEqual(FakeVisionClient.calls, calls_before_review)
+        self.assertEqual(reviewed["accepted_identity_count"], 1)
+        self.assertEqual(reviewed["identity_excluded_count"], 0)
+        self.assertTrue(reviewed["undo_available"])
+        entry = self.service.state.get(proposal["doc_id"])
+        assert entry is not None
+        self.assertIn("Cosplay", entry["accepted_auto_tags"])
+        self.assertIn("刻晴", entry["accepted_auto_tags"])
+
+        undone = self.service.undo_latest_auto_tag_review_batch()
+        self.assertTrue(undone["undone"])
+        restored = self.service.state.get(proposal["doc_id"])
+        assert restored is not None
+        self.assertNotIn("Cosplay", restored["accepted_auto_tags"])
+        self.assertNotIn("刻晴", restored["accepted_auto_tags"])
+
+    def test_recommended_batch_skips_conflicting_identity_from_client(self):
+        self.service.index_folder(str(self.root))
+        structured = annotation_payload(
+            character=None,
+            work=None,
+            requires_review=True,
+            review_reasons=("entity:character:conflict",),
+        )
+        structured["entities"]["character"] = [
+            {
+                "name": "刻晴",
+                "state": "conflict",
+                "evidence": ["visual"],
+                "evidence_text": "",
+                "confidence": 0.91,
+            },
+            {
+                "name": "甘雨",
+                "state": "conflict",
+                "evidence": ["visual"],
+                "evidence_text": "",
+                "confidence": 0.89,
+            },
+        ]
+        entry = self.service.state.list_entries()[0]
+        self.service.state.set_document_annotation(
+            doc_id=str(entry["doc_id"]),
+            source_sha256=str(entry["sha256"]),
+            cache_key="batch-conflict",
+            status="pending_review",
+            proposed_tags=["Cosplay", "刻晴", "甘雨"],
+            structured=structured,
+            policy={"policy_version": 2},
+        )
+
+        reviewed = self.service.review_auto_tags_batch(
+            proposal_ids=[str(entry["doc_id"])],
+            accepted_tags_by_proposal={
+                str(entry["doc_id"]): ["Cosplay", "刻晴", "甘雨"],
+            },
+            exclude_identity_tags=False,
+            acceptance_mode="recommended",
+            batch_confirmation=True,
+        )
+
+        self.assertEqual(reviewed["accepted_identity_count"], 0)
+        self.assertEqual(reviewed["identity_excluded_count"], 2)
+        current = self.service.state.get(str(entry["doc_id"]))
+        annotation = self.service.state.get_document_annotation(str(entry["doc_id"]))
+        assert current is not None
+        assert annotation is not None
+        self.assertIn("Cosplay", current["accepted_auto_tags"])
+        self.assertNotIn("刻晴", current["accepted_auto_tags"])
+        self.assertNotIn("甘雨", current["accepted_auto_tags"])
+        self.assertEqual(set(annotation["proposed_tags"]), {"刻晴", "甘雨"})
+
+    def test_legacy_batch_accepts_one_hundred_items_and_undoes_once(self):
         source = self.root / "set-a" / "image.png"
         for index in range(98):
             shutil.copy2(source, self.root / "set-a" / f"batch-{index:03}.png")
         indexed = self.service.index_folder(str(self.root))
         self.assertEqual(indexed.inserted, 100)
-        with patch(
-            "image_vector_service.annotation_service.DashScopeVisionTaggingClient",
-            FakeVisionClient,
-        ):
-            self.service.auto_tag_images(
-                scope="latest_index_run",
-                max_images=100,
-                external_processing_confirmed=True,
+        structured = annotation_payload(character=None, work=None)
+        for entry in self.service.state.list_entries():
+            self.service.state.set_document_annotation(
+                doc_id=str(entry["doc_id"]),
+                source_sha256=str(entry["sha256"]),
+                cache_key="legacy-batch",
+                status="pending_review",
+                proposed_tags=["Cosplay"],
+                structured=structured,
+                policy={"policy_version": 2},
             )
-        self.assertEqual(FakeVisionClient.calls, 1)
+        self.assertEqual(FakeVisionClient.calls, 0)
         proposals = self.service.pending_auto_tags(limit=100)["proposals"]
         proposal_ids = [proposal["doc_id"] for proposal in proposals]
         accepted_by_id = {proposal["doc_id"]: ["Cosplay"] for proposal in proposals}
@@ -1580,10 +1947,7 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
             annotation = self.service.state.get_document_annotation(doc_id)
             assert entry is not None
             assert annotation is not None
-            self.assertEqual(
-                entry["accepted_auto_tags"],
-                ["刻晴", "原神", "Cosplay"],
-            )
+            self.assertEqual(entry["accepted_auto_tags"], ["Cosplay"])
             self.assertEqual(annotation["status"], "accepted")
             self.assertNotIn("Cosplay", annotation["proposed_tags"])
 
@@ -1603,7 +1967,7 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
             annotation = self.service.state.get_document_annotation(doc_id)
             assert entry is not None
             assert annotation is not None
-            self.assertEqual(entry["accepted_auto_tags"], ["刻晴", "原神"])
+            self.assertEqual(entry["accepted_auto_tags"], [])
             self.assertIn("Cosplay", annotation["proposed_tags"])
         repeated = self.service.undo_latest_auto_tag_review_batch()
         self.assertFalse(repeated["undone"])
@@ -1613,13 +1977,16 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
 
     def test_batch_failure_restores_repository_and_state(self):
         self.service.index_folder(str(self.root))
-        with patch(
-            "image_vector_service.annotation_service.DashScopeVisionTaggingClient",
-            FakeVisionClient,
-        ):
-            self.service.auto_tag_images(
-                scope="latest_index_run",
-                external_processing_confirmed=True,
+        structured = annotation_payload(character=None, work=None)
+        for entry in self.service.state.list_entries():
+            self.service.state.set_document_annotation(
+                doc_id=str(entry["doc_id"]),
+                source_sha256=str(entry["sha256"]),
+                cache_key="legacy-batch-failure",
+                status="pending_review",
+                proposed_tags=["Cosplay"],
+                structured=structured,
+                policy={"policy_version": 2},
             )
         proposals = self.service.pending_auto_tags(limit=10)["proposals"]
         original_upsert = self.service.repository.upsert_records
@@ -1653,7 +2020,7 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
             annotation = self.service.state.get_document_annotation(proposal["doc_id"])
             assert entry is not None
             assert annotation is not None
-            self.assertEqual(entry["accepted_auto_tags"], ["刻晴", "原神"])
+            self.assertEqual(entry["accepted_auto_tags"], [])
             self.assertEqual(annotation["status"], "pending_review")
             self.assertIn("Cosplay", annotation["proposed_tags"])
         latest = self.service.state.latest_auto_tag_review_batch()

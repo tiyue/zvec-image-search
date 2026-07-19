@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 import math
 import os
+import stat
+import threading
+from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from concurrent.futures import CancelledError
 from dataclasses import dataclass
@@ -15,6 +18,8 @@ DEFAULT_PAGE_SIZE = 15
 MAX_PAGE_SIZE = 500
 MAX_CONFIG_BYTES = 2 * 1024 * 1024
 MAX_MANIFEST_BYTES = 32 * 1024 * 1024
+DEFAULT_MANIFEST_CACHE_ENTRIES = 8
+DEFAULT_MANIFEST_CACHE_RESULTS = 100_000
 IMAGE_SUFFIXES = frozenset(
     {
         ".avif",
@@ -73,9 +78,19 @@ class SearchResult:
     library_name: str
     tags: tuple[str, ...] = ()
     matched_tags: tuple[str, ...] = ()
+    raw_score: float = 0.0
+    normalized_score: float = 0.0
     confidence: float = 0.0
+    ranking_confidence: float | None = None
     match_state: str = "weak"
     rank_source: str = "folder"
+    image_confidence: float | None = None
+    text_confidence: float | None = None
+    metadata_confidence: float | None = None
+    image_rank: int | None = None
+    text_rank: int | None = None
+    metadata_rank: int | None = None
+    rank_agreement: float | None = None
     library_id: str = ""
     doc_id: str = ""
 
@@ -95,6 +110,8 @@ class SearchResultPage:
     source_folder: Path | None = None
     query_type: str = "folder"
     status: str = "ok"
+    sort_mode: str = "legacy"
+    ranking_diagnostics: dict[str, Any] | None = None
 
     @property
     def has_previous(self) -> bool:
@@ -105,14 +122,62 @@ class SearchResultPage:
         return self.page < self.total_pages
 
 
+@dataclass(frozen=True, slots=True)
+class _FileVersion:
+    mtime_ns: int
+    size: int
+
+
+@dataclass(frozen=True, slots=True)
+class _ManifestSnapshot:
+    path: Path
+    version: _FileVersion
+    results: tuple[SearchResult, ...]
+    raw_result_count: int
+    source_label: str
+    query_type: str
+    status: str
+    sort_mode: str
+    ranking_diagnostics: dict[str, Any]
+    created_timestamp: float
+
+
+@dataclass(frozen=True, slots=True)
+class _LatestDiscovery:
+    root_version: _FileVersion
+    directory_versions: tuple[tuple[Path, _FileVersion], ...]
+    manifest_versions: tuple[tuple[Path, _FileVersion], ...]
+    selected_path: Path
+
+
 class ResultCatalog:
     """Read-only adapter between existing result files and the Python UI."""
 
-    def __init__(self, config: CatalogConfig) -> None:
+    def __init__(
+        self,
+        config: CatalogConfig,
+        *,
+        manifest_cache_entries: int = DEFAULT_MANIFEST_CACHE_ENTRIES,
+        manifest_cache_results: int = DEFAULT_MANIFEST_CACHE_RESULTS,
+    ) -> None:
+        if isinstance(manifest_cache_entries, bool) or manifest_cache_entries < 1:
+            raise ValueError("manifest_cache_entries must be positive")
+        if isinstance(manifest_cache_results, bool) or manifest_cache_results < 1:
+            raise ValueError("manifest_cache_results must be positive")
         self.config = config
+        self._libraries_by_id = config.libraries_by_id
         # Folder browsing may contain hundreds of thousands of images. Keep one
         # sorted path snapshot so changing gallery pages does not rescan the tree.
         self._folder_cache: dict[Path, tuple[Path, ...]] = {}
+        self._manifest_cache_entries = manifest_cache_entries
+        self._manifest_cache_results_limit = manifest_cache_results
+        self._manifest_cache_results = 0
+        self._manifest_cache: OrderedDict[Path, _ManifestSnapshot] = OrderedDict()
+        self._cache_condition = threading.Condition(threading.RLock())
+        self._manifest_loading: set[Path] = set()
+        self._latest_loading = False
+        self._latest_discovery: _LatestDiscovery | None = None
+        self._cache_generation = 0
 
     @property
     def results_directory(self) -> Path:
@@ -197,10 +262,18 @@ class ResultCatalog:
         """Load the newest valid immediate-child ``results.json`` manifest."""
 
         page, page_size = _validate_pagination(page, page_size)
-        manifest_path, payload = self._latest_manifest()
-        return self._page_from_manifest(
-            manifest_path, payload, page=page, page_size=page_size
-        )
+        snapshot = self._latest_snapshot()
+        snapshot = self._refresh_snapshot_for_page(snapshot, page, page_size)
+        if (
+            snapshot.raw_result_count
+            and len(snapshot.results) != snapshot.raw_result_count
+        ):
+            # The selected search became incomplete without changing its
+            # manifest (for example, an exported image was deleted). Rediscover
+            # so an older complete search can be shown instead.
+            self.clear_manifest_cache(snapshot.path)
+            snapshot = self._latest_snapshot()
+        return self._page_from_snapshot(snapshot, page=page, page_size=page_size)
 
     def load_manifest(
         self,
@@ -211,6 +284,12 @@ class ResultCatalog:
         """Load one explicit result manifest below the configured results root."""
 
         page, page_size = _validate_pagination(page, page_size)
+        resolved = self._resolve_manifest_path(manifest_path)
+        snapshot = self._manifest_snapshot(resolved)
+        snapshot = self._refresh_snapshot_for_page(snapshot, page, page_size)
+        return self._page_from_snapshot(snapshot, page=page, page_size=page_size)
+
+    def _resolve_manifest_path(self, manifest_path: str | Path) -> Path:
         requested = Path(manifest_path).expanduser()
         if requested.name.casefold() != "results.json":
             raise ResultCatalogError("A result manifest must be named results.json.")
@@ -234,21 +313,14 @@ class ResultCatalog:
             raise ResultCatalogError(
                 f"Result manifest directory must not be a link: {resolved.parent}"
             )
-        payload = _read_json_object(
-            resolved, label="search result manifest", limit=MAX_MANIFEST_BYTES
-        )
-        return self._page_from_manifest(
-            resolved, payload, page=page, page_size=page_size
-        )
+        return resolved
 
-    def _page_from_manifest(
+    def _snapshot_from_payload(
         self,
         manifest_path: Path,
+        version: _FileVersion,
         payload: Mapping[str, Any],
-        *,
-        page: int,
-        page_size: int,
-    ) -> SearchResultPage:
+    ) -> _ManifestSnapshot:
         raw_results = payload.get("results")
         if not isinstance(raw_results, list):
             raise ResultCatalogError(
@@ -270,14 +342,42 @@ class ResultCatalog:
             if result is not None:
                 results.append(result)
 
-        return _page_of(
-            results,
-            page=page,
-            page_size=page_size,
-            manifest_path=manifest_path,
+        return _ManifestSnapshot(
+            path=manifest_path,
+            version=version,
+            results=tuple(results),
+            raw_result_count=len(raw_results),
             source_label=manifest_path.parent.name,
             query_type=_optional_text(payload.get("query_type"), "unknown"),
             status=_optional_text(payload.get("status"), "ok"),
+            sort_mode=_optional_text(payload.get("sort_mode"), "legacy"),
+            ranking_diagnostics=(
+                dict(payload["ranking_diagnostics"])
+                if isinstance(payload.get("ranking_diagnostics"), Mapping)
+                else {}
+            ),
+            created_timestamp=_created_timestamp(payload.get("created_at")),
+        )
+
+    def _page_from_snapshot(
+        self,
+        snapshot: _ManifestSnapshot,
+        *,
+        page: int,
+        page_size: int,
+    ) -> SearchResultPage:
+        start = (page - 1) * page_size
+        return _page_of_slice(
+            list(snapshot.results[start : start + page_size]),
+            total_items=len(snapshot.results),
+            page=page,
+            page_size=page_size,
+            manifest_path=snapshot.path,
+            source_label=snapshot.source_label,
+            query_type=snapshot.query_type,
+            status=snapshot.status,
+            sort_mode=snapshot.sort_mode,
+            ranking_diagnostics=snapshot.ranking_diagnostics,
         )
 
     def from_folder(
@@ -340,12 +440,156 @@ class ResultCatalog:
             return
         self._folder_cache.pop(Path(folder).expanduser().resolve(), None)
 
-    def _latest_manifest(self) -> tuple[Path, dict[str, Any]]:
+    def clear_manifest_cache(self, manifest_path: str | Path | None = None) -> None:
+        """Clear parsed manifests and invalidate latest-result discovery."""
+
+        resolved = (
+            None
+            if manifest_path is None
+            else Path(manifest_path).expanduser().resolve(strict=False)
+        )
+        with self._cache_condition:
+            self._cache_generation += 1
+            self._latest_discovery = None
+            if resolved is None:
+                self._manifest_cache.clear()
+                self._manifest_cache_results = 0
+            else:
+                self._discard_manifest_locked(resolved)
+            self._cache_condition.notify_all()
+
+    def _manifest_snapshot(self, manifest_path: Path) -> _ManifestSnapshot:
+        unstable_reads = 0
+        while unstable_reads < 3:
+            try:
+                version = _file_version(manifest_path, require_file=True)
+            except ResultCatalogError:
+                with self._cache_condition:
+                    self._discard_manifest_locked(manifest_path)
+                raise
+
+            with self._cache_condition:
+                cached = self._manifest_cache.get(manifest_path)
+                if cached is not None and cached.version == version:
+                    self._manifest_cache.move_to_end(manifest_path)
+                    return cached
+                if cached is not None:
+                    self._discard_manifest_locked(manifest_path)
+                if manifest_path in self._manifest_loading:
+                    self._cache_condition.wait()
+                    continue
+                self._manifest_loading.add(manifest_path)
+                generation = self._cache_generation
+
+            try:
+                payload = _read_json_object(
+                    manifest_path,
+                    label="search result manifest",
+                    limit=MAX_MANIFEST_BYTES,
+                )
+                snapshot = self._snapshot_from_payload(manifest_path, version, payload)
+                after = _file_version(manifest_path, require_file=True)
+            except Exception:
+                with self._cache_condition:
+                    self._manifest_loading.discard(manifest_path)
+                    self._cache_condition.notify_all()
+                raise
+
+            stable = after == version
+            with self._cache_condition:
+                self._manifest_loading.discard(manifest_path)
+                if stable and generation == self._cache_generation:
+                    self._cache_manifest_locked(snapshot)
+                self._cache_condition.notify_all()
+            if stable:
+                return snapshot
+            unstable_reads += 1
+
+        raise ResultCatalogError(
+            f"Result manifest changed repeatedly while being read: {manifest_path}"
+        )
+
+    def _cache_manifest_locked(self, snapshot: _ManifestSnapshot) -> None:
+        self._discard_manifest_locked(snapshot.path)
+        result_count = len(snapshot.results)
+        if result_count > self._manifest_cache_results_limit:
+            return
+        while self._manifest_cache and (
+            len(self._manifest_cache) >= self._manifest_cache_entries
+            or self._manifest_cache_results + result_count
+            > self._manifest_cache_results_limit
+        ):
+            _path, evicted = self._manifest_cache.popitem(last=False)
+            self._manifest_cache_results -= len(evicted.results)
+        self._manifest_cache[snapshot.path] = snapshot
+        self._manifest_cache_results += result_count
+
+    def _discard_manifest_locked(self, manifest_path: Path) -> None:
+        cached = self._manifest_cache.pop(manifest_path, None)
+        if cached is not None:
+            self._manifest_cache_results -= len(cached.results)
+
+    def _refresh_snapshot_for_page(
+        self,
+        snapshot: _ManifestSnapshot,
+        page: int,
+        page_size: int,
+    ) -> _ManifestSnapshot:
+        start = (page - 1) * page_size
+        page_items = snapshot.results[start : start + page_size]
+        if all(_result_path_is_current(item) for item in page_items):
+            return snapshot
+        # Result files are external to results.json and can be removed without
+        # changing the manifest fingerprint. Reparse once so original/copy
+        # fallback and total counts remain correct.
+        self.clear_manifest_cache(snapshot.path)
+        return self._manifest_snapshot(snapshot.path)
+
+    def _latest_snapshot(self) -> _ManifestSnapshot:
+        while True:
+            with self._cache_condition:
+                discovery = self._latest_discovery
+            if discovery is not None and self._latest_discovery_is_current(discovery):
+                try:
+                    return self._manifest_snapshot(discovery.selected_path)
+                except ResultCatalogError:
+                    self.clear_manifest_cache(discovery.selected_path)
+
+            with self._cache_condition:
+                if self._latest_loading:
+                    self._cache_condition.wait()
+                    continue
+                self._latest_loading = True
+                generation = self._cache_generation
+
+            try:
+                discovered, snapshot, cacheable = self._discover_latest()
+                stable = self._latest_discovery_is_current(discovered)
+            except Exception:
+                with self._cache_condition:
+                    self._latest_loading = False
+                    self._cache_condition.notify_all()
+                raise
+
+            with self._cache_condition:
+                self._latest_loading = False
+                if stable and cacheable and generation == self._cache_generation:
+                    self._latest_discovery = discovered
+                self._cache_condition.notify_all()
+            if stable:
+                return snapshot
+
+    def _discover_latest(
+        self,
+    ) -> tuple[_LatestDiscovery, _ManifestSnapshot, bool]:
         root = self.results_directory
         if not root.is_dir():
             raise ResultCatalogError(f"Results directory does not exist: {root}")
 
-        candidates: list[tuple[float, int, str, Path, dict[str, Any]]] = []
+        root_version = _file_version(root, require_file=False)
+        candidates: list[tuple[float, int, str, _ManifestSnapshot]] = []
+        directory_versions: list[tuple[Path, _FileVersion]] = []
+        manifest_versions: list[tuple[Path, _FileVersion]] = []
         errors: list[str] = []
         try:
             directories = list(root.iterdir())
@@ -357,29 +601,41 @@ class ResultCatalog:
         for directory in directories:
             if not directory.is_dir() or _is_link_like(directory):
                 continue
+            try:
+                directory_versions.append(
+                    (directory, _file_version(directory, require_file=False))
+                )
+            except ResultCatalogError as exc:
+                errors.append(str(exc))
+                continue
             manifest_path = directory / "results.json"
             if not manifest_path.is_file() or _is_link_like(manifest_path):
                 continue
             try:
-                payload = _read_json_object(
-                    manifest_path,
-                    label="search result manifest",
-                    limit=MAX_MANIFEST_BYTES,
-                )
-                modified_ns = manifest_path.stat().st_mtime_ns
-            except (OSError, ResultCatalogError) as exc:
+                manifest_version = _file_version(manifest_path, require_file=True)
+                manifest_versions.append((manifest_path, manifest_version))
+                snapshot = self._manifest_snapshot(manifest_path)
+                if (
+                    snapshot.raw_result_count
+                    and len(snapshot.results) != snapshot.raw_result_count
+                ):
+                    with self._cache_condition:
+                        self._discard_manifest_locked(manifest_path)
+                    raise ResultCatalogError(
+                        f"Manifest references unavailable result images: "
+                        f"{manifest_path}"
+                    )
+            except ResultCatalogError as exc:
                 # A partially written/corrupt directory must not hide the last
                 # complete search result from the gallery.
                 errors.append(str(exc))
                 continue
-            created_timestamp = _created_timestamp(payload.get("created_at"))
             candidates.append(
                 (
-                    created_timestamp,
-                    modified_ns,
+                    snapshot.created_timestamp,
+                    manifest_version.mtime_ns,
                     directory.name.casefold(),
-                    manifest_path,
-                    payload,
+                    snapshot,
                 )
             )
 
@@ -389,47 +645,30 @@ class ResultCatalog:
                 f"No valid results.json was found below {root}.{detail}"
             )
         candidates.sort(key=lambda item: item[:3], reverse=True)
-        for _created, _modified, _name, manifest_path, payload in candidates:
-            try:
-                raw_results = payload.get("results")
-                if not isinstance(raw_results, list):
-                    raise ResultCatalogError(
-                        f"Manifest results must be an array: {manifest_path}"
-                    )
-                displayable = 0
-                for index, raw_result in enumerate(raw_results):
-                    if not isinstance(raw_result, Mapping):
-                        raise ResultCatalogError(
-                            f"Manifest results[{index}] must be an object: "
-                            f"{manifest_path}"
-                        )
-                    if (
-                        self._manifest_result(
-                            raw_result,
-                            index=index,
-                            manifest_path=manifest_path,
-                            manifest=payload,
-                        )
-                        is not None
-                    ):
-                        displayable += 1
-                if raw_results and displayable != len(raw_results):
-                    raise ResultCatalogError(
-                        f"Manifest references unavailable result images: "
-                        f"{manifest_path}"
-                    )
-            except ResultCatalogError as exc:
-                # A valid JSON object can still be an incomplete manifest while
-                # an exporter is writing it. Fall back to the newest complete
-                # search instead of blanking the gallery.
-                errors.append(str(exc))
-                continue
-            return manifest_path, payload
-
-        detail = f" Last error: {errors[-1]}" if errors else ""
-        raise ResultCatalogError(
-            f"No complete results.json was found below {root}.{detail}"
+        selected = candidates[0][3]
+        discovery = _LatestDiscovery(
+            root_version=root_version,
+            directory_versions=tuple(directory_versions),
+            manifest_versions=tuple(manifest_versions),
+            selected_path=selected.path,
         )
+        # Do not negative-cache discovery while any candidate is incomplete or
+        # malformed. An unchanged manifest can become displayable when its
+        # exported image arrives moments later.
+        return discovery, selected, not errors
+
+    def _latest_discovery_is_current(self, discovery: _LatestDiscovery) -> bool:
+        if _file_version_or_none(self.results_directory, require_file=False) != (
+            discovery.root_version
+        ):
+            return False
+        for path, version in discovery.directory_versions:
+            if _file_version_or_none(path, require_file=False) != version:
+                return False
+        for path, version in discovery.manifest_versions:
+            if _file_version_or_none(path, require_file=True) != version:
+                return False
+        return True
 
     def _manifest_result(
         self,
@@ -472,6 +711,14 @@ class ResultCatalog:
         rank = raw.get("rank", index + 1)
         if isinstance(rank, bool) or not isinstance(rank, int) or rank < 1:
             raise ResultCatalogError(f"{label}.rank must be a positive integer.")
+        raw_score = _finite_number(
+            raw.get("raw_score", raw.get("distance", 0.0)),
+            f"{label}.raw_score",
+        )
+        normalized_score = _finite_number(
+            raw.get("normalized_score", raw.get("confidence", 0.0)),
+            f"{label}.normalized_score",
+        )
         confidence = _finite_number(raw.get("confidence", 0.0), f"{label}.confidence")
         return SearchResult(
             display_path=display_path,
@@ -487,9 +734,35 @@ class ResultCatalog:
             matched_tags=_string_tuple(
                 raw.get("matched_tags"), f"{label}.matched_tags"
             ),
+            raw_score=raw_score,
+            normalized_score=normalized_score,
             confidence=confidence,
+            ranking_confidence=_optional_finite_number(
+                raw.get("ranking_confidence"), f"{label}.ranking_confidence"
+            ),
             match_state=_optional_text(raw.get("match_state"), "weak"),
             rank_source=_optional_text(raw.get("rank_source"), "unknown"),
+            image_confidence=_optional_finite_number(
+                raw.get("image_confidence"), f"{label}.image_confidence"
+            ),
+            text_confidence=_optional_finite_number(
+                raw.get("text_confidence"), f"{label}.text_confidence"
+            ),
+            metadata_confidence=_optional_finite_number(
+                raw.get("metadata_confidence"), f"{label}.metadata_confidence"
+            ),
+            image_rank=_optional_positive_integer(
+                raw.get("image_rank"), f"{label}.image_rank"
+            ),
+            text_rank=_optional_positive_integer(
+                raw.get("text_rank"), f"{label}.text_rank"
+            ),
+            metadata_rank=_optional_positive_integer(
+                raw.get("metadata_rank"), f"{label}.metadata_rank"
+            ),
+            rank_agreement=_optional_finite_number(
+                raw.get("rank_agreement"), f"{label}.rank_agreement"
+            ),
             library_id=(library.library_id if library else ""),
             doc_id=_optional_text(raw.get("doc_id"), ""),
         )
@@ -497,7 +770,7 @@ class ResultCatalog:
     def _result_library(
         self, raw: Mapping[str, Any], manifest: Mapping[str, Any]
     ) -> LibraryRecord | None:
-        by_id = self.config.libraries_by_id
+        by_id = self._libraries_by_id
         raw_id = raw.get("library_id")
         if isinstance(raw_id, str) and raw_id.strip():
             return by_id.get(raw_id.strip())
@@ -554,6 +827,37 @@ def _read_json_object(path: Path, *, label: str, limit: int) -> dict[str, Any]:
     return payload
 
 
+def _file_version(path: Path, *, require_file: bool) -> _FileVersion:
+    try:
+        metadata = path.stat()
+    except OSError as exc:
+        raise ResultCatalogError(f"Result path does not exist: {path}") from exc
+    if require_file and not stat.S_ISREG(metadata.st_mode):
+        raise ResultCatalogError(f"Result manifest is not a file: {path}")
+    if not require_file and not stat.S_ISDIR(metadata.st_mode):
+        raise ResultCatalogError(f"Results path is not a directory: {path}")
+    return _FileVersion(metadata.st_mtime_ns, metadata.st_size)
+
+
+def _file_version_or_none(path: Path, *, require_file: bool) -> _FileVersion | None:
+    try:
+        return _file_version(path, require_file=require_file)
+    except ResultCatalogError:
+        return None
+
+
+def _result_path_is_current(result: SearchResult) -> bool:
+    path = result.display_path
+    try:
+        return (
+            path.is_file()
+            and not _is_link_like(path)
+            and path.resolve(strict=True) == path
+        )
+    except OSError:
+        return False
+
+
 def _absolute_path(value: Any, label: str) -> Path:
     if not isinstance(value, str) or not value.strip():
         raise ResultCatalogError(f"{label} must be a non-empty absolute path.")
@@ -594,6 +898,20 @@ def _finite_number(value: Any, label: str) -> float:
     if not math.isfinite(number):
         raise ResultCatalogError(f"{label} must be a finite number.")
     return number
+
+
+def _optional_finite_number(value: Any, label: str) -> float | None:
+    if value is None:
+        return None
+    return _finite_number(value, label)
+
+
+def _optional_positive_integer(value: Any, label: str) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ResultCatalogError(f"{label} must be a positive integer.")
+    return value
 
 
 def _safe_relative_path(
@@ -680,6 +998,8 @@ def _page_of_slice(
     source_label: str,
     query_type: str,
     status: str,
+    sort_mode: str = "legacy",
+    ranking_diagnostics: dict[str, Any] | None = None,
 ) -> SearchResultPage:
     """Create page metadata for an already sliced result sequence."""
 
@@ -700,6 +1020,8 @@ def _page_of_slice(
         source_folder=source_folder,
         query_type=query_type,
         status=status,
+        sort_mode=sort_mode,
+        ranking_diagnostics=ranking_diagnostics,
     )
 
 

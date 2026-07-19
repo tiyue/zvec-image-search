@@ -1,4 +1,9 @@
-"""Build-plan and payload validation helpers for the Python desktop preview."""
+"""Build-plan and payload validation helpers for the pure-Python desktop.
+
+The module name is retained temporarily for source compatibility with the
+preview branch.  All generated artifacts use the primary ``Zvec Desktop``
+identity and are suitable for the default CI/release path.
+"""
 
 from __future__ import annotations
 
@@ -17,9 +22,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final
 
-PRODUCT_DIRECTORY: Final = "Zvec-Python-Preview"
-MANIFEST_FILE: Final = "python-preview-manifest.json"
-MANIFEST_SCHEMA_VERSION: Final = 1
+PRODUCT_NAME: Final = "Zvec Desktop"
+PRODUCT_DIRECTORY: Final = "Zvec-Desktop"
+MANIFEST_FILE: Final = "desktop-payload-manifest.json"
+MANIFEST_SCHEMA_VERSION: Final = 2
 TARGET_RUNTIME: Final = "win-x64"
 TARGET_PYTHON: Final = "CPython 3.12"
 PYINSTALLER_VERSION: Final = "6.16.0"
@@ -54,18 +60,39 @@ _DOTNET_RUNTIME_FILES = frozenset(
 _FORBIDDEN_SOURCE_SUFFIXES = frozenset(
     {".cs", ".csproj", ".ps1", ".psd1", ".psm1", ".sln", ".xaml"}
 )
+_FORBIDDEN_EXTERNAL_RUNTIME_FILES = frozenset(
+    {
+        "compose.yaml",
+        "compose.yml",
+        "docker-compose.yaml",
+        "docker-compose.yml",
+        "docker.exe",
+        "dockerfile",
+        "dotnet.exe",
+        "powershell.exe",
+        "pwsh.exe",
+    }
+)
+_FORBIDDEN_CONTAINER_FILE_PREFIXES = ("compose.", "docker-compose.", "dockerfile.")
 
 
 class PreviewPackagingError(RuntimeError):
-    """Raised when a preview build or its payload violates the release contract."""
+    """Raised when a desktop build or its payload violates the release contract."""
+
+
+# Public migration alias.  New code should use the product-neutral name while
+# old callers can keep importing PreviewPackagingError until the legacy files
+# are removed in a later cleanup release.
+DesktopPackagingError = PreviewPackagingError
 
 
 @dataclass(frozen=True, slots=True)
 class BuildPlan:
-    """Resolved, side-effect-free description of one preview build."""
+    """Resolved, side-effect-free description of one desktop build."""
 
     repository_root: Path
     version: str
+    signing_status: str
     spec_path: Path
     icon_path: Path
     nsis_path: Path
@@ -80,8 +107,9 @@ class BuildPlan:
     def to_dict(self) -> dict[str, Any]:
         return {
             "schema_version": 1,
-            "product": "Zvec Desktop Python Preview",
+            "product": PRODUCT_NAME,
             "version": self.version,
+            "signing_status": self.signing_status,
             "target_runtime": TARGET_RUNTIME,
             "target_python": TARGET_PYTHON,
             "repository_root": str(self.repository_root),
@@ -167,29 +195,35 @@ def create_build_plan(
     output_root: Path | None = None,
     work_directory: Path | None = None,
     makensis: Path | None = None,
+    signing_status: str = "unsigned",
 ) -> BuildPlan:
     resolved_root = (root or repository_root()).resolve()
+    if signing_status not in {"unsigned", "authenticode"}:
+        raise PreviewPackagingError(
+            "signing_status must be 'unsigned' or 'authenticode'"
+        )
     version = read_project_version(resolved_root)
     resolved_output = (
         output_root.resolve()
         if output_root is not None
-        else resolved_root / "dist" / "python-preview" / version / TARGET_RUNTIME
+        else resolved_root / "dist" / "desktop" / version / TARGET_RUNTIME
     )
     work_root = (
         work_directory.resolve()
         if work_directory is not None
-        else resolved_root / "build" / "python-preview"
+        else resolved_root / "build" / "python-desktop"
     )
     resolved_work = work_root / TARGET_RUNTIME
     spec_path = (
         resolved_root / "release" / "python_preview" / ("zvec_python_preview.spec")
     )
     payload_directory = resolved_output / PRODUCT_DIRECTORY
+    installer_qualifier = "" if signing_status == "authenticode" else "-unsigned"
     installer_output = resolved_output / (
-        f"Zvec-Desktop-Python-Preview-{version}-{TARGET_RUNTIME}-unsigned-setup.exe"
+        f"Zvec-Desktop-{version}-{TARGET_RUNTIME}{installer_qualifier}-setup.exe"
     )
     portable_output = resolved_output / (
-        f"Zvec-Desktop-Python-Preview-{version}-{TARGET_RUNTIME}-portable.zip"
+        f"Zvec-Desktop-{version}-{TARGET_RUNTIME}-portable.zip"
     )
     pyinstaller_command = (
         sys.executable,
@@ -212,18 +246,17 @@ def create_build_plan(
             f"/DFILE_VERSION={windows_file_version(version)}",
             f"/DSOURCE_DIR={payload_directory}",
             f"/DOUTPUT_FILE={installer_output}",
-            str(resolved_root / "installer" / "Zvec.PythonPreview.nsi"),
+            f"/DRID={TARGET_RUNTIME}",
+            f"/DSIGNING_STATUS={signing_status}",
+            str(resolved_root / "installer" / "Zvec.PythonDesktop.nsi"),
         )
     return BuildPlan(
         repository_root=resolved_root,
         version=version,
+        signing_status=signing_status,
         spec_path=spec_path,
-        icon_path=resolved_root
-        / "desktop"
-        / "Zvec.Desktop"
-        / "Assets"
-        / "Zvec.AppIcon.ico",
-        nsis_path=resolved_root / "installer" / "Zvec.PythonPreview.nsi",
+        icon_path=resolved_root / "assets" / "Zvec.AppIcon.ico",
+        nsis_path=resolved_root / "installer" / "Zvec.PythonDesktop.nsi",
         output_root=resolved_output,
         payload_directory=payload_directory,
         work_directory=resolved_work,
@@ -248,7 +281,7 @@ def validate_static_inputs(plan: BuildPlan) -> None:
     missing = [str(path) for path in required_files if not path.is_file()]
     if missing:
         raise PreviewPackagingError(
-            "Python preview build inputs are missing:\n" + "\n".join(missing)
+            "Python desktop build inputs are missing:\n" + "\n".join(missing)
         )
     if plan.makensis_command is not None:
         executable = Path(plan.makensis_command[0])
@@ -259,19 +292,19 @@ def validate_static_inputs(plan: BuildPlan) -> None:
 def validate_build_runtime() -> None:
     errors: list[str] = []
     if os.name != "nt" or sys.platform != "win32":
-        errors.append("The preview payload must be built on Windows.")
+        errors.append("The desktop payload must be built on Windows.")
     if platform.python_implementation() != "CPython":
-        errors.append("The preview payload must be built with CPython.")
+        errors.append("The desktop payload must be built with CPython.")
     if sys.version_info[:2] != (3, 12):
         errors.append(
-            "The preview payload is pinned to CPython 3.12; "
+            "The desktop payload is pinned to CPython 3.12; "
             f"the active interpreter is {platform.python_version()}."
         )
     if struct.calcsize("P") != 8 or platform.machine().casefold() not in {
         "amd64",
         "x86_64",
     }:
-        errors.append("The preview payload requires a native Windows x64 process.")
+        errors.append("The desktop payload requires a native Windows x64 process.")
     if importlib.util.find_spec("PyInstaller") is None:
         errors.append(
             "PyInstaller is not installed. Prepare the offline build environment "
@@ -298,17 +331,17 @@ def inspect_payload(payload_directory: Path) -> PayloadInspection:
     errors: list[str] = []
     if _is_link_or_reparse_point(supplied_root):
         errors.append(
-            f"Preview payload must not be a link or reparse point: {supplied_root}"
+            f"Desktop payload must not be a link or reparse point: {supplied_root}"
         )
     if not root.is_dir():
-        errors.append(f"Preview payload is missing: {root}")
+        errors.append(f"Desktop payload is missing: {root}")
         return PayloadInspection((), tuple(errors))
 
     discovered = tuple(root.rglob("*"))
     for path in discovered:
         if _is_link_or_reparse_point(path):
             errors.append(
-                "Preview payload contains a link or reparse point: "
+                "Desktop payload contains a link or reparse point: "
                 f"{path.relative_to(root).as_posix()}"
             )
     files = tuple(
@@ -339,6 +372,12 @@ def inspect_payload(payload_directory: Path) -> PayloadInspection:
             errors.append(
                 f"Forbidden source/runtime file is packaged: {rel.as_posix()}"
             )
+        if folded_name in _FORBIDDEN_EXTERNAL_RUNTIME_FILES or folded_name.startswith(
+            _FORBIDDEN_CONTAINER_FILE_PREFIXES
+        ):
+            errors.append(
+                f"Forbidden external runtime file is packaged: {rel.as_posix()}"
+            )
         if folded_name in _DOTNET_RUNTIME_FILES:
             errors.append(f".NET/WPF runtime file is packaged: {rel.as_posix()}")
         if folded_name.endswith((".deps.json", ".runtimeconfig.json")):
@@ -368,6 +407,7 @@ def inspect_payload(payload_directory: Path) -> PayloadInspection:
         "init.tcl",
         "tk.tcl",
         "model-catalog.default.json",
+        "Zvec.AppIcon.ico",
     )
     for required_name in required_named_files:
         if required_name.casefold() not in folded_names:
@@ -384,7 +424,7 @@ def inspect_payload(payload_directory: Path) -> PayloadInspection:
     ):
         errors.append("The Pillow native image extension (_imaging*.pyd) is missing.")
     if not relative:
-        errors.append("Preview payload contains no files.")
+        errors.append("Desktop payload contains no files.")
     return PayloadInspection(files=files, errors=tuple(dict.fromkeys(errors)))
 
 
@@ -411,7 +451,12 @@ def write_payload_manifest(
     *,
     version: str,
     pyinstaller_version: str,
+    signing_status: str = "unsigned",
 ) -> Path:
+    if signing_status not in {"unsigned", "authenticode"}:
+        raise PreviewPackagingError(
+            "signing_status must be 'unsigned' or 'authenticode'"
+        )
     inspection = inspect_payload(payload_directory)
     inspection.require_valid()
     root = payload_directory.resolve()
@@ -431,8 +476,9 @@ def write_payload_manifest(
         )
     payload = {
         "schema_version": MANIFEST_SCHEMA_VERSION,
-        "product": "Zvec Desktop Python Preview",
+        "product": PRODUCT_NAME,
         "version": version,
+        "signing_status": signing_status,
         "target_runtime": TARGET_RUNTIME,
         "python_runtime": TARGET_PYTHON,
         "pyinstaller_version": pyinstaller_version,
@@ -464,7 +510,7 @@ def verify_payload_manifest(payload_directory: Path) -> dict[str, Any]:
     try:
         if manifest_path.stat().st_size > _MAX_MANIFEST_BYTES:
             raise PreviewPackagingError(
-                "Preview payload manifest is unexpectedly large."
+                "Desktop payload manifest is unexpectedly large."
             )
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except PreviewPackagingError:
@@ -472,12 +518,12 @@ def verify_payload_manifest(payload_directory: Path) -> dict[str, Any]:
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise PreviewPackagingError(f"Unable to read payload manifest: {exc}") from exc
     if not isinstance(manifest, dict):
-        raise PreviewPackagingError("Preview payload manifest must be a JSON object.")
+        raise PreviewPackagingError("Desktop payload manifest must be a JSON object.")
     if manifest.get("schema_version") != MANIFEST_SCHEMA_VERSION:
-        raise PreviewPackagingError("Unsupported preview payload manifest schema.")
+        raise PreviewPackagingError("Unsupported desktop payload manifest schema.")
     entries = manifest.get("files")
     if not isinstance(entries, list):
-        raise PreviewPackagingError("Preview payload manifest files must be a list.")
+        raise PreviewPackagingError("Desktop payload manifest files must be a list.")
 
     expected_paths = {
         path.relative_to(root).as_posix()
@@ -489,7 +535,7 @@ def verify_payload_manifest(payload_directory: Path) -> dict[str, Any]:
     for entry in entries:
         if not isinstance(entry, dict):
             raise PreviewPackagingError(
-                "Preview payload manifest has an invalid entry."
+                "Desktop payload manifest has an invalid entry."
             )
         relative = entry.get("path")
         size = entry.get("size")
@@ -501,7 +547,7 @@ def verify_payload_manifest(payload_directory: Path) -> dict[str, Any]:
             or Path(relative).is_absolute()
             or ".." in Path(relative).parts
         ):
-            raise PreviewPackagingError("Preview payload manifest has an unsafe path.")
+            raise PreviewPackagingError("Desktop payload manifest has an unsafe path.")
         if relative in manifest_paths:
             raise PreviewPackagingError(f"Duplicate manifest path: {relative}")
         manifest_paths.add(relative)

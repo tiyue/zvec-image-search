@@ -59,6 +59,107 @@ def candidate(
 
 
 class FederatedSearchTest(unittest.TestCase):
+    def test_confidence_sort_spans_more_than_fifty_cross_collection_results(self):
+        collections: list[LibraryCandidateSet] = []
+        for library, source, prefix, offset in (
+            (self.library_a, self.source_a, "a", 0.000),
+            (self.library_b, self.source_b, "b", 0.001),
+        ):
+            hits = [
+                candidate(
+                    f"{prefix}-{index:02d}",
+                    2.0 * (1.0 - (0.99 - index * 0.005 - offset)),
+                    f"{prefix}{index:063d}"[-64:],
+                    source,
+                    confidence=0.99 - index * 0.005 - offset,
+                    rank_source="text",
+                    rank=index + 1,
+                )
+                for index in range(45)
+            ]
+            collections.append(
+                LibraryCandidateSet(
+                    library,
+                    PreparedSearchCandidates(
+                        query_type="text",
+                        hits=hits,
+                        candidate_k=90,
+                        collection_size=90,
+                        quality_configured=True,
+                        minimum_confidence=0.20,
+                        score_gap=1.0,
+                        max_confidence_drop=1.0,
+                    ),
+                )
+            )
+
+        ranking = rank_federated_hits(
+            collections,
+            top_k=75,
+            diversify_results=False,
+        )
+
+        self.assertEqual(len(ranking.hits), 75)
+        self.assertEqual(ranking.candidate_count, 90)
+        self.assertEqual([hit.rank for hit in ranking.hits], list(range(1, 76)))
+        self.assertEqual(
+            {str(hit.fields["library_id"]) for hit in ranking.hits},
+            {"library-a", "library-b"},
+        )
+        confidences = [float(hit.ranking_confidence or 0.0) for hit in ranking.hits]
+        self.assertEqual(confidences, sorted(confidences, reverse=True))
+        self.assertEqual(ranking.ranking_diagnostics["candidate_limit"], 112)
+
+    def test_sort_modes_keep_confidence_default_and_legacy_fallback(self):
+        collections = [
+            LibraryCandidateSet(
+                self.library_a,
+                PreparedSearchCandidates(
+                    query_type="text",
+                    hits=[
+                        candidate(
+                            "best",
+                            0.2,
+                            "best",
+                            self.source_a,
+                            confidence=0.90,
+                            rank_source="text",
+                        )
+                    ],
+                    quality_configured=True,
+                    minimum_confidence=0.20,
+                    score_gap=1.0,
+                    max_confidence_drop=1.0,
+                ),
+            )
+        ]
+
+        confidence = rank_federated_hits(
+            collections,
+            top_k=1,
+            sort_mode="confidence",
+            diversify_results=True,
+        )
+        diverse = rank_federated_hits(
+            collections,
+            top_k=1,
+            sort_mode="diverse",
+            diversify_results=False,
+        )
+        legacy = rank_federated_hits(
+            collections,
+            top_k=1,
+            sort_mode="legacy",
+            diversify_results=False,
+        )
+
+        self.assertEqual(confidence.sort_mode, "confidence")
+        self.assertFalse(confidence.ranking_diagnostics["effective_diversity"])
+        self.assertEqual(diverse.sort_mode, "diverse")
+        self.assertTrue(diverse.ranking_diagnostics["effective_diversity"])
+        self.assertEqual(legacy.sort_mode, "legacy")
+        self.assertEqual(legacy.status, "legacy_fallback")
+
     def test_metadata_candidates_join_global_text_fusion(self):
         collections = [
             LibraryCandidateSet(

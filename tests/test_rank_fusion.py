@@ -3,7 +3,11 @@ from __future__ import annotations
 import unittest
 
 from image_vector_service.models import RankSource, SearchHit
-from image_vector_service.rank_fusion import confidence_rank, weighted_rrf
+from image_vector_service.rank_fusion import (
+    confidence_rank,
+    sort_confidence_hits,
+    weighted_rrf,
+)
 
 
 def hit(
@@ -130,7 +134,7 @@ class ConfidenceRankTest(unittest.TestCase):
         )
         self.assertEqual(ranking.filtered_count, 2)
 
-    def test_default_confidence_band_preserves_full_unit_interval(self):
+    def test_hard_confidence_floor_excludes_values_below_twenty_percent(self):
         ranking = confidence_rank(
             [
                 hit("best", 1.0, source="text"),
@@ -143,7 +147,11 @@ class ConfidenceRankTest(unittest.TestCase):
         )
         self.assertIsNotNone(ranking)
         assert ranking is not None
-        self.assertEqual([item.doc_id for item in ranking.hits], ["best", "tail"])
+        self.assertEqual([item.doc_id for item in ranking.hits], ["best"])
+        self.assertEqual(
+            ranking.diagnostics["effective_minimum_confidence"],
+            0.20,
+        )
 
     def test_invalid_confidence_band_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "max_confidence_drop"):
@@ -233,13 +241,14 @@ class ConfidenceRankTest(unittest.TestCase):
         )
         self.assertIsNotNone(ranking)
         assert ranking is not None
-        self.assertEqual([item.doc_id for item in ranking.hits], ["best", "after-gap"])
-        self.assertEqual([item.rank for item in ranking.hits], [1, 2])
+        self.assertEqual([item.doc_id for item in ranking.hits], ["best"])
+        self.assertEqual([item.rank for item in ranking.hits], [1])
         self.assertEqual(ranking.candidate_count, 3)
-        self.assertEqual(ranking.filtered_count, 1)
+        self.assertEqual(ranking.filtered_count, 2)
         self.assertEqual(ranking.status, "low_confidence_override")
+        self.assertEqual(ranking.diagnostics["hard_floor_filtered_count"], 2)
 
-    def test_global_candidate_pool_is_hard_capped_at_fifty(self):
+    def test_global_candidate_pool_expands_for_requests_above_fifty(self):
         ranking = confidence_rank(
             [
                 hit(
@@ -247,17 +256,47 @@ class ConfidenceRankTest(unittest.TestCase):
                     1.0 - index / 1000,
                     source="text",
                 )
-                for index in range(60)
+                for index in range(120)
             ],
             query_type="text",
-            top_k=100,
+            top_k=75,
             min_confidence=0.0,
             score_gap=1.0,
         )
         self.assertIsNotNone(ranking)
         assert ranking is not None
-        self.assertEqual(ranking.candidate_count, 50)
-        self.assertEqual(len(ranking.hits), 50)
+        self.assertEqual(ranking.candidate_count, 112)
+        self.assertEqual(len(ranking.hits), 75)
+        self.assertEqual(ranking.diagnostics["candidate_limit"], 112)
+
+    def test_raw_score_breaks_confidence_ties_in_query_specific_direction(self):
+        text_ranking = sort_confidence_hits(
+            [
+                hit("far", 0.8, source="text", raw_score=0.30),
+                hit("near", 0.8, source="text", raw_score=0.10),
+            ],
+            query_type="text",
+            top_k=2,
+            score_gap=1.0,
+            max_confidence_drop=1.0,
+        )
+        combined_ranking = sort_confidence_hits(
+            [
+                hit("lower", 0.8, source="fused", raw_score=0.70),
+                hit("higher", 0.8, source="fused", raw_score=0.90),
+            ],
+            query_type="image_text",
+            top_k=2,
+            score_gap=1.0,
+            max_confidence_drop=1.0,
+        )
+        assert text_ranking is not None and combined_ranking is not None
+        self.assertEqual([item.doc_id for item in text_ranking.hits], ["near", "far"])
+        self.assertEqual(
+            [item.doc_id for item in combined_ranking.hits],
+            ["higher", "lower"],
+        )
+        self.assertFalse(text_ranking.diagnostics["normalized_score_used"])
 
     def test_missing_confidence_requests_legacy_fallback(self):
         ranking = confidence_rank(

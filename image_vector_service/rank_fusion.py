@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import cast
 
 from .models import (
@@ -11,11 +11,16 @@ from .models import (
     RRF_RANK_CONSTANT,
     RankSource,
     SearchHit,
+    SearchSortMode,
     classify_match_state,
     normalize_rrf_score,
 )
 
-MAX_CONFIDENCE_CANDIDATES = 50
+DEFAULT_CONFIDENCE_CANDIDATES = 50
+# Backwards-compatible import name. This value is now a default pool size, not
+# a hard ceiling; requests above 50 expand the candidate pool dynamically.
+MAX_CONFIDENCE_CANDIDATES = DEFAULT_CONFIDENCE_CANDIDATES
+MINIMUM_RESULT_CONFIDENCE = 0.20
 DEFAULT_MIN_CONFIDENCE = 0.25
 DEFAULT_SCORE_GAP = 0.20
 DEFAULT_MAX_CONFIDENCE_DROP = 1.0
@@ -25,6 +30,7 @@ DEFAULT_RANK_DECAY = 10.0
 DEFAULT_WEAK_CHANNEL_FLOOR = 0.45
 DEFAULT_WEAK_CHANNEL_PENALTY = 0.08
 FUSION_MODES = {"confidence_v1", "confidence_v2"}
+SEARCH_SORT_MODES = {"relevance", "confidence", "diverse", "legacy"}
 
 
 @dataclass(frozen=True)
@@ -33,6 +39,52 @@ class ConfidenceRanking:
     status: str
     candidate_count: int
     filtered_count: int
+    sort_mode: SearchSortMode = "confidence"
+    diagnostics: dict[str, object] = field(default_factory=dict)
+
+
+def normalize_sort_mode(value: str) -> SearchSortMode:
+    """Validate a public sort mode without silently changing its meaning."""
+
+    if not isinstance(value, str):
+        raise ValueError("sort_mode must be relevance, confidence, diverse, or legacy.")
+    normalized = value.strip().lower()
+    if normalized not in SEARCH_SORT_MODES:
+        raise ValueError("sort_mode must be relevance, confidence, diverse, or legacy.")
+    return cast(SearchSortMode, normalized)
+
+
+def sort_mode_uses_diversity(
+    sort_mode: SearchSortMode,
+    *,
+    legacy_diversity: bool,
+) -> bool:
+    """Resolve the old diversity flag against the explicit sort contract."""
+
+    if sort_mode == "diverse":
+        return True
+    if sort_mode == "confidence":
+        return False
+    return legacy_diversity
+
+
+def confidence_candidate_limit(top_k: int, requested: int | None = None) -> int:
+    """Return a positive pool that can always contain the requested Top-K."""
+
+    if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k < 1:
+        raise ValueError("top_k must be positive.")
+    if requested is not None and (
+        isinstance(requested, bool) or not isinstance(requested, int) or requested < 1
+    ):
+        raise ValueError("max_candidates must be positive when supplied.")
+    if requested is not None:
+        return max(top_k, requested)
+    # Keep enough headroom for SHA de-duplication and the hard confidence floor
+    # without returning to an unbounded full-Collection scan.
+    return max(
+        DEFAULT_CONFIDENCE_CANDIDATES,
+        top_k + max(25, top_k // 2),
+    )
 
 
 def weighted_rrf(
@@ -126,9 +178,10 @@ def confidence_rank(
     rank_decay: float = DEFAULT_RANK_DECAY,
     weak_channel_floor: float = DEFAULT_WEAK_CHANNEL_FLOOR,
     weak_channel_penalty: float = DEFAULT_WEAK_CHANNEL_PENALTY,
-    max_candidates: int = MAX_CONFIDENCE_CANDIDATES,
+    max_candidates: int | None = None,
     show_low_confidence: bool = False,
     collection_confidence_offsets: Mapping[str, float] | None = None,
+    sort_mode: SearchSortMode = "confidence",
 ) -> ConfidenceRanking | None:
     """Rank comparable confidence scores, or request the legacy fallback.
 
@@ -136,6 +189,8 @@ def confidence_rank(
     legacy hit is deliberately not compared on the new scale; callers should use
     their previous distance/RRF behavior instead.
     """
+    resolved_sort_mode = normalize_sort_mode(sort_mode)
+    candidate_limit = confidence_candidate_limit(top_k, max_candidates)
     _validate_confidence_options(
         query_type=query_type,
         top_k=top_k,
@@ -153,7 +208,7 @@ def confidence_rank(
         rank_decay=rank_decay,
         weak_channel_floor=weak_channel_floor,
         weak_channel_penalty=weak_channel_penalty,
-        max_candidates=max_candidates,
+        max_candidates=candidate_limit,
     )
     if any(_confidence(hit) is None for hit in hits):
         return None
@@ -175,21 +230,94 @@ def confidence_rank(
         possible_confidence=possible_confidence,
         high_confidence=high_confidence,
     )
-    if collection_confidence_offsets is not None:
-        fused = [
-            replace(
+    fused = [
+        replace(
+            hit,
+            ranking_confidence=_ranking_confidence(
                 hit,
-                ranking_confidence=_ranking_confidence(
-                    hit,
-                    resolved_collection_offsets,
-                ),
-            )
-            for hit in fused
-        ]
-    ordered = sorted(
+                resolved_collection_offsets,
+            ),
+        )
+        for hit in fused
+    ]
+    return sort_confidence_hits(
         fused,
-        key=lambda hit: _confidence_sort_key(hit, resolved_collection_offsets),
+        query_type=query_type,
+        top_k=top_k,
+        min_confidence=min_confidence,
+        minimum_score=minimum_score,
+        score_gap=score_gap,
+        max_confidence_drop=max_confidence_drop,
+        max_candidates=candidate_limit,
+        show_low_confidence=show_low_confidence,
+        collection_confidence_offsets=resolved_collection_offsets,
+        sort_mode=resolved_sort_mode,
     )
+
+
+def sort_confidence_hits(
+    hits: list[SearchHit],
+    *,
+    query_type: str,
+    top_k: int,
+    min_confidence: float = MINIMUM_RESULT_CONFIDENCE,
+    minimum_score: float | None = None,
+    score_gap: float = DEFAULT_SCORE_GAP,
+    max_confidence_drop: float = DEFAULT_MAX_CONFIDENCE_DROP,
+    max_candidates: int | None = None,
+    show_low_confidence: bool = False,
+    collection_confidence_offsets: Mapping[str, float] | None = None,
+    sort_mode: SearchSortMode = "confidence",
+) -> ConfidenceRanking | None:
+    """Filter and order already-fused candidates on the public score contract.
+
+    ``normalized_score`` is intentionally absent from every ordering key. The
+    primary value is ``ranking_confidence`` (falling back to ``confidence``),
+    while the original score is used only to break confidence ties in its
+    documented direction for the active query type.
+    """
+
+    resolved_sort_mode = normalize_sort_mode(sort_mode)
+    candidate_limit = confidence_candidate_limit(top_k, max_candidates)
+    _validate_confidence_options(
+        query_type=query_type,
+        top_k=top_k,
+        image_weight=0.5,
+        text_weight=0.5,
+        min_confidence=min_confidence,
+        minimum_score=minimum_score,
+        possible_confidence=DEFAULT_POSSIBLE_THRESHOLD,
+        high_confidence=DEFAULT_HIGH_THRESHOLD,
+        score_gap=score_gap,
+        max_confidence_drop=max_confidence_drop,
+        source_reward=DEFAULT_SOURCE_REWARD,
+        fusion_mode="confidence_v1",
+        agreement_reward=DEFAULT_AGREEMENT_REWARD,
+        rank_decay=DEFAULT_RANK_DECAY,
+        weak_channel_floor=DEFAULT_WEAK_CHANNEL_FLOOR,
+        weak_channel_penalty=DEFAULT_WEAK_CHANNEL_PENALTY,
+        max_candidates=candidate_limit,
+    )
+    if any(_confidence(hit) is None for hit in hits):
+        return None
+    offsets = _validated_collection_offsets(collection_confidence_offsets)
+    prepared = [
+        replace(hit, ranking_confidence=_ranking_confidence(hit, offsets))
+        for hit in hits
+    ]
+    ordered = (
+        prepared
+        if resolved_sort_mode == "legacy"
+        else sorted(
+            prepared,
+            key=lambda hit: _confidence_sort_key(
+                hit,
+                offsets,
+                query_type=query_type,
+            ),
+        )
+    )
+
     distinct: list[SearchHit] = []
     seen_documents: set[tuple[str, str]] = set()
     seen_hashes: set[str] = set()
@@ -198,35 +326,51 @@ def confidence_rank(
         if document_key in seen_documents:
             continue
         seen_documents.add(document_key)
-        sha256 = str(hit.fields.get("sha256") or "")
+        sha256 = str(hit.fields.get("sha256") or "").casefold()
         if sha256 and sha256 in seen_hashes:
             continue
         if sha256:
             seen_hashes.add(sha256)
         distinct.append(hit)
-        if len(distinct) >= max_candidates:
+        if len(distinct) >= candidate_limit:
             break
 
     candidate_count = len(distinct)
+    hard_floor_passing = [
+        hit
+        for hit in distinct
+        if _ranking_confidence(hit, offsets) >= MINIMUM_RESULT_CONFIDENCE
+    ]
+    hard_floor_filtered = candidate_count - len(hard_floor_passing)
+    effective_minimum = max(MINIMUM_RESULT_CONFIDENCE, min_confidence)
+
     if show_low_confidence:
         selected = [
             replace(hit, rank=rank)
-            for rank, hit in enumerate(distinct[:top_k], start=1)
+            for rank, hit in enumerate(hard_floor_passing[:top_k], start=1)
         ]
         return ConfidenceRanking(
             hits=selected,
             status="low_confidence_override" if selected else "no_reliable_match",
             candidate_count=candidate_count,
             filtered_count=candidate_count - len(selected),
+            sort_mode=resolved_sort_mode,
+            diagnostics=_sorting_diagnostics(
+                query_type=query_type,
+                sort_mode=resolved_sort_mode,
+                candidate_limit=candidate_limit,
+                configured_minimum=min_confidence,
+                effective_minimum=effective_minimum,
+                hard_floor_filtered=hard_floor_filtered,
+                show_low_confidence=True,
+            ),
         )
 
     passing: list[SearchHit] = []
-    for hit in distinct:
-        confidence = _confidence(hit)
-        assert confidence is not None
+    for hit in hard_floor_passing:
         if not _passes_minimum_score(hit, query_type, minimum_score):
             continue
-        if confidence < min_confidence:
+        if _ranking_confidence(hit, offsets) < effective_minimum:
             continue
         passing.append(hit)
 
@@ -234,16 +378,20 @@ def confidence_rank(
     top_ranking_confidence: float | None = None
     previous_ranking_confidence: float | None = None
     for hit in passing:
-        ranking_confidence = _ranking_confidence(hit, resolved_collection_offsets)
-        if top_ranking_confidence is None:
-            top_ranking_confidence = ranking_confidence
-        elif top_ranking_confidence - ranking_confidence > max_confidence_drop + 1e-12:
-            break
-        if (
-            previous_ranking_confidence is not None
-            and previous_ranking_confidence - ranking_confidence >= score_gap
-        ):
-            break
+        ranking_confidence = _ranking_confidence(hit, offsets)
+        if resolved_sort_mode != "legacy":
+            if top_ranking_confidence is None:
+                top_ranking_confidence = ranking_confidence
+            elif (
+                top_ranking_confidence - ranking_confidence
+                > max_confidence_drop + 1e-12
+            ):
+                break
+            if (
+                previous_ranking_confidence is not None
+                and previous_ranking_confidence - ranking_confidence >= score_gap
+            ):
+                break
         gap_limited.append(hit)
         previous_ranking_confidence = ranking_confidence
 
@@ -255,6 +403,16 @@ def confidence_rank(
         status="ok" if selected else "no_reliable_match",
         candidate_count=candidate_count,
         filtered_count=candidate_count - len(selected),
+        sort_mode=resolved_sort_mode,
+        diagnostics=_sorting_diagnostics(
+            query_type=query_type,
+            sort_mode=resolved_sort_mode,
+            candidate_limit=candidate_limit,
+            configured_minimum=min_confidence,
+            effective_minimum=effective_minimum,
+            hard_floor_filtered=hard_floor_filtered,
+            show_low_confidence=False,
+        ),
     )
 
 
@@ -306,7 +464,14 @@ def _fuse_confidence_sources(
                         high=high_confidence,
                         possible=possible_confidence,
                     ),
-                    rank_source="image" if query_type == "image" else "text",
+                    rank_source=cast(
+                        RankSource,
+                        "image"
+                        if query_type == "image"
+                        else "tag"
+                        if query_type == "tag"
+                        else "text",
+                    ),
                 )
             )
             continue
@@ -662,13 +827,59 @@ def _passes_minimum_score(
 def _confidence_sort_key(
     hit: SearchHit,
     collection_confidence_offsets: Mapping[str, float] | None = None,
-) -> tuple[float, float, str, str]:
+    *,
+    query_type: str | None = None,
+) -> tuple[float, float, int, str, str]:
     return (
         -_ranking_confidence(hit, collection_confidence_offsets or {}),
-        hit.distance,
+        _raw_score_sort_value(hit, query_type),
+        hit.rank if hit.rank > 0 else 2**31 - 1,
         str(hit.fields.get("library_id") or ""),
         hit.doc_id,
     )
+
+
+def _raw_score_sort_value(hit: SearchHit, query_type: str | None) -> float:
+    raw_score = hit.raw_score
+    if isinstance(raw_score, bool) or not isinstance(raw_score, (int, float)):
+        return math.inf
+    value = float(raw_score)
+    if not math.isfinite(value):
+        return math.inf
+    higher_is_better = query_type == "image_text" or (
+        query_type is None and hit.rank_source == "fused"
+    )
+    return -value if higher_is_better else value
+
+
+def _sorting_diagnostics(
+    *,
+    query_type: str,
+    sort_mode: SearchSortMode,
+    candidate_limit: int,
+    configured_minimum: float,
+    effective_minimum: float,
+    hard_floor_filtered: int,
+    show_low_confidence: bool,
+) -> dict[str, object]:
+    return {
+        "sort_mode": sort_mode,
+        "primary": "ranking_confidence_or_confidence_desc",
+        "secondary": "raw_score",
+        "secondary_direction": (
+            "higher_is_better" if query_type == "image_text" else "lower_is_better"
+        ),
+        "normalized_score_used": False,
+        "stable_tiebreakers": ["source_rank", "library_id", "doc_id"],
+        "candidate_limit": candidate_limit,
+        "candidate_limit_policy": "dynamic_top_k_with_dedup_headroom",
+        "hard_minimum_confidence": MINIMUM_RESULT_CONFIDENCE,
+        "configured_minimum_confidence": configured_minimum,
+        "effective_minimum_confidence": effective_minimum,
+        "hard_floor_filtered_count": hard_floor_filtered,
+        "low_confidence_override": show_low_confidence,
+        "low_confidence_override_floor": MINIMUM_RESULT_CONFIDENCE,
+    }
 
 
 def _ranking_confidence(
@@ -724,14 +935,12 @@ def _validate_confidence_options(
     weak_channel_penalty: float,
     max_candidates: int,
 ) -> None:
-    if query_type not in {"text", "image", "image_text"}:
+    if query_type not in {"text", "image", "image_text", "tag"}:
         raise ValueError(f"Unsupported confidence query type: {query_type}")
     if top_k < 1:
         raise ValueError("top_k must be positive.")
-    if max_candidates < 1 or max_candidates > MAX_CONFIDENCE_CANDIDATES:
-        raise ValueError(
-            f"max_candidates must be between 1 and {MAX_CONFIDENCE_CANDIDATES}."
-        )
+    if max_candidates < 1:
+        raise ValueError("max_candidates must be positive.")
     if not 0 <= min_confidence <= 1:
         raise ValueError("min_confidence must be between zero and one.")
     if minimum_score is not None:

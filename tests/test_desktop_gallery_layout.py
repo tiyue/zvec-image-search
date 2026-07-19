@@ -40,8 +40,15 @@ class DesktopGalleryLayoutTest(unittest.TestCase):
         self.assertLessEqual(extremely_narrow.card_width, 72)
         self.assertTrue(extremely_narrow.scroll_required)
 
+    def test_scaled_normal_window_still_fits_five_by_three(self) -> None:
+        layout = calculate_gallery_layout(600, 380, DEFAULT_GALLERY_PAGE_SIZE)
+
+        self.assertEqual((layout.columns, layout.rows), (5, 3))
+        self.assertGreaterEqual(layout.card_height, 112)
+        self.assertFalse(layout.scroll_required)
+
     def test_short_window_keeps_readable_cards_and_enables_scroll(self) -> None:
-        layout = calculate_gallery_layout(600, 400, DEFAULT_GALLERY_PAGE_SIZE)
+        layout = calculate_gallery_layout(600, 320, DEFAULT_GALLERY_PAGE_SIZE)
 
         self.assertEqual((layout.columns, layout.rows), (5, 3))
         self.assertGreaterEqual(layout.card_height, 154)

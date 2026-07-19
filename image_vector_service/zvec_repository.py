@@ -5,7 +5,7 @@ import uuid
 from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import zvec
 
@@ -264,6 +264,93 @@ class ZvecImageRepository:
                 failed[record.doc_id] = str(status)
         return succeeded, failed
 
+    def update_record_tags(
+        self,
+        items: Iterable[tuple[ImageRecord, Iterable[str]]],
+    ) -> tuple[list[str], dict[str, str]]:
+        """Update many documents' tags while retaining their image vectors.
+
+        Metadata embeddings are deliberately invalidated by ``_to_doc`` because
+        accepted/manual tag changes make their source text stale.  A later local
+        metadata backfill can rebuild them without regenerating image vectors.
+        """
+
+        normalized: list[tuple[ImageRecord, list[str]]] = []
+        seen: set[str] = set()
+        for record, tags in items:
+            if record.doc_id in seen:
+                raise ValueError(f"Duplicate document id: {record.doc_id}")
+            seen.add(record.doc_id)
+            normalized.append((record, list(normalize_tags(tags))))
+        if not normalized:
+            return [], {}
+
+        ids = [record.doc_id for record, _tags in normalized]
+        try:
+            fetched = self.collection.fetch(
+                ids,
+                output_fields=[],
+                include_vector=True,
+            )
+        except Exception:
+            # A batch fetch can fail for one corrupt document. Retrying each item
+            # preserves the batch operation's item-level failure contract.
+            fetched = {}
+            fetch_errors: dict[str, str] = {}
+            for doc_id in ids:
+                try:
+                    fetched.update(
+                        self.collection.fetch(
+                            doc_id,
+                            output_fields=[],
+                            include_vector=True,
+                        )
+                    )
+                except Exception as exc:
+                    fetch_errors[doc_id] = str(exc) or exc.__class__.__name__
+        else:
+            fetch_errors = {}
+
+        documents: list[zvec.Doc] = []
+        document_ids: list[str] = []
+        failures = dict(fetch_errors)
+        for record, tags in normalized:
+            if record.doc_id in failures:
+                continue
+            document = fetched.get(record.doc_id)
+            vector = document.vectors.get("embedding") if document else None
+            if vector is None or len(vector) != self.config.dimension:
+                failures[record.doc_id] = "The indexed image vector is missing."
+                continue
+            documents.append(self._to_doc(record, list(vector), tags))
+            document_ids.append(record.doc_id)
+
+        if not documents:
+            return [], failures
+        try:
+            statuses = self.collection.upsert(documents)
+            if not isinstance(statuses, list):
+                statuses = [statuses]
+            succeeded: list[str] = []
+            for doc_id, status in zip(document_ids, statuses, strict=True):
+                if status.ok():
+                    succeeded.append(doc_id)
+                else:
+                    failures[doc_id] = str(status)
+            return succeeded, failures
+        except Exception:
+            succeeded = []
+            for doc_id, document in zip(document_ids, documents, strict=True):
+                try:
+                    status = self.collection.upsert(document)
+                    if status.ok():
+                        succeeded.append(doc_id)
+                    else:
+                        failures[doc_id] = str(status)
+                except Exception as exc:
+                    failures[doc_id] = str(exc) or exc.__class__.__name__
+            return succeeded, failures
+
     def _to_doc(
         self, record: ImageRecord, vector: list[float], tags: list[str]
     ) -> zvec.Doc:
@@ -411,6 +498,109 @@ class ZvecImageRepository:
                 failed[doc_id] = str(status)
         return succeeded, failed
 
+    def snapshot_documents(
+        self, doc_ids: Iterable[str]
+    ) -> tuple[dict[str, zvec.Doc], dict[str, str]]:
+        """Read exact Collection documents for a local rollback.
+
+        Folder deletion never regenerates embeddings.  Before a destructive
+        batch, callers can retain these small, bounded snapshots and restore
+        the original fields and both vectors if the SQLite commit fails.
+        A corrupt document must not make unrelated documents unavailable, so a
+        failed batch fetch is retried one item at a time.
+        """
+
+        ids = list(dict.fromkeys(str(doc_id) for doc_id in doc_ids))
+        if not ids:
+            return {}, {}
+        try:
+            fetched = self.collection.fetch(
+                ids,
+                output_fields=[*OUTPUT_FIELDS, *METADATA_FIELDS],
+                include_vector=True,
+            )
+        except Exception:
+            fetched = {}
+            failures: dict[str, str] = {}
+            for doc_id in ids:
+                try:
+                    fetched.update(
+                        self.collection.fetch(
+                            doc_id,
+                            output_fields=[*OUTPUT_FIELDS, *METADATA_FIELDS],
+                            include_vector=True,
+                        )
+                    )
+                except Exception as exc:
+                    failures[doc_id] = str(exc) or exc.__class__.__name__
+        else:
+            failures = {}
+
+        snapshots: dict[str, zvec.Doc] = {}
+        for doc_id, document in fetched.items():
+            try:
+                snapshots[str(doc_id)] = _clone_document(document)
+            except Exception as exc:
+                failures[str(doc_id)] = str(exc) or exc.__class__.__name__
+        return snapshots, failures
+
+    def delete_resilient(
+        self, doc_ids: Iterable[str]
+    ) -> tuple[list[str], dict[str, str]]:
+        """Delete documents with item-level isolation after a batch failure."""
+
+        ids = list(dict.fromkeys(str(doc_id) for doc_id in doc_ids))
+        if not ids:
+            return [], {}
+        try:
+            return self.delete(ids)
+        except Exception:
+            succeeded: list[str] = []
+            failures: dict[str, str] = {}
+            for doc_id in ids:
+                try:
+                    deleted, failed = self.delete([doc_id])
+                except Exception as exc:
+                    failures[doc_id] = str(exc) or exc.__class__.__name__
+                    continue
+                succeeded.extend(deleted)
+                failures.update(failed)
+            return succeeded, failures
+
+    def restore_documents(
+        self, documents: Iterable[zvec.Doc]
+    ) -> tuple[list[str], dict[str, str]]:
+        """Restore exact snapshots without invoking an embedding model."""
+
+        items = [_clone_document(document) for document in documents]
+        if not items:
+            return [], {}
+        try:
+            statuses = self.collection.upsert(items)
+            if not isinstance(statuses, list):
+                statuses = [statuses]
+            succeeded: list[str] = []
+            failures: dict[str, str] = {}
+            for document, status in zip(items, statuses, strict=True):
+                if status.ok():
+                    succeeded.append(str(document.id))
+                else:
+                    failures[str(document.id)] = str(status)
+            return succeeded, failures
+        except Exception:
+            succeeded = []
+            failures = {}
+            for document in items:
+                try:
+                    status = self.collection.upsert(document)
+                    if status.ok():
+                        succeeded.append(str(document.id))
+                    else:
+                        failures[str(document.id)] = str(status)
+                except Exception as exc:
+                    failures[str(document.id)] = str(exc) or exc.__class__.__name__
+            return succeeded, failures
+
     def optimize(self) -> None:
         self.collection.optimize()
 
@@ -485,3 +675,21 @@ def empty_metadata_embedding(dimension: int) -> list[float]:
     if dimension < 1:
         raise ValueError("Embedding dimension must be positive.")
     return [0.0] * dimension
+
+
+def _clone_document(document: Any) -> zvec.Doc:
+    """Detach a fetched Zvec document from Collection-owned buffers."""
+
+    vectors = {
+        str(name): list(vector)
+        for name, vector in dict(getattr(document, "vectors", {}) or {}).items()
+    }
+    if "embedding" not in vectors or "metadata_embedding" not in vectors:
+        raise ConfigurationError(
+            f"Collection document {getattr(document, 'id', '')!r} lacks vectors."
+        )
+    return zvec.Doc(
+        id=str(document.id),
+        fields=dict(getattr(document, "fields", {}) or {}),
+        vectors=vectors,
+    )

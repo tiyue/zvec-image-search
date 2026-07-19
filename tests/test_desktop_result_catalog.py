@@ -3,8 +3,9 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 import unittest
-from concurrent.futures import CancelledError
+from concurrent.futures import CancelledError, ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
@@ -16,7 +17,7 @@ class ResultCatalogTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.temporary.name).resolve()
         self.images = self.root / "图库（原神）"
         self.results = self.root / "搜索结果"
         self.workspace = self.root / "工作区"
@@ -151,6 +152,18 @@ class ResultCatalogTests(unittest.TestCase):
         self.assertEqual(page.items[0].name, "新图.jpg")
         self.assertEqual(page.items[0].tags, ("原神", "雷电将军"))
         self.assertEqual(page.items[0].matched_tags, ("雷神",))
+        self.assertAlmostEqual(page.items[0].raw_score, 0.18)
+        self.assertAlmostEqual(page.items[0].normalized_score, 0.91)
+        self.assertAlmostEqual(page.items[0].confidence, 0.91)
+        self.assertAlmostEqual(page.items[0].image_confidence or 0.0, 0.88)
+        self.assertAlmostEqual(page.items[0].text_confidence or 0.0, 0.93)
+        self.assertEqual(page.items[0].image_rank, 2)
+        self.assertEqual(page.items[0].text_rank, 1)
+        self.assertEqual(page.sort_mode, "confidence")
+        self.assertEqual(
+            page.ranking_diagnostics,
+            {"primary": "ranking_confidence_or_confidence_desc"},
+        )
         self.assertEqual(page.source_label, "最新搜索")
 
     def test_load_latest_falls_back_when_newest_manifest_is_incomplete(self) -> None:
@@ -165,6 +178,10 @@ class ResultCatalogTests(unittest.TestCase):
                 "created_at": "2026-07-18T13:00:00+08:00",
                 "query_type": "text",
                 "status": "ok",
+                "sort_mode": "confidence",
+                "ranking_diagnostics": {
+                    "primary": "ranking_confidence_or_confidence_desc"
+                },
                 "library_ids": ["library-main"],
                 # The exporter has created valid JSON but has not written the
                 # required results array yet.
@@ -187,9 +204,13 @@ class ResultCatalogTests(unittest.TestCase):
         )
         (incomplete / "尚未写入.jpg").unlink()
 
-        page = ResultCatalog.from_config(self.config_path).load_latest()
+        catalog = ResultCatalog.from_config(self.config_path)
+        page = catalog.load_latest()
 
         self.assertEqual(page.manifest_path, complete / "results.json")
+        (incomplete / "尚未写入.jpg").write_bytes(b"completed")
+        recovered = catalog.load_latest()
+        self.assertEqual(recovered.manifest_path, incomplete / "results.json")
 
     def test_load_manifest_opens_an_explicit_history_item(self) -> None:
         old = self._manifest(
@@ -226,6 +247,224 @@ class ResultCatalogTests(unittest.TestCase):
         fallback = catalog.load_latest().items[0]
         self.assertIsNone(fallback.original_path)
         self.assertEqual(fallback.display_path, (output / "副本.jpg").resolve())
+
+    def test_large_manifest_is_parsed_once_then_pages_are_constant_work(self) -> None:
+        manifest, copied = self._bulk_manifest("large", 10_000)
+        catalog = ResultCatalog.from_config(self.config_path)
+
+        def materialize(
+            _raw: object,
+            *,
+            index: int,
+            manifest_path: Path,
+            manifest: object,
+        ) -> SearchResult:
+            del manifest_path, manifest
+            return SearchResult(
+                display_path=copied,
+                copied_path=copied,
+                original_path=None,
+                name=copied.name,
+                rank=index + 1,
+                relative_path="",
+                library_name="二次元图库",
+            )
+
+        with (
+            mock.patch.object(
+                catalog, "_manifest_result", side_effect=materialize
+            ) as parsed,
+            mock.patch(
+                "zvec_desktop.result_catalog._read_json_object",
+                wraps=result_catalog_module._read_json_object,
+            ) as reads,
+        ):
+            first = catalog.load_manifest(manifest, page=1, page_size=15)
+            second = catalog.load_manifest(manifest, page=2, page_size=15)
+
+        self.assertEqual(first.total_items, 10_000)
+        self.assertEqual([item.rank for item in second.items], list(range(16, 31)))
+        self.assertEqual(parsed.call_count, 10_000)
+        self.assertEqual(reads.call_count, 1)
+
+    def test_manifest_version_change_invalidates_cached_snapshot(self) -> None:
+        manifest, _copied = self._bulk_manifest("mutable", 1)
+        catalog = ResultCatalog.from_config(self.config_path)
+        first = catalog.load_manifest(manifest)
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+        payload["results"].append({**payload["results"][0], "rank": 2})
+        self._write_json(manifest, payload)
+
+        second = catalog.load_manifest(manifest)
+
+        self.assertEqual(first.total_items, 1)
+        self.assertEqual(second.total_items, 2)
+
+    def test_manifest_cache_key_uses_path_mtime_and_size(self) -> None:
+        first, _copied = self._bulk_manifest("fingerprint-a", 1)
+        second, _copied = self._bulk_manifest("fingerprint-b", 1)
+        catalog = ResultCatalog.from_config(self.config_path)
+        with mock.patch(
+            "zvec_desktop.result_catalog._read_json_object",
+            wraps=result_catalog_module._read_json_object,
+        ) as reads:
+            catalog.load_manifest(first)
+            original = first.stat()
+            first.write_text(first.read_text(encoding="utf-8") + " ", encoding="utf-8")
+            os.utime(
+                first,
+                ns=(original.st_atime_ns, original.st_mtime_ns),
+            )
+            catalog.load_manifest(first)
+
+            resized = first.stat()
+            os.utime(
+                first,
+                ns=(resized.st_atime_ns, resized.st_mtime_ns + 10_000_000),
+            )
+            catalog.load_manifest(first)
+
+            second.write_text(
+                second.read_text(encoding="utf-8") + " ", encoding="utf-8"
+            )
+            current = first.stat()
+            os.utime(
+                second,
+                ns=(second.stat().st_atime_ns, current.st_mtime_ns),
+            )
+            catalog.load_manifest(second)
+
+        self.assertEqual(first.stat().st_size, second.stat().st_size)
+        self.assertEqual(first.stat().st_mtime_ns, second.stat().st_mtime_ns)
+        self.assertEqual(reads.call_count, 4)
+
+    def test_manifest_errors_are_not_cached_and_can_be_retried(self) -> None:
+        manifest, _copied = self._bulk_manifest("retry", 1)
+        catalog = ResultCatalog.from_config(self.config_path)
+        with (
+            mock.patch(
+                "zvec_desktop.result_catalog._read_json_object",
+                side_effect=ResultCatalogError("transient read failure"),
+            ),
+            self.assertRaisesRegex(ResultCatalogError, "transient"),
+        ):
+            catalog.load_manifest(manifest)
+
+        recovered = catalog.load_manifest(manifest)
+        self.assertEqual(recovered.total_items, 1)
+
+    def test_deleted_manifest_or_result_never_survives_cache(self) -> None:
+        explicit, copied = self._bulk_manifest("explicit-delete", 1)
+        catalog = ResultCatalog.from_config(self.config_path)
+        self.assertEqual(catalog.load_manifest(explicit).total_items, 1)
+        copied.unlink()
+        self.assertEqual(catalog.load_manifest(explicit).total_items, 0)
+        explicit.unlink()
+        with self.assertRaisesRegex(ResultCatalogError, "does not exist"):
+            catalog.load_manifest(explicit)
+
+        old = self._manifest(
+            "old-complete", "2026-07-18T12:00:00+08:00", copied_file="old.jpg"
+        )
+        newest = self._manifest(
+            "newest-delete", "2026-07-18T13:00:00+08:00", copied_file="new.jpg"
+        )
+        self.assertEqual(catalog.load_latest().manifest_path, newest / "results.json")
+        (newest / "results.json").unlink()
+        self.assertEqual(catalog.load_latest().manifest_path, old / "results.json")
+
+    def test_latest_cache_discovers_manifest_created_in_existing_directory(
+        self,
+    ) -> None:
+        old = self._manifest("old", "2026-07-18T12:00:00+08:00", copied_file="old.jpg")
+        pending = self.results / "pending"
+        pending.mkdir()
+        catalog = ResultCatalog.from_config(self.config_path)
+        self.assertEqual(catalog.load_latest().manifest_path, old / "results.json")
+
+        (pending / "new.jpg").write_bytes(b"copy")
+        self._write_json(
+            pending / "results.json",
+            {
+                "created_at": "2026-07-18T14:00:00+08:00",
+                "query_type": "text",
+                "status": "ok",
+                "library_ids": ["library-main"],
+                "results": [
+                    {
+                        "rank": 1,
+                        "copied_file": "new.jpg",
+                        "relative_path": "missing/new.jpg",
+                        "library_id": "library-main",
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual(catalog.load_latest().manifest_path, pending / "results.json")
+
+    def test_latest_cache_reorders_when_existing_manifest_changes(self) -> None:
+        old = self._manifest(
+            "old-reordered", "2026-07-18T12:00:00+08:00", copied_file="old.jpg"
+        )
+        current = self._manifest(
+            "current", "2026-07-18T13:00:00+08:00", copied_file="current.jpg"
+        )
+        catalog = ResultCatalog.from_config(self.config_path)
+        self.assertEqual(catalog.load_latest().manifest_path, current / "results.json")
+
+        manifest = old / "results.json"
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+        payload["created_at"] = "2026-07-18T14:00:00+08:00"
+        self._write_json(manifest, payload)
+
+        self.assertEqual(catalog.load_latest().manifest_path, manifest)
+
+    def test_concurrent_pages_share_one_manifest_parse(self) -> None:
+        manifest, _copied = self._bulk_manifest("concurrent", 120)
+        catalog = ResultCatalog.from_config(self.config_path)
+        original_read = result_catalog_module._read_json_object
+
+        def slow_read(*args: object, **kwargs: object) -> dict[str, object]:
+            time.sleep(0.05)
+            return original_read(*args, **kwargs)
+
+        with (
+            mock.patch(
+                "zvec_desktop.result_catalog._read_json_object",
+                side_effect=slow_read,
+            ) as reads,
+            ThreadPoolExecutor(max_workers=8) as executor,
+        ):
+            pages = list(
+                executor.map(
+                    lambda page: catalog.load_manifest(
+                        manifest, page=page, page_size=15
+                    ),
+                    range(1, 9),
+                )
+            )
+
+        self.assertEqual(reads.call_count, 1)
+        self.assertEqual(
+            [page.items[0].rank for page in pages], list(range(1, 107, 15))
+        )
+
+    def test_manifest_cache_is_lru_bounded(self) -> None:
+        first, _copied = self._bulk_manifest("cache-a", 1)
+        second, _copied = self._bulk_manifest("cache-b", 1)
+        base = ResultCatalog.from_config(self.config_path)
+        catalog = ResultCatalog(
+            base.config, manifest_cache_entries=1, manifest_cache_results=10
+        )
+        with mock.patch(
+            "zvec_desktop.result_catalog._read_json_object",
+            wraps=result_catalog_module._read_json_object,
+        ) as reads:
+            catalog.load_manifest(first)
+            catalog.load_manifest(second)
+            catalog.load_manifest(first)
+        self.assertEqual(reads.call_count, 3)
 
     def test_rejects_copied_file_path_traversal(self) -> None:
         self._manifest("穿越", "2026-07-18T13:00:00+08:00", copied_file="../逃逸.jpg")
@@ -275,6 +514,10 @@ class ResultCatalogTests(unittest.TestCase):
                 "created_at": created_at,
                 "query_type": "text",
                 "status": "ok",
+                "sort_mode": "confidence",
+                "ranking_diagnostics": {
+                    "primary": "ranking_confidence_or_confidence_desc"
+                },
                 "library_ids": ["library-main"],
                 "results": [
                     {
@@ -286,7 +529,17 @@ class ResultCatalogTests(unittest.TestCase):
                         "doc_id": "doc-001",
                         "tags": ["原神", "雷电将军"],
                         "matched_tags": ["雷神"],
+                        "raw_score": 0.18,
+                        "normalized_score": 0.91,
                         "confidence": 0.91,
+                        "ranking_confidence": 0.92,
+                        "image_confidence": 0.88,
+                        "text_confidence": 0.93,
+                        "metadata_confidence": 0.72,
+                        "image_rank": 2,
+                        "text_rank": 1,
+                        "metadata_rank": 3,
+                        "rank_agreement": 0.8,
                         "match_state": "high",
                         "rank_source": "text",
                     }
@@ -294,6 +547,32 @@ class ResultCatalogTests(unittest.TestCase):
             },
         )
         return output
+
+    def _bulk_manifest(self, directory_name: str, count: int) -> tuple[Path, Path]:
+        output = self.results / directory_name
+        output.mkdir()
+        copied = output / "shared.jpg"
+        copied.write_bytes(b"copy")
+        manifest = output / "results.json"
+        self._write_json(
+            manifest,
+            {
+                "created_at": "2026-07-18T13:00:00+08:00",
+                "query_type": "text",
+                "status": "ok",
+                "library_ids": ["library-main"],
+                "results": [
+                    {
+                        "rank": index + 1,
+                        "copied_file": copied.name,
+                        "relative_path": "missing/original.jpg",
+                        "library_id": "library-main",
+                    }
+                    for index in range(count)
+                ],
+            },
+        )
+        return manifest, copied.resolve()
 
     @staticmethod
     def _write_json(path: Path, payload: object) -> None:

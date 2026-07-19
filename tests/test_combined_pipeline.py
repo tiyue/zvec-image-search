@@ -411,7 +411,12 @@ class CombinedPipelineTest(unittest.TestCase):
             self.assertIsNone(self._annotation_for(service, updated))
             inserted_annotation = self._annotation_for(service, inserted)
             assert inserted_annotation is not None
-            self.assertEqual(inserted_annotation["status"], "pending_review")
+            inserted_entry = service.state.find_entry_for_path(inserted)
+            assert inserted_entry is not None
+            self.assertEqual(inserted_annotation["status"], "accepted")
+            self.assertEqual(inserted_annotation["proposed_tags"], [])
+            self.assertEqual(inserted_entry["accepted_auto_tags"], ["Cosplay"])
+            self.assertIn("Cosplay", inserted_entry["effective_tags"])
         finally:
             service.close()
 
@@ -452,8 +457,13 @@ class CombinedPipelineTest(unittest.TestCase):
             )
             for path in (first, second):
                 annotation = self._annotation_for(service, path)
+                entry = service.state.find_entry_for_path(path)
                 assert annotation is not None
-                self.assertEqual(annotation["status"], "pending_review")
+                assert entry is not None
+                self.assertEqual(annotation["status"], "accepted")
+                self.assertEqual(annotation["proposed_tags"], [])
+                self.assertEqual(entry["accepted_auto_tags"], ["Cosplay"])
+                self.assertIn("Cosplay", entry["effective_tags"])
         finally:
             service.close()
 
@@ -486,8 +496,13 @@ class CombinedPipelineTest(unittest.TestCase):
             self.assertEqual(self._annotation_for(service, bad)["status"], "failed")
             for path in (good_a, good_b):
                 annotation = self._annotation_for(service, path)
+                entry = service.state.find_entry_for_path(path)
                 assert annotation is not None
-                self.assertEqual(annotation["status"], "pending_review")
+                assert entry is not None
+                self.assertEqual(annotation["status"], "accepted")
+                self.assertEqual(annotation["proposed_tags"], [])
+                self.assertEqual(entry["accepted_auto_tags"], ["Cosplay"])
+                self.assertIn("Cosplay", entry["effective_tags"])
         finally:
             service.close()
 

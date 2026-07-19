@@ -191,6 +191,39 @@ class OrganizePayloadAdapterTest(unittest.TestCase):
             [("刻晴", "character"), ("原神", "work")],
         )
 
+    def test_existing_low_risk_identity_is_not_pending_confirmation(self) -> None:
+        raw = proposal_payload()
+        raw["existing_tags"] = ["写真", "原神-刻晴", "刻晴"]
+        raw["proposed_tags"] = ["站姿"]
+        raw["identity_tags"] = []
+        raw["low_risk_tags"] = ["站姿", "刻晴"]
+        raw["tag_details"] = [
+            *(
+                detail
+                for detail in raw["tag_details"]
+                if detail["tag"] not in {"刻晴", "原神"}
+            ),
+            {
+                "tag": "刻晴",
+                "source": "accepted_auto",
+                "risk": "low",
+                "identity": True,
+                "entity_type": "character",
+                "already_present": True,
+                "requires_individual_confirmation": False,
+                "confidence": 0.94,
+            },
+        ]
+        raw["entities"]["character"][0]["state"] = "confirmed"
+        raw["entities"]["work"] = []
+
+        item = parse_pending_page(page_payload([raw])).proposals[0]
+
+        self.assertEqual(item.identity_tags, ())
+        self.assertNotIn("identity", item.review_buckets)
+        self.assertEqual(item.identity_choices, ())
+        self.assertEqual(item.batch_safe_tags, ("站姿",))
+
     def test_entity_names_are_a_second_identity_safety_boundary(self) -> None:
         raw = proposal_payload()
         raw["identity_tags"] = []

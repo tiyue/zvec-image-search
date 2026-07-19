@@ -9,9 +9,10 @@ from unittest import mock
 
 from PIL import Image
 
+import zvec_desktop.widgets as desktop_widgets
+from zvec_desktop.theme import DEFAULT_THEME
 from zvec_desktop.widgets import (
     AsyncImageCanvas,
-    FullscreenImageViewer,
     ImageTaskDispatcher,
     ResponsiveGallery,
 )
@@ -40,22 +41,11 @@ class DesktopWidgetContractTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "contain.*cover"):
             AsyncImageCanvas._validate_mode("stretch")
 
-    def test_fullscreen_defaults_to_cover_and_space_toggles_both_modes(self) -> None:
-        viewer = object.__new__(FullscreenImageViewer)
-        viewer._mode = "cover"
-        viewer._surface = mock.Mock()
-        viewer._mode_button = mock.Mock()
+    def test_removed_immersive_viewer_is_not_exposed(self) -> None:
+        self.assertFalse(hasattr(desktop_widgets, "FullscreenImageViewer"))
 
-        result = viewer._on_toggle_mode(mock.Mock())
-        self.assertEqual(result, "break")
-        self.assertEqual(viewer._mode, "contain")
-        viewer._surface.set_mode.assert_called_once_with("contain")
-        viewer._mode_button.configure.assert_called_once_with(text="铺满屏幕")
-
-        viewer.toggle_mode()
-        self.assertEqual(viewer._mode, "cover")
-        viewer._surface.set_mode.assert_called_with("cover")
-        viewer._mode_button.configure.assert_called_with(text="完整显示")
+        parameters = inspect.signature(ResponsiveGallery.set_items).parameters
+        self.assertNotIn("on_open", parameters)
 
     def test_destroyed_canvas_cancels_queued_decode_and_releases_photo(self) -> None:
         canvas = object.__new__(AsyncImageCanvas)
@@ -89,6 +79,114 @@ class DesktopWidgetContractTest(unittest.TestCase):
         self.assertEqual(calls[1], mock.call(1, weight=1, uniform="gallery"))
         self.assertEqual(calls[2], mock.call(2, weight=0, uniform=""))
         self.assertEqual(calls[4], mock.call(4, weight=0, uniform=""))
+
+    def test_gallery_waits_for_initial_geometry_without_starving_tk(self) -> None:
+        gallery = object.__new__(ResponsiveGallery)
+        gallery._resize_handle = "old-handle"
+        gallery._layout_signature = (5, 120, 140, False)
+        gallery._canvas = mock.Mock()
+        gallery._canvas.winfo_width.return_value = 1
+        gallery._canvas.winfo_height.return_value = 1
+        gallery.after = mock.Mock(return_value="retry-handle")
+
+        gallery._rebuild()
+
+        self.assertIsNone(gallery._layout_signature)
+        self.assertEqual(gallery._resize_handle, "retry-handle")
+        gallery.after.assert_called_once_with(
+            ResponsiveGallery._LAYOUT_RETRY_MS,
+            gallery._rebuild,
+        )
+
+    def test_gallery_ignores_stale_content_height_for_scrollbar_visibility(
+        self,
+    ) -> None:
+        gallery = object.__new__(ResponsiveGallery)
+        gallery._desired_scrollbar_visible = False
+        gallery._scrollbar_visible = True
+        gallery._canvas = mock.Mock()
+        gallery._canvas.bbox.return_value = (0, 0, 600, 900)
+        gallery._scrollbar = mock.Mock()
+
+        gallery._update_scroll_region(mock.Mock())
+
+        self.assertFalse(gallery._scrollbar_visible)
+        gallery._canvas.configure.assert_called_once_with(scrollregion=(0, 0, 600, 900))
+        gallery._scrollbar.grid_remove.assert_called_once_with()
+        gallery._canvas.yview_moveto.assert_called_once_with(0.0)
+
+    def test_gallery_portrait_thumbnails_use_contain_and_compact_captions(
+        self,
+    ) -> None:
+        self.assertEqual(ResponsiveGallery._THUMBNAIL_MODE, "contain")
+        self.assertEqual(ResponsiveGallery._caption_height(112), 40)
+        self.assertEqual(ResponsiveGallery._caption_height(139), 42)
+        self.assertEqual(ResponsiveGallery._caption_height(400), 44)
+
+    def test_gallery_selection_style_always_takes_precedence_over_hover(self) -> None:
+        gallery = object.__new__(ResponsiveGallery)
+        gallery._theme = DEFAULT_THEME
+        gallery._selected_index = 2
+        gallery._hovered_index = 2
+
+        self.assertEqual(
+            gallery._card_visual_style(2),
+            (DEFAULT_THEME.selection, DEFAULT_THEME.primary, 2),
+        )
+
+        gallery._selected_index = None
+        self.assertEqual(
+            gallery._card_visual_style(2),
+            (DEFAULT_THEME.surface_subtle, DEFAULT_THEME.focus, 1),
+        )
+        self.assertEqual(
+            gallery._card_visual_style(1),
+            (DEFAULT_THEME.surface, DEFAULT_THEME.border_strong, 1),
+        )
+
+    def test_gallery_hover_updates_chrome_without_clearing_another_card(self) -> None:
+        gallery = object.__new__(ResponsiveGallery)
+        gallery._hovered_index = None
+        gallery._update_selection_styles = mock.Mock()
+
+        gallery._set_hovered_index(4)
+        self.assertEqual(gallery._hovered_index, 4)
+        gallery._update_selection_styles.assert_called_once_with()
+
+        gallery._clear_hovered_index(3)
+        self.assertEqual(gallery._hovered_index, 4)
+        gallery._update_selection_styles.assert_called_once_with()
+
+        gallery._clear_hovered_index(4)
+        self.assertIsNone(gallery._hovered_index)
+        self.assertEqual(gallery._update_selection_styles.call_count, 2)
+
+    def test_gallery_selected_card_repaints_caption_and_title_consistently(
+        self,
+    ) -> None:
+        gallery = object.__new__(ResponsiveGallery)
+        gallery._theme = DEFAULT_THEME
+        gallery._selected_index = 0
+        gallery._hovered_index = 0
+        card = mock.Mock()
+        caption = mock.Mock()
+        title = mock.Mock()
+        subtitle = mock.Mock()
+        gallery._card_chrome = {0: (card, caption, title, subtitle)}
+
+        gallery._update_selection_styles()
+
+        card.configure.assert_called_once_with(
+            background=DEFAULT_THEME.selection,
+            highlightbackground=DEFAULT_THEME.primary,
+            highlightthickness=2,
+        )
+        caption.configure.assert_called_once_with(background=DEFAULT_THEME.selection)
+        title.configure.assert_called_once_with(
+            background=DEFAULT_THEME.selection,
+            foreground=DEFAULT_THEME.primary,
+        )
+        subtitle.configure.assert_called_once_with(background=DEFAULT_THEME.selection)
 
     def test_callback_failure_does_not_freeze_later_image_completions(self) -> None:
         root = _FakeRoot()

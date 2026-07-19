@@ -16,19 +16,22 @@ from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.metadata import PackageNotFoundError, version
-from pathlib import Path
-from time import perf_counter
-from typing import Any
+from pathlib import Path, PurePosixPath
+from time import monotonic, perf_counter
+from typing import Any, Literal
 from urllib.parse import parse_qs, urlsplit
 
+from .activity_store import ActivityStore
 from .backend_instance_lock import BackendInstanceLock
 from .config import RuntimeCredentials, ServiceConfig
 from .federated_search import LibraryCandidateSet, export_federated_search
+from .library_browser import LibraryBrowser
 from .library_config import (
     LibraryCatalog,
     LibraryDefinition,
     load_library_catalog,
 )
+from .rank_fusion import confidence_candidate_limit
 from .service import ImageVectorService
 
 ServiceFactory = Callable[[Callable[[str], None], Callable[[], None]], Any]
@@ -42,26 +45,47 @@ _TERMINAL_STATUSES = frozenset(
 _JOB_PATH = re.compile(r"^/v1/jobs/([0-9a-f]{32})/?$")
 _PROGRESS_NUMBERS = re.compile(r"(?P<current>\d+)\s*/\s*(?P<total>\d+)")
 _MAX_REQUEST_BYTES = 1024 * 1024
-_DEFAULT_FEDERATED_CANDIDATES_PER_LIBRARY = 50
-_MAX_FEDERATED_CANDIDATES = 100
 _PROTOCOL_VERSION = 2
+_ACTIVITY_JOB_HISTORY_EXCLUDED_COMMANDS = frozenset(
+    {
+        "search",
+        "stats",
+        "roots",
+        "libraries",
+        "folder_list",
+        "folder_images",
+        "folder_delete_preview",
+        "auto_tag_estimate",
+        "auto_tag_pending",
+        "tag_alias_list",
+    }
+)
+_ACTIVITY_PROGRESS_INTERVAL_SECONDS = 0.75
 _CAPABILITIES = {
     "multi_library": True,
     "federated_search": True,
     "session_credentials": True,
     "low_confidence_override": True,
     "folder_tags": True,
+    "folder_browser": True,
+    "folder_delete_two_phase": True,
+    "manual_tag_batch": True,
+    "manual_tag_undo": True,
+    "search_results_cleanup": True,
     "fuzzy_tag_search": True,
     "tag_only_search": True,
     "hybrid_tag_vector_search": True,
     "metadata_embedding_search": True,
     "result_diversity": True,
+    "search_sort_modes": ["confidence", "relevance", "diverse", "legacy"],
     "index_and_auto_tag": True,
     "auto_tagging": True,
     "auto_tag_pending": True,
     "auto_tag_review": True,
     "auto_tag_review_batch": True,
+    "auto_tag_identity_batch_review": True,
     "auto_tag_review_undo": True,
+    "auto_tag_policy_migrate": True,
     "metadata_embedding_backfill": True,
     "tag_alias_list": True,
     "tag_alias_upsert": True,
@@ -171,6 +195,7 @@ class _LibraryWorker:
         self._ready = threading.Event()
         self._stop = threading.Event()
         self._startup_error: dict[str, Any] | None = None
+        self._recovery_report: dict[str, Any] | None = None
         self._current_job_id: str | None = None
         self._thread = threading.Thread(
             target=self._main,
@@ -185,6 +210,10 @@ class _LibraryWorker:
     @property
     def ready(self) -> bool:
         return self._ready.is_set() and self._startup_error is None
+
+    @property
+    def recovery_report(self) -> dict[str, Any] | None:
+        return self._recovery_report
 
     @property
     def alive(self) -> bool:
@@ -227,6 +256,11 @@ class _LibraryWorker:
                 self._report_progress,
                 self._check_cancel,
             )
+            recover = getattr(service, "recover_folder_deletions", None)
+            if callable(recover):
+                recovery = recover(library_id=self.library.library_id)
+                if isinstance(recovery, dict):
+                    self._recovery_report = _json_safe(recovery)
             self._ready.set()
             while True:
                 call = self._queue.get()
@@ -296,7 +330,11 @@ class BackendJobManager:
         service_factory: ServiceFactory | None = None,
         library_service_factory: LibraryServiceFactory | None = None,
         library_catalog: LibraryCatalog | None = None,
+        activity_store: ActivityStore | None = None,
+        owns_activity_store: bool = False,
     ) -> None:
+        if owns_activity_store and activity_store is None:
+            raise ValueError("owns_activity_store requires an activity_store")
         self._instance_id = instance_id
         self._config_fingerprint = config_fingerprint
         self._config = config or ServiceConfig()
@@ -312,6 +350,11 @@ class BackendJobManager:
         self._catalog = library_catalog or load_library_catalog(None, self._config)
         self._jobs: dict[str, BackendJob] = {}
         self._jobs_lock = threading.RLock()
+        self._activity = activity_store
+        self._owns_activity = owns_activity_store
+        self._activity_lock = threading.Lock()
+        self._activity_progress_times: dict[str, float] = {}
+        self._activity_health_state: str | None = None
         self._stop_requested = threading.Event()
         self._started = False
         self._closed = False
@@ -361,26 +404,218 @@ class BackendJobManager:
 
         return create
 
+    def _activity_log(
+        self,
+        *,
+        level: Literal["debug", "info", "warning", "error"],
+        event: str,
+        message: str,
+        category: str = "backend",
+        library_id: str | None = None,
+        library_name: str | None = None,
+        job_id: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        """Persist one bounded backend event without affecting primary work."""
+
+        activity = self._activity
+        if activity is None:
+            return
+        with suppress(Exception):
+            activity.log(
+                level=level,
+                category=category,
+                event=event,
+                source="backend",
+                message=message,
+                library_id=library_id,
+                library_name=library_name,
+                job_id=job_id,
+                operation_id=job_id,
+                details=details or {},
+            )
+
+    def _job_library_context(
+        self, snapshot: dict[str, Any]
+    ) -> tuple[str | None, str | None]:
+        params = snapshot.get("params")
+        params = params if isinstance(params, dict) else {}
+        library_id = params.get("library_id") or self._catalog.default_library_id
+        if not isinstance(library_id, str) or not library_id:
+            return None, None
+        library = self._catalog.by_id.get(library_id)
+        return library_id, library.name if library is not None else None
+
+    def _record_job_history(
+        self,
+        snapshot: dict[str, Any],
+        *,
+        force: bool = False,
+    ) -> None:
+        """Best-effort durable snapshot; high-frequency progress is throttled."""
+
+        activity = self._activity
+        command = str(snapshot.get("command") or "")
+        job_id = str(snapshot.get("id") or "")
+        if (
+            activity is None
+            or not command
+            or not job_id
+            or command in _ACTIVITY_JOB_HISTORY_EXCLUDED_COMMANDS
+        ):
+            return
+        status = str(snapshot.get("status") or "unknown")
+        now = monotonic()
+        with self._activity_lock:
+            if not force and status == "running":
+                previous = self._activity_progress_times.get(job_id, 0.0)
+                if now - previous < _ACTIVITY_PROGRESS_INTERVAL_SECONDS:
+                    return
+                self._activity_progress_times[job_id] = now
+            if status in _TERMINAL_STATUSES:
+                self._activity_progress_times.pop(job_id, None)
+        library_id, library_name = self._job_library_context(snapshot)
+        record = dict(snapshot)
+        record["library_id"] = library_id
+        record["library_name"] = library_name
+        with suppress(Exception):
+            activity.record_job(record)
+
+    def _record_image_failures(self, snapshot: dict[str, Any]) -> None:
+        """Persist bounded per-image failures even when no UI is connected."""
+
+        result = snapshot.get("result")
+        result = result if isinstance(result, dict) else {}
+        raw_failures = result.get("error_images")
+        if not isinstance(raw_failures, list):
+            raw_failures = result.get("failures")
+        if not isinstance(raw_failures, list):
+            return
+        library_id, library_name = self._job_library_context(snapshot)
+        job_id = str(snapshot.get("id") or "") or None
+        task_type = str(snapshot.get("command") or "unknown")
+        logged = 0
+        for item in raw_failures[:200]:
+            if not isinstance(item, dict):
+                continue
+            relative_path = _safe_activity_relative_path(item.get("relative_path"))
+            details: dict[str, Any] = {
+                "task_type": task_type,
+                "name": str(item.get("name") or item.get("file_name") or ""),
+                "reason": str(item.get("reason") or item.get("error") or ""),
+            }
+            if relative_path:
+                details["relative_path"] = relative_path
+            self._activity_log(
+                level="warning",
+                category="image_failure",
+                event="image_failed",
+                message=str(
+                    item.get("reason")
+                    or item.get("error")
+                    or "One image failed; the batch continued."
+                ),
+                library_id=library_id,
+                library_name=library_name,
+                job_id=job_id,
+                details=details,
+            )
+            logged += 1
+        if len(raw_failures) > logged:
+            self._activity_log(
+                level="warning",
+                category="image_failure",
+                event="image_failure_log_truncated",
+                message="Additional image failures remain in the task result manifest.",
+                library_id=library_id,
+                library_name=library_name,
+                job_id=job_id,
+                details={
+                    "task_type": task_type,
+                    "logged_count": logged,
+                    "omitted_count": len(raw_failures) - logged,
+                },
+            )
+
+    def _record_health_transition(
+        self,
+        status: str,
+        *,
+        error_library_ids: list[str],
+        worker_alive: bool,
+    ) -> None:
+        with self._activity_lock:
+            if self._activity_health_state == status:
+                return
+            self._activity_health_state = status
+        level: Literal["info", "warning", "error"] = (
+            "error" if status == "degraded" else "info"
+        )
+        event = {
+            "ok": "backend_workers_ready",
+            "starting": "backend_workers_starting",
+            "degraded": "backend_workers_degraded",
+        }.get(status, "backend_worker_state_changed")
+        message = {
+            "ok": "图库工作线程已就绪。",
+            "starting": "图库工作线程正在初始化。",
+            "degraded": "一个或多个图库工作线程不可用。",
+        }.get(status, f"图库工作线程状态变为 {status}。")
+        self._activity_log(
+            level=level,
+            event=event,
+            message=message,
+            details={
+                "status": status,
+                "worker_alive": worker_alive,
+                "library_count": len(self._library_workers),
+                "error_count": len(error_library_ids),
+                "error_library_ids": error_library_ids,
+            },
+        )
+
     def start(self) -> None:
         if self._started:
             return
         self._started = True
         for worker in self._library_workers.values():
             worker.start()
+        self._activity_log(
+            level="info",
+            event="backend_workers_started",
+            message="图库工作线程已启动。",
+            details={"library_count": len(self._library_workers)},
+        )
 
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
+        self._activity_log(
+            level="info",
+            event="backend_workers_stopping",
+            message="图库工作线程正在安全停止。",
+            details={"library_count": len(self._library_workers)},
+        )
         self._stop_requested.set()
         with self._jobs_lock:
             for job in self._jobs.values():
                 if job.status not in _TERMINAL_STATUSES:
                     job.cancel_requested = True
-        if self._started:
-            for worker in self._library_workers.values():
-                worker.close()
-        self._control_executor.shutdown(wait=True, cancel_futures=False)
+        try:
+            if self._started:
+                for worker in self._library_workers.values():
+                    worker.close()
+            self._control_executor.shutdown(wait=True, cancel_futures=False)
+        finally:
+            self._activity_log(
+                level="info",
+                event="backend_workers_stopped",
+                message="图库工作线程已停止。",
+                details={"library_count": len(self._library_workers)},
+            )
+            if self._owns_activity and self._activity is not None:
+                self._activity.close(timeout=2.0)
 
     def health(self) -> tuple[HTTPStatus, dict[str, Any]]:
         coordinator_alive = self._started and not self._closed
@@ -426,6 +661,11 @@ class BackendJobManager:
                     "ready": self._library_workers[library.library_id].ready
                     if library.enabled
                     else False,
+                    "folder_delete_recovery": (
+                        self._library_workers[library.library_id].recovery_report
+                        if library.enabled
+                        else None
+                    ),
                 }
                 for library in self._catalog.libraries
             ],
@@ -436,6 +676,11 @@ class BackendJobManager:
                 "message": "One or more library services failed to initialize.",
                 "details": errors,
             }
+        self._record_health_transition(
+            status_text,
+            error_library_ids=sorted(errors),
+            worker_alive=bool(payload["worker_alive"]),
+        )
         return status, payload
 
     def version_info(self) -> dict[str, Any]:
@@ -482,7 +727,11 @@ class BackendJobManager:
                     "invalid_credentials",
                     "api_url must be an HTTP(S) URL without embedded credentials.",
                 )
-        self._credentials.configure(api_key.strip(), api_url)
+        normalized_key = api_key.strip()
+        if self._activity is not None:
+            with suppress(Exception):
+                self._activity.add_redactions(normalized_key)
+        self._credentials.configure(normalized_key, api_url)
         return {"credentials_configured": True}
 
     def submit(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -508,6 +757,8 @@ class BackendJobManager:
                     status=HTTPStatus.SERVICE_UNAVAILABLE,
                 )
             self._jobs[job.id] = job
+            snapshot = job.to_dict()
+        self._record_job_history(snapshot, force=True)
         self._schedule(job)
         return job.to_dict()
 
@@ -596,22 +847,26 @@ class BackendJobManager:
                     details={"status": job.status},
                 )
             job.cancel_requested = True
+            previous_progress = job.progress or {}
             if job.status == "queued":
                 job.status = "cancelled"
                 job.finished_at = _utc_now()
                 job.progress = {
+                    **previous_progress,
                     "message": "Cancelled before execution.",
                     "updated_at": job.finished_at,
                 }
             else:
                 job.status = "cancelling"
                 job.progress = {
+                    **previous_progress,
                     "message": "Cancellation requested.",
                     "updated_at": _utc_now(),
                 }
             future = self._job_futures.get(job_id)
             result = job.to_dict()
-        if future is not None and job.status == "cancelled":
+        self._record_job_history(result, force=True)
+        if future is not None and result["status"] == "cancelled":
             future.cancel()
         return result
 
@@ -619,6 +874,13 @@ class BackendJobManager:
         if job.command == "libraries":
             future = self._control_executor.submit(
                 self._run_control_job, job.id, lambda: self._catalog.to_dict()
+            )
+        elif job.command in {"folder_list", "folder_images"}:
+            library = self._single_library(job.params)
+            future = self._control_executor.submit(
+                self._run_browse_job,
+                job.id,
+                library,
             )
         elif job.command == "search":
             libraries = self._search_libraries(job.params)
@@ -655,7 +917,9 @@ class BackendJobManager:
                 "message": "Running.",
                 "updated_at": _utc_now(),
             }
-            return job
+            snapshot = job.to_dict()
+        self._record_job_history(snapshot, force=True)
+        return job
 
     def _run_control_job(self, job_id: str, callback: Callable[[], Any]) -> Any:
         self._begin_job(job_id)
@@ -670,6 +934,36 @@ class BackendJobManager:
         self._check_cancel(job_id)
         return _attribute_result(result, library)
 
+    def _run_browse_job(
+        self,
+        job_id: str,
+        library: LibraryDefinition,
+    ) -> Any:
+        job = self._begin_job(job_id)
+        self._check_cancel(job_id)
+        with LibraryBrowser(
+            library_id=library.library_id,
+            state_path=library.workspace / "image_collection.state.sqlite3",
+        ) as browser:
+            if job.command == "folder_list":
+                result = browser.list_folders(
+                    root_id=job.params["root_id"],
+                    query=job.params["query"],
+                    offset=job.params["offset"],
+                    limit=job.params["limit"],
+                )
+            elif job.command == "folder_images":
+                result = browser.folder_images(
+                    job.params["folder_key"],
+                    include_subfolders=job.params["include_subfolders"],
+                    offset=job.params["offset"],
+                    limit=job.params["limit"],
+                )
+            else:  # pragma: no cover - guarded by _schedule
+                raise AssertionError(f"Unsupported browse command: {job.command}")
+        self._check_cancel(job_id)
+        return _attribute_result(result, library)
+
     def _run_federated_job(
         self, job_id: str, libraries: list[LibraryDefinition]
     ) -> Any:
@@ -677,6 +971,7 @@ class BackendJobManager:
         return self._execute_federated_search(job, libraries)
 
     def _complete_job(self, job_id: str, future: Future[Any]) -> None:
+        failure_type: str | None = None
         try:
             result = future.result()
         except JobCancelled:
@@ -686,6 +981,7 @@ class BackendJobManager:
                 job.result = None
                 job.error = None
                 job.progress = {
+                    **(job.progress or {}),
                     "message": "Cancelled.",
                     "updated_at": _utc_now(),
                 }
@@ -701,7 +997,9 @@ class BackendJobManager:
                     "message": str(exc) or exc.__class__.__name__,
                     "details": {"type": exc.__class__.__name__},
                 }
+                failure_type = exc.__class__.__name__
                 job.progress = {
+                    **(job.progress or {}),
                     "message": "Failed.",
                     "updated_at": _utc_now(),
                 }
@@ -725,7 +1023,14 @@ class BackendJobManager:
                     if failure_count
                     else "succeeded"
                 )
+                completion_progress = dict(job.progress or {})
+                processed, total = _result_progress_counts(safe_result)
+                if processed is not None:
+                    completion_progress["current"] = processed
+                if total is not None:
+                    completion_progress["total"] = total
                 job.progress = {
+                    **completion_progress,
                     "message": (
                         "Completed and needs attention."
                         if needs_attention
@@ -742,6 +1047,28 @@ class BackendJobManager:
                 if job.status in _TERMINAL_STATUSES:
                     job.finished_at = job.finished_at or _utc_now()
                 self._job_futures.pop(job_id, None)
+                snapshot = job.to_dict()
+            self._record_job_history(snapshot, force=True)
+            if snapshot.get("status") in {
+                "partial",
+                "needs_attention",
+                "failed",
+            }:
+                self._record_image_failures(snapshot)
+            if failure_type is not None:
+                library_id, library_name = self._job_library_context(snapshot)
+                self._activity_log(
+                    level="error",
+                    event="backend_job_exception",
+                    message="图库任务因后端异常失败。",
+                    library_id=library_id,
+                    library_name=library_name,
+                    job_id=job_id,
+                    details={
+                        "task_type": str(snapshot.get("command") or "unknown"),
+                        "error_type": failure_type,
+                    },
+                )
 
     def _execute_federated_search(
         self, job: BackendJob, libraries: list[LibraryDefinition]
@@ -765,7 +1092,9 @@ class BackendJobManager:
                 )
             ),
         )
-        candidate_k = min(self._config.max_top_k, params["candidate_k"])
+        candidate_k = params["candidate_k"]
+        if self._config.max_top_k is not None:
+            candidate_k = min(self._config.max_top_k, candidate_k)
         futures = [
             (
                 library,
@@ -803,6 +1132,7 @@ class BackendJobManager:
             latency_ms=(perf_counter() - started_at) * 1000,
             show_low_confidence=params["show_low_confidence"],
             diversify_results=params["diversify_results"],
+            sort_mode=params["sort_mode"],
         )
 
     def _execute_single(
@@ -870,9 +1200,40 @@ class BackendJobManager:
                 proposal_ids=params["proposal_ids"],
                 accepted_tags_by_proposal=params["accepted_tags_by_proposal"],
                 exclude_identity_tags=params["exclude_identity_tags"],
+                acceptance_mode=params["acceptance_mode"],
+                batch_confirmation=params["batch_confirmation"],
             )
         if command == "auto_tag_review_undo":
             return service.undo_latest_auto_tag_review_batch()
+        if command == "auto_tag_policy_migrate":
+            return service.reconcile_pending_identity_tags(dry_run=params["dry_run"])
+        if command == "manual_tag_batch":
+            return service.manual_tag_batch(
+                library_id=library.library_id,
+                selection=params["selection"],
+                operation=params["operation"],
+                tags=params["tags"],
+            )
+        if command == "manual_tag_undo":
+            return service.undo_latest_manual_tag_batch()
+        if command == "search_results_cleanup":
+            return service.cleanup_search_results(
+                keep_latest=params["keep_latest"],
+                dry_run=params["dry_run"],
+            )
+        if command == "folder_delete_preview":
+            return service.preview_folder_deletion(
+                library_id=library.library_id,
+                folder_key=params["folder_key"],
+                include_subfolders=params["include_subfolders"],
+            )
+        if command == "folder_delete_commit":
+            return service.commit_folder_deletion(
+                library_id=library.library_id,
+                operation_id=params["operation_id"],
+                confirmation_token=params["confirmation_token"],
+                confirm=params["confirm"],
+            )
         if command == "metadata_backfill":
             return service.backfill_metadata_embeddings(
                 max_images=params["max_images"],
@@ -906,6 +1267,7 @@ class BackendJobManager:
                 "tag_mode": params["tag_mode"],
                 "show_low_confidence": params["show_low_confidence"],
                 "diversify_results": params["diversify_results"],
+                "sort_mode": params["sort_mode"],
             }
             if params["search_mode"] == "tags":
                 return service.search_by_tags(text, **common)
@@ -969,11 +1331,14 @@ class BackendJobManager:
                 "library_name": library.name,
             }
             job.progress = {
+                **previous,
                 **item,
                 "library_id": library.library_id,
                 "library_name": library.name,
                 "libraries": per_library,
             }
+            snapshot = job.to_dict()
+        self._record_job_history(snapshot)
 
     def _check_cancel(self, job_id: str) -> None:
         with self._jobs_lock:
@@ -1085,9 +1450,15 @@ class BackendHTTPServer(ThreadingHTTPServer):
 
     def server_close(self) -> None:
         try:
-            super().server_close()
+            # Keep backend.lock until every Collection worker and the owned
+            # ActivityStore are closed.  Embedded callers may invoke
+            # server_close() without first entering serve_forever().
+            self.manager.close()
         finally:
-            self._instance_lock.release()
+            try:
+                super().server_close()
+            finally:
+                self._instance_lock.release()
 
 
 class BackendRequestHandler(BaseHTTPRequestHandler):
@@ -1415,11 +1786,17 @@ def create_backend_server(
     library_service_factory: LibraryServiceFactory | None = None,
     libraries_config: str | Path | None = None,
     library_catalog: LibraryCatalog | None = None,
+    activity_store: ActivityStore | None = None,
+    activity_config_home: str | Path | None = None,
 ) -> tuple[BackendHTTPServer, BackendJobManager]:
     if not token:
         raise ValueError("A non-empty backend Bearer token is required.")
     if not 0 <= port <= 65535:
         raise ValueError("port must be between 0 and 65535.")
+    if activity_store is not None and activity_config_home is not None:
+        raise ValueError(
+            "activity_store and activity_config_home cannot be supplied together."
+        )
     resolved_config = config or ServiceConfig()
     resolved_instance_id = _normalized_identity(
         instance_id,
@@ -1449,9 +1826,19 @@ def create_backend_server(
 
     manager: BackendJobManager | None = None
     server: BackendHTTPServer | None = None
+    resolved_activity = activity_store
+    owns_activity = False
     try:
         # Loading catalogs and constructing workers happens only after the process
         # lock is held. A second desktop process therefore cannot open Collections.
+        if resolved_activity is None and activity_config_home is not None:
+            resolved_activity = ActivityStore(
+                activity_config_home,
+                # This process owns backend.lock, so no older backend can still
+                # be running the jobs that crash recovery will mark interrupted.
+                recover_interrupted=True,
+            )
+            owns_activity = True
         resolved_catalog = library_catalog or load_library_catalog(
             libraries_config, resolved_config
         )
@@ -1463,6 +1850,8 @@ def create_backend_server(
             service_factory=service_factory,
             library_service_factory=library_service_factory,
             library_catalog=resolved_catalog,
+            activity_store=resolved_activity,
+            owns_activity_store=owns_activity,
         )
         server = BackendHTTPServer((host, port), manager, token, instance_lock)
         manager.start()
@@ -1471,6 +1860,9 @@ def create_backend_server(
         if manager is not None:
             with suppress(Exception):
                 manager.close()
+        elif owns_activity and resolved_activity is not None:
+            with suppress(Exception):
+                resolved_activity.close(timeout=2.0)
         if server is not None:
             with suppress(Exception):
                 server.server_close()
@@ -1501,6 +1893,7 @@ def serve_backend(
         config=config,
         query_root=query_root,
         libraries_config=libraries_config,
+        activity_config_home=_default_config_home(),
     )
     print(
         json.dumps(
@@ -1547,6 +1940,13 @@ def _normalize_job(
         "cache_clear",
         "clean_results",
         "libraries",
+        "folder_list",
+        "folder_images",
+        "folder_delete_preview",
+        "folder_delete_commit",
+        "manual_tag_batch",
+        "manual_tag_undo",
+        "search_results_cleanup",
         "folder_tag_backfill",
         "index_and_auto_tag",
         "auto_tag_estimate",
@@ -1555,6 +1955,7 @@ def _normalize_job(
         "auto_tag_review",
         "auto_tag_review_batch",
         "auto_tag_review_undo",
+        "auto_tag_policy_migrate",
         "metadata_backfill",
         "tag_alias_list",
         "tag_alias_upsert",
@@ -1574,6 +1975,147 @@ def _normalize_job(
     if command == "libraries":
         _reject_unknown(params, set())
         return command, {}
+
+    if command == "folder_list":
+        _reject_unknown(
+            params,
+            {"library_id", "root_id", "query", "offset", "limit"},
+        )
+        query = params.get("query", "")
+        if not isinstance(query, str) or len(query.strip()) > 256:
+            raise BackendRequestError(
+                "invalid_params", "query must be a string of at most 256 characters."
+            )
+        return command, {
+            "library_id": _optional_string(params, "library_id"),
+            "root_id": _optional_string(params, "root_id"),
+            "query": query.strip(),
+            "offset": _non_negative_integer(params, "offset", 0),
+            "limit": _bounded_positive_integer(params, "limit", 200, 1_000),
+        }
+
+    if command == "folder_images":
+        _reject_unknown(
+            params,
+            {
+                "library_id",
+                "folder_key",
+                "include_subfolders",
+                "offset",
+                "limit",
+            },
+        )
+        folder_key = _required_string(params, "folder_key")
+        if len(folder_key) > 8_192:
+            raise BackendRequestError(
+                "invalid_params", "folder_key must be at most 8192 characters."
+            )
+        return command, {
+            "library_id": _optional_string(params, "library_id"),
+            "folder_key": folder_key,
+            "include_subfolders": _boolean(params, "include_subfolders", False),
+            "offset": _non_negative_integer(params, "offset", 0),
+            "limit": _bounded_positive_integer(params, "limit", 100, 1_000),
+        }
+
+    if command == "folder_delete_preview":
+        _reject_unknown(
+            params,
+            {"library_id", "folder_key", "include_subfolders"},
+        )
+        folder_key = _required_string(params, "folder_key")
+        if len(folder_key) > 8_192:
+            raise BackendRequestError(
+                "invalid_params", "folder_key must be at most 8192 characters."
+            )
+        include_subfolders = _boolean(params, "include_subfolders", True)
+        if not include_subfolders:
+            raise BackendRequestError(
+                "invalid_params",
+                "Folder deletion must include every descendant folder.",
+            )
+        return command, {
+            "library_id": _optional_string(params, "library_id"),
+            "folder_key": folder_key,
+            "include_subfolders": True,
+        }
+
+    if command == "folder_delete_commit":
+        _reject_unknown(
+            params,
+            {
+                "library_id",
+                "operation_id",
+                "confirmation_token",
+                "confirm",
+            },
+        )
+        operation_id = _required_string(params, "operation_id").lower()
+        if re.fullmatch(r"[0-9a-f]{32}", operation_id) is None:
+            raise BackendRequestError(
+                "invalid_params", "operation_id must be a 32-character hex id."
+            )
+        confirmation_token = _required_string(params, "confirmation_token")
+        if len(confirmation_token) > 512:
+            raise BackendRequestError(
+                "invalid_params", "confirmation_token must be at most 512 characters."
+            )
+        confirm = _boolean(params, "confirm", False)
+        if not confirm:
+            raise BackendRequestError(
+                "confirmation_required",
+                "Explicit folder deletion confirmation is required.",
+            )
+        return command, {
+            "library_id": _optional_string(params, "library_id"),
+            "operation_id": operation_id,
+            "confirmation_token": confirmation_token,
+            "confirm": True,
+        }
+
+    if command == "manual_tag_batch":
+        _reject_unknown(
+            params,
+            {"library_id", "selection", "operation", "tags"},
+        )
+        selection = _manual_tag_selection(params.get("selection"))
+        operation = params.get("operation")
+        if not isinstance(operation, str) or operation.strip().lower() not in {
+            "add",
+            "remove",
+            "replace_manual",
+        }:
+            raise BackendRequestError(
+                "invalid_params",
+                "operation must be add, remove, or replace_manual.",
+            )
+        normalized_operation = operation.strip().lower()
+        tags = _manual_tags(params.get("tags"))
+        if normalized_operation in {"add", "remove"} and not tags:
+            raise BackendRequestError(
+                "invalid_params",
+                f"{normalized_operation} requires at least one tag.",
+            )
+        return command, {
+            "library_id": _optional_string(params, "library_id"),
+            "selection": selection,
+            "operation": normalized_operation,
+            "tags": tags,
+        }
+
+    if command == "manual_tag_undo":
+        _reject_unknown(params, {"library_id"})
+        return command, {
+            "library_id": _optional_string(params, "library_id"),
+        }
+
+    if command == "search_results_cleanup":
+        _reject_unknown(params, {"library_id", "keep_latest", "dry_run"})
+        return command, {
+            "library_id": _optional_string(params, "library_id"),
+            "keep_latest": _bounded_positive_integer(params, "keep_latest", 3, 100),
+            "dry_run": _boolean(params, "dry_run", False),
+        }
 
     if command == "index":
         _reject_unknown(
@@ -1835,6 +2377,8 @@ def _normalize_job(
                 "proposal_ids",
                 "accepted_tags_by_proposal",
                 "exclude_identity_tags",
+                "acceptance_mode",
+                "batch_confirmation",
             },
         )
         proposal_ids = params.get("proposal_ids")
@@ -1877,22 +2421,56 @@ def _normalize_job(
                     "accepted_tags_by_proposal values must be arrays of strings.",
                 )
             normalized_accepted[proposal_id] = tags
-        exclude_identity = _boolean(params, "exclude_identity_tags", True)
-        if not exclude_identity:
+        raw_mode = params.get("acceptance_mode")
+        if raw_mode is None:
+            exclude_identity = _boolean(params, "exclude_identity_tags", True)
+            acceptance_mode = "low_risk_only" if exclude_identity else "recommended"
+        else:
+            if not isinstance(raw_mode, str) or raw_mode.strip().lower() not in {
+                "low_risk_only",
+                "recommended",
+                "all_non_conflicting",
+            }:
+                raise BackendRequestError(
+                    "invalid_params",
+                    "acceptance_mode must be low_risk_only, recommended, or "
+                    "all_non_conflicting.",
+                )
+            acceptance_mode = raw_mode.strip().lower()
+            exclude_identity = _boolean(
+                params,
+                "exclude_identity_tags",
+                acceptance_mode == "low_risk_only",
+            )
+        if exclude_identity != (acceptance_mode == "low_risk_only"):
             raise BackendRequestError(
                 "invalid_params",
-                "exclude_identity_tags must be true for batch review.",
+                "exclude_identity_tags conflicts with acceptance_mode.",
+            )
+        batch_confirmation = _boolean(params, "batch_confirmation", False)
+        if acceptance_mode != "low_risk_only" and not batch_confirmation:
+            raise BackendRequestError(
+                "invalid_params",
+                "Identity-inclusive batch review requires batch_confirmation=true.",
             )
         return command, {
             "library_id": _optional_string(params, "library_id"),
             "proposal_ids": normalized_ids,
             "accepted_tags_by_proposal": normalized_accepted,
-            "exclude_identity_tags": True,
+            "exclude_identity_tags": exclude_identity,
+            "acceptance_mode": acceptance_mode,
+            "batch_confirmation": batch_confirmation,
         }
     if command == "auto_tag_review_undo":
         _reject_unknown(params, {"library_id"})
         return command, {
             "library_id": _optional_string(params, "library_id"),
+        }
+    if command == "auto_tag_policy_migrate":
+        _reject_unknown(params, {"library_id", "dry_run"})
+        return command, {
+            "library_id": _optional_string(params, "library_id"),
+            "dry_run": _boolean(params, "dry_run", False),
         }
     if command == "metadata_backfill":
         _reject_unknown(params, {"library_id", "max_images"})
@@ -1990,6 +2568,7 @@ def _normalize_job(
                 "include_self",
                 "show_low_confidence",
                 "diversify_results",
+                "sort_mode",
                 "search_mode",
                 "library_id",
                 "library_ids",
@@ -2032,17 +2611,35 @@ def _normalize_job(
             raise BackendRequestError(
                 "invalid_params", "tag_mode must be 'all' or 'any'."
             )
+        top_k = _positive_integer(params, "top_k", 10)
+        requested_candidate_k = (
+            None
+            if params.get("candidate_k") is None
+            else _positive_integer(params, "candidate_k", 1)
+        )
+        raw_sort_mode = params.get("sort_mode", "confidence")
+        sort_mode = (
+            raw_sort_mode.strip().lower() if isinstance(raw_sort_mode, str) else ""
+        )
+        if sort_mode not in {
+            "relevance",
+            "confidence",
+            "diverse",
+            "legacy",
+        }:
+            raise BackendRequestError(
+                "invalid_params",
+                "sort_mode must be relevance, confidence, diverse, or legacy.",
+            )
         return command, {
             "library_ids": _search_library_ids(params),
             "text": text,
             "image": image,
             "search_mode": search_mode,
-            "top_k": _positive_integer(params, "top_k", 10),
-            "candidate_k": _bounded_positive_integer(
-                params,
-                "candidate_k",
-                _DEFAULT_FEDERATED_CANDIDATES_PER_LIBRARY,
-                _MAX_FEDERATED_CANDIDATES,
+            "top_k": top_k,
+            "candidate_k": confidence_candidate_limit(
+                top_k,
+                requested_candidate_k,
             ),
             "tags": _tags(params.get("tags")),
             "tag_mode": tag_mode,
@@ -2051,6 +2648,7 @@ def _normalize_job(
             "include_self": _boolean(params, "include_self", False),
             "show_low_confidence": _boolean(params, "show_low_confidence", False),
             "diversify_results": _boolean(params, "diversify_results", True),
+            "sort_mode": sort_mode,
         }
     if command in {"stats", "roots", "cache_clear"}:
         _reject_unknown(params, {"library_id"})
@@ -2062,6 +2660,21 @@ def _normalize_job(
         "days": _non_negative_integer(params, "days", 7),
         "dry_run": _boolean(params, "dry_run", False),
     }
+
+
+def _safe_activity_relative_path(value: Any) -> str:
+    """Return one bounded portable relative path for durable activity logs."""
+
+    if not isinstance(value, str) or not value.strip():
+        return ""
+    candidate = value.replace("\\", "/").strip("/")
+    if not candidate or ":" in candidate.split("/", 1)[0]:
+        return ""
+    parts = PurePosixPath(candidate).parts
+    if any(part in {"", ".", ".."} for part in parts):
+        return ""
+    normalized = "/".join(parts)
+    return normalized if len(normalized) <= 4_096 else ""
 
 
 def _validate_query_image(value: str, query_root: Path) -> str:
@@ -2233,6 +2846,124 @@ def _tags(value: Any) -> list[str] | None:
     return value
 
 
+def _manual_tags(value: Any) -> list[str]:
+    if not isinstance(value, list) or not all(isinstance(tag, str) for tag in value):
+        raise BackendRequestError("invalid_params", "tags must be an array of strings.")
+    if len(value) > 1_000:
+        raise BackendRequestError(
+            "invalid_params", "tags can contain at most 1000 items."
+        )
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for tag in value:
+        cleaned = tag.strip()
+        if (
+            not cleaned
+            or len(cleaned) > 4_096
+            or any(ord(character) < 32 for character in cleaned)
+        ):
+            raise BackendRequestError(
+                "invalid_params",
+                "tags must contain non-empty strings of at most 4096 characters "
+                "without control characters.",
+            )
+        if cleaned not in seen:
+            seen.add(cleaned)
+            normalized.append(cleaned)
+    return normalized
+
+
+def _manual_tag_selection(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise BackendRequestError("invalid_params", "selection must be an object.")
+    mode = value.get("mode")
+    if not isinstance(mode, str):
+        raise BackendRequestError(
+            "invalid_params", "selection.mode must be selected or folder."
+        )
+    normalized_mode = mode.strip().lower()
+    if normalized_mode == "selected":
+        _reject_unknown(value, {"mode", "doc_ids"})
+        raw_ids = value.get("doc_ids")
+        if (
+            not isinstance(raw_ids, list)
+            or not raw_ids
+            or not all(isinstance(doc_id, str) and doc_id.strip() for doc_id in raw_ids)
+        ):
+            raise BackendRequestError(
+                "invalid_params",
+                "selected mode requires a non-empty doc_ids array.",
+            )
+        if len(raw_ids) > 10_000:
+            raise BackendRequestError(
+                "invalid_params", "doc_ids can contain at most 10000 items."
+            )
+        normalized_ids: list[str] = []
+        seen: set[str] = set()
+        for raw_id in raw_ids:
+            doc_id = raw_id.strip()
+            if len(doc_id) > 256:
+                raise BackendRequestError(
+                    "invalid_params", "document ids must be at most 256 characters."
+                )
+            if doc_id not in seen:
+                seen.add(doc_id)
+                normalized_ids.append(doc_id)
+        return {"mode": "selected", "doc_ids": normalized_ids}
+    if normalized_mode == "folder":
+        _reject_unknown(
+            value,
+            {"mode", "folder_key", "include_subfolders", "excluded_doc_ids"},
+        )
+        folder_key = value.get("folder_key")
+        if (
+            not isinstance(folder_key, str)
+            or not folder_key.strip()
+            or len(folder_key.strip()) > 8_192
+        ):
+            raise BackendRequestError(
+                "invalid_params",
+                "folder selection requires a valid folder_key.",
+            )
+        include_subfolders = value.get("include_subfolders", False)
+        if not isinstance(include_subfolders, bool):
+            raise BackendRequestError(
+                "invalid_params", "include_subfolders must be a boolean."
+            )
+        raw_excluded = value.get("excluded_doc_ids", [])
+        if not isinstance(raw_excluded, list) or not all(
+            isinstance(doc_id, str) and doc_id.strip() for doc_id in raw_excluded
+        ):
+            raise BackendRequestError(
+                "invalid_params", "excluded_doc_ids must be an array of strings."
+            )
+        if len(raw_excluded) > 10_000:
+            raise BackendRequestError(
+                "invalid_params",
+                "excluded_doc_ids can contain at most 10000 items.",
+            )
+        excluded: list[str] = []
+        seen = set()
+        for raw_id in raw_excluded:
+            doc_id = raw_id.strip()
+            if len(doc_id) > 256:
+                raise BackendRequestError(
+                    "invalid_params", "document ids must be at most 256 characters."
+                )
+            if doc_id not in seen:
+                seen.add(doc_id)
+                excluded.append(doc_id)
+        return {
+            "mode": "folder",
+            "folder_key": folder_key.strip(),
+            "include_subfolders": include_subfolders,
+            "excluded_doc_ids": excluded,
+        }
+    raise BackendRequestError(
+        "invalid_params", "selection.mode must be selected or folder."
+    )
+
+
 def _attribute_result(value: Any, library: LibraryDefinition) -> Any:
     result = _json_safe(value)
     if not isinstance(result, dict):
@@ -2292,6 +3023,29 @@ def _result_failure_count(value: Any) -> int:
     if isinstance(failures, list):
         return len(failures)
     return 0
+
+
+def _result_progress_counts(value: Any) -> tuple[int | None, int | None]:
+    """Read final progress counters when a report exposes them explicitly."""
+
+    if not isinstance(value, dict):
+        return None, None
+
+    def count(*keys: str) -> int | None:
+        for key in keys:
+            candidate = value.get(key)
+            if (
+                isinstance(candidate, int)
+                and not isinstance(candidate, bool)
+                and candidate >= 0
+            ):
+                return candidate
+        return None
+
+    return (
+        count("processed", "processed_count", "completed", "current"),
+        count("total", "total_count", "candidate_count", "selected"),
+    )
 
 
 def _job_list_query(query: str) -> dict[str, Any]:

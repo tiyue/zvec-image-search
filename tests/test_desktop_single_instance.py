@@ -140,7 +140,7 @@ class _FakeTkRoot:
 
 
 class WindowsSingleInstanceCoordinatorTest(unittest.TestCase):
-    def test_names_and_exit_argument_match_the_wpf_contract(self) -> None:
+    def test_names_and_exit_argument_keep_upgrade_compatibility(self) -> None:
         self.assertEqual(SINGLE_INSTANCE_MUTEX_NAME, r"Local\Zvec.ImageSearch.Desktop")
         self.assertEqual(
             ACTIVATE_INSTANCE_EVENT_NAME,
@@ -151,19 +151,6 @@ class WindowsSingleInstanceCoordinatorTest(unittest.TestCase):
             r"Local\Zvec.ImageSearch.Desktop.Exit",
         )
         self.assertEqual(EXIT_RUNNING_INSTANCE_ARGUMENT, "--exit-running-instance")
-        legacy_source = (
-            Path(__file__).resolve().parents[1]
-            / "desktop"
-            / "Zvec.Desktop"
-            / "App.xaml.cs"
-        ).read_text(encoding="utf-8")
-        for value in (
-            SINGLE_INSTANCE_MUTEX_NAME,
-            ACTIVATE_INSTANCE_EVENT_NAME,
-            EXIT_INSTANCE_EVENT_NAME,
-            EXIT_RUNNING_INSTANCE_ARGUMENT,
-        ):
-            self.assertIn(value, legacy_source)
 
     def test_second_instance_sends_only_payload_free_activation_and_exits(self) -> None:
         native = _FakeNativeApi(created_new=False)

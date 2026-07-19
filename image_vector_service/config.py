@@ -66,7 +66,10 @@ class ServiceConfig:
     timeout_seconds: int = 120
     max_retries: int = 3
     retry_base_seconds: float = 1.0
-    max_top_k: int = 1000
+    # ``None`` means the user may request any positive result count. Query
+    # implementations still cap work to the Collection document count, so a
+    # request larger than the library returns only the available matches.
+    max_top_k: int | None = None
     # Outbound data-URI ceiling. Keep a small margin below DashScope's 10 MiB
     # per-item hard limit so JSON envelope accounting cannot push it over.
     max_image_bytes: int = 10 * 1024 * 1024 - 64 * 1024
@@ -189,7 +192,7 @@ class ServiceConfig:
             raise ConfigurationError("timeout_seconds must be positive.")
         if self.max_retries < 0:
             raise ConfigurationError("max_retries cannot be negative.")
-        if self.max_top_k < 1:
+        if self.max_top_k is not None and self.max_top_k < 1:
             raise ConfigurationError("max_top_k must be positive.")
         for name in ("max_image_bytes", "max_source_image_bytes"):
             if getattr(self, name) < 1:

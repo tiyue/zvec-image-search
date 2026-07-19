@@ -4,10 +4,10 @@ import os
 import threading
 import uuid
 from collections import defaultdict
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from hashlib import sha256
 from pathlib import Path
 from time import perf_counter
@@ -26,6 +26,7 @@ from .dashscope_client import (
     ImageInputError,
 )
 from .failure_sink import IndexFailureSink
+from .folder_deletion import FolderDeletionManager
 from .hybrid_search import (
     HybridTagIntent,
     detect_hybrid_tag_intent,
@@ -36,6 +37,7 @@ from .image_scanner import (
     inspect_query_image,
     scan_folder,
 )
+from .library_browser import LibraryBrowser
 from .logical_paths import normalize_path
 from .metadata_backfill import (
     MetadataBackfillItem,
@@ -58,6 +60,7 @@ from .models import (
     ResolvedSearchHit,
     SearchHit,
     SearchReport,
+    SearchSortMode,
 )
 from .process_lock import ProcessLock
 from .rank_fusion import (
@@ -65,12 +68,20 @@ from .rank_fusion import (
     DEFAULT_RANK_DECAY,
     DEFAULT_WEAK_CHANNEL_FLOOR,
     DEFAULT_WEAK_CHANNEL_PENALTY,
-    MAX_CONFIDENCE_CANDIDATES,
+    MINIMUM_RESULT_CONFIDENCE,
     ConfidenceRanking,
+    confidence_candidate_limit,
     confidence_rank,
+    normalize_sort_mode,
+    sort_confidence_hits,
+    sort_mode_uses_diversity,
 )
 from .result_diversity import DiversityRanking, diversify_search_hits
-from .result_exporter import clean_result_directories, export_results
+from .result_exporter import (
+    clean_result_directories,
+    cleanup_search_results,
+    export_results,
+)
 from .search_quality import (
     QualityMode,
     annotate_search_hits,
@@ -120,6 +131,13 @@ class _EmbeddingBatchResult:
 class _UpsertResult:
     committed: bool
     inserted_entries: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class _ManualTagPlan:
+    entry: dict[str, Any]
+    before_tags: tuple[str, ...]
+    after_tags: tuple[str, ...]
 
 
 @dataclass
@@ -330,6 +348,660 @@ class ImageVectorService:
             "deleted": deleted,
             "entry": None,
         }
+
+    def preview_folder_deletion(
+        self,
+        *,
+        library_id: str,
+        folder_key: str,
+        include_subfolders: bool = True,
+    ) -> dict[str, Any]:
+        """Create a model-free, expiring snapshot for one folder deletion."""
+
+        manager = self._folder_deletion_manager(library_id)
+        try:
+            preview = manager.preview(
+                folder_key=folder_key,
+                include_subfolders=include_subfolders,
+            )
+        finally:
+            manager.close()
+        self.logger.info(
+            "folder_delete_preview library_id=%s operation_id=%s images=%d "
+            "files=%d blocked=%s api_requests=0",
+            library_id,
+            preview["operation_id"],
+            preview["image_count"],
+            preview["file_count"],
+            preview["blocked"],
+        )
+        return preview
+
+    def commit_folder_deletion(
+        self,
+        *,
+        library_id: str,
+        operation_id: str,
+        confirmation_token: str,
+        confirm: bool,
+    ) -> dict[str, Any]:
+        """Commit a previously previewed deletion without invoking any model."""
+
+        manager = self._folder_deletion_manager(library_id)
+        try:
+            result = manager.commit(
+                operation_id=operation_id,
+                confirmation_token=confirmation_token,
+                confirm=confirm,
+            )
+        finally:
+            manager.close()
+        self._refresh_tag_catalog()
+        self.logger.info(
+            "folder_delete_commit library_id=%s operation_id=%s status=%s "
+            "deleted=%d failed=%d api_requests=0",
+            library_id,
+            operation_id,
+            result.get("status"),
+            result.get("indexed_deleted", 0),
+            result.get("failed", 0),
+        )
+        return result
+
+    def recover_folder_deletions(self, *, library_id: str) -> dict[str, Any]:
+        """Resume deletion sagas that crossed the physical staging boundary."""
+
+        manager = self._folder_deletion_manager(library_id)
+        try:
+            report = manager.recover_incomplete()
+        finally:
+            manager.close()
+        if report["recovered"] or report["failed"]:
+            self._refresh_tag_catalog()
+        log = self.logger.warning if report["failed"] else self.logger.info
+        log(
+            "folder_delete_recovery library_id=%s recovered=%d failed=%d "
+            "api_requests=0",
+            library_id,
+            report["recovered"],
+            report["failed"],
+        )
+        return report
+
+    def _folder_deletion_manager(self, library_id: str) -> FolderDeletionManager:
+        normalized = str(library_id).strip()
+        if not normalized:
+            raise ValueError("library_id must not be empty.")
+        return FolderDeletionManager(
+            config=self.config,
+            state=self.state,
+            repository=self.repository,
+            library_id=normalized,
+            progress=self.progress,
+            cancel_check=self.cancel_check,
+        )
+
+    def manual_tag_batch(
+        self,
+        *,
+        library_id: str,
+        selection: Mapping[str, Any],
+        operation: str,
+        tags: Iterable[str],
+    ) -> dict[str, Any]:
+        """Apply manual tags in bounded chunks without touching other sources."""
+
+        normalized_operation = str(operation).strip().lower()
+        if normalized_operation not in {"add", "remove", "replace_manual"}:
+            raise ValueError("operation must be add, remove, or replace_manual.")
+        normalized_tags = normalize_tags(tags)
+        if normalized_operation in {"add", "remove"} and not normalized_tags:
+            raise ValueError(f"{normalized_operation} requires at least one tag.")
+
+        selection_view, total, chunks = self._manual_tag_selection(
+            library_id=library_id,
+            selection=selection,
+        )
+        batch_id = uuid.uuid4().hex
+        self.state.create_manual_tag_batch(
+            batch_id=batch_id,
+            operation=normalized_operation,
+            selection=selection_view,
+            tags=normalized_tags,
+            total_count=total,
+        )
+
+        processed = 0
+        updated = 0
+        unchanged = 0
+        failed = 0
+        failures: list[dict[str, str]] = []
+        warnings: list[str] = []
+        needs_attention = False
+        try:
+            for selected in chunks:
+                self.cancel_check()
+                plans: list[_ManualTagPlan] = []
+                missing_snapshots: list[
+                    tuple[str, tuple[str, ...], tuple[str, ...]]
+                ] = []
+                missing_outcomes: list[tuple[str, str, str]] = []
+                for doc_id, entry in selected:
+                    if entry is None:
+                        error = "The selected indexed image no longer exists."
+                        missing_snapshots.append((doc_id, (), ()))
+                        missing_outcomes.append((doc_id, "failed", error))
+                        failed += 1
+                        _append_manual_failure(
+                            failures,
+                            doc_id=doc_id,
+                            relative_path="",
+                            error=error,
+                        )
+                        continue
+                    before = normalize_tags(entry.get("tags", ()))
+                    after = _manual_tags_after_operation(
+                        before,
+                        normalized_tags,
+                        normalized_operation,
+                    )
+                    if before == after:
+                        unchanged += 1
+                        continue
+                    plans.append(_ManualTagPlan(entry, before, after))
+
+                if missing_snapshots:
+                    self.state.record_manual_tag_batch_entries(
+                        batch_id, missing_snapshots
+                    )
+                    self.state.update_manual_tag_batch_entries(
+                        batch_id, missing_outcomes
+                    )
+                if plans:
+                    self.state.record_manual_tag_batch_entries(
+                        batch_id,
+                        (
+                            (
+                                str(plan.entry["doc_id"]),
+                                plan.before_tags,
+                                plan.after_tags,
+                            )
+                            for plan in plans
+                        ),
+                    )
+                    succeeded, plan_failures, inconsistent = (
+                        self._apply_manual_tag_plans(plans)
+                    )
+                    needs_attention = needs_attention or inconsistent
+                    succeeded_set = set(succeeded)
+                    outcomes: list[tuple[str, str, str]] = []
+                    for plan in plans:
+                        doc_id = str(plan.entry["doc_id"])
+                        if doc_id in succeeded_set:
+                            updated += 1
+                            outcomes.append((doc_id, "applied", ""))
+                            continue
+                        error = plan_failures.get(
+                            doc_id, "The manual tag update failed."
+                        )
+                        failed += 1
+                        outcomes.append((doc_id, "failed", error))
+                        _append_manual_failure(
+                            failures,
+                            doc_id=doc_id,
+                            relative_path=str(plan.entry.get("relative_path") or ""),
+                            error=error,
+                        )
+                    self.state.update_manual_tag_batch_entries(batch_id, outcomes)
+
+                processed += len(selected)
+                self.state.update_manual_tag_batch_progress(
+                    batch_id,
+                    processed=processed,
+                    updated=updated,
+                    unchanged=unchanged,
+                    failed=failed,
+                )
+                self.progress(f"Updated manual tags {processed}/{total} images.")
+        except BaseException as exc:
+            status = (
+                "cancelled" if exc.__class__.__name__ == "JobCancelled" else "failed"
+            )
+            self.state.finish_manual_tag_batch(
+                batch_id,
+                status=status,
+                processed=processed,
+                updated=updated,
+                unchanged=unchanged,
+                failed=failed,
+                result={
+                    "batch_id": batch_id,
+                    "processed": processed,
+                    "updated": updated,
+                    "unchanged": unchanged,
+                    "failed": failed,
+                },
+                error=str(exc) or exc.__class__.__name__,
+            )
+            raise
+
+        if updated:
+            self._refresh_tag_catalog()
+            try:
+                self.repository.optimize()
+            except Exception as exc:
+                warnings.append(
+                    "Tag updates were saved, but Collection optimization failed: "
+                    f"{str(exc) or exc.__class__.__name__}"
+                )
+                needs_attention = True
+
+        status = (
+            "partial"
+            if failed and updated
+            else "failed"
+            if failed
+            else "no_changes"
+            if not updated
+            else "applied"
+        )
+        result = {
+            "batch_id": batch_id,
+            "operation": normalized_operation,
+            "selection": selection_view,
+            "selected": total,
+            "processed": processed,
+            "updated": updated,
+            "unchanged": unchanged,
+            "failed": failed,
+            "failures": failures,
+            "failures_truncated": failed > len(failures),
+            "warnings": warnings,
+            "needs_attention": needs_attention,
+            "undo_available": updated > 0,
+            "api_requests": 0,
+        }
+        self.state.finish_manual_tag_batch(
+            batch_id,
+            status=status,
+            processed=processed,
+            updated=updated,
+            unchanged=unchanged,
+            failed=failed,
+            result=result,
+        )
+        return result
+
+    def undo_latest_manual_tag_batch(self) -> dict[str, Any]:
+        """Restore both SQLite and Zvec for the most recent manual batch."""
+
+        latest = self.state.latest_manual_tag_batch()
+        if latest is None:
+            return {
+                "undone": False,
+                "already_undone": False,
+                "restored": 0,
+                "failed": 0,
+                "failures": [],
+                "undo_available": False,
+                "api_requests": 0,
+            }
+        batch_id = str(latest["batch_id"])
+        if str(latest["status"]) == "undone":
+            return {
+                "batch_id": batch_id,
+                "undone": False,
+                "already_undone": True,
+                "restored": 0,
+                "failed": 0,
+                "failures": [],
+                "undo_available": False,
+                "api_requests": 0,
+            }
+
+        retryable_statuses = ("applied", "undo_failed", "conflict")
+        total = self.state.count_manual_tag_batch_entries(
+            batch_id,
+            statuses=retryable_statuses,
+        )
+        self.state.finish_manual_tag_undo(
+            batch_id,
+            status="undoing",
+            result={"batch_id": batch_id, "restored": 0, "failed": 0},
+        )
+        restored = 0
+        failed = 0
+        failures: list[dict[str, str]] = []
+        needs_attention = False
+        after_doc_id = ""
+        try:
+            while True:
+                history = self.state.manual_tag_batch_entries(
+                    batch_id,
+                    statuses=retryable_statuses,
+                    limit=128,
+                    after_doc_id=after_doc_id,
+                )
+                if not history:
+                    break
+                after_doc_id = str(history[-1]["doc_id"])
+                current = self.state.get_many(str(item["doc_id"]) for item in history)
+                plans: list[_ManualTagPlan] = []
+                outcomes: list[tuple[str, str, str]] = []
+                for snapshot in history:
+                    doc_id = str(snapshot["doc_id"])
+                    entry = current.get(doc_id)
+                    if entry is None:
+                        error = "The indexed image no longer exists."
+                        failed += 1
+                        outcomes.append((doc_id, "undo_failed", error))
+                        _append_manual_failure(
+                            failures,
+                            doc_id=doc_id,
+                            relative_path="",
+                            error=error,
+                        )
+                        continue
+                    current_tags = normalize_tags(entry.get("tags", ()))
+                    expected = normalize_tags(snapshot.get("after_tags", ()))
+                    if current_tags != expected:
+                        error = (
+                            "Manual tags changed after this batch; undo did not "
+                            "overwrite the newer edit."
+                        )
+                        failed += 1
+                        outcomes.append((doc_id, "conflict", error))
+                        _append_manual_failure(
+                            failures,
+                            doc_id=doc_id,
+                            relative_path=str(entry.get("relative_path") or ""),
+                            error=error,
+                        )
+                        continue
+                    plans.append(
+                        _ManualTagPlan(
+                            entry,
+                            current_tags,
+                            normalize_tags(snapshot.get("before_tags", ())),
+                        )
+                    )
+
+                if plans:
+                    succeeded, plan_failures, inconsistent = (
+                        self._apply_manual_tag_plans(plans)
+                    )
+                    needs_attention = needs_attention or inconsistent
+                    succeeded_set = set(succeeded)
+                    for plan in plans:
+                        doc_id = str(plan.entry["doc_id"])
+                        if doc_id in succeeded_set:
+                            restored += 1
+                            outcomes.append((doc_id, "undone", ""))
+                        else:
+                            error = plan_failures.get(
+                                doc_id, "The manual tag undo failed."
+                            )
+                            failed += 1
+                            outcomes.append((doc_id, "undo_failed", error))
+                            _append_manual_failure(
+                                failures,
+                                doc_id=doc_id,
+                                relative_path=str(
+                                    plan.entry.get("relative_path") or ""
+                                ),
+                                error=error,
+                            )
+                self.state.update_manual_tag_batch_entries(batch_id, outcomes)
+                self.progress(
+                    f"Restored manual tags {restored + failed}/{total} images."
+                )
+                self.cancel_check()
+        except BaseException as exc:
+            self.state.finish_manual_tag_undo(
+                batch_id,
+                status="undo_failed",
+                result={
+                    "batch_id": batch_id,
+                    "restored": restored,
+                    "failed": failed,
+                },
+                error=str(exc) or exc.__class__.__name__,
+            )
+            raise
+
+        if restored:
+            self._refresh_tag_catalog()
+            try:
+                self.repository.optimize()
+            except Exception as exc:
+                needs_attention = True
+                _append_manual_failure(
+                    failures,
+                    doc_id="",
+                    relative_path="",
+                    error=(
+                        "Tags were restored, but Collection optimization failed: "
+                        f"{str(exc) or exc.__class__.__name__}"
+                    ),
+                )
+        remaining = self.state.count_manual_tag_batch_entries(
+            batch_id,
+            statuses=retryable_statuses,
+        )
+        result = {
+            "batch_id": batch_id,
+            "undone": remaining == 0,
+            "already_undone": False,
+            "restored": restored,
+            "failed": failed,
+            "failures": failures,
+            "failures_truncated": failed > len(failures),
+            "needs_attention": needs_attention,
+            "undo_available": remaining > 0,
+            "api_requests": 0,
+        }
+        self.state.finish_manual_tag_undo(
+            batch_id,
+            status="undone" if remaining == 0 else "undo_partial",
+            result=result,
+        )
+        return result
+
+    def _manual_tag_selection(
+        self,
+        *,
+        library_id: str,
+        selection: Mapping[str, Any],
+    ) -> tuple[
+        dict[str, Any],
+        int,
+        Iterator[list[tuple[str, dict[str, Any] | None]]],
+    ]:
+        if not isinstance(selection, Mapping):
+            raise ValueError("selection must be an object.")
+        mode = str(selection.get("mode") or "").strip().lower()
+        if mode == "selected":
+            raw_ids = selection.get("doc_ids")
+            if isinstance(raw_ids, (str, bytes)) or not isinstance(raw_ids, Sequence):
+                raise ValueError("selected mode requires a doc_ids array.")
+            if not all(isinstance(value, str) for value in raw_ids):
+                raise ValueError("doc_ids must contain strings.")
+            doc_ids = list(dict.fromkeys(str(value).strip() for value in raw_ids))
+            if not doc_ids or any(not value for value in doc_ids):
+                raise ValueError("doc_ids must contain non-empty document ids.")
+            if len(doc_ids) > 10_000:
+                raise ValueError("doc_ids can contain at most 10000 items.")
+
+            def selected_chunks() -> Iterator[list[tuple[str, dict[str, Any] | None]]]:
+                for offset in range(0, len(doc_ids), 128):
+                    chunk = doc_ids[offset : offset + 128]
+                    entries = self.state.get_many(chunk)
+                    yield [(doc_id, entries.get(doc_id)) for doc_id in chunk]
+
+            return (
+                {"mode": "selected", "doc_ids": doc_ids},
+                len(doc_ids),
+                selected_chunks(),
+            )
+        if mode != "folder":
+            raise ValueError("selection.mode must be selected or folder.")
+        folder_key = selection.get("folder_key")
+        if not isinstance(folder_key, str) or not folder_key.strip():
+            raise ValueError("folder selection requires folder_key.")
+        include_subfolders = selection.get("include_subfolders", False)
+        if not isinstance(include_subfolders, bool):
+            raise ValueError("include_subfolders must be a boolean.")
+        raw_excluded = selection.get("excluded_doc_ids", ())
+        if isinstance(raw_excluded, (str, bytes)) or not isinstance(
+            raw_excluded, Sequence
+        ):
+            raise ValueError("excluded_doc_ids must be an array.")
+        if not all(isinstance(value, str) for value in raw_excluded):
+            raise ValueError("excluded_doc_ids must contain strings.")
+        excluded = {str(value).strip() for value in raw_excluded if str(value).strip()}
+        if len(excluded) > 10_000:
+            raise ValueError("excluded_doc_ids can contain at most 10000 items.")
+        with LibraryBrowser(
+            library_id=library_id,
+            state_path=self.config.state_path,
+        ) as browser:
+            root_id, relative_folder = browser.decode_folder_key(folder_key)
+        base_total = self.state.count_folder_entries(
+            root_id,
+            relative_folder,
+            include_subfolders=include_subfolders,
+        )
+        excluded_entries = self.state.get_many(excluded)
+        excluded_in_scope = {
+            doc_id
+            for doc_id, entry in excluded_entries.items()
+            if _entry_is_in_folder(
+                entry,
+                root_id=root_id,
+                relative_folder=relative_folder,
+                include_subfolders=include_subfolders,
+            )
+        }
+
+        def folder_chunks() -> Iterator[list[tuple[str, dict[str, Any] | None]]]:
+            for entries in self.state.iter_folder_entries(
+                root_id,
+                relative_folder,
+                include_subfolders=include_subfolders,
+                chunk_size=128,
+            ):
+                selected: list[tuple[str, dict[str, Any] | None]] = [
+                    (str(entry["doc_id"]), entry)
+                    for entry in entries
+                    if str(entry["doc_id"]) not in excluded
+                ]
+                if selected:
+                    yield selected
+
+        return (
+            {
+                "mode": "folder",
+                "folder_key": folder_key,
+                "root_id": root_id,
+                "relative_folder": relative_folder,
+                "include_subfolders": include_subfolders,
+                "excluded_count": len(excluded_in_scope),
+            },
+            max(0, base_total - len(excluded_in_scope)),
+            folder_chunks(),
+        )
+
+    def _apply_manual_tag_plans(
+        self,
+        plans: Sequence[_ManualTagPlan],
+    ) -> tuple[list[str], dict[str, str], bool]:
+        items = [
+            (
+                _record_from_state_entry(plan.entry),
+                normalize_tags(
+                    [
+                        *plan.after_tags,
+                        *plan.entry.get("folder_tags", ()),
+                        *plan.entry.get("accepted_auto_tags", ()),
+                        *plan.entry.get("inherited_tags", ()),
+                    ]
+                ),
+            )
+            for plan in plans
+        ]
+        succeeded, failures = self._repository_update_record_tags(items)
+        if not succeeded:
+            return [], failures, False
+        succeeded_set = set(succeeded)
+        state_entries = [
+            {**plan.entry, "tags": list(plan.after_tags)}
+            for plan in plans
+            if str(plan.entry["doc_id"]) in succeeded_set
+        ]
+        try:
+            self.state.set_many(state_entries)
+        except Exception as exc:
+            state_error = str(exc) or exc.__class__.__name__
+            rollback_items = [
+                (
+                    _record_from_state_entry(plan.entry),
+                    normalize_tags(
+                        [
+                            *plan.before_tags,
+                            *plan.entry.get("folder_tags", ()),
+                            *plan.entry.get("accepted_auto_tags", ()),
+                            *plan.entry.get("inherited_tags", ()),
+                        ]
+                    ),
+                )
+                for plan in plans
+                if str(plan.entry["doc_id"]) in succeeded_set
+            ]
+            rolled_back, rollback_failures = self._repository_update_record_tags(
+                rollback_items
+            )
+            rolled_back_set = set(rolled_back)
+            inconsistent = False
+            for doc_id in succeeded:
+                if doc_id in rolled_back_set:
+                    failures[doc_id] = (
+                        f"SQLite update failed and was rolled back: {state_error}"
+                    )
+                else:
+                    inconsistent = True
+                    rollback_error = rollback_failures.get(
+                        doc_id, "Collection rollback failed."
+                    )
+                    failures[doc_id] = (
+                        f"SQLite update failed ({state_error}); {rollback_error}"
+                    )
+            return [], failures, inconsistent
+        return succeeded, failures, False
+
+    def _repository_update_record_tags(
+        self,
+        items: Sequence[tuple[ImageRecord, Iterable[str]]],
+    ) -> tuple[list[str], dict[str, str]]:
+        updater = getattr(self.repository, "update_record_tags", None)
+        if callable(updater):
+            return updater(items)
+        succeeded: list[str] = []
+        failures: dict[str, str] = {}
+        for record, tags in items:
+            try:
+                vector = self.repository.fetch_vector(record.doc_id)
+                if vector is None:
+                    raise ConfigurationError("The indexed image vector is missing.")
+                stored, errors = self.repository.upsert_records([record], vector, tags)
+                if stored == [record.doc_id] and not errors:
+                    succeeded.append(record.doc_id)
+                else:
+                    failures[record.doc_id] = errors.get(
+                        record.doc_id, "Collection tag update failed."
+                    )
+            except Exception as exc:
+                failures[record.doc_id] = str(exc) or exc.__class__.__name__
+        return succeeded, failures
 
     def index_folder(
         self,
@@ -1142,14 +1814,25 @@ class ImageVectorService:
                 if existing is not None and existing.get("sha256") == record.sha256
                 else ()
             )
+            inherited_tags = (
+                tuple(existing.get("inherited_tags", ()))
+                if existing is not None and existing.get("sha256") == record.sha256
+                else ()
+            )
             effective_tags = normalize_tags(
-                [*manual_tags, *folder_tags, *accepted_auto_tags]
+                [
+                    *manual_tags,
+                    *folder_tags,
+                    *accepted_auto_tags,
+                    *inherited_tags,
+                ]
             )
             records_by_tags[effective_tags].append(record)
             state_values[record.doc_id] = {
                 "tags": list(manual_tags),
                 "folder_tags": list(folder_tags),
                 "accepted_auto_tags": list(accepted_auto_tags),
+                "inherited_tags": list(inherited_tags),
             }
 
         by_id = {record.doc_id: record for record in records}
@@ -1251,10 +1934,12 @@ class ImageVectorService:
         tag_mode: str = "all",
         show_low_confidence: bool = False,
         diversify_results: bool = True,
+        sort_mode: SearchSortMode = "confidence",
     ) -> SearchReport:
         started_at = perf_counter()
         self.cancel_check()
         self._validate_top_k(top_k)
+        resolved_sort_mode = normalize_sort_mode(sort_mode)
         normalized_tags = self._validate_search_tags(tags, tag_mode)
         text = text.strip()
         if not text:
@@ -1269,8 +1954,9 @@ class ImageVectorService:
                 tags=normalized_tags,
                 tag_mode=tag_mode,
                 show_low_confidence=show_low_confidence,
+                sort_mode=resolved_sort_mode,
             )
-            if self.search_quality.configured
+            if self.search_quality.configured and resolved_sort_mode != "legacy"
             else None
         )
         hybrid_intent = HybridTagIntent()
@@ -1292,11 +1978,23 @@ class ImageVectorService:
                 tag_mode=tag_mode,
             )
             ranking_mode = str(metadata_search.get("mode") or "distance")
-        candidate_count = ranking.candidate_count if ranking is not None else len(hits)
+            ranking = self._sort_request_hits(
+                hits,
+                query_type="text",
+                top_k=top_k,
+                show_low_confidence=show_low_confidence,
+                sort_mode=resolved_sort_mode,
+            )
+            hits = ranking.hits
+        candidate_count = ranking.candidate_count
+        diversity_enabled = sort_mode_uses_diversity(
+            resolved_sort_mode,
+            legacy_diversity=diversify_results,
+        )
         diversity = diversify_search_hits(
             hits,
             top_k=top_k,
-            enabled=diversify_results,
+            enabled=diversity_enabled,
         )
         hits = diversity.hits
         report = export_results(
@@ -1310,6 +2008,7 @@ class ImageVectorService:
                 "tag_mode": tag_mode,
                 "show_low_confidence": show_low_confidence,
                 "diversify_results": diversify_results,
+                "sort_mode": resolved_sort_mode,
             },
             request_ids=[request_id],
             usage=[usage] if usage else [],
@@ -1323,16 +2022,16 @@ class ImageVectorService:
                 hybrid_intent=hybrid_intent,
                 metadata_search=metadata_search,
                 diversity=diversity,
+                sorting=ranking.diagnostics,
             ),
-            status=ranking.status if ranking is not None else "ok",
+            status=ranking.status,
             candidate_count=candidate_count,
-            filtered_count=(
-                ranking.filtered_count
-                if ranking is not None
-                else max(0, candidate_count - len(hits))
-            ),
+            filtered_count=ranking.filtered_count
+            + max(0, len(ranking.hits) - len(hits)),
             latency_ms=(perf_counter() - started_at) * 1000,
             ranking_mode=ranking_mode,
+            sort_mode=resolved_sort_mode,
+            ranking_diagnostics=ranking.diagnostics,
             show_low_confidence=show_low_confidence,
             low_confidence_override=(
                 ranking is not None and ranking.status == "low_confidence_override"
@@ -1349,12 +2048,14 @@ class ImageVectorService:
         tag_mode: str = "all",
         show_low_confidence: bool = False,
         diversify_results: bool = True,
+        sort_mode: SearchSortMode = "confidence",
     ) -> SearchReport:
         """Search locally by fuzzy tag fragments without creating an embedding."""
 
         started_at = perf_counter()
         self.cancel_check()
         self._validate_top_k(top_k)
+        resolved_sort_mode = normalize_sort_mode(sort_mode)
         normalized_tags = self._validate_search_tags(tags, tag_mode)
         text = text.strip()
         if not text:
@@ -1365,10 +2066,21 @@ class ImageVectorService:
             tags=normalized_tags,
             tag_mode=tag_mode,
         )
-        diversity = diversify_search_hits(
+        ranking = self._sort_request_hits(
             candidates,
+            query_type="tag",
             top_k=top_k,
-            enabled=diversify_results,
+            show_low_confidence=show_low_confidence,
+            sort_mode=resolved_sort_mode,
+        )
+        diversity_enabled = sort_mode_uses_diversity(
+            resolved_sort_mode,
+            legacy_diversity=diversify_results,
+        )
+        diversity = diversify_search_hits(
+            ranking.hits,
+            top_k=top_k,
+            enabled=diversity_enabled,
         )
         hits = diversity.hits
         report = export_results(
@@ -1383,6 +2095,7 @@ class ImageVectorService:
                 "tag_mode": tag_mode,
                 "show_low_confidence": show_low_confidence,
                 "diversify_results": diversify_results,
+                "sort_mode": resolved_sort_mode,
             },
             request_ids=[],
             usage=[],
@@ -1394,12 +2107,16 @@ class ImageVectorService:
                 "tag_only": True,
                 "fuzzy": True,
                 "diversity": diversity.diagnostics(),
+                "sorting": ranking.diagnostics,
             },
-            status="ok" if hits else "no_reliable_match",
-            candidate_count=len(candidates),
-            filtered_count=max(0, len(candidates) - len(hits)),
+            status=ranking.status,
+            candidate_count=ranking.candidate_count,
+            filtered_count=ranking.filtered_count
+            + max(0, len(ranking.hits) - len(hits)),
             latency_ms=(perf_counter() - started_at) * 1000,
             ranking_mode="tag_match",
+            sort_mode=resolved_sort_mode,
+            ranking_diagnostics=ranking.diagnostics,
             show_low_confidence=show_low_confidence,
         )
         self._log_search(report)
@@ -1473,11 +2190,15 @@ class ImageVectorService:
         proposal_ids: Iterable[str],
         accepted_tags_by_proposal: Mapping[str, object] | None = None,
         exclude_identity_tags: bool = True,
+        acceptance_mode: str = "low_risk_only",
+        batch_confirmation: bool = False,
     ) -> dict[str, object]:
         return self.auto_tagging.review_batch(
             proposal_ids=proposal_ids,
             accepted_tags_by_proposal=accepted_tags_by_proposal,
             exclude_identity_tags=exclude_identity_tags,
+            acceptance_mode=acceptance_mode,
+            batch_confirmation=batch_confirmation,
         )
 
     def undo_latest_auto_tag_review_batch(self) -> dict[str, object]:
@@ -1492,10 +2213,12 @@ class ImageVectorService:
         tag_mode: str = "all",
         show_low_confidence: bool = False,
         diversify_results: bool = True,
+        sort_mode: SearchSortMode = "confidence",
     ) -> SearchReport:
         started_at = perf_counter()
         self.cancel_check()
         self._validate_top_k(top_k)
+        resolved_sort_mode = normalize_sort_mode(sort_mode)
         normalized_tags = self._validate_search_tags(tags, tag_mode)
         path = inspect_query_image(image_path)
         vector, source, request_id, usage, image_hash = self._image_embedding(path)
@@ -1510,8 +2233,9 @@ class ImageVectorService:
                 tags=normalized_tags,
                 tag_mode=tag_mode,
                 show_low_confidence=show_low_confidence,
+                sort_mode=resolved_sort_mode,
             )
-            if self.search_quality.configured
+            if self.search_quality.configured and resolved_sort_mode != "legacy"
             else None
         )
         hits = (
@@ -1528,11 +2252,25 @@ class ImageVectorService:
                 rank_source="image",
             )
         )
-        candidate_count = ranking.candidate_count if ranking is not None else len(hits)
+        ranking_mode = "confidence" if ranking is not None else "distance"
+        if ranking is None:
+            ranking = self._sort_request_hits(
+                hits,
+                query_type="image",
+                top_k=top_k,
+                show_low_confidence=show_low_confidence,
+                sort_mode=resolved_sort_mode,
+            )
+            hits = ranking.hits
+        candidate_count = ranking.candidate_count
+        diversity_enabled = sort_mode_uses_diversity(
+            resolved_sort_mode,
+            legacy_diversity=diversify_results,
+        )
         diversity = diversify_search_hits(
             hits,
             top_k=top_k,
-            enabled=diversify_results,
+            enabled=diversity_enabled,
         )
         hits = diversity.hits
         report = export_results(
@@ -1546,6 +2284,7 @@ class ImageVectorService:
                 "tag_mode": tag_mode,
                 "show_low_confidence": show_low_confidence,
                 "diversify_results": diversify_results,
+                "sort_mode": resolved_sort_mode,
             },
             request_ids=[request_id],
             usage=[usage] if usage else [],
@@ -1558,16 +2297,16 @@ class ImageVectorService:
                     ranking is not None and ranking.status == "low_confidence_override"
                 ),
                 diversity=diversity,
+                sorting=ranking.diagnostics,
             ),
-            status=ranking.status if ranking is not None else "ok",
+            status=ranking.status,
             candidate_count=candidate_count,
-            filtered_count=(
-                ranking.filtered_count
-                if ranking is not None
-                else max(0, candidate_count - len(hits))
-            ),
+            filtered_count=ranking.filtered_count
+            + max(0, len(ranking.hits) - len(hits)),
             latency_ms=(perf_counter() - started_at) * 1000,
-            ranking_mode="confidence" if ranking is not None else "distance",
+            ranking_mode=ranking_mode,
+            sort_mode=resolved_sort_mode,
+            ranking_diagnostics=ranking.diagnostics,
             show_low_confidence=show_low_confidence,
             low_confidence_override=(
                 ranking is not None and ranking.status == "low_confidence_override"
@@ -1588,10 +2327,12 @@ class ImageVectorService:
         tag_mode: str = "all",
         show_low_confidence: bool = False,
         diversify_results: bool = True,
+        sort_mode: SearchSortMode = "confidence",
     ) -> SearchReport:
         started_at = perf_counter()
         self.cancel_check()
         self._validate_top_k(top_k)
+        resolved_sort_mode = normalize_sort_mode(sort_mode)
         self._validate_weights(image_weight, text_weight)
         normalized_tags = self._validate_search_tags(tags, tag_mode)
         text = text.strip()
@@ -1644,8 +2385,9 @@ class ImageVectorService:
                 tags=normalized_tags,
                 tag_mode=tag_mode,
                 show_low_confidence=show_low_confidence,
+                sort_mode=resolved_sort_mode,
             )
-            if self.search_quality.configured
+            if self.search_quality.configured and resolved_sort_mode != "legacy"
             else None
         )
         metadata_search: dict[str, object] = {
@@ -1656,6 +2398,11 @@ class ImageVectorService:
         }
         if ranking is not None:
             fused_hits = ranking.hits
+            ranking_mode = (
+                self.search_quality.fusion_mode
+                if self.search_quality.fusion_mode == "confidence_v2"
+                else "confidence"
+            )
         else:
             fused_hits, metadata_search = self._query_fused_until_sufficient(
                 image_vector,
@@ -1668,13 +2415,24 @@ class ImageVectorService:
                 normalized_tags,
                 tag_mode,
             )
-        candidate_count = (
-            ranking.candidate_count if ranking is not None else len(fused_hits)
+            ranking_mode = str(metadata_search.get("mode") or "weighted_rrf")
+            ranking = self._sort_request_hits(
+                fused_hits,
+                query_type="image_text",
+                top_k=top_k,
+                show_low_confidence=show_low_confidence,
+                sort_mode=resolved_sort_mode,
+            )
+            fused_hits = ranking.hits
+        candidate_count = ranking.candidate_count
+        diversity_enabled = sort_mode_uses_diversity(
+            resolved_sort_mode,
+            legacy_diversity=diversify_results,
         )
         diversity = diversify_search_hits(
             fused_hits,
             top_k=top_k,
-            enabled=diversify_results,
+            enabled=diversity_enabled,
         )
         fused_hits = diversity.hits
         report = export_results(
@@ -1691,6 +2449,7 @@ class ImageVectorService:
                 "tag_mode": tag_mode,
                 "show_low_confidence": show_low_confidence,
                 "diversify_results": diversify_results,
+                "sort_mode": resolved_sort_mode,
             },
             request_ids=[response.request_id for response in responses.values()],
             usage=[response.usage for response in responses.values()],
@@ -1707,23 +2466,16 @@ class ImageVectorService:
                 ),
                 metadata_search=metadata_search,
                 diversity=diversity,
+                sorting=ranking.diagnostics,
             ),
-            status=ranking.status if ranking is not None else "ok",
+            status=ranking.status,
             candidate_count=candidate_count,
-            filtered_count=(
-                ranking.filtered_count
-                if ranking is not None
-                else max(0, candidate_count - len(fused_hits))
-            ),
+            filtered_count=ranking.filtered_count
+            + max(0, len(ranking.hits) - len(fused_hits)),
             latency_ms=(perf_counter() - started_at) * 1000,
-            ranking_mode=(
-                self.search_quality.fusion_mode
-                if ranking is not None
-                and self.search_quality.fusion_mode == "confidence_v2"
-                else "confidence"
-                if ranking is not None
-                else str(metadata_search.get("mode") or "weighted_rrf")
-            ),
+            ranking_mode=ranking_mode,
+            sort_mode=resolved_sort_mode,
+            ranking_diagnostics=ranking.diagnostics,
             show_low_confidence=show_low_confidence,
             low_confidence_override=(
                 ranking is not None and ranking.status == "low_confidence_override"
@@ -2264,6 +3016,7 @@ class ImageVectorService:
         self, show_low_confidence: bool, low_confidence_override: bool
     ) -> dict[str, object]:
         diagnostics: dict[str, object] = self.search_quality.to_dict()
+        diagnostics["hard_minimum_confidence"] = MINIMUM_RESULT_CONFIDENCE
         if show_low_confidence:
             diagnostics = {
                 **diagnostics,
@@ -2281,6 +3034,7 @@ class ImageVectorService:
         hybrid_intent: HybridTagIntent | None = None,
         metadata_search: Mapping[str, object] | None = None,
         diversity: DiversityRanking | None = None,
+        sorting: Mapping[str, object] | None = None,
     ) -> dict[str, object]:
         diagnostics = self._search_quality_diagnostics(
             show_low_confidence,
@@ -2292,7 +3046,49 @@ class ImageVectorService:
             diagnostics["metadata_search"] = dict(metadata_search)
         if diversity is not None:
             diagnostics["diversity"] = diversity.diagnostics()
+        if sorting is not None:
+            diagnostics["sorting"] = dict(sorting)
         return diagnostics
+
+    @staticmethod
+    def _sort_request_hits(
+        hits: list[SearchHit],
+        *,
+        query_type: str,
+        top_k: int,
+        show_low_confidence: bool,
+        sort_mode: SearchSortMode,
+    ) -> ConfidenceRanking:
+        """Apply the public confidence floor to non-calibrated/legacy hits."""
+
+        ranking = sort_confidence_hits(
+            hits,
+            query_type=query_type,
+            top_k=top_k,
+            min_confidence=0.0,
+            score_gap=1.0,
+            max_confidence_drop=1.0,
+            max_candidates=max(1, len(hits)),
+            show_low_confidence=show_low_confidence,
+            sort_mode=sort_mode,
+        )
+        if ranking is not None:
+            return ranking
+        # Truly legacy records may not expose a finite confidence. Preserve
+        # their previous order rather than dropping valid historical results.
+        selected = [replace(hit, rank=rank) for rank, hit in enumerate(hits[:top_k], 1)]
+        return ConfidenceRanking(
+            selected,
+            "legacy_fallback" if selected else "no_reliable_match",
+            len(hits),
+            max(0, len(hits) - len(selected)),
+            sort_mode="legacy",
+            diagnostics={
+                "sort_mode": "legacy",
+                "fallback": "missing_finite_confidence",
+                "normalized_score_used": False,
+            },
+        )
 
     def _configured_single_ranking(
         self,
@@ -2304,13 +3100,14 @@ class ImageVectorService:
         tags: tuple[str, ...] = (),
         tag_mode: str = "all",
         show_low_confidence: bool = False,
+        sort_mode: SearchSortMode = "confidence",
     ) -> ConfidenceRanking:
         if query_type not in {"text", "image"}:
             raise ValueError(f"Unsupported single query type: {query_type}")
         total = self.repository.doc_count
         if total == 0:
             return ConfidenceRanking([], "no_reliable_match", 0, 0)
-        candidate_k = min(total, MAX_CONFIDENCE_CANDIDATES)
+        candidate_k = min(total, confidence_candidate_limit(top_k))
         quality_mode: QualityMode = "image" if query_type == "image" else "text"
         candidates = self._query_quality_candidates(
             vector,
@@ -2332,8 +3129,9 @@ class ImageVectorService:
             high_confidence=thresholds.high,
             score_gap=thresholds.score_gap,
             max_confidence_drop=thresholds.max_confidence_drop,
-            max_candidates=MAX_CONFIDENCE_CANDIDATES,
+            max_candidates=candidate_k,
             show_low_confidence=show_low_confidence,
+            sort_mode=sort_mode,
         )
         if ranking is None:
             raise RuntimeError("Configured search candidates are missing confidence.")
@@ -2351,11 +3149,12 @@ class ImageVectorService:
         tags: tuple[str, ...],
         tag_mode: str,
         show_low_confidence: bool = False,
+        sort_mode: SearchSortMode = "confidence",
     ) -> ConfidenceRanking:
         total = self.repository.doc_count
         if total == 0:
             return ConfidenceRanking([], "no_reliable_match", 0, 0)
-        candidate_k = min(total, MAX_CONFIDENCE_CANDIDATES)
+        candidate_k = min(total, confidence_candidate_limit(top_k))
         with ThreadPoolExecutor(max_workers=2) as executor:
             image_future = executor.submit(
                 self._query_quality_candidates,
@@ -2404,8 +3203,9 @@ class ImageVectorService:
             weak_channel_penalty=self.search_quality.fusion_options.get(
                 "weak_channel_penalty", DEFAULT_WEAK_CHANNEL_PENALTY
             ),
-            max_candidates=MAX_CONFIDENCE_CANDIDATES,
+            max_candidates=candidate_k,
             show_low_confidence=show_low_confidence,
+            sort_mode=sort_mode,
         )
         if ranking is None:
             raise RuntimeError("Configured search candidates are missing confidence.")
@@ -2833,9 +3633,34 @@ class ImageVectorService:
         )
         return report
 
+    def cleanup_search_results(
+        self,
+        *,
+        keep_latest: int = 3,
+        dry_run: bool = False,
+    ) -> dict[str, object]:
+        report = cleanup_search_results(
+            self.config.results_path,
+            keep_latest=keep_latest,
+            dry_run=dry_run,
+        )
+        self.logger.info(
+            "search_results_cleanup keep_latest=%d dry_run=%s owned=%d "
+            "deleted=%d skipped=%d failed=%d",
+            keep_latest,
+            dry_run,
+            report["owned"],
+            report["deleted"],
+            report["skipped"],
+            report["failed"],
+        )
+        return report
+
     def _validate_top_k(self, top_k: int) -> None:
-        if not 1 <= top_k <= self.config.max_top_k:
-            raise ValueError(f"top_k must be between 1 and {self.config.max_top_k}.")
+        if top_k < 1:
+            raise ValueError("top_k must be positive.")
+        if self.config.max_top_k is not None and top_k > self.config.max_top_k:
+            raise ValueError(f"top_k must not exceed {self.config.max_top_k}.")
 
     def _validate_search_tags(
         self, tags: Iterable[str] | None, tag_mode: str
@@ -3063,3 +3888,75 @@ def _exclude_content_hash(
     return [
         hit for hit in hits if str(hit.fields.get("sha256") or "") != exclude_sha256
     ]
+
+
+def _manual_tags_after_operation(
+    before: Iterable[str],
+    requested: Iterable[str],
+    operation: str,
+) -> tuple[str, ...]:
+    current = normalize_tags(before)
+    values = normalize_tags(requested)
+    if operation == "add":
+        return normalize_tags([*current, *values])
+    if operation == "remove":
+        removed = set(values)
+        return tuple(tag for tag in current if tag not in removed)
+    if operation == "replace_manual":
+        return values
+    raise ValueError("Unsupported manual tag operation.")
+
+
+def _record_from_state_entry(entry: Mapping[str, Any]) -> ImageRecord:
+    return ImageRecord(
+        doc_id=str(entry["doc_id"]),
+        root_id=str(entry["root_id"]),
+        relative_path=str(entry["relative_path"]),
+        # Tag-only Collection writes do not read the source image. Keeping this
+        # empty lets manual work continue while an image root is offline.
+        absolute_path="",
+        file_name=str(entry["file_name"]),
+        extension=str(entry["extension"]),
+        mime_type=str(entry["mime_type"]),
+        sha256=str(entry["sha256"]),
+        size_bytes=int(entry["size_bytes"]),
+        mtime_ns=int(entry["mtime_ns"]),
+        width=int(entry["width"]),
+        height=int(entry["height"]),
+    )
+
+
+def _entry_is_in_folder(
+    entry: Mapping[str, Any],
+    *,
+    root_id: str,
+    relative_folder: str,
+    include_subfolders: bool,
+) -> bool:
+    if str(entry.get("root_id") or "") != root_id:
+        return False
+    parent = str(entry.get("parent_directory") or "").replace("\\", "/")
+    normalized = str(relative_folder).replace("\\", "/").strip("/")
+    if parent == normalized:
+        return True
+    return include_subfolders and (
+        not normalized or parent.startswith(f"{normalized}/")
+    )
+
+
+def _append_manual_failure(
+    failures: list[dict[str, str]],
+    *,
+    doc_id: str,
+    relative_path: str,
+    error: str,
+) -> None:
+    if len(failures) >= 100:
+        return
+    failures.append(
+        {
+            "doc_id": str(doc_id),
+            "relative_path": str(relative_path),
+            "error": str(error),
+        }
+    )

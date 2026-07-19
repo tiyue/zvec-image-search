@@ -5,8 +5,8 @@ import os
 import sqlite3
 import uuid
 from array import array
-from collections.abc import Iterable
-from pathlib import Path
+from collections.abc import Iterable, Iterator, Sequence
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .config import ConfigurationError
@@ -17,6 +17,7 @@ ENTRY_COLUMNS = (
     "doc_id",
     "root_id",
     "relative_path",
+    "parent_directory",
     "file_name",
     "extension",
     "mime_type",
@@ -28,6 +29,7 @@ ENTRY_COLUMNS = (
     "tags_json",
     "folder_tags_json",
     "accepted_auto_tags_json",
+    "inherited_tags_json",
 )
 
 _SQLITE_PARAMETER_CHUNK = 900
@@ -72,6 +74,7 @@ class IndexState:
                 doc_id TEXT PRIMARY KEY,
                 root_id TEXT NOT NULL,
                 relative_path TEXT NOT NULL,
+                parent_directory TEXT NOT NULL DEFAULT '',
                 file_name TEXT NOT NULL,
                 extension TEXT NOT NULL,
                 mime_type TEXT NOT NULL,
@@ -82,7 +85,8 @@ class IndexState:
                 height INTEGER NOT NULL,
                 tags_json TEXT NOT NULL DEFAULT '[]',
                 folder_tags_json TEXT NOT NULL DEFAULT '[]',
-                accepted_auto_tags_json TEXT NOT NULL DEFAULT '[]'
+                accepted_auto_tags_json TEXT NOT NULL DEFAULT '[]',
+                inherited_tags_json TEXT NOT NULL DEFAULT '[]'
             );
             CREATE INDEX IF NOT EXISTS idx_entries_sha256 ON entries(sha256);
             CREATE INDEX IF NOT EXISTS idx_entries_root_id ON entries(root_id);
@@ -110,6 +114,25 @@ class IndexState:
             );
             CREATE INDEX IF NOT EXISTS idx_entry_tag_index_tag
                 ON entry_tag_index(tag);
+            CREATE TABLE IF NOT EXISTS entry_folder_index (
+                doc_id TEXT NOT NULL,
+                root_id TEXT NOT NULL,
+                relative_folder TEXT NOT NULL,
+                is_direct INTEGER NOT NULL,
+                PRIMARY KEY(doc_id, relative_folder)
+            );
+            CREATE INDEX IF NOT EXISTS idx_entry_folder_index_page
+                ON entry_folder_index(root_id, relative_folder, doc_id);
+            CREATE TABLE IF NOT EXISTS folder_catalog (
+                root_id TEXT NOT NULL,
+                relative_folder TEXT NOT NULL,
+                first_indexed_at TEXT NOT NULL,
+                last_indexed_at TEXT NOT NULL,
+                timestamp_source TEXT NOT NULL,
+                PRIMARY KEY(root_id, relative_folder)
+            );
+            CREATE INDEX IF NOT EXISTS idx_folder_catalog_first_indexed
+                ON folder_catalog(first_indexed_at DESC, root_id, relative_folder);
             CREATE TABLE IF NOT EXISTS index_runs (
                 run_id TEXT PRIMARY KEY,
                 root_id TEXT NOT NULL,
@@ -183,6 +206,38 @@ class IndexState:
             );
             CREATE INDEX IF NOT EXISTS idx_auto_tag_review_batches_latest
                 ON auto_tag_review_batches(sequence DESC);
+            CREATE TABLE IF NOT EXISTS manual_tag_batches (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_id TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL,
+                operation TEXT NOT NULL,
+                selection_json TEXT NOT NULL DEFAULT '{}',
+                tags_json TEXT NOT NULL DEFAULT '[]',
+                total_count INTEGER NOT NULL DEFAULT 0,
+                processed_count INTEGER NOT NULL DEFAULT 0,
+                updated_count INTEGER NOT NULL DEFAULT 0,
+                unchanged_count INTEGER NOT NULL DEFAULT 0,
+                failed_count INTEGER NOT NULL DEFAULT 0,
+                result_json TEXT NOT NULL DEFAULT '{}',
+                error TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                undone_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_manual_tag_batches_latest
+                ON manual_tag_batches(sequence DESC);
+            CREATE TABLE IF NOT EXISTS manual_tag_batch_entries (
+                batch_id TEXT NOT NULL,
+                doc_id TEXT NOT NULL,
+                before_tags_json TEXT NOT NULL,
+                after_tags_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                error TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(batch_id, doc_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_manual_tag_batch_entries_status
+                ON manual_tag_batch_entries(batch_id, status, doc_id);
             """
         )
         root_columns = {
@@ -201,6 +256,10 @@ class IndexState:
             str(row[1])
             for row in self.connection.execute("PRAGMA table_info(index_runs)")
         }
+        folder_catalog_columns = {
+            str(row[1])
+            for row in self.connection.execute("PRAGMA table_info(folder_catalog)")
+        }
         if "tags_json" not in entry_columns:
             self.connection.execute(
                 "ALTER TABLE entries ADD COLUMN tags_json TEXT NOT NULL DEFAULT '[]'"
@@ -214,6 +273,16 @@ class IndexState:
             self.connection.execute(
                 "ALTER TABLE entries ADD COLUMN accepted_auto_tags_json "
                 "TEXT NOT NULL DEFAULT '[]'"
+            )
+        if "inherited_tags_json" not in entry_columns:
+            self.connection.execute(
+                "ALTER TABLE entries ADD COLUMN inherited_tags_json "
+                "TEXT NOT NULL DEFAULT '[]'"
+            )
+        if "parent_directory" not in entry_columns:
+            self.connection.execute(
+                "ALTER TABLE entries ADD COLUMN parent_directory "
+                "TEXT NOT NULL DEFAULT ''"
             )
         if "tags_json" not in root_columns:
             self.connection.execute(
@@ -244,6 +313,19 @@ class IndexState:
                 "ALTER TABLE index_runs ADD COLUMN failure_manifest "
                 "TEXT NOT NULL DEFAULT ''"
             )
+        if "last_indexed_at" not in folder_catalog_columns:
+            self.connection.execute(
+                "ALTER TABLE folder_catalog ADD COLUMN last_indexed_at "
+                "TEXT NOT NULL DEFAULT ''"
+            )
+        self._backfill_parent_directories()
+        self._backfill_folder_index()
+        self._backfill_folder_catalog()
+        self._backfill_folder_catalog_last_indexed()
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_entries_folder_page "
+            "ON entries(root_id, parent_directory, relative_path, doc_id)"
+        )
         tag_index_count = int(
             self.connection.execute("SELECT COUNT(*) FROM entry_tag_index").fetchone()[
                 0
@@ -284,6 +366,173 @@ class IndexState:
                 "Legacy JSON state must be migrated before using schema V2."
             )
 
+    def _backfill_parent_directories(self) -> None:
+        """Populate the additive folder index once for pre-feature databases."""
+
+        marker = self.connection.execute(
+            "SELECT value FROM metadata WHERE key = 'parent_directory_backfill_v1'"
+        ).fetchone()
+        if marker is not None and str(marker[0]) == "1":
+            return
+        cursor = self.connection.execute(
+            "SELECT doc_id, relative_path FROM entries ORDER BY doc_id"
+        )
+        with self.connection:
+            while True:
+                rows = cursor.fetchmany(1_000)
+                if not rows:
+                    break
+                self.connection.executemany(
+                    "UPDATE entries SET parent_directory = ? WHERE doc_id = ?",
+                    [
+                        (
+                            _relative_parent_directory(str(row["relative_path"])),
+                            str(row["doc_id"]),
+                        )
+                        for row in rows
+                    ],
+                )
+            self.connection.execute(
+                "INSERT INTO metadata(key, value) "
+                "VALUES('parent_directory_backfill_v1', '1') "
+                "ON CONFLICT(key) DO UPDATE SET value='1'"
+            )
+
+    def _backfill_folder_index(self) -> None:
+        marker = self.connection.execute(
+            "SELECT value FROM metadata WHERE key = 'entry_folder_index_v1'"
+        ).fetchone()
+        if marker is not None and str(marker[0]) == "1":
+            return
+        cursor = self.connection.execute(
+            "SELECT doc_id, root_id, relative_path FROM entries ORDER BY doc_id"
+        )
+        with self.connection:
+            self.connection.execute("DELETE FROM entry_folder_index")
+            while True:
+                rows = cursor.fetchmany(1_000)
+                if not rows:
+                    break
+                for row in rows:
+                    self._replace_folder_index(dict(row))
+            self.connection.execute(
+                "INSERT INTO metadata(key, value) "
+                "VALUES('entry_folder_index_v1', '1') "
+                "ON CONFLICT(key) DO UPDATE SET value='1'"
+            )
+
+    def _backfill_folder_catalog(self) -> None:
+        """Recover stable folder timestamps without consulting image files.
+
+        Existing schema-v2 databases did not store first-indexed timestamps on
+        entries or folders.  Successful ``inserted`` index-run membership is
+        the only trustworthy historical source.  Folders without complete run
+        coverage receive one deterministic migration timestamp and an explicit
+        source marker instead of pretending that file mtimes are import times.
+        """
+
+        marker = self.connection.execute(
+            "SELECT value FROM metadata WHERE key = 'folder_catalog_v1'"
+        ).fetchone()
+        if marker is not None and str(marker[0]) == "1":
+            return
+        migration_row = self.connection.execute(
+            "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')"
+        ).fetchone()
+        migration_time = str(migration_row[0])
+        rows = self.connection.execute(
+            "WITH first_insert AS ("
+            "SELECT index_run_entries.doc_id, MIN(index_runs.started_at) "
+            "AS started_at FROM index_run_entries JOIN index_runs "
+            "ON index_runs.run_id = index_run_entries.run_id "
+            "WHERE index_run_entries.change_type = 'inserted' "
+            "AND index_runs.status IN ('succeeded', 'partial') "
+            "GROUP BY index_run_entries.doc_id) "
+            "SELECT entries.root_id, entries.parent_directory, "
+            "COUNT(*) AS image_count, COUNT(first_insert.started_at) "
+            "AS timestamped_count, "
+            "MIN(strftime('%Y-%m-%dT%H:%M:%fZ', "
+            "first_insert.started_at)) AS first_indexed_at "
+            "FROM entries LEFT JOIN first_insert "
+            "ON first_insert.doc_id = entries.doc_id "
+            "GROUP BY entries.root_id, entries.parent_directory "
+            "ORDER BY entries.root_id, entries.parent_directory"
+        ).fetchall()
+        values: list[tuple[str, str, str, str, str]] = []
+        for row in rows:
+            image_count = int(row["image_count"])
+            timestamped_count = int(row["timestamped_count"])
+            if timestamped_count == image_count:
+                source = "index_run"
+            elif timestamped_count:
+                source = "partial_index_run"
+            else:
+                source = "migration"
+            values.append(
+                (
+                    str(row["root_id"]),
+                    str(row["parent_directory"]),
+                    str(row["first_indexed_at"] or migration_time),
+                    str(row["first_indexed_at"] or migration_time),
+                    source,
+                )
+            )
+        with self.connection:
+            self.connection.execute("DELETE FROM folder_catalog")
+            if values:
+                self.connection.executemany(
+                    "INSERT INTO folder_catalog("
+                    "root_id, relative_folder, first_indexed_at, "
+                    "last_indexed_at, timestamp_source) VALUES(?, ?, ?, ?, ?)",
+                    values,
+                )
+            self.connection.execute(
+                "INSERT INTO metadata(key, value) "
+                "VALUES('folder_catalog_v1', '1') "
+                "ON CONFLICT(key) DO UPDATE SET value='1'"
+            )
+
+    def _backfill_folder_catalog_last_indexed(self) -> None:
+        """Add stable last-indexed timestamps to existing folder catalogs."""
+
+        marker = self.connection.execute(
+            "SELECT value FROM metadata WHERE key = 'folder_catalog_v2'"
+        ).fetchone()
+        if marker is not None and str(marker[0]) == "1":
+            return
+        rows = self.connection.execute(
+            "SELECT folder_catalog.root_id, folder_catalog.relative_folder, "
+            "folder_catalog.first_indexed_at, "
+            "MAX(strftime('%Y-%m-%dT%H:%M:%fZ', index_runs.started_at)) "
+            "AS last_indexed_at FROM folder_catalog "
+            "LEFT JOIN entries ON entries.root_id = folder_catalog.root_id "
+            "AND entries.parent_directory = folder_catalog.relative_folder "
+            "LEFT JOIN index_run_entries ON "
+            "index_run_entries.doc_id = entries.doc_id "
+            "AND index_run_entries.change_type IN ('inserted', 'updated') "
+            "LEFT JOIN index_runs ON index_runs.run_id = index_run_entries.run_id "
+            "AND index_runs.status IN ('succeeded', 'partial') "
+            "GROUP BY folder_catalog.root_id, folder_catalog.relative_folder"
+        ).fetchall()
+        with self.connection:
+            self.connection.executemany(
+                "UPDATE folder_catalog SET last_indexed_at = ? "
+                "WHERE root_id = ? AND relative_folder = ?",
+                [
+                    (
+                        str(row["last_indexed_at"] or row["first_indexed_at"]),
+                        str(row["root_id"]),
+                        str(row["relative_folder"]),
+                    )
+                    for row in rows
+                ],
+            )
+            self.connection.execute(
+                "INSERT INTO metadata(key, value) "
+                "VALUES('folder_catalog_v2', '1') "
+                "ON CONFLICT(key) DO UPDATE SET value='1'"
+            )
+
     def ensure_collection_uuid(
         self, collection_uuid: str, reset_if_unbound: bool = False
     ) -> bool:
@@ -303,10 +552,14 @@ class IndexState:
             self.connection.execute("DELETE FROM roots")
             self.connection.execute("DELETE FROM embedding_cache")
             self.connection.execute("DELETE FROM entry_tag_index")
+            self.connection.execute("DELETE FROM entry_folder_index")
+            self.connection.execute("DELETE FROM folder_catalog")
             self.connection.execute("DELETE FROM index_runs")
             self.connection.execute("DELETE FROM index_run_entries")
             self.connection.execute("DELETE FROM document_annotations")
             self.connection.execute("DELETE FROM auto_tag_review_batches")
+            self.connection.execute("DELETE FROM manual_tag_batch_entries")
+            self.connection.execute("DELETE FROM manual_tag_batches")
             self.connection.execute(
                 "INSERT INTO metadata(key, value) VALUES('collection_uuid', ?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -327,7 +580,32 @@ class IndexState:
         return self._entry_from_row(row) if row else None
 
     def set_many(self, entries: Iterable[dict[str, Any]]) -> None:
-        items = list(entries)
+        items = [dict(entry) for entry in entries]
+        missing_inherited = [
+            str(entry["doc_id"]) for entry in items if "inherited_tags" not in entry
+        ]
+        inherited_by_id: dict[str, list[str]] = {}
+        for offset in range(0, len(missing_inherited), _SQLITE_PARAMETER_CHUNK):
+            chunk = missing_inherited[offset : offset + _SQLITE_PARAMETER_CHUNK]
+            if not chunk:
+                continue
+            placeholders = ", ".join("?" for _ in chunk)
+            rows = self.connection.execute(
+                "SELECT doc_id, inherited_tags_json FROM entries "
+                f"WHERE doc_id IN ({placeholders})",
+                chunk,
+            )
+            inherited_by_id.update(
+                {
+                    str(row["doc_id"]): self._decode_tags(
+                        str(row["inherited_tags_json"])
+                    )
+                    for row in rows
+                }
+            )
+        for entry in items:
+            if "inherited_tags" not in entry:
+                entry["inherited_tags"] = inherited_by_id.get(str(entry["doc_id"]), [])
         values = [self._entry_values(entry) for entry in items]
         if not values:
             return
@@ -337,6 +615,10 @@ class IndexState:
             for column in ENTRY_COLUMNS
             if column != "doc_id"
         )
+        observed_row = self.connection.execute(
+            "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')"
+        ).fetchone()
+        observed_at = str(observed_row[0])
         with self.connection:
             columns = ", ".join(ENTRY_COLUMNS)
             self.connection.executemany(
@@ -346,14 +628,56 @@ class IndexState:
             )
             for entry in items:
                 self._replace_indexed_tags(entry)
+                self._replace_folder_index(entry)
+                self._ensure_folder_catalog(entry, observed_at)
 
     def remove_many(self, doc_ids: Iterable[str]) -> None:
-        values = [(doc_id,) for doc_id in doc_ids]
-        if not values:
-            return
+        self._remove_many(doc_ids, mark_source_deleted=False)
+
+    def remove_many_for_folder_delete(self, doc_ids: Iterable[str]) -> int:
+        """Delete folder-owned state and retire undo records atomically.
+
+        A folder deletion removes the source documents themselves, so an old
+        manual-tag undo must not attempt to write those documents back later.
+        The history row remains available for audit, but leaves the retryable
+        status set used by ``manual_tag_undo_available``.
+        """
+
+        return self._remove_many(doc_ids, mark_source_deleted=True)
+
+    def _remove_many(self, doc_ids: Iterable[str], *, mark_source_deleted: bool) -> int:
+        normalized_ids = list(dict.fromkeys(str(doc_id) for doc_id in doc_ids))
+        if not normalized_ids:
+            return 0
         with self.connection:
+            existing_ids: list[str] = []
+            for offset in range(0, len(normalized_ids), _SQLITE_PARAMETER_CHUNK):
+                chunk = normalized_ids[offset : offset + _SQLITE_PARAMETER_CHUNK]
+                placeholders = ", ".join("?" for _ in chunk)
+                rows = self.connection.execute(
+                    f"SELECT doc_id FROM entries WHERE doc_id IN ({placeholders})",
+                    chunk,
+                )
+                existing_ids.extend(str(row["doc_id"]) for row in rows)
+            if not existing_ids:
+                return 0
+            values = [(doc_id,) for doc_id in existing_ids]
+            if mark_source_deleted:
+                self.connection.executemany(
+                    "UPDATE manual_tag_batch_entries SET "
+                    "status = 'source_deleted', "
+                    "error = CASE WHEN error = '' THEN "
+                    "'Source document deleted with its folder.' ELSE error END, "
+                    "updated_at = CURRENT_TIMESTAMP WHERE doc_id = ? AND "
+                    "status IN ('planned', 'applied', 'undo_failed', 'conflict')",
+                    values,
+                )
+                self._invalidate_latest_auto_tag_review_batch(set(existing_ids))
             self.connection.executemany(
                 "DELETE FROM entry_tag_index WHERE doc_id = ?", values
+            )
+            self.connection.executemany(
+                "DELETE FROM entry_folder_index WHERE doc_id = ?", values
             )
             self.connection.executemany(
                 "DELETE FROM document_annotations WHERE doc_id = ?", values
@@ -362,6 +686,65 @@ class IndexState:
                 "DELETE FROM index_run_entries WHERE doc_id = ?", values
             )
             self.connection.executemany("DELETE FROM entries WHERE doc_id = ?", values)
+            self.connection.execute(
+                "DELETE FROM folder_catalog WHERE NOT EXISTS ("
+                "SELECT 1 FROM entry_folder_index WHERE "
+                "entry_folder_index.root_id = folder_catalog.root_id AND "
+                "entry_folder_index.relative_folder = "
+                "folder_catalog.relative_folder AND "
+                "entry_folder_index.is_direct = 1)"
+            )
+        return len(existing_ids)
+
+    def _invalidate_latest_auto_tag_review_batch(
+        self, deleted_doc_ids: set[str]
+    ) -> None:
+        row = self.connection.execute(
+            "SELECT batch_id, status, snapshots_json, result_json "
+            "FROM auto_tag_review_batches ORDER BY sequence DESC LIMIT 1"
+        ).fetchone()
+        if row is None or str(row["status"]) in {
+            "invalidated",
+            "undone",
+            "rolled_back",
+        }:
+            return
+        try:
+            snapshots = json.loads(str(row["snapshots_json"]))
+            result = json.loads(str(row["result_json"]))
+        except json.JSONDecodeError as exc:
+            raise ConfigurationError(
+                "Invalid auto-tag review batch JSON during source deletion."
+            ) from exc
+        if not isinstance(snapshots, list) or not isinstance(result, dict):
+            raise ConfigurationError(
+                "Invalid auto-tag review batch state during source deletion."
+            )
+        after_snapshots = result.get("after_snapshots")
+        referenced = {
+            str(snapshot.get("doc_id") or "")
+            for group in (
+                snapshots,
+                after_snapshots if isinstance(after_snapshots, list) else [],
+            )
+            for snapshot in group
+            if isinstance(snapshot, dict)
+        }
+        invalidated = sorted(deleted_doc_ids & referenced)
+        if not invalidated:
+            return
+        result.update(
+            {
+                "undo_available": False,
+                "invalidated_reason": "source_deleted",
+                "invalidated_doc_ids": invalidated,
+            }
+        )
+        self.connection.execute(
+            "UPDATE auto_tag_review_batches SET status = 'invalidated', "
+            "result_json = ?, updated_at = CURRENT_TIMESTAMP WHERE batch_id = ?",
+            (json.dumps(result, ensure_ascii=False), str(row["batch_id"])),
+        )
 
     def list_effective_tags(self) -> list[str]:
         rows = self.connection.execute(
@@ -374,6 +757,99 @@ class IndexState:
             "SELECT * FROM entries ORDER BY root_id, relative_path"
         )
         return [self._entry_from_row(row) for row in rows]
+
+    def list_folders(
+        self,
+        *,
+        root_id: str | None = None,
+        query: str = "",
+        offset: int = 0,
+        limit: int = 200,
+    ) -> tuple[int, list[dict[str, Any]]]:
+        return _list_folders(
+            self.connection,
+            root_id=root_id,
+            query=query,
+            offset=offset,
+            limit=limit,
+        )
+
+    def list_folder_roots(self) -> list[dict[str, Any]]:
+        return _list_folder_roots(self.connection)
+
+    def count_folder_entries(
+        self,
+        root_id: str,
+        relative_folder: str,
+        *,
+        include_subfolders: bool = False,
+    ) -> int:
+        return _count_folder_entries(
+            self.connection,
+            root_id,
+            relative_folder,
+            include_subfolders=include_subfolders,
+        )
+
+    def page_folder_entries(
+        self,
+        root_id: str,
+        relative_folder: str,
+        *,
+        include_subfolders: bool = False,
+        offset: int = 0,
+        limit: int = 100,
+    ) -> tuple[int, list[dict[str, Any]]]:
+        return _page_folder_entries(
+            self.connection,
+            root_id,
+            relative_folder,
+            include_subfolders=include_subfolders,
+            offset=offset,
+            limit=limit,
+        )
+
+    def iter_folder_entries(
+        self,
+        root_id: str,
+        relative_folder: str,
+        *,
+        include_subfolders: bool = False,
+        chunk_size: int = 256,
+    ) -> Iterator[list[dict[str, Any]]]:
+        if isinstance(chunk_size, bool) or not isinstance(chunk_size, int):
+            raise ValueError("Folder chunk_size must be an integer.")
+        if not 1 <= chunk_size <= 1_000:
+            raise ValueError("Folder chunk_size must be between 1 and 1000.")
+        offset = 0
+        while True:
+            _total, entries = self.page_folder_entries(
+                root_id,
+                relative_folder,
+                include_subfolders=include_subfolders,
+                offset=offset,
+                limit=chunk_size,
+            )
+            if not entries:
+                return
+            yield entries
+            offset += len(entries)
+
+    def get_many(self, doc_ids: Iterable[str]) -> dict[str, dict[str, Any]]:
+        normalized = list(dict.fromkeys(str(doc_id) for doc_id in doc_ids))
+        result: dict[str, dict[str, Any]] = {}
+        for offset in range(0, len(normalized), _SQLITE_PARAMETER_CHUNK):
+            chunk = normalized[offset : offset + _SQLITE_PARAMETER_CHUNK]
+            if not chunk:
+                continue
+            placeholders = ", ".join("?" for _ in chunk)
+            rows = self.connection.execute(
+                f"SELECT * FROM entries WHERE doc_id IN ({placeholders})", chunk
+            )
+            for row in rows:
+                entry = self._entry_from_row(row)
+                result[str(entry["doc_id"])] = entry
+        return result
 
     def entries_for_any_effective_tags(
         self, tags: Iterable[str]
@@ -436,6 +912,10 @@ class IndexState:
                 "VALUES(?, ?, ?) ON CONFLICT(run_id, doc_id) DO UPDATE SET "
                 "change_type=excluded.change_type",
                 values,
+            )
+            self._record_folder_index_times(
+                run_id,
+                [doc_id for _run_id, doc_id, _change_type in values],
             )
 
     def finish_index_run(
@@ -719,6 +1199,7 @@ class IndexState:
             "undone",
             "rollback_failed",
             "undo_failed",
+            "invalidated",
         }:
             raise ValueError("Invalid auto-tag review batch status.")
         with self.connection:
@@ -750,6 +1231,254 @@ class IndexState:
             (str(batch_id),),
         ).fetchone()
         return self._auto_tag_review_batch_from_row(row) if row else None
+
+    def create_manual_tag_batch(
+        self,
+        *,
+        batch_id: str,
+        operation: str,
+        selection: dict[str, Any],
+        tags: Iterable[str],
+        total_count: int,
+    ) -> None:
+        normalized_id = str(batch_id).strip()
+        if not normalized_id:
+            raise ValueError("Manual tag batch_id is required.")
+        if operation not in {"add", "remove", "replace_manual"}:
+            raise ValueError("Invalid manual tag batch operation.")
+        if isinstance(total_count, bool) or total_count < 0:
+            raise ValueError("Manual tag batch total_count must be non-negative.")
+        with self.connection:
+            self.connection.execute(
+                "INSERT INTO manual_tag_batches("
+                "batch_id, status, operation, selection_json, tags_json, total_count"
+                ") VALUES(?, 'applying', ?, ?, ?, ?)",
+                (
+                    normalized_id,
+                    operation,
+                    json.dumps(selection, ensure_ascii=False, separators=(",", ":")),
+                    json.dumps(
+                        list(normalize_tags(tags)),
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                    total_count,
+                ),
+            )
+
+    def record_manual_tag_batch_entries(
+        self,
+        batch_id: str,
+        snapshots: Iterable[tuple[str, Iterable[str], Iterable[str]]],
+    ) -> None:
+        values = [
+            (
+                str(batch_id),
+                str(doc_id),
+                json.dumps(
+                    list(normalize_tags(before)),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+                json.dumps(
+                    list(normalize_tags(after)),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+                "planned",
+            )
+            for doc_id, before, after in snapshots
+        ]
+        if not values:
+            return
+        with self.connection:
+            self.connection.executemany(
+                "INSERT INTO manual_tag_batch_entries("
+                "batch_id, doc_id, before_tags_json, after_tags_json, status"
+                ") VALUES(?, ?, ?, ?, ?) "
+                "ON CONFLICT(batch_id, doc_id) DO NOTHING",
+                values,
+            )
+
+    def update_manual_tag_batch_entries(
+        self,
+        batch_id: str,
+        outcomes: Iterable[tuple[str, str, str]],
+    ) -> None:
+        allowed = {
+            "planned",
+            "applied",
+            "failed",
+            "undone",
+            "undo_failed",
+            "conflict",
+            "source_deleted",
+        }
+        values: list[tuple[str, str, str, str]] = []
+        for doc_id, status, error in outcomes:
+            if status not in allowed:
+                raise ValueError("Invalid manual tag batch entry status.")
+            values.append((status, str(error or ""), str(batch_id), str(doc_id)))
+        if not values:
+            return
+        with self.connection:
+            self.connection.executemany(
+                "UPDATE manual_tag_batch_entries SET status = ?, error = ?, "
+                "updated_at = CURRENT_TIMESTAMP WHERE batch_id = ? AND doc_id = ?",
+                values,
+            )
+
+    def finish_manual_tag_batch(
+        self,
+        batch_id: str,
+        *,
+        status: str,
+        processed: int,
+        updated: int,
+        unchanged: int,
+        failed: int,
+        result: dict[str, Any] | None = None,
+        error: str = "",
+    ) -> None:
+        allowed = {
+            "applying",
+            "applied",
+            "partial",
+            "failed",
+            "cancelled",
+            "undoing",
+            "undone",
+            "undo_partial",
+            "undo_failed",
+            "no_changes",
+        }
+        if status not in allowed:
+            raise ValueError("Invalid manual tag batch status.")
+        counts = (processed, updated, unchanged, failed)
+        if any(isinstance(value, bool) or value < 0 for value in counts):
+            raise ValueError("Manual tag batch counters must be non-negative.")
+        with self.connection:
+            cursor = self.connection.execute(
+                "UPDATE manual_tag_batches SET status = ?, processed_count = ?, "
+                "updated_count = ?, unchanged_count = ?, failed_count = ?, "
+                "result_json = ?, error = ?, updated_at = CURRENT_TIMESTAMP, "
+                "undone_at = CASE WHEN ? = 'undone' THEN CURRENT_TIMESTAMP "
+                "ELSE undone_at END WHERE batch_id = ?",
+                (
+                    status,
+                    processed,
+                    updated,
+                    unchanged,
+                    failed,
+                    json.dumps(result or {}, ensure_ascii=False),
+                    str(error or ""),
+                    status,
+                    str(batch_id),
+                ),
+            )
+        if cursor.rowcount != 1:
+            raise ValueError(f"Unknown manual tag batch: {batch_id}")
+
+    def update_manual_tag_batch_progress(
+        self,
+        batch_id: str,
+        *,
+        processed: int,
+        updated: int,
+        unchanged: int,
+        failed: int,
+    ) -> None:
+        counts = (processed, updated, unchanged, failed)
+        if any(isinstance(value, bool) or value < 0 for value in counts):
+            raise ValueError("Manual tag batch counters must be non-negative.")
+        with self.connection:
+            cursor = self.connection.execute(
+                "UPDATE manual_tag_batches SET processed_count = ?, "
+                "updated_count = ?, unchanged_count = ?, failed_count = ?, "
+                "updated_at = CURRENT_TIMESTAMP WHERE batch_id = ?",
+                (processed, updated, unchanged, failed, str(batch_id)),
+            )
+        if cursor.rowcount != 1:
+            raise ValueError(f"Unknown manual tag batch: {batch_id}")
+
+    def finish_manual_tag_undo(
+        self,
+        batch_id: str,
+        *,
+        status: str,
+        result: dict[str, Any],
+        error: str = "",
+    ) -> None:
+        if status not in {"undoing", "undone", "undo_partial", "undo_failed"}:
+            raise ValueError("Invalid manual tag undo status.")
+        with self.connection:
+            cursor = self.connection.execute(
+                "UPDATE manual_tag_batches SET status = ?, result_json = ?, "
+                "error = ?, updated_at = CURRENT_TIMESTAMP, "
+                "undone_at = CASE WHEN ? = 'undone' THEN CURRENT_TIMESTAMP "
+                "ELSE undone_at END WHERE batch_id = ?",
+                (
+                    status,
+                    json.dumps(result, ensure_ascii=False),
+                    str(error or ""),
+                    status,
+                    str(batch_id),
+                ),
+            )
+        if cursor.rowcount != 1:
+            raise ValueError(f"Unknown manual tag batch: {batch_id}")
+
+    def latest_manual_tag_batch(self) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            "SELECT * FROM manual_tag_batches "
+            "WHERE updated_count > 0 ORDER BY sequence DESC LIMIT 1"
+        ).fetchone()
+        return self._manual_tag_batch_from_row(row) if row else None
+
+    def manual_tag_batch_entries(
+        self,
+        batch_id: str,
+        *,
+        statuses: Sequence[str] = ("applied",),
+        offset: int = 0,
+        limit: int = 256,
+        after_doc_id: str = "",
+    ) -> list[dict[str, Any]]:
+        if not statuses:
+            return []
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise ValueError("Manual tag history offset must be non-negative.")
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= 1000
+        ):
+            raise ValueError("Manual tag history limit must be between 1 and 1000.")
+        placeholders = ", ".join("?" for _ in statuses)
+        after = str(after_doc_id)
+        rows = self.connection.execute(
+            "SELECT * FROM manual_tag_batch_entries WHERE batch_id = ? "
+            f"AND status IN ({placeholders}) AND doc_id > ? "
+            "ORDER BY doc_id LIMIT ? OFFSET ?",
+            (str(batch_id), *statuses, after, limit, offset),
+        )
+        return [self._manual_tag_batch_entry_from_row(row) for row in rows]
+
+    def count_manual_tag_batch_entries(
+        self,
+        batch_id: str,
+        *,
+        statuses: Sequence[str],
+    ) -> int:
+        if not statuses:
+            return 0
+        placeholders = ", ".join("?" for _ in statuses)
+        row = self.connection.execute(
+            "SELECT COUNT(*) FROM manual_tag_batch_entries WHERE batch_id = ? "
+            f"AND status IN ({placeholders})",
+            (str(batch_id), *statuses),
+        ).fetchone()
+        return int(row[0]) if row else 0
 
     def ids_for_root(self, root_id: str) -> set[str]:
         rows = self.connection.execute(
@@ -900,6 +1629,20 @@ class IndexState:
         ).fetchone()
         return str(row["current_path"]) if row else None
 
+    def manual_tag_undo_available(self) -> bool:
+        row = self.connection.execute(
+            "SELECT batch_id, status FROM manual_tag_batches "
+            "WHERE updated_count > 0 ORDER BY sequence DESC LIMIT 1"
+        ).fetchone()
+        if row is None or str(row["status"]) == "undone":
+            return False
+        pending = self.connection.execute(
+            "SELECT 1 FROM manual_tag_batch_entries WHERE batch_id = ? "
+            "AND status IN ('applied', 'undo_failed', 'conflict') LIMIT 1",
+            (str(row["batch_id"]),),
+        ).fetchone()
+        return pending is not None
+
     def list_roots(self) -> list[dict[str, Any]]:
         rows = self.connection.execute(
             "SELECT roots.root_id, roots.current_path, roots.recursive, "
@@ -1007,6 +1750,25 @@ class IndexState:
         return item
 
     @classmethod
+    def _manual_tag_batch_from_row(cls, row: sqlite3.Row) -> dict[str, Any]:
+        item = dict(row)
+        item["selection"] = cls._decode_json_object(
+            item.pop("selection_json"), "manual tag batch selection"
+        )
+        item["tags"] = cls._decode_tags(str(item.pop("tags_json")))
+        item["result"] = cls._decode_json_object(
+            item.pop("result_json"), "manual tag batch result"
+        )
+        return item
+
+    @classmethod
+    def _manual_tag_batch_entry_from_row(cls, row: sqlite3.Row) -> dict[str, Any]:
+        item = dict(row)
+        item["before_tags"] = cls._decode_tags(str(item.pop("before_tags_json")))
+        item["after_tags"] = cls._decode_tags(str(item.pop("after_tags_json")))
+        return item
+
+    @classmethod
     def _entry_from_row(cls, row: sqlite3.Row) -> dict[str, Any]:
         entry = dict(row)
         entry["tags"] = cls._decode_tags(str(entry.pop("tags_json")))
@@ -1015,6 +1777,9 @@ class IndexState:
         )
         entry["accepted_auto_tags"] = cls._decode_tags(
             str(entry.pop("accepted_auto_tags_json", "[]"))
+        )
+        entry["inherited_tags"] = cls._decode_tags(
+            str(entry.pop("inherited_tags_json", "[]"))
         )
         entry["effective_tags"] = list(cls._effective_tags(entry))
         return entry
@@ -1033,9 +1798,17 @@ class IndexState:
                 list(normalize_tags(entry.get("accepted_auto_tags", ()))),
                 ensure_ascii=False,
             ),
+            "inherited_tags_json": json.dumps(
+                list(normalize_tags(entry.get("inherited_tags", ()))),
+                ensure_ascii=False,
+            ),
         }
         return tuple(
-            encoded_tags[column] if column in encoded_tags else entry[column]
+            encoded_tags[column]
+            if column in encoded_tags
+            else _relative_parent_directory(str(entry["relative_path"]))
+            if column == "parent_directory"
+            else entry[column]
             for column in ENTRY_COLUMNS
         )
 
@@ -1046,6 +1819,7 @@ class IndexState:
                 *entry.get("tags", ()),
                 *entry.get("folder_tags", ()),
                 *entry.get("accepted_auto_tags", ()),
+                *entry.get("inherited_tags", ()),
             ]
         )
 
@@ -1060,6 +1834,87 @@ class IndexState:
                 "INSERT INTO entry_tag_index(doc_id, tag) VALUES(?, ?)",
                 [(doc_id, tag) for tag in tags],
             )
+
+    def _replace_folder_index(self, entry: dict[str, Any]) -> None:
+        doc_id = str(entry["doc_id"])
+        root_id = str(entry["root_id"])
+        direct = _relative_parent_directory(str(entry["relative_path"]))
+        self.connection.execute(
+            "DELETE FROM entry_folder_index WHERE doc_id = ?", (doc_id,)
+        )
+        self.connection.executemany(
+            "INSERT INTO entry_folder_index("
+            "doc_id, root_id, relative_folder, is_direct) VALUES(?, ?, ?, ?)",
+            [
+                (doc_id, root_id, folder, int(folder == direct))
+                for folder in _folder_ancestors(direct)
+            ],
+        )
+
+    def _ensure_folder_catalog(
+        self, entry: dict[str, Any], first_indexed_at: str
+    ) -> None:
+        """Record only the image's actionable, direct parent directory."""
+
+        self.connection.execute(
+            "INSERT INTO folder_catalog("
+            "root_id, relative_folder, first_indexed_at, last_indexed_at, "
+            "timestamp_source) VALUES(?, ?, ?, ?, 'observed') "
+            "ON CONFLICT(root_id, relative_folder) DO NOTHING",
+            (
+                str(entry["root_id"]),
+                _relative_parent_directory(str(entry["relative_path"])),
+                first_indexed_at,
+                first_indexed_at,
+            ),
+        )
+
+    def _record_folder_index_times(
+        self,
+        run_id: str,
+        doc_ids: Iterable[str],
+    ) -> None:
+        """Update folder chronology only for explicit index-run membership."""
+
+        normalized_ids = list(dict.fromkeys(str(doc_id) for doc_id in doc_ids))
+        if not normalized_ids:
+            return
+        run = self.connection.execute(
+            "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', started_at) "
+            "FROM index_runs WHERE run_id = ?",
+            (str(run_id),),
+        ).fetchone()
+        if run is None:
+            raise ConfigurationError(f"Unknown index run: {run_id}")
+        indexed_at = str(run[0])
+        folders: set[tuple[str, str]] = set()
+        for offset in range(0, len(normalized_ids), _SQLITE_PARAMETER_CHUNK):
+            chunk = normalized_ids[offset : offset + _SQLITE_PARAMETER_CHUNK]
+            placeholders = ", ".join("?" for _ in chunk)
+            rows = self.connection.execute(
+                "SELECT root_id, parent_directory FROM entries "
+                f"WHERE doc_id IN ({placeholders})",
+                chunk,
+            )
+            folders.update(
+                (str(row["root_id"]), str(row["parent_directory"])) for row in rows
+            )
+        self.connection.executemany(
+            "INSERT INTO folder_catalog("
+            "root_id, relative_folder, first_indexed_at, last_indexed_at, "
+            "timestamp_source) VALUES(?, ?, ?, ?, 'index_run') "
+            "ON CONFLICT(root_id, relative_folder) DO UPDATE SET "
+            "first_indexed_at = MIN(folder_catalog.first_indexed_at, "
+            "excluded.first_indexed_at), "
+            "last_indexed_at = MAX(folder_catalog.last_indexed_at, "
+            "excluded.last_indexed_at), "
+            "timestamp_source = CASE WHEN folder_catalog.timestamp_source = "
+            "'observed' THEN 'index_run' ELSE folder_catalog.timestamp_source END",
+            [
+                (root_id, relative_folder, indexed_at, indexed_at)
+                for root_id, relative_folder in sorted(folders)
+            ],
+        )
 
     def _rebuild_tag_index(self) -> None:
         self.connection.execute("DELETE FROM entry_tag_index")
@@ -1123,3 +1978,368 @@ class IndexState:
 
     def close(self) -> None:
         self.connection.close()
+
+
+class IndexStateReader:
+    """Independent WAL reader used by responsive gallery endpoints.
+
+    The persistent service owns the writable :class:`IndexState` connection on
+    its Collection worker.  Opening a short-lived query-only connection lets the
+    desktop browse folders while a long index or annotation task is running.
+    """
+
+    def __init__(self, path: Path):
+        resolved = path.expanduser().resolve()
+        if not resolved.is_file():
+            raise ConfigurationError(f"State database is missing: {resolved}")
+        try:
+            self.connection = sqlite3.connect(
+                f"{resolved.as_uri()}?mode=ro",
+                uri=True,
+                timeout=2,
+            )
+            self.connection.row_factory = sqlite3.Row
+            self.connection.execute("PRAGMA query_only=ON")
+            self.connection.execute("PRAGMA busy_timeout=2000")
+        except sqlite3.DatabaseError as exc:
+            raise ConfigurationError(
+                f"Cannot open the state database for browsing: {resolved}"
+            ) from exc
+
+    def get_metadata(self, key: str) -> str | None:
+        row = self.connection.execute(
+            "SELECT value FROM metadata WHERE key = ?", (key,)
+        ).fetchone()
+        return str(row["value"]) if row else None
+
+    def root_path(self, root_id: str) -> str | None:
+        row = self.connection.execute(
+            "SELECT current_path FROM roots WHERE root_id = ?", (root_id,)
+        ).fetchone()
+        return str(row["current_path"]) if row else None
+
+    def manual_tag_undo_available(self) -> bool:
+        row = self.connection.execute(
+            "SELECT batch_id, status FROM manual_tag_batches "
+            "WHERE updated_count > 0 ORDER BY sequence DESC LIMIT 1"
+        ).fetchone()
+        if row is None or str(row["status"]) == "undone":
+            return False
+        pending = self.connection.execute(
+            "SELECT 1 FROM manual_tag_batch_entries WHERE batch_id = ? "
+            "AND status IN ('applied', 'undo_failed', 'conflict') LIMIT 1",
+            (str(row["batch_id"]),),
+        ).fetchone()
+        return pending is not None
+
+    def list_folders(
+        self,
+        *,
+        root_id: str | None = None,
+        query: str = "",
+        offset: int = 0,
+        limit: int = 200,
+    ) -> tuple[int, list[dict[str, Any]]]:
+        return _list_folders(
+            self.connection,
+            root_id=root_id,
+            query=query,
+            offset=offset,
+            limit=limit,
+        )
+
+    def list_folder_roots(self) -> list[dict[str, Any]]:
+        return _list_folder_roots(self.connection)
+
+    def page_folder_entries(
+        self,
+        root_id: str,
+        relative_folder: str,
+        *,
+        include_subfolders: bool = False,
+        offset: int = 0,
+        limit: int = 100,
+    ) -> tuple[int, list[dict[str, Any]]]:
+        return _page_folder_entries(
+            self.connection,
+            root_id,
+            relative_folder,
+            include_subfolders=include_subfolders,
+            offset=offset,
+            limit=limit,
+        )
+
+    def resolve_document_path(self, doc_id: str) -> Path:
+        row = self.connection.execute(
+            "SELECT entries.root_id, entries.relative_path, roots.current_path "
+            "FROM entries JOIN roots ON roots.root_id = entries.root_id "
+            "WHERE entries.doc_id = ?",
+            (str(doc_id),),
+        ).fetchone()
+        if row is None:
+            raise ConfigurationError(f"Unknown document: {doc_id}")
+        return resolve_under_root(str(row["current_path"]), str(row["relative_path"]))
+
+    def close(self) -> None:
+        self.connection.close()
+
+    def __enter__(self) -> IndexStateReader:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
+
+
+def _relative_parent_directory(relative_path: str) -> str:
+    normalized = str(relative_path).replace("\\", "/").strip("/")
+    parts = PurePosixPath(normalized).parts
+    return "/".join(parts[:-1]) if len(parts) > 1 else ""
+
+
+def _folder_ancestors(relative_folder: str) -> tuple[str, ...]:
+    normalized = _normalized_relative_folder(relative_folder)
+    if not normalized:
+        return ("",)
+    parts = PurePosixPath(normalized).parts
+    return ("", *("/".join(parts[:index]) for index in range(1, len(parts) + 1)))
+
+
+def _normalized_relative_folder(value: str) -> str:
+    normalized = str(value).replace("\\", "/").strip("/")
+    if normalized in {"", "."}:
+        return ""
+    parts = PurePosixPath(normalized).parts
+    if any(part in {"", ".", ".."} for part in parts):
+        raise ValueError("relative_folder must stay inside its registered root.")
+    return "/".join(parts)
+
+
+def _validate_page(offset: int, limit: int, *, maximum: int) -> None:
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        raise ValueError("Folder page offset must be a non-negative integer.")
+    if (
+        isinstance(limit, bool)
+        or not isinstance(limit, int)
+        or not 1 <= limit <= maximum
+    ):
+        raise ValueError(f"Folder page limit must be between 1 and {maximum}.")
+
+
+def _escape_like(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _list_folders(
+    connection: sqlite3.Connection,
+    *,
+    root_id: str | None,
+    query: str,
+    offset: int,
+    limit: int,
+) -> tuple[int, list[dict[str, Any]]]:
+    _validate_page(offset, limit, maximum=1_000)
+    normalized_query = str(query).strip()
+    where: list[str] = []
+    values: list[Any] = []
+    if root_id is not None:
+        normalized_root = str(root_id).strip()
+        if not normalized_root:
+            raise ValueError("root_id must not be empty when supplied.")
+        where.append("folder_index.root_id = ?")
+        values.append(normalized_root)
+    if normalized_query:
+        pattern = f"%{_escape_like(normalized_query)}%"
+        where.append(
+            "(folder_index.relative_folder LIKE ? ESCAPE '\\' "
+            "OR roots.current_path LIKE ? ESCAPE '\\')"
+        )
+        values.extend((pattern, pattern))
+    where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+    grouped_from = (
+        "FROM entry_folder_index AS folder_index "
+        "JOIN entries ON entries.doc_id = folder_index.doc_id "
+        "JOIN roots ON roots.root_id = folder_index.root_id "
+        "JOIN folder_catalog ON "
+        "folder_catalog.root_id = folder_index.root_id AND "
+        "folder_catalog.relative_folder = folder_index.relative_folder "
+        "LEFT JOIN document_annotations "
+        "ON document_annotations.doc_id = entries.doc_id "
+        f"{where_sql} GROUP BY folder_index.root_id, "
+        "folder_index.relative_folder HAVING SUM(folder_index.is_direct) > 0"
+    )
+    count_row = connection.execute(
+        f"SELECT COUNT(*) FROM (SELECT 1 {grouped_from})", values
+    ).fetchone()
+    total = int(count_row[0]) if count_row else 0
+    rows = connection.execute(
+        "SELECT folder_index.root_id, folder_index.relative_folder, "
+        "roots.current_path, SUM(folder_index.is_direct) AS image_count, "
+        "SUM(folder_index.is_direct) AS direct_image_count, "
+        "COUNT(*) AS descendant_image_count, "
+        "folder_catalog.first_indexed_at, folder_catalog.last_indexed_at, "
+        "folder_catalog.timestamp_source, "
+        "SUM(CASE WHEN folder_index.is_direct = 1 AND "
+        "LENGTH(TRIM(entries.tags_json)) > 2 THEN 1 ELSE 0 END) "
+        "AS manual_tagged_count, "
+        "SUM(CASE WHEN folder_index.is_direct = 1 AND "
+        "LENGTH(TRIM(entries.accepted_auto_tags_json)) > 2 "
+        "THEN 1 ELSE 0 END) AS model_tagged_count, "
+        "SUM(CASE WHEN folder_index.is_direct = 1 AND "
+        "LENGTH(TRIM(entries.inherited_tags_json)) > 2 "
+        "THEN 1 ELSE 0 END) AS inherited_tagged_count, "
+        "SUM(CASE WHEN folder_index.is_direct = 1 AND "
+        "document_annotations.status = 'failed' THEN 1 ELSE 0 END) "
+        f"AS failed_count {grouped_from} "
+        "ORDER BY folder_catalog.first_indexed_at DESC, "
+        "roots.current_path COLLATE NOCASE, roots.current_path, "
+        "folder_index.relative_folder COLLATE NOCASE, "
+        "folder_index.relative_folder, folder_index.root_id "
+        "LIMIT ? OFFSET ?",
+        (*values, limit, offset),
+    )
+    folders: list[dict[str, Any]] = []
+    for row in rows:
+        relative_folder = str(row["relative_folder"])
+        root_name = Path(str(row["current_path"])).name or str(row["current_path"])
+        folders.append(
+            {
+                "root_id": str(row["root_id"]),
+                "root_name": root_name,
+                "relative_folder": relative_folder,
+                "name": (
+                    PurePosixPath(relative_folder).name
+                    if relative_folder
+                    else root_name
+                ),
+                "image_count": int(row["image_count"]),
+                "direct_image_count": int(row["direct_image_count"] or 0),
+                "descendant_image_count": int(row["descendant_image_count"] or 0),
+                "first_indexed_at": str(row["first_indexed_at"]),
+                "last_indexed_at": str(row["last_indexed_at"]),
+                "timestamp_source": str(row["timestamp_source"]),
+                "manual_tagged_count": int(row["manual_tagged_count"] or 0),
+                "model_tagged_count": int(row["model_tagged_count"] or 0),
+                "inherited_tagged_count": int(row["inherited_tagged_count"] or 0),
+                "failed_count": int(row["failed_count"] or 0),
+            }
+        )
+    return total, folders
+
+
+def _list_folder_roots(connection: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Return every registered root, including a clear zero-image state."""
+
+    rows = connection.execute(
+        "SELECT roots.root_id, roots.current_path, "
+        "COUNT(DISTINCT entries.parent_directory) AS folder_count, "
+        "COUNT(entries.doc_id) AS image_count, "
+        "MIN(folder_catalog.first_indexed_at) AS first_indexed_at, "
+        "MAX(folder_catalog.last_indexed_at) AS last_indexed_at "
+        "FROM roots LEFT JOIN entries ON entries.root_id = roots.root_id "
+        "LEFT JOIN folder_catalog ON folder_catalog.root_id = entries.root_id "
+        "AND folder_catalog.relative_folder = entries.parent_directory "
+        "GROUP BY roots.root_id "
+        "ORDER BY CASE WHEN COUNT(entries.doc_id) = 0 THEN 1 ELSE 0 END, "
+        "MIN(folder_catalog.first_indexed_at) DESC, "
+        "roots.current_path COLLATE NOCASE, roots.current_path, roots.root_id"
+    )
+    summaries: list[dict[str, Any]] = []
+    for row in rows:
+        current_path = str(row["current_path"])
+        summaries.append(
+            {
+                "root_id": str(row["root_id"]),
+                "root_name": Path(current_path).name or current_path,
+                "folder_count": int(row["folder_count"]),
+                "image_count": int(row["image_count"]),
+                "is_empty": int(row["image_count"]) == 0,
+                "first_indexed_at": str(row["first_indexed_at"] or ""),
+                "last_indexed_at": str(row["last_indexed_at"] or ""),
+            }
+        )
+    return summaries
+
+
+def _folder_predicate(
+    root_id: str,
+    relative_folder: str,
+    *,
+    include_subfolders: bool,
+) -> tuple[str, tuple[Any, ...]]:
+    normalized_root = str(root_id).strip()
+    if not normalized_root:
+        raise ValueError("root_id must be a non-empty string.")
+    normalized_folder = _normalized_relative_folder(relative_folder)
+    if not include_subfolders:
+        return (
+            "entries.root_id = ? AND entries.parent_directory = ?",
+            (normalized_root, normalized_folder),
+        )
+    if not normalized_folder:
+        return "entries.root_id = ?", (normalized_root,)
+    descendant_pattern = f"{_escape_like(normalized_folder)}/%"
+    return (
+        "entries.root_id = ? AND (entries.parent_directory = ? OR "
+        "entries.parent_directory LIKE ? ESCAPE '\\')",
+        (normalized_root, normalized_folder, descendant_pattern),
+    )
+
+
+def _count_folder_entries(
+    connection: sqlite3.Connection,
+    root_id: str,
+    relative_folder: str,
+    *,
+    include_subfolders: bool,
+) -> int:
+    predicate, values = _folder_predicate(
+        root_id,
+        relative_folder,
+        include_subfolders=include_subfolders,
+    )
+    row = connection.execute(
+        f"SELECT COUNT(*) FROM entries WHERE {predicate.replace('entries.', '')}",
+        values,
+    ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def _page_folder_entries(
+    connection: sqlite3.Connection,
+    root_id: str,
+    relative_folder: str,
+    *,
+    include_subfolders: bool,
+    offset: int,
+    limit: int,
+) -> tuple[int, list[dict[str, Any]]]:
+    _validate_page(offset, limit, maximum=1_000)
+    predicate, values = _folder_predicate(
+        root_id,
+        relative_folder,
+        include_subfolders=include_subfolders,
+    )
+    count_row = connection.execute(
+        f"SELECT COUNT(*) FROM entries WHERE {predicate.replace('entries.', '')}",
+        values,
+    ).fetchone()
+    total = int(count_row[0]) if count_row else 0
+    rows = connection.execute(
+        "SELECT entries.*, document_annotations.status AS annotation_status, "
+        "document_annotations.policy_json AS annotation_policy_json "
+        "FROM entries LEFT JOIN document_annotations "
+        "ON document_annotations.doc_id = entries.doc_id "
+        f"WHERE {predicate} "
+        "ORDER BY entries.relative_path COLLATE NOCASE, entries.doc_id "
+        "LIMIT ? OFFSET ?",
+        (*values, limit, offset),
+    )
+    entries: list[dict[str, Any]] = []
+    for row in rows:
+        entry = IndexState._entry_from_row(row)
+        entry["annotation_status"] = str(entry.get("annotation_status") or "")
+        entry["annotation_policy"] = IndexState._decode_json_object(
+            entry.pop("annotation_policy_json", "{}"), "annotation policy"
+        )
+        entries.append(entry)
+    return total, entries

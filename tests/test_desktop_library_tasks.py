@@ -16,6 +16,8 @@ from zvec_desktop.library_tasks import (
     AutoTagReviewRequest,
     AutoTagRunRequest,
     AutoTagUndoRequest,
+    FolderDeleteCommitRequest,
+    FolderDeletePreviewRequest,
     FolderTagBackfillRequest,
     IdentityConfirmationRequest,
     IndexAndAutoTagRequest,
@@ -101,6 +103,12 @@ class LibraryTaskRequestContractTest(unittest.TestCase):
             ),
             StatsRequest("library-a"),
             RootsRequest("library-a"),
+            FolderDeletePreviewRequest("library-a", "zvec-folder-v1.preview"),
+            FolderDeleteCommitRequest(
+                "library-a",
+                "0123456789abcdef0123456789abcdef",
+                "preview-token",
+            ),
             AutoTagEstimateRequest("library-a"),
             AutoTagRunRequest(
                 "library-a",
@@ -143,6 +151,24 @@ class LibraryTaskRequestContractTest(unittest.TestCase):
             with self.subTest(command=request.command):
                 self.assert_backend_accepts(request)
 
+    def test_folder_delete_commit_requires_valid_preview_and_confirmation(
+        self,
+    ) -> None:
+        with self.assertRaises(LibraryTaskValidationError):
+            FolderDeletePreviewRequest(
+                "library-a", "zvec-folder-v1.preview", include_subfolders=False
+            )
+        with self.assertRaises(LibraryTaskValidationError):
+            FolderDeleteCommitRequest("library-a", "not-an-operation", "preview-token")
+        with self.assertRaises(LibraryTaskValidationError) as caught:
+            FolderDeleteCommitRequest(
+                "library-a",
+                "a" * 32,
+                "preview-token",
+                confirm=False,
+            )
+        self.assertEqual(caught.exception.code, "confirmation_required")
+
     def test_index_tags_preserve_no_change_new_only_and_clear_intent(self) -> None:
         unchanged = IndexRequest("library-a", tags=None).to_params()
         add_to_new = IndexRequest(
@@ -161,6 +187,26 @@ class LibraryTaskRequestContractTest(unittest.TestCase):
         ).to_params()
         self.assertEqual(combined["tags"], ["本批新增"])
         self.assertNotIn("scope", combined)
+
+    def test_execution_policy_is_not_exposed_as_fake_per_job_fields(self) -> None:
+        requests = (
+            IndexRequest("library-a"),
+            SyncRequest("library-a"),
+            IndexAndAutoTagRequest(
+                "library-a",
+                external_processing_confirmed=True,
+            ),
+            AutoTagRunRequest(
+                "library-a",
+                external_processing_confirmed=True,
+            ),
+        )
+
+        for request in requests:
+            with self.subTest(command=request.command):
+                params = request.to_params()
+                self.assertNotIn("concurrency", params)
+                self.assertNotIn("skip_errors", params)
 
     def test_folder_tag_backfill_cannot_inject_manual_tags(self) -> None:
         params = FolderTagBackfillRequest(
@@ -321,6 +367,32 @@ class AutoTagReviewRequestTest(unittest.TestCase):
                 accepted_tags_by_proposal={"proposal-1": ("站姿",)},
             )
         self.assertEqual(mismatch.exception.code, "batch_proposal_mismatch")
+
+    def test_recommended_batch_requires_one_batch_confirmation(self) -> None:
+        with self.assertRaises(LibraryTaskValidationError) as raised:
+            LowRiskBatchReviewRequest(
+                "library-a",
+                proposal_ids=("proposal-1",),
+                accepted_tags_by_proposal={
+                    "proposal-1": ("站姿", "刻晴"),
+                },
+                acceptance_mode="recommended",
+            )
+        self.assertEqual(raised.exception.code, "batch_confirmation_required")
+
+        request = LowRiskBatchReviewRequest(
+            "library-a",
+            proposal_ids=("proposal-1",),
+            accepted_tags_by_proposal={
+                "proposal-1": ("站姿", "刻晴"),
+            },
+            acceptance_mode="recommended",
+            batch_confirmation=True,
+        )
+        params = request.to_params()
+        self.assertEqual(params["acceptance_mode"], "recommended")
+        self.assertTrue(params["batch_confirmation"])
+        self.assertFalse(params["exclude_identity_tags"])
 
     def test_general_review_rejects_duplicate_proposals(self) -> None:
         decision = AutoTagReviewDecision(

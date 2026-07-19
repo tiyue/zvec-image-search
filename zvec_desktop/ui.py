@@ -14,12 +14,14 @@ import weakref
 from collections.abc import Callable
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from functools import partial
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
+from tkinter import font as tkfont
 from typing import Any, cast
 
-from PIL import Image
+from PIL import Image, ImageTk
 
 from .app import DesktopLaunchOptions
 from .backend_host import BackendHost, BackendRuntime
@@ -48,6 +50,11 @@ from .library_tasks import (
 from .model_settings import ModelSettingsService
 from .organize_panel import OrganizePanel
 from .organize_runtime import RuntimeOrganizeOperations
+from .resources import (
+    apply_application_icon,
+    configure_tk_scaling,
+    resolve_ui_font_family,
+)
 from .result_catalog import (
     CatalogConfig,
     LibraryRecord,
@@ -84,7 +91,6 @@ from .theme import DEFAULT_THEME, DesktopTheme
 from .tray import TrayEvent, TrayEventKind, TrayIconError, TrayIconService
 from .widgets import (
     AsyncImageCanvas,
-    FullscreenImageViewer,
     ImageTaskDispatcher,
     ResponsiveGallery,
 )
@@ -126,9 +132,17 @@ class ZvecDesktopWindow:
         autostart_backend: bool = True,
     ) -> None:
         self.options = options
-        self.theme = theme
         self.root = tk.Tk(className="ZvecDesktop")
+        configure_tk_scaling(self.root)
+        resolved_font = resolve_ui_font_family(self.root, theme.typography)
+        if resolved_font != theme.typography.family:
+            theme = replace(
+                theme,
+                typography=replace(theme.typography, family=resolved_font),
+            )
+        self.theme = theme
         self.root.title("Zvec 图片库")
+        self._application_icon = apply_application_icon(self.root)
         screen_width = max(720, self.root.winfo_screenwidth())
         screen_height = max(500, self.root.winfo_screenheight())
         initial_width = min(1280, max(720, screen_width - 80))
@@ -136,7 +150,7 @@ class ZvecDesktopWindow:
         self.root.geometry(f"{initial_width}x{initial_height}")
         self.root.minsize(720, 500)
         self.root.configure(background=theme.window)
-        self.root.option_add("*Font", ("Microsoft YaHei UI", 9))
+        self._configure_fonts()
         self._configure_styles()
 
         self._catalog: ResultCatalog | None = None
@@ -389,139 +403,929 @@ class ZvecDesktopWindow:
         with suppress(tk.TclError):
             self.root.destroy()
 
+    def _configure_fonts(self) -> None:
+        """Configure Tk named fonts without overriding ttk style hierarchy."""
+
+        for name, size in (
+            ("TkDefaultFont", self.theme.typography.body),
+            ("TkTextFont", self.theme.typography.body),
+            ("TkMenuFont", self.theme.typography.body),
+            ("TkCaptionFont", self.theme.typography.body),
+            ("TkSmallCaptionFont", self.theme.typography.supporting),
+            ("TkIconFont", self.theme.typography.body),
+            ("TkTooltipFont", self.theme.typography.supporting),
+        ):
+            with suppress(tk.TclError):
+                tkfont.nametofont(name, root=self.root).configure(
+                    family=self.theme.typography.family,
+                    size=size,
+                )
+
     def _configure_styles(self) -> None:
         style = ttk.Style(self.root)
         with suppress(tk.TclError):
             style.theme_use("clam")
+        font = self.theme.typography.family
+        style.configure(
+            ".",
+            background=self.theme.window,
+            foreground=self.theme.text,
+            font=(font, self.theme.typography.body),
+        )
         style.configure("App.TFrame", background=self.theme.window)
+        style.configure("Header.TFrame", background=self.theme.surface)
         style.configure("Surface.TFrame", background=self.theme.surface)
+        style.configure("Subtle.TFrame", background=self.theme.surface_subtle)
+        style.configure(
+            "Hero.TFrame",
+            background=self.theme.surface,
+            bordercolor=self.theme.primary_soft,
+            lightcolor=self.theme.primary_soft,
+            darkcolor=self.theme.primary_soft,
+            borderwidth=1,
+            relief="solid",
+        )
+        style.configure(
+            "Card.TFrame",
+            background=self.theme.surface,
+            bordercolor=self.theme.border,
+            lightcolor=self.theme.border,
+            darkcolor=self.theme.border,
+            borderwidth=1,
+            relief="solid",
+        )
+        style.configure(
+            "StatusPill.TFrame",
+            background=self.theme.surface_subtle,
+            bordercolor=self.theme.border,
+            lightcolor=self.theme.border,
+            darkcolor=self.theme.border,
+            borderwidth=1,
+            relief="solid",
+        )
+        style.configure(
+            "Navigation.TFrame",
+            background=self.theme.navigation,
+            bordercolor=self.theme.navigation,
+            borderwidth=0,
+        )
+        style.configure(
+            "StatusBar.TFrame",
+            background=self.theme.surface,
+            bordercolor=self.theme.border,
+            borderwidth=1,
+            relief="flat",
+        )
         style.configure(
             "Title.TLabel",
             background=self.theme.window,
             foreground=self.theme.text,
-            font=("Microsoft YaHei UI", 16, "bold"),
+            font=(font, self.theme.typography.title, "bold"),
+        )
+        style.configure(
+            "BrandSubtitle.TLabel",
+            background=self.theme.window,
+            foreground=self.theme.text_muted,
+            font=(font, self.theme.typography.body),
+        )
+        style.configure(
+            "HeaderTitle.TLabel",
+            background=self.theme.surface,
+            foreground=self.theme.text,
+            font=(font, self.theme.typography.page_title, "bold"),
+        )
+        style.configure(
+            "HeaderSubtitle.TLabel",
+            background=self.theme.surface,
+            foreground=self.theme.text_muted,
+            font=(font, self.theme.typography.body),
+        )
+        style.configure(
+            "SidebarTitle.TLabel",
+            background=self.theme.navigation,
+            foreground="#FFFFFF",
+            font=(font, self.theme.typography.section, "bold"),
+        )
+        style.configure(
+            "SidebarSubtitle.TLabel",
+            background=self.theme.navigation,
+            foreground=self.theme.navigation_muted,
+            font=(font, self.theme.typography.supporting),
         )
         style.configure(
             "Section.TLabel",
             background=self.theme.surface,
             foreground=self.theme.text,
-            font=("Microsoft YaHei UI", 11, "bold"),
+            font=(font, self.theme.typography.section, "bold"),
+        )
+        style.configure(
+            "Eyebrow.TLabel",
+            background=self.theme.surface,
+            foreground=self.theme.primary,
+            font=(font, self.theme.typography.supporting, "bold"),
+        )
+        style.configure(
+            "SubtleSection.TLabel",
+            background=self.theme.surface_subtle,
+            foreground=self.theme.text,
+            font=(font, self.theme.typography.control, "bold"),
+        )
+        style.configure(
+            "SubtleMuted.TLabel",
+            background=self.theme.surface_subtle,
+            foreground=self.theme.text_muted,
+            font=(font, self.theme.typography.supporting),
+        )
+        style.configure(
+            "Badge.TLabel",
+            background=self.theme.primary_soft,
+            foreground=self.theme.primary_pressed,
+            font=(font, self.theme.typography.supporting, "bold"),
+            padding=(8, 4),
+        )
+        style.configure(
+            "SuccessBadge.TLabel",
+            background=self.theme.success_soft,
+            foreground=self.theme.success,
+            font=(font, self.theme.typography.supporting, "bold"),
+            padding=(8, 4),
+        )
+        style.configure(
+            "EmptyTitle.TLabel",
+            background=self.theme.surface,
+            foreground=self.theme.text,
+            font=(font, self.theme.typography.section, "bold"),
+        )
+        style.configure(
+            "EmptyHint.TLabel",
+            background=self.theme.surface,
+            foreground=self.theme.text_muted,
+            font=(font, self.theme.typography.body),
+        )
+        style.configure(
+            "PreviewTitle.TLabel",
+            background=self.theme.surface,
+            foreground=self.theme.text,
+            font=(font, self.theme.typography.preview_title, "bold"),
         )
         style.configure(
             "Muted.TLabel",
             background=self.theme.surface,
             foreground=self.theme.text_muted,
-            font=("Microsoft YaHei UI", 9),
+            font=(font, self.theme.typography.body),
+        )
+        style.configure(
+            "Hint.TLabel",
+            background=self.theme.surface,
+            foreground=self.theme.text_faint,
+            font=(font, self.theme.typography.supporting),
+        )
+        style.configure(
+            "ErrorHint.TLabel",
+            background=self.theme.surface,
+            foreground=self.theme.danger,
+            font=(font, self.theme.typography.supporting),
+        )
+        style.configure(
+            "NavHeading.TLabel",
+            background=self.theme.navigation,
+            foreground=self.theme.navigation_muted,
+            font=(font, self.theme.typography.supporting, "bold"),
+        )
+        style.configure(
+            "StatusMuted.TLabel",
+            background=self.theme.surface_subtle,
+            foreground=self.theme.text_muted,
+            font=(font, self.theme.typography.body, "bold"),
+        )
+        style.configure(
+            "StatusStarting.TLabel",
+            background=self.theme.surface_subtle,
+            foreground=self.theme.primary,
+            font=(font, self.theme.typography.body, "bold"),
+        )
+        style.configure(
+            "StatusSuccess.TLabel",
+            background=self.theme.surface_subtle,
+            foreground=self.theme.success,
+            font=(font, self.theme.typography.body, "bold"),
+        )
+        style.configure(
+            "StatusError.TLabel",
+            background=self.theme.surface_subtle,
+            foreground=self.theme.danger,
+            font=(font, self.theme.typography.body, "bold"),
         )
         style.configure(
             "Primary.TButton",
             background=self.theme.primary,
             foreground="white",
-            borderwidth=0,
-            padding=(13, 8),
+            bordercolor=self.theme.primary,
+            lightcolor=self.theme.primary,
+            darkcolor=self.theme.primary,
+            focuscolor=self.theme.primary,
+            borderwidth=1,
+            padding=(15, 9),
+            font=(font, self.theme.typography.control, "bold"),
         )
         style.map(
             "Primary.TButton",
-            background=[("active", self.theme.primary_hover)],
-            foreground=[("disabled", "#D7DCEF")],
+            background=[
+                ("pressed", self.theme.primary_pressed),
+                ("active", self.theme.primary_hover),
+                ("disabled", self.theme.surface_strong),
+            ],
+            bordercolor=[
+                ("pressed", self.theme.primary_pressed),
+                ("active", self.theme.primary_hover),
+                ("disabled", self.theme.surface_strong),
+            ],
+            foreground=[("disabled", self.theme.text_faint)],
         )
-        style.configure("Quiet.TButton", padding=(10, 7))
+        style.configure(
+            "Secondary.TButton",
+            background=self.theme.primary_soft,
+            foreground=self.theme.primary_pressed,
+            bordercolor=self.theme.primary_soft,
+            lightcolor=self.theme.primary_soft,
+            darkcolor=self.theme.primary_soft,
+            focuscolor=self.theme.primary_soft,
+            borderwidth=1,
+            padding=(13, 8),
+            font=(font, self.theme.typography.control, "bold"),
+        )
+        style.map(
+            "Secondary.TButton",
+            background=[("active", self.theme.selection)],
+            bordercolor=[("active", self.theme.selection)],
+            foreground=[("disabled", self.theme.text_faint)],
+        )
+        style.configure(
+            "Quiet.TButton",
+            background=self.theme.surface,
+            foreground=self.theme.text,
+            bordercolor=self.theme.border_strong,
+            lightcolor=self.theme.border_strong,
+            darkcolor=self.theme.border_strong,
+            focuscolor=self.theme.border_strong,
+            borderwidth=1,
+            padding=(11, 8),
+            font=(font, self.theme.typography.control),
+        )
+        style.map(
+            "Quiet.TButton",
+            background=[
+                ("active", self.theme.surface_muted),
+                ("disabled", self.theme.surface_subtle),
+            ],
+            foreground=[("disabled", self.theme.text_faint)],
+        )
+        style.configure(
+            "Danger.TButton",
+            background=self.theme.surface,
+            foreground=self.theme.danger,
+            bordercolor=self.theme.danger_soft,
+            lightcolor=self.theme.danger_soft,
+            darkcolor=self.theme.danger_soft,
+            borderwidth=1,
+            padding=(11, 8),
+        )
+        style.map(
+            "Danger.TButton",
+            background=[
+                ("active", self.theme.danger_soft),
+                ("disabled", self.theme.surface),
+            ],
+            foreground=[("disabled", self.theme.text_faint)],
+            bordercolor=[("disabled", self.theme.border)],
+            lightcolor=[("disabled", self.theme.border)],
+            darkcolor=[("disabled", self.theme.border)],
+        )
+        style.configure(
+            "Nav.TButton",
+            anchor="w",
+            background=self.theme.navigation,
+            foreground=self.theme.navigation_text,
+            bordercolor=self.theme.navigation,
+            lightcolor=self.theme.navigation,
+            darkcolor=self.theme.navigation,
+            focuscolor=self.theme.navigation,
+            borderwidth=0,
+            padding=(13, 11),
+            font=(font, self.theme.typography.control),
+        )
+        style.map(
+            "Nav.TButton",
+            background=[("active", self.theme.navigation_hover)],
+            foreground=[("active", "#FFFFFF")],
+        )
+        style.configure(
+            "NavSelected.TButton",
+            anchor="w",
+            background=self.theme.navigation_selected,
+            foreground="#FFFFFF",
+            bordercolor=self.theme.navigation_selected,
+            lightcolor=self.theme.navigation_selected,
+            darkcolor=self.theme.navigation_selected,
+            focuscolor=self.theme.navigation_selected,
+            borderwidth=0,
+            padding=(13, 11),
+            font=(font, self.theme.typography.control, "bold"),
+        )
+        style.map(
+            "NavSelected.TButton",
+            background=[("active", self.theme.primary)],
+        )
+        style.configure(
+            "NavExit.TButton",
+            anchor="w",
+            background=self.theme.navigation,
+            foreground=self.theme.navigation_muted,
+            bordercolor=self.theme.navigation,
+            lightcolor=self.theme.navigation,
+            darkcolor=self.theme.navigation,
+            focuscolor=self.theme.navigation,
+            borderwidth=0,
+            padding=(13, 10),
+            font=(font, self.theme.typography.control),
+        )
+        style.map(
+            "NavExit.TButton",
+            background=[("active", self.theme.danger)],
+            foreground=[("active", "#FFFFFF")],
+        )
+        # A modern default keeps the embedded organize/settings pages from
+        # falling back to the platform's dated raised-button appearance.
+        style.configure(
+            "TButton",
+            background=self.theme.surface,
+            foreground=self.theme.text,
+            bordercolor=self.theme.border_strong,
+            lightcolor=self.theme.border_strong,
+            darkcolor=self.theme.border_strong,
+            focuscolor=self.theme.primary_soft,
+            borderwidth=1,
+            padding=(11, 7),
+            font=(font, self.theme.typography.control),
+        )
+        style.map(
+            "TButton",
+            background=[
+                ("pressed", self.theme.surface_strong),
+                ("active", self.theme.surface_muted),
+                ("disabled", self.theme.surface_subtle),
+            ],
+            foreground=[("disabled", self.theme.text_faint)],
+            bordercolor=[("focus", self.theme.primary)],
+        )
+        style.configure(
+            "TEntry",
+            fieldbackground=self.theme.surface,
+            foreground=self.theme.text,
+            bordercolor=self.theme.border_strong,
+            lightcolor=self.theme.border_strong,
+            darkcolor=self.theme.border_strong,
+            insertcolor=self.theme.primary,
+            padding=(9, 7),
+            borderwidth=1,
+        )
+        style.map(
+            "TEntry",
+            bordercolor=[("focus", self.theme.primary)],
+            lightcolor=[("focus", self.theme.primary)],
+            darkcolor=[("focus", self.theme.primary)],
+        )
+        style.configure(
+            "Search.TEntry",
+            padding=(12, 11),
+            font=(font, 10),
+        )
+        style.configure(
+            "TCombobox",
+            fieldbackground=self.theme.surface,
+            background=self.theme.surface,
+            foreground=self.theme.text,
+            arrowcolor=self.theme.text_muted,
+            bordercolor=self.theme.border_strong,
+            lightcolor=self.theme.border_strong,
+            darkcolor=self.theme.border_strong,
+            padding=(8, 7),
+        )
+        style.map(
+            "TCombobox",
+            fieldbackground=[("readonly", self.theme.surface)],
+            bordercolor=[("focus", self.theme.primary)],
+            lightcolor=[("focus", self.theme.primary)],
+            darkcolor=[("focus", self.theme.primary)],
+        )
+        style.configure(
+            "TSpinbox",
+            fieldbackground=self.theme.surface,
+            background=self.theme.surface,
+            foreground=self.theme.text,
+            arrowcolor=self.theme.text_muted,
+            bordercolor=self.theme.border_strong,
+            lightcolor=self.theme.border_strong,
+            darkcolor=self.theme.border_strong,
+            insertcolor=self.theme.primary,
+            padding=(8, 7),
+        )
+        style.map(
+            "TSpinbox",
+            bordercolor=[("focus", self.theme.primary)],
+            lightcolor=[("focus", self.theme.primary)],
+            darkcolor=[("focus", self.theme.primary)],
+        )
+        style.configure(
+            "TCheckbutton",
+            background=self.theme.surface,
+            foreground=self.theme.text_muted,
+            indicatorbackground=self.theme.surface,
+            indicatorforeground=self.theme.primary,
+            padding=(2, 2),
+        )
+        style.map(
+            "TCheckbutton",
+            background=[("active", self.theme.surface)],
+            foreground=[("active", self.theme.text)],
+            indicatorbackground=[("selected", self.theme.primary)],
+        )
+        style.configure(
+            "Subtle.TCheckbutton",
+            background=self.theme.surface_subtle,
+            foreground=self.theme.text_muted,
+            indicatorbackground=self.theme.surface,
+            indicatorforeground=self.theme.primary,
+            padding=(2, 2),
+        )
+        style.map(
+            "Subtle.TCheckbutton",
+            background=[("active", self.theme.surface_subtle)],
+            foreground=[("active", self.theme.text)],
+            indicatorbackground=[("selected", self.theme.primary)],
+        )
+        style.configure(
+            "Treeview",
+            background=self.theme.surface,
+            fieldbackground=self.theme.surface,
+            foreground=self.theme.text,
+            bordercolor=self.theme.border,
+            rowheight=34,
+        )
+        style.map(
+            "Treeview",
+            background=[("selected", self.theme.selection)],
+            foreground=[("selected", self.theme.text)],
+        )
+        style.configure(
+            "Treeview.Heading",
+            background=self.theme.surface_muted,
+            foreground=self.theme.text_muted,
+            bordercolor=self.theme.border,
+            padding=(8, 7),
+            font=(font, self.theme.typography.supporting, "bold"),
+        )
+        style.map(
+            "Treeview.Heading", background=[("active", self.theme.surface_strong)]
+        )
+        style.configure(
+            "TLabelframe",
+            background=self.theme.surface,
+            bordercolor=self.theme.border,
+            lightcolor=self.theme.border,
+            darkcolor=self.theme.border,
+            borderwidth=1,
+            relief="solid",
+        )
+        style.configure(
+            "TLabelframe.Label",
+            background=self.theme.surface,
+            foreground=self.theme.text,
+            font=(font, self.theme.typography.control, "bold"),
+        )
+        style.configure(
+            "TNotebook",
+            background=self.theme.surface,
+            bordercolor=self.theme.border,
+            borderwidth=0,
+            tabmargins=(0, 0, 0, 8),
+        )
+        style.configure(
+            "TNotebook.Tab",
+            background=self.theme.surface_muted,
+            foreground=self.theme.text_muted,
+            borderwidth=0,
+            padding=(14, 8),
+            font=(font, self.theme.typography.control),
+        )
+        style.map(
+            "TNotebook.Tab",
+            background=[
+                ("selected", self.theme.primary_soft),
+                ("active", self.theme.surface_strong),
+            ],
+            foreground=[("selected", self.theme.primary_pressed)],
+        )
+        style.configure(
+            "Vertical.TScrollbar",
+            background=self.theme.border_strong,
+            troughcolor=self.theme.surface_subtle,
+            bordercolor=self.theme.surface_subtle,
+            arrowcolor=self.theme.text_muted,
+            width=12,
+        )
+        style.configure(
+            "Horizontal.TProgressbar",
+            background=self.theme.primary,
+            troughcolor=self.theme.surface_muted,
+            bordercolor=self.theme.surface_muted,
+            lightcolor=self.theme.primary,
+            darkcolor=self.theme.primary,
+            borderwidth=0,
+            thickness=8,
+        )
+        style.configure(
+            "Workspace.TPanedwindow",
+            background=self.theme.window,
+            sashwidth=10,
+            sashpad=2,
+        )
+        style.configure(
+            "Workspace.TNotebook",
+            background=self.theme.window,
+            borderwidth=0,
+            tabmargins=0,
+        )
+        # Pages remain real Notebook tabs for keyboard/programmatic navigation,
+        # but the platform tab strip is replaced by the modern left rail.
+        style.layout("Workspace.TNotebook.Tab", [])
 
     def _build_window(self) -> None:
-        shell = ttk.Frame(self.root, style="App.TFrame", padding=(18, 14, 18, 10))
+        shell = ttk.Frame(self.root, style="App.TFrame")
         shell.pack(fill="both", expand=True)
-        shell.rowconfigure(1, weight=1)
-        shell.columnconfigure(0, weight=1)
+        shell.rowconfigure(0, weight=1)
+        shell.columnconfigure(1, weight=1)
 
-        header = ttk.Frame(shell, style="App.TFrame")
-        header.grid(row=0, column=0, sticky="ew", pady=(0, 12))
-        header.columnconfigure(1, weight=1)
-        ttk.Label(header, text="Zvec 图片库", style="Title.TLabel").grid(
-            row=0, column=0, sticky="w"
+        # The navigation rail now owns the brand and spans the full window.
+        # This removes the disconnected banner/sidebar composition and gives
+        # every page one stable visual anchor.
+        navigation = ttk.Frame(
+            shell,
+            style="Navigation.TFrame",
+            padding=(14, 20, 14, 16),
+            width=208,
         )
+        navigation.grid(row=0, column=0, sticky="ns")
+        navigation.grid_propagate(False)
+        navigation.columnconfigure(0, weight=1)
+        navigation.rowconfigure(8, weight=1)
+
+        brand = ttk.Frame(navigation, style="Navigation.TFrame")
+        brand.grid(row=0, column=0, sticky="ew", padx=7, pady=(0, 20))
+        brand.columnconfigure(1, weight=1)
+        self._navigation_logo_photo: ImageTk.PhotoImage | None = None
+        if self._application_icon is not None:
+            try:
+                with Image.open(self._application_icon) as icon_source:
+                    icon_image = icon_source.convert("RGBA").resize(
+                        (36, 36),
+                        Image.Resampling.LANCZOS,
+                    )
+                try:
+                    self._navigation_logo_photo = ImageTk.PhotoImage(
+                        icon_image,
+                        master=self.root,
+                    )
+                finally:
+                    icon_image.close()
+            except (OSError, RuntimeError, tk.TclError, ValueError):
+                # A damaged optional icon must never prevent the desktop from
+                # opening; the compact lettermark remains a safe fallback.
+                self._navigation_logo_photo = None
+        if self._navigation_logo_photo is None:
+            self._navigation_logo = tk.Label(
+                brand,
+                text="Z",
+                width=2,
+                height=1,
+                background=self.theme.primary,
+                foreground="#FFFFFF",
+                font=(self.theme.typography.family, 15, "bold"),
+                borderwidth=0,
+            )
+        else:
+            self._navigation_logo = tk.Label(
+                brand,
+                image=self._navigation_logo_photo,
+                background=self.theme.navigation,
+                borderwidth=0,
+            )
+        self._navigation_logo.grid(row=0, column=0, rowspan=2, sticky="w")
+        self._navigation_brand = ttk.Label(
+            brand,
+            text="Zvec",
+            style="SidebarTitle.TLabel",
+        )
+        self._navigation_brand.grid(row=0, column=1, sticky="sw", padx=(10, 0))
+        self._navigation_caption = ttk.Label(
+            brand,
+            text="智能图片库",
+            style="SidebarSubtitle.TLabel",
+        )
+        self._navigation_caption.grid(
+            row=1, column=1, sticky="nw", padx=(10, 0), pady=(1, 0)
+        )
+        tk.Frame(
+            navigation,
+            height=1,
+            background=self.theme.navigation_hover,
+            borderwidth=0,
+        ).grid(row=1, column=0, sticky="ew", padx=7, pady=(0, 16))
+        self._navigation_heading = ttk.Label(
+            navigation,
+            text="工作区",
+            style="NavHeading.TLabel",
+        )
+        self._navigation_heading.grid(row=2, column=0, sticky="w", padx=10, pady=(0, 8))
+
+        self._nav_buttons: list[ttk.Button] = []
+        self._nav_items = (
+            ("⌕", "图片搜索", "语义、图片与标签"),
+            ("▦", "图库任务", "索引、同步与标注"),
+            ("✓", "智能整理", "标签审核与别名"),
+            ("⚙", "设置", "图库、模型与密钥"),
+        )
+        self._nav_compact_labels = ("搜索", "任务", "整理", "设置")
+        for row, (icon, label, hint) in enumerate(self._nav_items, start=3):
+            button = ttk.Button(
+                navigation,
+                text=f"{icon}  {label}\n     {hint}",
+                style="NavSelected.TButton" if row == 3 else "Nav.TButton",
+                command=partial(self._select_main_page, row - 3),
+            )
+            button.grid(row=row, column=0, sticky="ew", pady=3)
+            self._nav_buttons.append(button)
+        self._navigation_footer = ttk.Label(
+            navigation,
+            text="本地运行\n隐私优先 · 无 Docker",
+            style="NavHeading.TLabel",
+            justify="left",
+        )
+        self._navigation_footer.grid(
+            row=9, column=0, sticky="sw", padx=10, pady=(12, 4)
+        )
+        self._exit_button = ttk.Button(
+            navigation,
+            text="退出应用",
+            style="NavExit.TButton",
+            command=self.close,
+        )
+        self._exit_button.grid(row=10, column=0, sticky="ew", pady=(4, 0))
+
+        content = ttk.Frame(shell, style="App.TFrame")
+        content.grid(row=0, column=1, sticky="nsew")
+        content.rowconfigure(1, weight=1)
+        content.columnconfigure(0, weight=1)
+
+        header = ttk.Frame(
+            content,
+            style="Header.TFrame",
+            padding=(22, 12, 20, 11),
+        )
+        header.grid(row=0, column=0, sticky="ew")
+        header.columnconfigure(0, weight=1)
+        self._page_title_text = tk.StringVar(value="图片搜索")
+        self._page_subtitle_text = tk.StringVar(value="正在读取图片…")
         self._source_text = tk.StringVar(value="正在读取图片…")
+        page_heading = ttk.Frame(header, style="Header.TFrame")
+        page_heading.grid(row=0, column=0, sticky="w")
         ttk.Label(
-            header,
-            textvariable=self._source_text,
-            style="Muted.TLabel",
-        ).grid(row=0, column=1, sticky="w", padx=(14, 12))
-        self._latest_button = ttk.Button(
-            header,
-            text="载入最新结果",
+            page_heading,
+            textvariable=self._page_title_text,
+            style="HeaderTitle.TLabel",
+        ).grid(row=0, column=0, sticky="w")
+        self._page_subtitle_label = ttk.Label(
+            page_heading,
+            textvariable=self._page_subtitle_text,
+            style="HeaderSubtitle.TLabel",
+        )
+        self._page_subtitle_label.grid(row=1, column=0, sticky="w", pady=(2, 0))
+
+        header_actions = ttk.Frame(header, style="Header.TFrame")
+        header_actions.grid(row=0, column=1, sticky="e", padx=(16, 0))
+        self._backend_status_text = tk.StringVar(value="等待启动")
+        self._backend_status_pill = ttk.Frame(
+            header_actions,
+            style="StatusPill.TFrame",
+            padding=(9, 5),
+        )
+        self._backend_status_pill.grid(row=0, column=0, padx=(0, 9))
+        self._backend_status_dot = ttk.Label(
+            self._backend_status_pill,
+            text="●",
+            style="StatusMuted.TLabel",
+        )
+        self._backend_status_dot.grid(row=0, column=0, padx=(0, 5))
+        self._backend_status_label = ttk.Label(
+            self._backend_status_pill,
+            textvariable=self._backend_status_text,
+            style="StatusMuted.TLabel",
+        )
+        self._backend_status_label.grid(row=0, column=1)
+        self._retry_backend_button = ttk.Button(
+            header_actions,
+            text="重试",
             style="Quiet.TButton",
+            command=self.start_backend,
+        )
+        self._retry_backend_button.grid(row=0, column=1, padx=(0, 12))
+        self._retry_backend_button.grid_remove()
+        self._header_search_actions = ttk.Frame(
+            header_actions,
+            style="Header.TFrame",
+        )
+        self._header_search_actions.grid(row=0, column=2)
+        self._latest_button = ttk.Button(
+            self._header_search_actions,
+            text="最近结果",
+            style="Secondary.TButton",
             command=self.load_latest,
         )
-        self._latest_button.grid(row=0, column=2, padx=(0, 7))
+        self._latest_button.grid(row=0, column=0, padx=(0, 8))
         self._folder_button = ttk.Button(
-            header,
-            text="打开图片文件夹",
+            self._header_search_actions,
+            text="打开图片",
             style="Primary.TButton",
             command=self.choose_folder,
         )
-        self._folder_button.grid(row=0, column=3, padx=(0, 7))
-        self._exit_button = ttk.Button(
-            header,
-            text="退出",
-            style="Quiet.TButton",
-            command=self.close,
-        )
-        self._exit_button.grid(row=0, column=4)
+        self._folder_button.grid(row=0, column=1)
 
-        self._notebook = ttk.Notebook(shell)
+        self._notebook = ttk.Notebook(content, style="Workspace.TNotebook")
         self._notebook.grid(row=1, column=0, sticky="nsew")
-        search_page = ttk.Frame(self._notebook, style="App.TFrame")
-        task_page = ttk.Frame(self._notebook, style="App.TFrame")
-        self._organize_page = ttk.Frame(self._notebook, style="App.TFrame")
-        self._settings_page = ttk.Frame(self._notebook, style="App.TFrame")
+        page_padding = (18, 11, 18, 10)
+        search_page = ttk.Frame(
+            self._notebook,
+            style="App.TFrame",
+            padding=page_padding,
+        )
+        task_page = ttk.Frame(
+            self._notebook,
+            style="App.TFrame",
+            padding=page_padding,
+        )
+        self._organize_page = ttk.Frame(
+            self._notebook,
+            style="App.TFrame",
+            padding=page_padding,
+        )
+        self._settings_page = ttk.Frame(
+            self._notebook,
+            style="App.TFrame",
+            padding=page_padding,
+        )
         self._notebook.add(search_page, text="图片搜索")
         self._notebook.add(task_page, text="图库任务")
         self._notebook.add(self._organize_page, text="智能整理")
         self._notebook.add(self._settings_page, text="设置")
+        self._main_pages = (
+            search_page,
+            task_page,
+            self._organize_page,
+            self._settings_page,
+        )
+        self._page_header_items = (
+            ("图片搜索", ""),
+            ("图库任务", "批量索引、同步与自动标注"),
+            ("智能整理", "快速审核模型建议、身份标签与别名"),
+            ("设置", "管理图库路径、阿里云模型与安全凭据"),
+        )
+        self._page_status_hints = (
+            "单击图片查看详情 · 右侧预览完整显示且不裁剪",
+            "任务在后台运行 · 单图失败会跳过并统一汇总",
+            "快捷键：A 接受 · E 编辑 · R 拒绝 · Space 批量勾选",
+            "设置保存后会等待任务结束并安全重启后台",
+        )
+        self._navigation_compact = False
+
+        def update_shell(event: tk.Event[tk.Misc]) -> None:
+            compact = event.width < 900
+            if compact == self._navigation_compact:
+                return
+            self._navigation_compact = compact
+            navigation.configure(
+                width=92 if compact else 184,
+                padding=(6, 16, 6, 12) if compact else (12, 18, 12, 14),
+            )
+            for button, (icon, label, hint), compact_label in zip(
+                self._nav_buttons,
+                self._nav_items,
+                self._nav_compact_labels,
+                strict=True,
+            ):
+                button.configure(
+                    text=(
+                        f"{icon} {compact_label}"
+                        if compact
+                        else f"{icon}  {label}\n     {hint}"
+                    )
+                )
+            if compact:
+                self._navigation_caption.grid_remove()
+                self._navigation_brand.grid_remove()
+                brand.columnconfigure(0, weight=1)
+                brand.columnconfigure(1, weight=0)
+                self._navigation_logo.grid_configure(sticky="")
+                self._navigation_heading.configure(text="导航")
+                self._status_hint_label.grid_remove()
+            else:
+                self._navigation_caption.grid()
+                self._navigation_brand.grid()
+                brand.columnconfigure(0, weight=0)
+                brand.columnconfigure(1, weight=1)
+                self._navigation_logo.grid_configure(sticky="w")
+                self._navigation_heading.configure(text="工作区")
+                self._status_hint_label.grid()
+            self._navigation_footer.configure(
+                text="本地运行" if compact else "本地运行\n隐私优先 · 无 Docker"
+            )
+            self._exit_button.configure(text="退出" if compact else "退出应用")
+
         self._notebook.bind("<<NotebookTabChanged>>", self._on_main_tab_changed)
         search_page.rowconfigure(1, weight=1)
         search_page.columnconfigure(0, weight=1)
         self._build_search(search_page)
 
-        body = ttk.Panedwindow(search_page, orient="horizontal")
+        body = ttk.Frame(search_page, style="App.TFrame")
         body.grid(row=1, column=0, sticky="nsew")
-        gallery_card = ttk.Frame(body, style="Surface.TFrame", padding=12)
-        preview_card = ttk.Frame(body, style="Surface.TFrame", padding=12)
-        body.add(gallery_card, weight=5)
-        body.add(preview_card, weight=3)
+        body.rowconfigure(0, weight=1)
+        body.columnconfigure(0, weight=5, uniform="search-panes")
+        body.columnconfigure(1, weight=3, uniform="search-panes")
+        gallery_card = ttk.Frame(body, style="Card.TFrame", padding=16)
+        preview_card = ttk.Frame(body, style="Card.TFrame", padding=16)
+        gallery_card.grid(row=0, column=0, sticky="nsew", padx=(0, 7))
+        preview_card.grid(row=0, column=1, sticky="nsew", padx=(7, 0))
+        self._search_preview_collapsed = False
+
+        def update_search_workspace(event: tk.Event[tk.Misc]) -> None:
+            # Below 1000 logical pixels the side preview makes both panes too
+            # narrow. The gallery takes the workspace until the user widens
+            # the window enough to restore the complete-image preview pane.
+            collapsed = event.width < 1000
+            if collapsed == self._search_preview_collapsed:
+                return
+            self._search_preview_collapsed = collapsed
+            if collapsed:
+                preview_card.grid_remove()
+                gallery_card.grid_configure(columnspan=2, padx=0)
+            else:
+                gallery_card.grid_configure(columnspan=1, padx=(0, 7))
+                preview_card.grid()
+
+        body.bind("<Configure>", update_search_workspace, add=True)
         self._build_gallery(gallery_card)
         self._build_preview(preview_card)
         self._build_library_tasks(task_page)
         self._build_organize_page(self._organize_page)
         self._build_settings_page(self._settings_page)
 
-        status_frame = ttk.Frame(shell, style="App.TFrame")
-        status_frame.grid(row=2, column=0, sticky="ew", pady=(9, 0))
-        status_frame.columnconfigure(0, weight=1)
+        status_frame = ttk.Frame(
+            content,
+            style="StatusBar.TFrame",
+            padding=(18, 6, 18, 6),
+        )
+        status_frame.grid(row=2, column=0, sticky="ew")
+        status_frame.columnconfigure(1, weight=1)
+        ttk.Label(
+            status_frame,
+            text="●",
+            background=self.theme.surface,
+            foreground=self.theme.success,
+        ).grid(row=0, column=0, sticky="w", padx=(0, 7))
         self._status_text = tk.StringVar(value="准备就绪")
         ttk.Label(
             status_frame,
             textvariable=self._status_text,
-            background=self.theme.window,
+            background=self.theme.surface,
             foreground=self.theme.text_muted,
-        ).grid(row=0, column=0, sticky="w")
-        ttk.Label(
+        ).grid(row=0, column=1, sticky="w")
+        self._status_hint_label = ttk.Label(
             status_frame,
-            text="双击图片全屏 · 空格切换完整/铺满 · Esc 关闭",
-            background=self.theme.window,
+            text="单击图片查看详情 · 右侧预览完整显示且不裁剪",
+            background=self.theme.surface,
             foreground=self.theme.text_muted,
-        ).grid(row=0, column=1, sticky="e")
+        )
+        self._status_hint_label.grid(row=0, column=2, sticky="e")
+        shell.bind("<Configure>", update_shell, add=True)
+        self._on_main_tab_changed()
 
     def _build_organize_page(self, parent: ttk.Frame) -> None:
         parent.rowconfigure(1, weight=1)
         parent.columnconfigure(0, weight=1)
         toolbar = ttk.Frame(parent, style="Surface.TFrame", padding=(12, 10))
         toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-        toolbar.columnconfigure(3, weight=1)
-        ttk.Label(toolbar, text="智能整理", style="Section.TLabel").grid(
-            row=0, column=0, sticky="w", padx=(0, 14)
-        )
-        ttk.Label(toolbar, text="图库", style="Muted.TLabel").grid(
-            row=0, column=1, sticky="e", padx=(0, 5)
+        toolbar.columnconfigure(1, weight=1)
+        ttk.Label(toolbar, text="当前图库", style="Section.TLabel").grid(
+            row=0, column=0, sticky="w", padx=(0, 12)
         )
         self._organize_library_var = tk.StringVar(value="")
         self._organize_library_combo = ttk.Combobox(
@@ -530,15 +1334,29 @@ class ZvecDesktopWindow:
             state="readonly",
             width=28,
         )
-        self._organize_library_combo.grid(row=0, column=2, sticky="w", padx=(0, 12))
+        self._organize_library_combo.grid(
+            row=0,
+            column=1,
+            sticky="ew",
+            padx=(0, 12),
+        )
         self._organize_library_combo.bind(
             "<<ComboboxSelected>>", self._on_organize_library_selected
         )
-        ttk.Label(
+        self._organize_toolbar_hint = ttk.Label(
             toolbar,
             text="支持本次新增、角色、作品、动作、神态和待审核状态筛选",
             style="Muted.TLabel",
-        ).grid(row=0, column=3, sticky="w")
+        )
+        self._organize_toolbar_hint.grid(row=0, column=2, sticky="e")
+
+        def update_toolbar(event: tk.Event[tk.Misc]) -> None:
+            if event.width < 760:
+                self._organize_toolbar_hint.grid_remove()
+            else:
+                self._organize_toolbar_hint.grid()
+
+        toolbar.bind("<Configure>", update_toolbar, add=True)
 
         self._organize_panel = OrganizePanel(
             parent,
@@ -565,9 +1383,36 @@ class ZvecDesktopWindow:
         )
         self._settings_panel.grid(row=0, column=0, sticky="nsew")
 
+    def _select_main_page(self, index: int) -> None:
+        """Switch the hidden notebook through the visible navigation rail."""
+
+        if index < 0 or index >= len(self._main_pages):
+            return
+        self._notebook.select(self._main_pages[index])
+
     def _on_main_tab_changed(self, _event: tk.Event[Any] | None = None) -> None:
         self._assert_ui_thread()
         selected = self._notebook.select()
+        selected_index = 0
+        for index, button in enumerate(self._nav_buttons):
+            is_selected = selected == str(self._main_pages[index])
+            button.configure(
+                style="NavSelected.TButton" if is_selected else "Nav.TButton"
+            )
+            if is_selected:
+                selected_index = index
+
+        title, subtitle = self._page_header_items[selected_index]
+        self._page_title_text.set(title)
+        self._page_subtitle_text.set(
+            self._source_text.get() if selected_index == 0 else subtitle
+        )
+        self._status_hint_label.configure(text=self._page_status_hints[selected_index])
+        if selected_index == 0:
+            self._header_search_actions.grid()
+        else:
+            self._header_search_actions.grid_remove()
+
         if selected == str(self._settings_page):
             if self._settings_panel is not None:
                 self._settings_panel.refresh(reload_json=False)
@@ -750,70 +1595,43 @@ class ZvecDesktopWindow:
             self._backend_error_text.set("已删除保存的 API Key。")
 
     def _build_search(self, parent: ttk.Frame) -> None:
-        card = ttk.Frame(parent, style="Surface.TFrame", padding=(11, 9))
-        card.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        card = ttk.Frame(parent, style="Hero.TFrame", padding=(18, 13))
+        card.grid(row=0, column=0, sticky="ew", pady=(0, 12))
         card.columnconfigure(0, weight=1)
 
-        connection = ttk.Frame(card, style="Surface.TFrame")
-        connection.grid(row=0, column=0, sticky="ew")
-        connection.columnconfigure(1, weight=1)
-        ttk.Label(connection, text="后台", style="Muted.TLabel").grid(
+        heading = ttk.Frame(card, style="Surface.TFrame")
+        heading.grid(row=0, column=0, columnspan=2, sticky="ew")
+        heading.columnconfigure(0, weight=1)
+        ttk.Label(heading, text="描述你想找的画面", style="Section.TLabel").grid(
             row=0, column=0, sticky="w"
         )
-        self._backend_status_text = tk.StringVar(value="等待启动")
-        ttk.Label(
-            connection,
-            textvariable=self._backend_status_text,
-            style="Section.TLabel",
-        ).grid(row=0, column=1, sticky="w", padx=(7, 10))
+        self._search_subtitle_label = ttk.Label(
+            heading,
+            text="输入人物、角色、作品、动作或神态，也可以附加参考图片",
+            style="Hint.TLabel",
+        )
+        self._search_subtitle_label.grid(row=1, column=0, sticky="w", pady=(3, 0))
+
         self._backend_error_text = tk.StringVar(value="")
-        ttk.Label(
-            connection,
+        self._backend_error_label = ttk.Label(
+            heading,
             textvariable=self._backend_error_text,
-            style="Muted.TLabel",
-        ).grid(row=0, column=2, sticky="e", padx=(0, 10))
-        self._retry_backend_button = ttk.Button(
-            connection,
-            text="重试",
-            style="Quiet.TButton",
-            command=self.start_backend,
+            style="ErrorHint.TLabel",
+            justify="right",
         )
-        self._retry_backend_button.grid(row=0, column=3, padx=(0, 12))
-        ttk.Label(connection, text="API Key", style="Muted.TLabel").grid(
-            row=0, column=4, padx=(0, 5)
+        self._backend_error_label.grid(
+            row=0, column=1, rowspan=2, sticky="e", padx=(18, 0)
         )
+
+        # Credentials are maintained once in Settings instead of being
+        # duplicated across search and task pages.  These variables remain the
+        # single session-configuration contract used by backend callbacks.
         self._api_key_var = tk.StringVar(value="")
-        self._api_key_entry = ttk.Entry(
-            connection,
-            textvariable=self._api_key_var,
-            show="●",
-            width=25,
-        )
-        self._api_key_entry.grid(row=0, column=5, padx=(0, 7))
-        self._api_key_entry.bind(
-            "<Return>", lambda _event: self.configure_api_key(), add=True
-        )
         self._remember_key_var = tk.BooleanVar(value=False)
-        self._remember_key_check = ttk.Checkbutton(
-            connection,
-            text="记住密钥",
-            variable=self._remember_key_var,
-        )
-        self._remember_key_check.grid(row=0, column=6, padx=(0, 7))
-        if not self._credential_store.persistent:
-            self._remember_key_check.configure(state="disabled")
-        self._configure_key_button = ttk.Button(
-            connection,
-            text="应用密钥",
-            style="Quiet.TButton",
-            command=self.configure_api_key,
-            state="disabled",
-        )
-        self._configure_key_button.grid(row=0, column=7)
-        self._configure_key_buttons = [self._configure_key_button]
+        self._configure_key_buttons: list[ttk.Button] = []
 
         query = ttk.Frame(card, style="Surface.TFrame")
-        query.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        query.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
         query.columnconfigure(1, weight=1)
         self._search_mode_var = tk.StringVar(value=SEMANTIC_MODE_LABEL)
         self._search_mode = ttk.Combobox(
@@ -829,44 +1647,37 @@ class ZvecDesktopWindow:
         self._query_entry = ttk.Entry(
             query,
             textvariable=self._query_text_var,
+            style="Search.TEntry",
         )
-        self._query_entry.grid(row=0, column=1, sticky="ew", padx=(0, 7))
+        self._query_entry.grid(row=0, column=1, sticky="ew", padx=(0, 8))
         self._query_entry.bind("<Return>", lambda _event: self.start_search(), add=True)
         self._choose_query_image_button = ttk.Button(
             query,
-            text="选择查询图片",
-            style="Quiet.TButton",
+            text="添加参考图",
+            style="Secondary.TButton",
             command=self.choose_query_image,
         )
-        self._choose_query_image_button.grid(row=0, column=2, padx=(0, 5))
-        self._clear_query_image_button = ttk.Button(
-            query,
-            text="清除图片",
-            style="Quiet.TButton",
-            command=self.clear_query_image,
-            state="disabled",
-        )
-        self._clear_query_image_button.grid(row=0, column=3, padx=(0, 7))
+        self._choose_query_image_button.grid(row=0, column=2, padx=(0, 8))
         self._search_button = ttk.Button(
             query,
-            text="搜索",
+            text="开始搜索",
             style="Primary.TButton",
             command=self.start_search,
             state="disabled",
         )
-        self._search_button.grid(row=0, column=4, padx=(0, 5))
+        self._search_button.grid(row=0, column=3, padx=(0, 8))
         self._cancel_search_button = ttk.Button(
             query,
             text="取消",
-            style="Quiet.TButton",
+            style="Danger.TButton",
             command=self.cancel_search,
             state="disabled",
         )
-        self._cancel_search_button.grid(row=0, column=5)
+        self._cancel_search_button.grid(row=0, column=4)
 
         options = ttk.Frame(card, style="Surface.TFrame")
-        options.grid(row=2, column=0, sticky="ew", pady=(7, 0))
-        options.columnconfigure(3, weight=1)
+        options.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(7, 0))
+        options.columnconfigure(4, weight=1)
         self._all_libraries_var = tk.BooleanVar(value=True)
         self._all_libraries_check = ttk.Checkbutton(
             options,
@@ -893,153 +1704,244 @@ class ZvecDesktopWindow:
         self._library_list.grid(row=0, column=1, sticky="ew", padx=(0, 9))
         self._library_list.bind("<<ListboxSelect>>", self._on_library_selection_changed)
         self._query_image_var = tk.StringVar(value="未选择查询图片")
-        ttk.Label(
+        self._query_image_label = ttk.Label(
             options,
             textvariable=self._query_image_var,
-            style="Muted.TLabel",
-        ).grid(row=0, column=2, sticky="nw", padx=(0, 12))
+            style="Hint.TLabel",
+        )
+        self._query_image_label.grid(row=0, column=2, sticky="nw", padx=(0, 7))
+        self._clear_query_image_button = ttk.Button(
+            options,
+            text="移除",
+            style="Quiet.TButton",
+            command=self.clear_query_image,
+            state="disabled",
+        )
+        self._clear_query_image_button.grid(row=0, column=3, sticky="n", padx=(0, 12))
         self._search_progress_text = tk.StringVar(value="默认返回 15 张，候选 50 张")
-        ttk.Label(
+        self._search_progress_label = ttk.Label(
             options,
             textvariable=self._search_progress_text,
-            style="Muted.TLabel",
-        ).grid(row=0, column=3, sticky="ne")
+            style="Badge.TLabel",
+        )
+        self._search_progress_label.grid(row=0, column=4, sticky="ne")
+        self._search_controls_compact = False
+
+        def sync_backend_error(*_args: object) -> None:
+            if self._search_controls_compact and not self._backend_error_text.get():
+                self._backend_error_label.grid_remove()
+            else:
+                self._backend_error_label.grid()
+
+        self._backend_error_text.trace_add("write", sync_backend_error)
+
+        def update_search_controls(event: tk.Event[tk.Misc]) -> None:
+            compact = event.width < 900
+            if compact == self._search_controls_compact:
+                return
+            self._search_controls_compact = compact
+            if compact:
+                self._search_subtitle_label.grid_remove()
+                sync_backend_error()
+                options.columnconfigure(1, weight=1)
+                options.columnconfigure(4, weight=0)
+                self._query_entry.grid_configure(
+                    row=0, column=1, columnspan=2, sticky="ew", padx=(0, 8)
+                )
+                self._choose_query_image_button.grid_configure(
+                    row=1,
+                    column=0,
+                    columnspan=2,
+                    sticky="w",
+                    padx=(0, 8),
+                    pady=(7, 0),
+                )
+                self._search_button.grid_configure(row=0, column=3, padx=0)
+                self._cancel_search_button.grid_configure(
+                    row=1, column=3, sticky="e", pady=(7, 0)
+                )
+                self._all_libraries_check.grid_configure(row=0, column=0)
+                self._library_list.grid_configure(
+                    row=0, column=1, columnspan=2, sticky="ew", padx=0
+                )
+                self._library_list.configure(height=1)
+                self._query_image_label.grid_remove()
+                self._search_progress_label.grid_remove()
+                self._sync_compact_query_image_controls()
+                return
+
+            self._search_subtitle_label.grid()
+            sync_backend_error()
+            options.columnconfigure(1, weight=0)
+            options.columnconfigure(4, weight=1)
+            self._query_entry.grid_configure(
+                row=0, column=1, columnspan=1, sticky="ew", padx=(0, 8)
+            )
+            self._choose_query_image_button.grid_configure(
+                row=0,
+                column=2,
+                columnspan=1,
+                sticky="",
+                padx=(0, 8),
+                pady=0,
+            )
+            self._search_button.grid_configure(row=0, column=3, padx=(0, 8))
+            self._cancel_search_button.grid_configure(
+                row=0, column=4, sticky="", pady=0
+            )
+            self._all_libraries_check.grid_configure(row=0, column=0)
+            self._library_list.grid_configure(
+                row=0, column=1, columnspan=1, sticky="ew", padx=(0, 9)
+            )
+            self._library_list.configure(height=2)
+            self._query_image_label.grid()
+            self._query_image_label.grid_configure(
+                row=0,
+                column=2,
+                columnspan=1,
+                sticky="nw",
+                padx=(0, 7),
+                pady=0,
+            )
+            self._clear_query_image_button.grid_configure(
+                row=0, column=3, sticky="n", padx=(0, 12), pady=0
+            )
+            self._search_progress_label.grid()
+            self._search_progress_label.grid_configure(
+                row=0, column=4, columnspan=1, sticky="ne", pady=0
+            )
+
+        card.bind("<Configure>", update_search_controls, add=True)
 
     def _build_library_tasks(self, parent: ttk.Frame) -> None:
         parent.rowconfigure(1, weight=1)
         parent.columnconfigure(0, weight=1)
 
-        controls = ttk.Frame(parent, style="Surface.TFrame", padding=(12, 10))
-        controls.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-        controls.columnconfigure(3, weight=1)
-        ttk.Label(controls, text="图库任务", style="Section.TLabel").grid(
-            row=0, column=0, sticky="w", padx=(0, 12)
+        controls = ttk.Frame(parent, style="Hero.TFrame", padding=(18, 15))
+        controls.grid(row=0, column=0, sticky="ew", pady=(0, 14))
+        controls.columnconfigure(0, weight=3)
+        controls.columnconfigure(1, weight=2)
+
+        task_heading = ttk.Frame(controls, style="Surface.TFrame")
+        task_heading.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 12))
+        task_heading.columnconfigure(0, weight=1)
+        ttk.Label(task_heading, text="批处理工作台", style="Eyebrow.TLabel").grid(
+            row=0, column=0, sticky="w"
         )
-        ttk.Label(controls, text="图库", style="Muted.TLabel").grid(
-            row=0, column=1, sticky="e", padx=(0, 5)
+        ttk.Label(task_heading, text="创建图库任务", style="Section.TLabel").grid(
+            row=1, column=0, sticky="w", pady=(3, 0)
+        )
+        ttk.Label(
+            task_heading,
+            text="任务在后台并发运行；单张失败会跳过并统一汇总，不会中断整个队列",
+            style="Hint.TLabel",
+        ).grid(row=2, column=0, sticky="w", pady=(3, 0))
+        ttk.Label(
+            task_heading,
+            text="支持并行",
+            style="SuccessBadge.TLabel",
+        ).grid(row=0, column=1, rowspan=3, sticky="e")
+
+        basics = ttk.Frame(controls, style="Surface.TFrame")
+        basics.grid(row=1, column=0, sticky="nsew", padx=(0, 14))
+        basics.columnconfigure(0, weight=1)
+        ttk.Label(basics, text="目标图库", style="Muted.TLabel").grid(
+            row=0, column=0, sticky="w"
         )
         self._task_library_var = tk.StringVar(value="")
         self._task_library_combo = ttk.Combobox(
-            controls,
+            basics,
             textvariable=self._task_library_var,
             state="readonly",
-            width=26,
         )
-        self._task_library_combo.grid(row=0, column=2, sticky="w", padx=(0, 12))
+        self._task_library_combo.grid(row=1, column=0, sticky="ew", pady=(5, 0))
         ttk.Label(
-            controls,
+            basics,
             text="每次任务只处理当前选择的一个图库",
-            style="Muted.TLabel",
-        ).grid(row=0, column=3, sticky="w")
-        ttk.Label(controls, text="API Key", style="Muted.TLabel").grid(
-            row=0, column=4, sticky="e", padx=(10, 5)
-        )
-        task_key_entry = ttk.Entry(
-            controls,
-            textvariable=self._api_key_var,
-            show="●",
-            width=20,
-        )
-        task_key_entry.grid(row=0, column=5, padx=(0, 7))
-        task_key_entry.bind(
-            "<Return>", lambda _event: self.configure_api_key(), add=True
-        )
-        task_remember = ttk.Checkbutton(
-            controls,
-            text="记住密钥",
-            variable=self._remember_key_var,
-        )
-        task_remember.grid(row=0, column=6, padx=(0, 7))
-        if not self._credential_store.persistent:
-            task_remember.configure(state="disabled")
-        task_key_button = ttk.Button(
-            controls,
-            text="应用密钥",
-            style="Quiet.TButton",
-            command=self.configure_api_key,
-            state="disabled",
-        )
-        task_key_button.grid(row=0, column=7)
-        self._configure_key_buttons.append(task_key_button)
-
+            style="Hint.TLabel",
+        ).grid(row=2, column=0, sticky="w", pady=(4, 0))
         ttk.Label(
-            controls,
+            basics,
             text="本次新增图片标签",
             style="Muted.TLabel",
-        ).grid(row=1, column=0, sticky="w", pady=(9, 0))
+        ).grid(row=3, column=0, sticky="w", pady=(11, 0))
         self._manual_tags_var = tk.StringVar(value="")
         self._manual_tags_entry = ttk.Entry(
-            controls,
+            basics,
             textvariable=self._manual_tags_var,
         )
-        self._manual_tags_entry.grid(
-            row=1,
-            column=1,
-            columnspan=3,
-            sticky="ew",
-            padx=(0, 12),
-            pady=(9, 0),
-        )
+        self._manual_tags_entry.grid(row=4, column=0, sticky="ew", pady=(5, 0))
         ttk.Label(
-            controls,
+            basics,
             text="逗号或换行分隔；不会应用到已有图片",
-            style="Muted.TLabel",
-        ).grid(row=1, column=4, sticky="w", pady=(9, 0))
+            style="Hint.TLabel",
+        ).grid(row=5, column=0, sticky="w", pady=(4, 0))
 
-        options = ttk.Frame(controls, style="Surface.TFrame")
-        options.grid(row=2, column=0, columnspan=5, sticky="ew", pady=(9, 0))
+        options = ttk.Frame(controls, style="Subtle.TFrame", padding=(13, 11))
+        options.grid(row=1, column=1, sticky="nsew")
+        options.columnconfigure(1, weight=1)
+        ttk.Label(options, text="自动标注选项", style="SubtleSection.TLabel").grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 5)
+        )
         self._task_recursive_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             options,
             text="包含子文件夹",
             variable=self._task_recursive_var,
-        ).grid(row=0, column=0, padx=(0, 10))
+            style="Subtle.TCheckbutton",
+        ).grid(row=1, column=0, sticky="w", padx=(0, 10))
         self._task_verify_hash_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             options,
             text="校验文件哈希",
             variable=self._task_verify_hash_var,
-        ).grid(row=0, column=1, padx=(0, 16))
-        ttk.Label(options, text="标注模型", style="Muted.TLabel").grid(
-            row=0, column=2, padx=(0, 5)
-        )
-        self._task_model_var = tk.StringVar(value=DEFAULT_AUTO_TAG_MODEL)
-        ttk.Entry(options, textvariable=self._task_model_var, width=20).grid(
-            row=0, column=3, padx=(0, 12)
-        )
-        ttk.Label(options, text="最多图片", style="Muted.TLabel").grid(
-            row=0, column=4, padx=(0, 5)
-        )
-        self._task_max_images_var = tk.StringVar(value=str(DEFAULT_AUTO_TAG_MAX_IMAGES))
-        ttk.Spinbox(
-            options,
-            from_=1,
-            to=10_000,
-            textvariable=self._task_max_images_var,
-            width=7,
-        ).grid(row=0, column=5, padx=(0, 12))
-        ttk.Label(options, text="预算（元）", style="Muted.TLabel").grid(
-            row=0, column=6, padx=(0, 5)
-        )
-        self._task_budget_var = tk.StringVar(value=str(DEFAULT_AUTO_TAG_BUDGET_CNY))
-        ttk.Entry(options, textvariable=self._task_budget_var, width=8).grid(
-            row=0, column=7, padx=(0, 12)
-        )
+            style="Subtle.TCheckbutton",
+        ).grid(row=1, column=1, sticky="w")
         self._task_external_confirm_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             options,
             text="确认图片将发送到阿里云模型",
             variable=self._task_external_confirm_var,
-        ).grid(row=0, column=8)
+            style="Subtle.TCheckbutton",
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        ttk.Label(options, text="标注模型", style="SubtleMuted.TLabel").grid(
+            row=3, column=0, sticky="w", padx=(0, 8), pady=(8, 0)
+        )
+        self._task_model_var = tk.StringVar(value=DEFAULT_AUTO_TAG_MODEL)
+        ttk.Entry(options, textvariable=self._task_model_var).grid(
+            row=3, column=1, sticky="ew", pady=(8, 0)
+        )
+        limits = ttk.Frame(options, style="Subtle.TFrame")
+        limits.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        limits.columnconfigure(1, weight=1)
+        ttk.Label(limits, text="最多图片", style="SubtleMuted.TLabel").grid(
+            row=0, column=0, sticky="w", padx=(0, 6)
+        )
+        self._task_max_images_var = tk.StringVar(value=str(DEFAULT_AUTO_TAG_MAX_IMAGES))
+        ttk.Spinbox(
+            limits,
+            from_=1,
+            to=10_000,
+            textvariable=self._task_max_images_var,
+            width=7,
+        ).grid(row=0, column=1, sticky="w")
+        ttk.Label(limits, text="预算（元）", style="SubtleMuted.TLabel").grid(
+            row=0, column=2, sticky="e", padx=(12, 6)
+        )
+        self._task_budget_var = tk.StringVar(value=str(DEFAULT_AUTO_TAG_BUDGET_CNY))
+        ttk.Entry(limits, textvariable=self._task_budget_var, width=8).grid(
+            row=0, column=3, sticky="e"
+        )
 
         actions = ttk.Frame(controls, style="Surface.TFrame")
-        actions.grid(row=3, column=0, columnspan=5, sticky="ew", pady=(9, 0))
+        actions.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(13, 0))
+        actions.columnconfigure(3, weight=1)
         self._task_action_buttons: list[ttk.Button] = []
         for column, (label, action, primary) in enumerate(
             (
-                ("建立索引", "index", True),
-                ("同步图库", "sync", False),
                 ("索引并自动标注", "index_and_auto_tag", True),
+                ("建立索引", "index", False),
+                ("同步图库", "sync", False),
                 ("查看统计", "stats", False),
                 ("查看根目录", "roots", False),
             )
@@ -1051,15 +1953,66 @@ class ZvecDesktopWindow:
                 command=self._task_action_command(cast(LibraryTaskAction, action)),
                 state="disabled",
             )
-            button.grid(row=0, column=column, padx=(0, 7))
+            button.grid(
+                row=0,
+                column=column,
+                sticky="e" if column >= 3 else "w",
+                padx=(0, 7) if column < 4 else 0,
+            )
             self._task_action_buttons.append(button)
 
-        content = ttk.Panedwindow(parent, orient="horizontal")
+        self._task_form_compact = False
+
+        def update_task_form(event: tk.Event[tk.Misc]) -> None:
+            compact = event.width < 880
+            if compact == self._task_form_compact:
+                return
+            self._task_form_compact = compact
+            if compact:
+                basics.grid_configure(row=1, column=0, columnspan=2, padx=0)
+                options.grid_configure(
+                    row=2,
+                    column=0,
+                    columnspan=2,
+                    pady=(12, 0),
+                )
+                actions.grid_configure(row=3)
+                return
+            basics.grid_configure(row=1, column=0, columnspan=1, padx=(0, 14))
+            options.grid_configure(
+                row=1,
+                column=1,
+                columnspan=1,
+                pady=0,
+            )
+            actions.grid_configure(row=2)
+
+        controls.bind("<Configure>", update_task_form, add=True)
+
+        content = ttk.Frame(parent, style="App.TFrame")
         content.grid(row=1, column=0, sticky="nsew")
-        center = ttk.Frame(content, style="Surface.TFrame", padding=12)
-        details = ttk.Frame(content, style="Surface.TFrame", padding=12)
-        content.add(center, weight=5)
-        content.add(details, weight=3)
+        content.rowconfigure(0, weight=1)
+        content.columnconfigure(0, weight=5, uniform="task-panes")
+        content.columnconfigure(1, weight=3, uniform="task-panes")
+        center = ttk.Frame(content, style="Card.TFrame", padding=16)
+        details = ttk.Frame(content, style="Card.TFrame", padding=16)
+        center.grid(row=0, column=0, sticky="nsew", padx=(0, 7))
+        details.grid(row=0, column=1, sticky="nsew", padx=(7, 0))
+        self._task_details_collapsed = False
+
+        def update_task_workspace(event: tk.Event[tk.Misc]) -> None:
+            collapsed = event.width < 900
+            if collapsed == self._task_details_collapsed:
+                return
+            self._task_details_collapsed = collapsed
+            if collapsed:
+                details.grid_remove()
+                center.grid_configure(columnspan=2, padx=0)
+            else:
+                center.grid_configure(columnspan=1, padx=(0, 7))
+                details.grid()
+
+        content.bind("<Configure>", update_task_workspace, add=True)
 
         center.rowconfigure(2, weight=1)
         center.columnconfigure(0, weight=1)
@@ -1070,11 +2023,12 @@ class ZvecDesktopWindow:
             row=0, column=0, sticky="w"
         )
         self._task_summary_var = tk.StringVar(value="没有运行中的任务")
-        ttk.Label(
+        self._task_summary_label = ttk.Label(
             heading,
             textvariable=self._task_summary_var,
-            style="Muted.TLabel",
-        ).grid(row=1, column=0, sticky="w", pady=(3, 0))
+            style="Badge.TLabel",
+        )
+        self._task_summary_label.grid(row=1, column=0, sticky="w", pady=(6, 0))
         self._task_refresh_button = ttk.Button(
             heading,
             text="刷新",
@@ -1122,10 +2076,30 @@ class ZvecDesktopWindow:
         scrollbar.grid(row=0, column=1, sticky="ns")
         self._task_tree.configure(yscrollcommand=scrollbar.set)
         self._task_tree.bind("<<TreeviewSelect>>", self._on_task_selected)
+        self._task_tree.tag_configure("active", foreground=self.theme.primary_pressed)
+        self._task_tree.tag_configure("success", foreground=self.theme.success)
+        self._task_tree.tag_configure("attention", foreground=self.theme.danger)
+        self._task_empty_state = ttk.Frame(
+            tree_frame,
+            style="Surface.TFrame",
+            padding=(28, 20),
+        )
+        ttk.Label(
+            self._task_empty_state,
+            text="暂无任务",
+            style="EmptyTitle.TLabel",
+        ).pack()
+        ttk.Label(
+            self._task_empty_state,
+            text="从上方创建任务后，可在这里持续查看进度和错误图片汇总。",
+            style="EmptyHint.TLabel",
+            justify="center",
+        ).pack(pady=(6, 0))
+        self._task_empty_state.place(relx=0.5, rely=0.5, anchor="center")
 
         details.rowconfigure(2, weight=1)
         details.columnconfigure(0, weight=1)
-        ttk.Label(details, text="任务结果", style="Section.TLabel").grid(
+        ttk.Label(details, text="任务详情", style="Section.TLabel").grid(
             row=0, column=0, sticky="w"
         )
         self._task_detail_var = tk.StringVar(value="请选择一个任务")
@@ -1144,8 +2118,8 @@ class ZvecDesktopWindow:
             result_frame,
             wrap="word",
             height=12,
-            background=self.theme.surface_muted,
-            foreground=self.theme.text,
+            background=self.theme.code_surface,
+            foreground=self.theme.code_text,
             relief="flat",
             padx=8,
             pady=8,
@@ -1413,6 +2387,10 @@ class ZvecDesktopWindow:
         for item in self._task_tree.get_children(""):
             self._task_tree.delete(item)
         jobs = self._task_center.jobs
+        if jobs:
+            self._task_empty_state.place_forget()
+        else:
+            self._task_empty_state.place(relx=0.5, rely=0.5, anchor="center")
         active = 0
         attention = 0
         for job in jobs:
@@ -1421,10 +2399,21 @@ class ZvecDesktopWindow:
             attention += int(
                 view.failed_count > 0 or view.status in {"failed", "needs_attention"}
             )
+            row_tone = (
+                "active"
+                if view.active
+                else "attention"
+                if view.failed_count > 0
+                or view.status in {"failed", "needs_attention", "partial"}
+                else "success"
+                if view.status == "succeeded"
+                else ""
+            )
             self._task_tree.insert(
                 "",
                 "end",
                 iid=view.job_id,
+                tags=(row_tone,) if row_tone else (),
                 values=(
                     view.title,
                     view.library,
@@ -1615,11 +2604,32 @@ class ZvecDesktopWindow:
         self._query_image_path = Path(selected).expanduser()
         self._query_image_var.set(self._query_image_path.name)
         self._clear_query_image_button.configure(state="normal")
+        self._sync_compact_query_image_controls()
 
     def clear_query_image(self) -> None:
         self._query_image_path = None
         self._query_image_var.set("未选择查询图片")
         self._clear_query_image_button.configure(state="disabled")
+        self._sync_compact_query_image_controls()
+
+    def _sync_compact_query_image_controls(self) -> None:
+        """Keep compact image-query feedback useful without adding a row."""
+
+        if not self._search_controls_compact:
+            self._choose_query_image_button.configure(text="参考图片")
+            self._clear_query_image_button.grid()
+            return
+        if self._query_image_path is None:
+            self._choose_query_image_button.configure(text="参考图片")
+            self._clear_query_image_button.grid_remove()
+            return
+        name = self._query_image_path.name
+        compact_name = name if len(name) <= 12 else f"{name[:11]}…"
+        self._choose_query_image_button.configure(text=f"图片 · {compact_name}")
+        self._clear_query_image_button.grid()
+        self._clear_query_image_button.grid_configure(
+            row=0, column=3, sticky="e", padx=0, pady=0
+        )
 
     def start_backend(self) -> None:
         """Start the native Python backend without blocking Tk's event loop."""
@@ -1630,7 +2640,7 @@ class ZvecDesktopWindow:
         if state in {RuntimeState.STARTING, RuntimeState.STOPPING}:
             return
         self._backend_error_text.set("")
-        self._backend_status_text.set("正在启动…")
+        self._set_backend_status("正在启动…", "starting")
         self._retry_backend_button.configure(state="disabled")
         # Runtime events, including errors, are consumed by the main-thread
         # polling loop.  No worker callback accesses tkinter state.
@@ -1645,16 +2655,15 @@ class ZvecDesktopWindow:
                 self._organize_loaded = False
                 self._search_service = None
                 self._library_task_service = None
-            self._backend_status_text.set(
-                {
-                    RuntimeState.STOPPED: "已停止",
-                    RuntimeState.STARTING: "正在启动…",
-                    RuntimeState.READY: "已就绪",
-                    RuntimeState.STOPPING: "正在停止…",
-                    RuntimeState.ERROR: "不可用",
-                    RuntimeState.DISPOSED: "已关闭",
-                }[event.state]
-            )
+            state_text, tone = {
+                RuntimeState.STOPPED: ("已停止", "muted"),
+                RuntimeState.STARTING: ("正在启动…", "starting"),
+                RuntimeState.READY: ("已就绪", "success"),
+                RuntimeState.STOPPING: ("正在停止…", "starting"),
+                RuntimeState.ERROR: ("不可用", "error"),
+                RuntimeState.DISPOSED: ("已关闭", "muted"),
+            }[event.state]
+            self._set_backend_status(state_text, tone)
             self._retry_backend_button.configure(
                 state=(
                     "normal"
@@ -1679,7 +2688,7 @@ class ZvecDesktopWindow:
                 self._library_task_service = None
                 self._backend_error_text.set(f"无法初始化桌面服务：{exc}")
                 return
-            self._backend_status_text.set("已就绪")
+            self._set_backend_status("已就绪", "success")
             self._backend_error_text.set("")
             self._search_button.configure(state="normal")
             self._set_configure_key_buttons_state("normal")
@@ -1703,8 +2712,31 @@ class ZvecDesktopWindow:
                 return
             prefix = "警告" if event.kind is RuntimeEventKind.WARNING else "错误"
             self._backend_error_text.set(f"{prefix}：{event.error.message}")
+            if event.kind is RuntimeEventKind.ERROR:
+                self._set_backend_status("不可用", "error")
             if event.operation == "list_jobs":
                 self._task_refresh_future = None
+
+    def _set_backend_status(self, text: str, tone: str) -> None:
+        """Update backend wording and colour as one semantic operation."""
+
+        styles = {
+            "muted": "StatusMuted.TLabel",
+            "starting": "StatusStarting.TLabel",
+            "success": "StatusSuccess.TLabel",
+            "error": "StatusError.TLabel",
+        }
+        try:
+            style = styles[tone]
+        except KeyError as exc:
+            raise ValueError(f"Unsupported backend status tone: {tone}") from exc
+        self._backend_status_text.set(text)
+        self._backend_status_label.configure(style=style)
+        self._backend_status_dot.configure(style=style)
+        if tone == "error" or text in {"已停止", "不可用"}:
+            self._retry_backend_button.grid()
+        else:
+            self._retry_backend_button.grid_remove()
 
     def _configure_saved_credential_once(self) -> None:
         if self._saved_credential_loaded:
@@ -1723,7 +2755,7 @@ class ZvecDesktopWindow:
         if not api_key:
             messagebox.showwarning(
                 "缺少 API Key",
-                "请输入阿里云百炼 API Key。",
+                "请前往“设置 → 模型与密钥”保存阿里云百炼 API Key。",
                 parent=self.root,
             )
             return
@@ -1748,7 +2780,7 @@ class ZvecDesktopWindow:
             self._backend_error_text.set("后台尚未就绪，暂时无法应用密钥。")
             return
         self._set_configure_key_buttons_state("disabled")
-        self._backend_status_text.set("正在应用密钥…")
+        self._set_backend_status("正在应用密钥…", "starting")
         future = self._runtime_controller.configure_credentials(api_key)
 
         def completed(_value: Any | None, error: BaseException | None) -> None:
@@ -1757,11 +2789,11 @@ class ZvecDesktopWindow:
             self._set_configure_key_buttons_state("normal")
             if error is not None:
                 self._credentials_configured = False
-                self._backend_status_text.set("已就绪")
+                self._set_backend_status("已就绪", "success")
                 self._backend_error_text.set(f"密钥不可用：{error}")
                 return
             self._credentials_configured = True
-            self._backend_status_text.set("已就绪 · 密钥已配置")
+            self._set_backend_status("已就绪 · 密钥已配置", "success")
             self._backend_error_text.set("")
             if not saved:
                 self._api_key_var.set("")
@@ -1950,12 +2982,12 @@ class ZvecDesktopWindow:
         heading = ttk.Frame(parent, style="Surface.TFrame")
         heading.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         heading.columnconfigure(0, weight=1)
-        ttk.Label(heading, text="图片", style="Section.TLabel").grid(
+        ttk.Label(heading, text="结果画廊", style="Section.TLabel").grid(
             row=0, column=0, sticky="w"
         )
         self._summary_text = tk.StringVar(value="尚未载入")
-        ttk.Label(heading, textvariable=self._summary_text, style="Muted.TLabel").grid(
-            row=1, column=0, sticky="w", pady=(3, 0)
+        ttk.Label(heading, textvariable=self._summary_text, style="Badge.TLabel").grid(
+            row=0, column=1, sticky="e"
         )
 
         self._gallery: ResponsiveGallery[SearchResult] = ResponsiveGallery(
@@ -1967,7 +2999,7 @@ class ZvecDesktopWindow:
         self._gallery.grid(row=1, column=0, sticky="nsew")
 
         pager = ttk.Frame(parent, style="Surface.TFrame")
-        pager.grid(row=2, column=0, sticky="ew", pady=(9, 0))
+        pager.grid(row=2, column=0, sticky="ew", pady=(10, 0))
         pager.columnconfigure(1, weight=1)
         self._previous_button = ttk.Button(
             pager,
@@ -1993,66 +3025,90 @@ class ZvecDesktopWindow:
     def _build_preview(self, parent: ttk.Frame) -> None:
         parent.rowconfigure(1, weight=1)
         parent.columnconfigure(0, weight=1)
-        ttk.Label(parent, text="完整预览", style="Section.TLabel").grid(
-            row=0, column=0, sticky="w", pady=(0, 8)
+        preview_heading = ttk.Frame(parent, style="Surface.TFrame")
+        preview_heading.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        preview_heading.columnconfigure(0, weight=1)
+        ttk.Label(preview_heading, text="图片详情", style="Section.TLabel").grid(
+            row=0, column=0, sticky="w"
         )
-        self._preview = AsyncImageCanvas(
+        ttk.Label(
+            preview_heading,
+            text="完整显示 · 不裁剪",
+            style="Hint.TLabel",
+        ).grid(row=0, column=1, sticky="e")
+
+        preview_surface = tk.Frame(
             parent,
+            background=self.theme.preview,
+            highlightthickness=1,
+            highlightbackground=self.theme.border_strong,
+            padx=5,
+            pady=5,
+        )
+        preview_surface.grid(row=1, column=0, sticky="nsew")
+        preview_surface.rowconfigure(0, weight=1)
+        preview_surface.columnconfigure(0, weight=1)
+        self._preview = AsyncImageCanvas(
+            preview_surface,
             self._image_dispatcher,
             mode="contain",
-            background=self.theme.surface_muted,
+            background=self.theme.preview,
             placeholder="请选择一张图片",
         )
-        self._preview.grid(row=1, column=0, sticky="nsew")
-        self._preview.bind(
-            "<Double-Button-1>", lambda _event: self.open_fullscreen(), add=True
-        )
+        self._preview.grid(row=0, column=0, sticky="nsew")
 
         details = ttk.Frame(parent, style="Surface.TFrame")
-        details.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        details.grid(row=2, column=0, sticky="ew", pady=(12, 0))
         details.columnconfigure(0, weight=1)
         self._preview_title = tk.StringVar(value="请选择结果图片")
-        ttk.Label(
+        self._preview_title_label = ttk.Label(
             details,
             textvariable=self._preview_title,
-            style="Section.TLabel",
+            style="PreviewTitle.TLabel",
             wraplength=360,
-        ).grid(row=0, column=0, sticky="w")
+        )
+        self._preview_title_label.grid(row=0, column=0, sticky="w")
         self._preview_meta = tk.StringVar(value="—")
-        ttk.Label(
+        self._preview_meta_label = ttk.Label(
             details,
             textvariable=self._preview_meta,
-            style="Muted.TLabel",
+            style="Hint.TLabel",
             wraplength=360,
             justify="left",
-        ).grid(row=1, column=0, sticky="w", pady=(5, 0))
+        )
+        self._preview_meta_label.grid(row=1, column=0, sticky="w", pady=(5, 0))
         self._preview_tags = tk.StringVar(value="标签：—")
-        ttk.Label(
+        self._preview_tags_label = ttk.Label(
             details,
             textvariable=self._preview_tags,
-            style="Muted.TLabel",
+            style="Hint.TLabel",
             wraplength=360,
             justify="left",
-        ).grid(row=2, column=0, sticky="w", pady=(4, 0))
-        buttons = ttk.Frame(details, style="Surface.TFrame")
-        buttons.grid(row=3, column=0, sticky="ew", pady=(9, 0))
-        buttons.columnconfigure(0, weight=1)
-        self._fullscreen_button = ttk.Button(
-            buttons,
-            text="全屏查看",
-            style="Primary.TButton",
-            command=self.open_fullscreen,
-            state="disabled",
         )
-        self._fullscreen_button.grid(row=0, column=0, sticky="ew", padx=(0, 5))
+        self._preview_tags_label.grid(row=2, column=0, sticky="w", pady=(4, 0))
+
+        def update_preview_wrap(event: tk.Event[tk.Misc]) -> None:
+            wraplength = max(140, event.width - 4)
+            for label in (
+                self._preview_title_label,
+                self._preview_meta_label,
+                self._preview_tags_label,
+            ):
+                label.configure(wraplength=wraplength)
+
+        details.bind("<Configure>", update_preview_wrap, add=True)
+        buttons = ttk.Frame(details, style="Surface.TFrame")
+        buttons.grid(row=3, column=0, sticky="ew", pady=(11, 0))
+        buttons.columnconfigure(0, weight=1)
+        buttons.columnconfigure(1, weight=1)
         self._open_button = ttk.Button(
             buttons,
             text="系统打开",
-            style="Quiet.TButton",
+            style="Primary.TButton",
             command=self.open_selected,
             state="disabled",
         )
-        self._open_button.grid(row=0, column=1, padx=5)
+        self._open_button.grid(row=0, column=0, sticky="ew", padx=(0, 5))
         self._folder_open_button = ttk.Button(
             buttons,
             text="所在文件夹",
@@ -2060,7 +3116,7 @@ class ZvecDesktopWindow:
             command=self.open_selected_folder,
             state="disabled",
         )
-        self._folder_open_button.grid(row=0, column=2, padx=(5, 0))
+        self._folder_open_button.grid(row=0, column=1, sticky="ew", padx=(5, 0))
 
     def _load_initial_source(self) -> None:
         if self.options.manifest_path is not None:
@@ -2188,6 +3244,8 @@ class ZvecDesktopWindow:
         self._selected_index = None
         self._summary_text.set(page.summary)
         self._source_text.set(page.source_label)
+        if self._notebook.select() == str(self._main_pages[0]):
+            self._page_subtitle_text.set(page.source_label)
         current = page.page if page.total_pages else 0
         self._page_text.set(f"第 {current} / {page.total_pages} 页")
         self._previous_button.configure(
@@ -2197,7 +3255,6 @@ class ZvecDesktopWindow:
         self._gallery.set_items(
             page.items,
             on_select=self._select_result,
-            on_open=self._open_result_fullscreen,
         )
         if page.items:
             self._gallery.select(0)
@@ -2234,11 +3291,7 @@ class ZvecDesktopWindow:
         tags = item.matched_tags or item.tags
         prefix = "命中标签" if item.matched_tags else "标签"
         self._preview_tags.set(f"{prefix}：{'、'.join(tags)}" if tags else "标签：—")
-        for button in (
-            self._fullscreen_button,
-            self._open_button,
-            self._folder_open_button,
-        ):
+        for button in (self._open_button, self._folder_open_button):
             button.configure(state="normal")
 
     def _clear_preview(self) -> None:
@@ -2247,27 +3300,8 @@ class ZvecDesktopWindow:
         self._preview_title.set("请选择结果图片")
         self._preview_meta.set("—")
         self._preview_tags.set("标签：—")
-        for button in (
-            self._fullscreen_button,
-            self._open_button,
-            self._folder_open_button,
-        ):
+        for button in (self._open_button, self._folder_open_button):
             button.configure(state="disabled")
-
-    def _open_result_fullscreen(self, index: int, _item: SearchResult) -> None:
-        self._selected_index = index
-        self.open_fullscreen()
-
-    def open_fullscreen(self) -> None:
-        if self._selected_index is None or not self._items:
-            return
-        FullscreenImageViewer(
-            self.root,
-            self._image_dispatcher,
-            self._items,
-            self._selected_index,
-            theme=self.theme,
-        )
 
     def open_selected(self) -> None:
         item = self._selected_item()
@@ -2413,11 +3447,11 @@ class ZvecDesktopWindow:
         self._page = None
         self._items = ()
         self._clear_preview()
-        self._gallery.set_items(
-            (), on_select=self._select_result, on_open=self._open_result_fullscreen
-        )
+        self._gallery.set_items((), on_select=self._select_result)
         self._summary_text.set("没有可显示的图片")
         self._source_text.set("请选择图片文件夹")
+        if self._notebook.select() == str(self._main_pages[0]):
+            self._page_subtitle_text.set("请选择图片文件夹")
         self._page_text.set("第 0 / 0 页")
         self._previous_button.configure(state="disabled")
         self._next_button.configure(state="disabled")

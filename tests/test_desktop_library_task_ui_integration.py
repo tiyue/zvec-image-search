@@ -29,6 +29,11 @@ class _LibraryTaskService:
         self.behaviours = deque(behaviours)
         self.requests: list[LibraryRequest] = []
         self.cancel_seen = threading.Event()
+        self.release_blocked = threading.Event()
+        self.two_waiters_started = threading.Event()
+        self._active_waiters = 0
+        self.peak_active_waiters = 0
+        self._waiter_lock = threading.Lock()
 
     def submit(self, request: LibraryRequest) -> SubmittedLibraryTask:
         self.requests.append(request)
@@ -71,6 +76,21 @@ class _LibraryTaskService:
             on_progress(running)
         if isinstance(behaviour, BaseException):
             raise behaviour
+        if behaviour == "block":
+            with self._waiter_lock:
+                self._active_waiters += 1
+                self.peak_active_waiters = max(
+                    self.peak_active_waiters,
+                    self._active_waiters,
+                )
+                if self._active_waiters >= 2:
+                    self.two_waiters_started.set()
+            try:
+                if not self.release_blocked.wait(timeout=5):
+                    raise TimeoutError("blocked desktop task was not released")
+            finally:
+                with self._waiter_lock:
+                    self._active_waiters -= 1
         if behaviour == "cancel":
             deadline = time.monotonic() + 5
             while not cancel_event.is_set() and time.monotonic() < deadline:
@@ -170,6 +190,11 @@ class DesktopLibraryTaskUiIntegrationTest(unittest.TestCase):
             assert selected is not None
             self.assertEqual(selected["failure_count"], 1)
             self.assertIn("inserted", window._task_result.get("1.0", "end"))
+            self.assertEqual(window._task_empty_state.winfo_manager(), "")
+            self.assertEqual(
+                tuple(window._task_tree.item("library-job-1", "tags")),
+                ("attention",),
+            )
 
             window.start_library_task("stats")
             self._pump_until(
@@ -231,6 +256,62 @@ class DesktopLibraryTaskUiIntegrationTest(unittest.TestCase):
             self.assertTrue(window.root.winfo_exists())
             self.assertIn("任务已取消", window._status_text.get())
         finally:
+            if window is not None:
+                search_fixture.DesktopSearchUiIntegrationTest._close_window(window)
+
+    def test_two_task_watchers_run_concurrently_and_actions_remain_available(
+        self,
+    ) -> None:
+        """The UI may queue more work while earlier backend jobs are active."""
+
+        from zvec_desktop.ui import ZvecDesktopWindow
+
+        controller = search_fixture._RuntimeController(self.runtime)
+        service = _LibraryTaskService(["block", "block"])
+        self.addCleanup(service.release_blocked.set)
+        window: ZvecDesktopWindow | None = None
+        try:
+            window = ZvecDesktopWindow(
+                DesktopLaunchOptions(config_path=self.config_path),
+                backend_host=cast(BackendHost, mock.Mock()),
+                runtime_controller=cast(BackendRuntimeController, controller),
+                search_service_factory=lambda _runtime: cast(
+                    Any, search_fixture._SearchService(RuntimeError("unused"))
+                ),
+                library_task_service_factory=lambda _runtime: cast(
+                    LibraryTaskService, service
+                ),
+                credential_store=cast(
+                    CredentialStore, search_fixture._CredentialStore(None)
+                ),
+            )
+            self._pump_until(window, lambda: window._library_task_service is not None)
+
+            window.start_library_task("index")
+            window.start_library_task("stats")
+
+            self.assertTrue(service.two_waiters_started.wait(timeout=5))
+            self.assertGreaterEqual(service.peak_active_waiters, 2)
+            self.assertEqual(len(service.requests), 2)
+            self.assertTrue(
+                all(
+                    str(button["state"]) == "normal"
+                    for button in window._task_action_buttons
+                )
+            )
+            self.assertTrue(window.root.winfo_exists())
+
+            service.release_blocked.set()
+            self._pump_until(
+                window,
+                lambda: all(
+                    (job := window._task_center.get(job_id)) is not None
+                    and job.get("status") == "partial"
+                    for job_id in ("library-job-1", "library-job-2")
+                ),
+            )
+        finally:
+            service.release_blocked.set()
             if window is not None:
                 search_fixture.DesktopSearchUiIntegrationTest._close_window(window)
 

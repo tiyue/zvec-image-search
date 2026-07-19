@@ -89,8 +89,18 @@ class SearchRequestValidationTest(unittest.TestCase):
         )
         self.assertEqual(normalized.library_ids, ("lib-a", "lib-b"))
         self.assertEqual(normalized.tags, ("原神", "动作"))
-        with self.assertRaisesRegex(SearchValidationError, "candidate_k"):
-            normalize_search_request(SearchRequest(text="x", top_k=15, candidate_k=10))
+        expanded = normalize_search_request(
+            SearchRequest(text="x", top_k=15, candidate_k=10)
+        )
+        self.assertEqual(expanded.candidate_k, 15)
+        self.assertEqual(expanded.sort_mode, "confidence")
+
+    def test_result_count_has_no_legacy_500_item_product_cap(self) -> None:
+        normalized = normalize_search_request(
+            SearchRequest(text="cosplay", top_k=750, candidate_k=750)
+        )
+        self.assertEqual(normalized.top_k, 750)
+        self.assertEqual(normalized.candidate_k, 750)
 
     def test_empty_and_invalid_weight_requests_are_rejected(self) -> None:
         with self.assertRaisesRegex(SearchValidationError, "请输入"):
@@ -105,12 +115,18 @@ class SearchRequestValidationTest(unittest.TestCase):
                 )
             )
 
+    def test_invalid_sort_mode_is_rejected(self) -> None:
+        with self.assertRaisesRegex(SearchValidationError, "sort_mode"):
+            normalize_search_request(
+                SearchRequest(text="x", sort_mode="unknown")  # type: ignore[arg-type]
+            )
+
 
 class SearchServiceTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.query_root = self.root / "query-staging"
         self.client = FakeSearchClient()
         self.service = SearchService(self.client, self.query_root)
@@ -156,6 +172,7 @@ class SearchServiceTest(unittest.TestCase):
         self.assertEqual(params["tags"], ["原神"])
         self.assertEqual(params["top_k"], 15)
         self.assertEqual(params["candidate_k"], 50)
+        self.assertEqual(params["sort_mode"], "confidence")
         self.assertAlmostEqual(params["image_weight"], 0.8)
         self.assertAlmostEqual(params["text_weight"], 0.2)
 

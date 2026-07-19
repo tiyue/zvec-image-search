@@ -6,6 +6,7 @@ from typing import Any, Literal
 
 MatchState = Literal["high", "possible", "weak"]
 RankSource = Literal["image", "text", "metadata", "fused", "tag"]
+SearchSortMode = Literal["relevance", "confidence", "diverse", "legacy"]
 FailureKind = Literal["item", "retryable", "systemic"]
 DEFAULT_HIGH_THRESHOLD = 0.75
 DEFAULT_POSSIBLE_THRESHOLD = 0.5
@@ -317,12 +318,16 @@ class SearchReport:
     filtered_count: int = 0
     latency_ms: float = 0.0
     ranking_mode: str = "distance"
+    sort_mode: SearchSortMode = "confidence"
+    ranking_diagnostics: dict[str, Any] | None = None
     show_low_confidence: bool = False
     low_confidence_override: bool = False
     search_quality: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         values = asdict(self)
+        if self.ranking_diagnostics is None:
+            values.pop("ranking_diagnostics")
         if self.search_quality is None:
             values.pop("search_quality")
         return values

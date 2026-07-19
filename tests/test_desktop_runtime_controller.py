@@ -42,6 +42,8 @@ class _FakeApiClient:
         self._lock = threading.Lock()
         self.job_id = "a" * 32
         self.submit_result = _job(self.job_id, "queued")
+        self.submit_entered = threading.Event()
+        self.submit_gate: threading.Event | None = None
         self.poll_results: deque[JsonObject | Exception] = deque(
             [_job(self.job_id, "succeeded", current=2)]
         )
@@ -62,6 +64,9 @@ class _FakeApiClient:
     ) -> JsonObject:
         if not command:
             raise ValueError("command must be non-empty")
+        self.submit_entered.set()
+        if self.submit_gate is not None and not self.submit_gate.wait(2):
+            raise TimeoutError("test submit gate timed out")
         return dict(self.submit_result)
 
     def get_job(self, job_id: str) -> JsonObject:
@@ -218,6 +223,22 @@ class BackendRuntimeControllerTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "succeeded")
         self.assertEqual(statuses, ["queued", "running", "succeeded"])
+
+    def test_slow_job_submission_never_blocks_the_ui_owner_thread(self) -> None:
+        self._start()
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        self.host.api.submit_gate = gate
+
+        started_at = time.monotonic()
+        future = self.controller.submit_job("index", {"library_id": "main"})
+        elapsed = time.monotonic() - started_at
+
+        self.assertLess(elapsed, 0.1)
+        self.assertTrue(self.host.api.submit_entered.wait(1))
+        self.assertFalse(future.done())
+        gate.set()
+        self.assertEqual(future.result(timeout=2)["status"], "succeeded")
 
     def test_transient_poll_failure_warns_then_recovers(self) -> None:
         self._start()

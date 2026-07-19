@@ -1,11 +1,11 @@
 # ruff: noqa: F821 - PyInstaller injects the spec globals at build time.
-"""PyInstaller onedir spec for the pure-Python Windows x64 preview."""
+"""PyInstaller onedir spec for the pure-Python Windows x64 desktop."""
 
 from pathlib import Path
 
 ROOT = Path(SPECPATH).resolve().parents[1]
 RELEASE_DIR = ROOT / "release" / "python_preview"
-ICON = ROOT / "desktop" / "Zvec.Desktop" / "Assets" / "Zvec.AppIcon.ico"
+ICON = ROOT / "assets" / "Zvec.AppIcon.ico"
 
 # One Analysis/PYZ and one COLLECT are intentional: all three executables share
 # Tcl/Tk, Pillow, the CPython runtime, and the zvec native dependency closure.
@@ -13,7 +13,10 @@ analysis = Analysis(
     [str(RELEASE_DIR / "frozen_entry.py")],
     pathex=[str(ROOT)],
     binaries=[],
-    datas=[(str(ROOT / "model-catalog.default.json"), ".")],
+    datas=[
+        (str(ROOT / "model-catalog.default.json"), "."),
+        (str(ICON), "assets"),
+    ],
     hiddenimports=[
         "image_service",
         "zvec_launcher",
@@ -86,7 +89,7 @@ backend_exe = EXE(
     icon=str(ICON),
 )
 
-preview = COLLECT(
+desktop = COLLECT(
     desktop_exe,
     cli_exe,
     backend_exe,
@@ -94,5 +97,5 @@ preview = COLLECT(
     analysis.datas,
     strip=False,
     upx=False,
-    name="Zvec-Python-Preview",
+    name="Zvec-Desktop",
 )

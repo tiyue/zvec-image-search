@@ -464,8 +464,8 @@ class ConfiguredSingleCollectionRankingTest(unittest.TestCase):
             exclude_sha256="sha-0",
         )
 
-        self.assertEqual(repository.calls, [(50, "image"), (51, "image")])
-        self.assertEqual(ranking.candidate_count, 50)
+        self.assertEqual(repository.calls, [(75, "image"), (76, "image")])
+        self.assertEqual(ranking.candidate_count, 75)
         self.assertNotIn("doc-0", [hit.doc_id for hit in ranking.hits])
         self.assertIn("doc-50", [hit.doc_id for hit in ranking.hits])
 

@@ -6,7 +6,6 @@ import tempfile
 import threading
 import time
 import unittest
-from contextlib import suppress
 from pathlib import Path
 from unittest import mock
 
@@ -33,6 +32,20 @@ class DesktopOptionTests(unittest.TestCase):
         compact = calculate_gallery_layout(340, 300, 15)
         self.assertGreater(compact.rows, 3)
         self.assertTrue(compact.scroll_required)
+
+    def test_missing_api_key_directs_the_user_to_settings(self) -> None:
+        from zvec_desktop.ui import ZvecDesktopWindow
+
+        window = object.__new__(ZvecDesktopWindow)
+        window._api_key_var = mock.Mock()
+        window._api_key_var.get.return_value = ""
+        window.root = mock.Mock()
+
+        with mock.patch("zvec_desktop.ui.messagebox.showwarning") as warning:
+            window.configure_api_key()
+
+        warning.assert_called_once()
+        self.assertIn("设置 → 模型与密钥", warning.call_args.args[1])
 
 
 @unittest.skipUnless(os.name == "nt", "tkinter widget tests are Windows-only")
@@ -177,7 +190,7 @@ class DesktopWindowSmokeTests(unittest.TestCase):
             del callback
             return ()
 
-    def test_preview_contains_full_image_and_fullscreen_defaults_to_cover(self) -> None:
+    def test_preview_contains_full_image_without_immersive_viewer(self) -> None:
         try:
             import tkinter as tk
         except ImportError as exc:
@@ -185,7 +198,6 @@ class DesktopWindowSmokeTests(unittest.TestCase):
         try:
             from zvec_desktop.result_catalog import ResultCatalogError
             from zvec_desktop.ui import ZvecDesktopWindow
-            from zvec_desktop.widgets import FullscreenImageViewer
         except ImportError as exc:
             self.skipTest(f"desktop UI dependencies are unavailable: {exc}")
 
@@ -193,7 +205,6 @@ class DesktopWindowSmokeTests(unittest.TestCase):
             root = Path(temporary)
             config_path = self._create_result_fixture(root)
             window: ZvecDesktopWindow | None = None
-            viewer: FullscreenImageViewer | None = None
             try:
                 window = ZvecDesktopWindow(
                     DesktopLaunchOptions(config_path=config_path, page_size=15),
@@ -209,26 +220,85 @@ class DesktopWindowSmokeTests(unittest.TestCase):
                 self.assertEqual(len(window._items), 15)
                 self.assertEqual(window._preview.mode, "contain")
                 self.assertEqual(window._selected_index, 0)
+                self.assertFalse(hasattr(window, "_fullscreen_button"))
+                self.assertFalse(hasattr(window, "open_fullscreen"))
+                self.assertEqual(str(window._open_button["state"]), "normal")
+                self.assertEqual(
+                    str(window._folder_open_button["state"]),
+                    "normal",
+                )
+                self.assertEqual(
+                    str(window._backend_status_label["style"]),
+                    "StatusMuted.TLabel",
+                )
+                self.assertEqual(
+                    str(window._backend_status_pill["style"]),
+                    "StatusPill.TFrame",
+                )
+                window._set_backend_status("正在启动…", "starting")
+                self.assertEqual(
+                    str(window._backend_status_label["style"]),
+                    "StatusStarting.TLabel",
+                )
+                window._set_backend_status("等待启动", "muted")
                 for _ in range(12):
                     window.root.update()
                     time.sleep(0.02)
                 self.assertFalse(window._gallery._scrollbar_visible)
+                self.assertEqual(len(window._nav_buttons), 4)
+                self.assertTrue(str(window._nav_buttons[0]["text"]).startswith("⌕"))
+                self.assertEqual(
+                    str(window._nav_buttons[0]["style"]), "NavSelected.TButton"
+                )
+                self.assertTrue(
+                    all(
+                        window._notebook.bbox(index) == (0, 0, 0, 0)
+                        for index in range(4)
+                    )
+                )
+                self.assertEqual(str(window._query_entry["style"]), "Search.TEntry")
+                self.assertEqual(str(window._search_button["style"]), "Primary.TButton")
+                self.assertEqual(
+                    str(window._task_summary_label["style"]),
+                    "Badge.TLabel",
+                )
+                self.assertEqual(window._task_empty_state.winfo_manager(), "place")
+                self.assertFalse(window._search_preview_collapsed)
+                self.assertEqual(window._page_title_text.get(), "图片搜索")
+                self.assertTrue(window._header_search_actions.winfo_ismapped())
+                self.assertFalse(window._retry_backend_button.winfo_ismapped())
+                self.assertTrue(window._navigation_logo.winfo_exists())
+                window._set_backend_status("不可用", "error")
+                window.root.update_idletasks()
+                self.assertTrue(window._retry_backend_button.winfo_ismapped())
+                window._set_backend_status("等待启动", "muted")
+                window.root.update_idletasks()
+                self.assertFalse(window._retry_backend_button.winfo_ismapped())
+
+                window._select_main_page(1)
+                window.root.update()
+                self.assertEqual(window._page_title_text.get(), "图库任务")
+                self.assertFalse(window._header_search_actions.winfo_ismapped())
+                window._select_main_page(0)
+                window.root.update()
+                self.assertEqual(window._page_title_text.get(), "图片搜索")
+                self.assertTrue(window._header_search_actions.winfo_ismapped())
                 first_card = window._gallery._content.winfo_children()[0]
                 caption = first_card.winfo_children()[1]
                 self.assertGreaterEqual(
                     caption.winfo_height(), caption.winfo_reqheight()
                 )
 
-                viewer = FullscreenImageViewer(
-                    window.root,
-                    window._image_dispatcher,
-                    window._items,
-                    0,
-                )
-                window.root.update()
-                self.assertEqual(viewer._surface.mode, "cover")
-                viewer.toggle_mode()
-                self.assertEqual(viewer._surface.mode, "contain")
+                window.root.geometry("760x600+20+20")
+                for _ in range(15):
+                    window.root.update()
+                    time.sleep(0.02)
+                self.assertTrue(window._navigation_compact)
+                self.assertTrue(window._search_controls_compact)
+                self.assertTrue(window._search_preview_collapsed)
+                self.assertTrue(window._gallery._scrollbar_visible)
+                self.assertNotIn("\n", str(window._nav_buttons[0]["text"]))
+                self.assertEqual(str(window._nav_buttons[0]["text"]), "⌕ 搜索")
 
                 window._previous_button.configure(state="normal")
                 window._next_button.configure(state="normal")
@@ -246,9 +316,6 @@ class DesktopWindowSmokeTests(unittest.TestCase):
             except tk.TclError as exc:
                 self.skipTest(f"tkinter display is unavailable: {exc}")
             finally:
-                if viewer is not None:
-                    with suppress(tk.TclError):
-                        viewer.destroy()
                 if window is not None:
                     window.close()
 

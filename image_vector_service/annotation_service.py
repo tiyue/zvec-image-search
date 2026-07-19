@@ -10,7 +10,7 @@ from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass, is_dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from time import monotonic
 from typing import Any
 
@@ -67,9 +67,19 @@ SUPPORTED_SCOPES = {
 FLASH_MODEL = "qwen3-vl-flash"
 PLUS_MODEL = "qwen3-vl-plus"
 HIGH_CONFIDENCE_ENTITY_THRESHOLD = 0.80
-POLICY_VERSION = 2
+POLICY_VERSION = 3
 LOW_RISK_FIELD_CONFIDENCE = 0.80
 REVIEW_STATES = {"all", "low_risk", "identity", "conflict", "failed"}
+FOLDER_INHERITANCE_POLICY_VERSION = 1
+FOLDER_INHERITANCE_BLOCKED_CATEGORIES = frozenset(
+    {
+        "action",
+        "pose",
+        "expression",
+        "emotion",
+        "facial_expression",
+    }
+)
 _ENTITY_STATES = {
     "confirmed",
     "suggested",
@@ -469,11 +479,12 @@ class AutoTaggingCoordinator:
         *,
         dry_run: bool = False,
     ) -> dict[str, Any]:
-        """Reapply the current identity policy to legacy pending annotations.
+        """Apply the current automatic-approval policy to legacy proposals.
 
-        This is a local metadata migration: it never calls a model. Safe,
-        explicitly supported identities are accepted automatically, while
-        conflicting identities remain proposed for individual review.
+        The public method name is retained for compatibility.  This is a local
+        metadata migration: it never calls a model or regenerates a vector.
+        Every still-valid proposed tag is accepted, while tags the user already
+        rejected remain suppressed.
         """
 
         annotations = self._annotations_in_library("pending_review")
@@ -481,6 +492,7 @@ class AutoTaggingCoordinator:
         eligible = 0
         updated = 0
         auto_accepted_documents = 0
+        auto_accepted_tags = 0
         auto_accepted_identity_tags = 0
         conflict_documents = 0
         conflict_identity_tags = 0
@@ -530,11 +542,16 @@ class AutoTaggingCoordinator:
                 local_structured,
                 proposed_tags,
             )
-            safe_tags = list(metadata["auto_accept_identity_tags"])
+            approved_identity_tags = normalize_tags(
+                str(detail.get("tag") or "")
+                for detail in metadata["tag_details"]
+                if isinstance(detail, Mapping) and bool(detail.get("identity"))
+            )
             conflicting_tags = list(metadata["conflicting_identity_tags"])
             eligible += 1
-            auto_accepted_documents += int(bool(safe_tags))
-            auto_accepted_identity_tags += len(safe_tags)
+            auto_accepted_documents += int(bool(proposed_tags))
+            auto_accepted_tags += len(proposed_tags)
+            auto_accepted_identity_tags += len(approved_identity_tags)
             conflict_documents += int(bool(conflicting_tags))
             conflict_identity_tags += len(conflicting_tags)
             if dry_run:
@@ -544,7 +561,8 @@ class AutoTaggingCoordinator:
                 **policy,
                 "policy_version": POLICY_VERSION,
                 "identity_auto_accept_migrated": True,
-                "identity_auto_accept_migration": "safe-identity-v2",
+                "identity_auto_accept_migration": "all-valid-model-tags-v3",
+                "automatic_approval_mode": "all_valid_model_tags",
             }
             try:
                 self._attach_proposal(
@@ -567,7 +585,7 @@ class AutoTaggingCoordinator:
                     f"Reconciled identity policy for {updated}/{eligible} annotations."
                 )
 
-        if not dry_run and auto_accepted_identity_tags:
+        if not dry_run and auto_accepted_tags:
             self._finalize_review_repository()
         return {
             "dry_run": dry_run,
@@ -576,6 +594,7 @@ class AutoTaggingCoordinator:
             "would_update": eligible,
             "updated": updated,
             "auto_accepted_documents": auto_accepted_documents,
+            "auto_accepted_tags": auto_accepted_tags,
             "auto_accepted_identity_tags": auto_accepted_identity_tags,
             "conflict_documents": conflict_documents,
             "conflict_identity_tags": conflict_identity_tags,
@@ -634,7 +653,12 @@ class AutoTaggingCoordinator:
         quarantined = 0
         quarantine_copy_failures = 0
         needs_attention = False
+        auto_accepted_tag_count = 0
         auto_accepted_identity_count = 0
+        content_policy_failures: list[dict[str, Any]] = []
+        deferred_content_policy_captures: list[
+            tuple[list[dict[str, Any]], _ModelResolution]
+        ] = []
         escalation_model = self.config.auto_tag_escalation_model
         plus_work_items: list[tuple[str, list[dict[str, Any]], TaggingContext]] = []
         normalized_flash: dict[str, dict[str, Any]] = {}
@@ -667,6 +691,10 @@ class AutoTaggingCoordinator:
                 deferred += len(entries)
                 continue
             if primary.annotation is None:
+                failure_category = _annotation_failure_category(
+                    primary.error,
+                    primary.failure_kind,
+                )
                 self._store_resolution_failure(
                     entries,
                     content_hash,
@@ -674,20 +702,26 @@ class AutoTaggingCoordinator:
                     selected_model,
                     model_steps,
                 )
-                for capture in self._capture_resolution_failures(
-                    failure_sink,
-                    entries,
-                    primary,
-                ):
-                    if len(failure_details) < 100:
-                        failure_details.append(asdict(capture.failure))
-                    quarantined += int(bool(capture.failure.quarantined_path))
-                    quarantine_copy_failures += int(bool(capture.failure.copy_error))
-                    needs_attention = (
-                        needs_attention
-                        or capture.needs_attention
-                        or primary.failure_kind == "systemic"
-                    )
+                if failure_category == "content_policy":
+                    content_policy_failures.extend(entries)
+                    deferred_content_policy_captures.append((list(entries), primary))
+                else:
+                    for capture in self._capture_resolution_failures(
+                        failure_sink,
+                        entries,
+                        primary,
+                    ):
+                        if len(failure_details) < 100:
+                            failure_details.append(asdict(capture.failure))
+                        quarantined += int(bool(capture.failure.quarantined_path))
+                        quarantine_copy_failures += int(
+                            bool(capture.failure.copy_error)
+                        )
+                        needs_attention = (
+                            needs_attention
+                            or capture.needs_attention
+                            or primary.failure_kind == "systemic"
+                        )
                 failed += len(entries)
                 processed += 1
                 cache_hits += int(primary.cached)
@@ -744,6 +778,7 @@ class AutoTaggingCoordinator:
                     structured=structured,
                     policy=policy,
                 )
+                auto_accepted_tag_count += len(proposal.get("auto_accepted_tags", ()))
                 auto_accepted_identity_count += len(
                     proposal.get("auto_accepted_identity_tags", ())
                 )
@@ -758,7 +793,38 @@ class AutoTaggingCoordinator:
                 )
                 last_commit_progress_at = now
 
-        if auto_accepted_identity_count:
+        model_failed = failed
+        inheritance = self._inherit_content_policy_failures(content_policy_failures)
+        recovered = int(inheritance["recovered"])
+        succeeded += recovered
+        failed = max(0, failed - recovered)
+        for captured_entries, resolution in deferred_content_policy_captures:
+            unresolved_entries = []
+            for captured_entry in captured_entries:
+                current_annotation = self.state.get_document_annotation(
+                    str(captured_entry.get("doc_id") or "")
+                )
+                if (
+                    current_annotation is not None
+                    and current_annotation.get("status") == "failed"
+                ):
+                    unresolved_entries.append(captured_entry)
+            for capture in self._capture_resolution_failures(
+                failure_sink,
+                unresolved_entries,
+                resolution,
+            ):
+                if len(failure_details) < 100:
+                    failure_details.append(asdict(capture.failure))
+                quarantined += int(bool(capture.failure.quarantined_path))
+                quarantine_copy_failures += int(bool(capture.failure.copy_error))
+                needs_attention = needs_attention or capture.needs_attention
+        for proposal in inheritance["proposals"]:
+            if len(proposals) >= AUTO_TAG_RESULT_PROPOSAL_LIMIT:
+                break
+            proposals.append(proposal)
+
+        if auto_accepted_tag_count or recovered:
             self._finalize_review_repository()
         pending_count = self.state.count_document_annotations("pending_review")
         return {
@@ -774,6 +840,7 @@ class AutoTaggingCoordinator:
             "cache_hits": cache_hits,
             "succeeded": succeeded,
             "failed": failed,
+            "model_failed": model_failed,
             "deferred": deferred,
             "needs_attention": needs_attention,
             "failures": failure_details,
@@ -799,7 +866,11 @@ class AutoTaggingCoordinator:
             "plus_requests": accounting.plus_requests,
             "escalated_count": escalated_count,
             "escalation_failures": escalation_failures,
+            "auto_accepted_tag_count": auto_accepted_tag_count,
             "auto_accepted_identity_count": auto_accepted_identity_count,
+            "folder_inheritance_recovered": recovered,
+            "folder_inheritance_unresolved": int(inheritance["unresolved"]),
+            "folder_inheritance_failures": list(inheritance["failures"]),
             "pending_count": pending_count,
             "proposals": proposals,
         }
@@ -1252,12 +1323,21 @@ class AutoTaggingCoordinator:
             "retry_eligible": retry_eligible,
         }
         for entry in entries:
+            previous = self.state.get_document_annotation(str(entry["doc_id"]))
+            rejected_tags = (
+                tuple(previous.get("rejected_tags", ()))
+                if previous is not None
+                and str(previous.get("source_sha256") or "")
+                == str(entry.get("sha256") or "")
+                else ()
+            )
             self.state.set_document_annotation(
                 doc_id=str(entry["doc_id"]),
                 source_sha256=content_hash,
                 cache_key=resolution.cache_key,
                 status="failed",
                 accepted_tags=entry.get("accepted_auto_tags", ()),
+                rejected_tags=rejected_tags,
                 structured={},
                 policy=policy,
                 error=error,
@@ -1308,6 +1388,327 @@ class AutoTaggingCoordinator:
             )
         return captures
 
+    def _inherit_content_policy_failures(
+        self,
+        entries: Iterable[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Resolve explicit model refusals from already labelled folder peers.
+
+        This intentionally runs only after the model wave and normal persistence
+        loop have finished.  It never handles transport/auth/schema failures and
+        never calls a model.  Folder identity includes ``root_id`` so equal folder
+        names in different roots cannot leak tags into each other.
+        """
+
+        candidates = {
+            str(entry.get("doc_id") or ""): entry
+            for entry in entries
+            if str(entry.get("doc_id") or "")
+        }
+        if not candidates:
+            return {
+                "recovered": 0,
+                "unresolved": 0,
+                "failures": [],
+                "proposals": [],
+            }
+
+        members_by_folder: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(
+            list
+        )
+        for member in self.state.list_entries():
+            members_by_folder[_folder_identity(member)].append(member)
+
+        recovered = 0
+        unresolved = 0
+        failures: list[dict[str, str]] = []
+        proposals: list[dict[str, Any]] = []
+        for doc_id in sorted(candidates):
+            self.cancel_check()
+            entry = self.state.get(doc_id)
+            annotation = self.state.get_document_annotation(doc_id)
+            if entry is None or annotation is None:
+                unresolved += 1
+                failures.append(
+                    {
+                        "doc_id": doc_id,
+                        "code": "folder_inheritance_target_missing",
+                        "error": "The failed image no longer exists in index state.",
+                    }
+                )
+                continue
+            policy = dict(annotation.get("policy") or {})
+            failure_category = str(policy.get("failure_category") or "").strip()
+            if not failure_category:
+                failure_category = _annotation_failure_category(
+                    str(annotation.get("error") or ""),
+                    "item",
+                )
+            if (
+                annotation.get("status") != "failed"
+                or str(annotation.get("source_sha256") or "")
+                != str(entry.get("sha256") or "")
+                or failure_category != "content_policy"
+            ):
+                # The target changed or was independently resolved after the
+                # model pass.  Never overwrite that newer state.
+                continue
+
+            donors = [
+                donor
+                for donor in members_by_folder.get(_folder_identity(entry), ())
+                if str(donor.get("doc_id") or "") != doc_id
+            ]
+            inheritance = self._folder_inheritance_payload(donors)
+            rejected_keys = {
+                _comparison_key(tag)
+                for tag in _iter_strings(annotation.get("rejected_tags"))
+            }
+            inherited_tags: list[str] = []
+            filtered_tags = list(inheritance["filtered_tags"])
+            for tag in inheritance["accepted_tags"]:
+                if _comparison_key(tag) in rejected_keys:
+                    filtered_tags.append(
+                        {
+                            "tag": tag,
+                            "category": "user_suppressed",
+                            "source": "target_annotation",
+                            "source_doc_id": doc_id,
+                            "reason": "target_rejected_tag",
+                        }
+                    )
+                    continue
+                inherited_tags.append(tag)
+
+            audit: dict[str, Any] = {
+                "schema_version": FOLDER_INHERITANCE_POLICY_VERSION,
+                "blocked_categories": sorted(FOLDER_INHERITANCE_BLOCKED_CATEGORIES),
+                "folder": _folder_display_path(entry),
+                "source_doc_ids": list(inheritance["source_doc_ids"]),
+                "source_relative_paths": list(inheritance["source_relative_paths"]),
+                "source_tags": dict(inheritance["source_tags"]),
+                "accepted_tags": list(normalize_tags(inherited_tags)),
+                "filtered_tags": filtered_tags,
+                "original_failure_category": failure_category,
+                "original_error": str(annotation.get("error") or ""),
+                "original_review_reasons": list(policy.get("review_reasons", ())),
+            }
+            if not inherited_tags:
+                audit.update(
+                    {
+                        "status": "failed",
+                        "error_code": "no_inheritable_folder_tags",
+                    }
+                )
+                message = (
+                    "Folder inheritance could not resolve the model refusal: "
+                    "no inheritable tags were found after action/expression "
+                    "filtering."
+                )
+                self._update_failed_folder_inheritance(
+                    entry=entry,
+                    annotation=annotation,
+                    policy=policy,
+                    audit=audit,
+                    error=message,
+                )
+                unresolved += 1
+                failures.append(
+                    {
+                        "doc_id": doc_id,
+                        "code": "no_inheritable_folder_tags",
+                        "error": message,
+                    }
+                )
+                continue
+
+            normalized_inherited = normalize_tags(
+                [*entry.get("inherited_tags", ()), *inherited_tags]
+            )
+            audit["status"] = "applied"
+            resolved_policy = {
+                **policy,
+                "requires_review": False,
+                "review_required": False,
+                "review_reasons": [],
+                "retry_eligible": False,
+                "resolved_by": "folder_inheritance",
+                "folder_inheritance": audit,
+            }
+            annotation_to_write = {
+                **annotation,
+                "policy": resolved_policy,
+                "error": "",
+            }
+            try:
+                self._write_review_document(
+                    entry=entry,
+                    annotation=annotation_to_write,
+                    accepted_tags=entry.get("accepted_auto_tags", ()),
+                    inherited_tags=normalized_inherited,
+                    rejected_tags=annotation.get("rejected_tags", ()),
+                    proposed_tags=(),
+                    status="accepted",
+                )
+            except Exception as exc:
+                error_text = str(exc) or exc.__class__.__name__
+                audit.update(
+                    {
+                        "status": "failed",
+                        "error_code": "folder_inheritance_write_failed",
+                        "write_error": error_text,
+                    }
+                )
+                self._update_failed_folder_inheritance(
+                    entry=entry,
+                    annotation=annotation,
+                    policy=policy,
+                    audit=audit,
+                    error=f"Folder inheritance failed to persist tags: {error_text}",
+                )
+                unresolved += 1
+                failures.append(
+                    {
+                        "doc_id": doc_id,
+                        "code": "folder_inheritance_write_failed",
+                        "error": error_text,
+                    }
+                )
+                continue
+
+            recovered += 1
+            stored = self.state.get_document_annotation(doc_id)
+            if stored is not None:
+                proposals.append(self._stored_proposal(stored))
+            self.progress(
+                f"Recovered refused image {recovered}/{len(candidates)} from "
+                "same-folder labels."
+            )
+
+        return {
+            "recovered": recovered,
+            "unresolved": unresolved,
+            "failures": failures[:100],
+            "proposals": proposals,
+        }
+
+    def _folder_inheritance_payload(
+        self,
+        donors: Iterable[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Collect deterministic, provenance-aware tags without voting."""
+
+        source_tags: dict[str, list[str]] = {
+            "manual": [],
+            "folder": [],
+            "accepted_auto": [],
+        }
+        accepted: list[str] = []
+        filtered: list[dict[str, str]] = []
+        source_doc_ids: list[str] = []
+        source_relative_paths: list[str] = []
+        ordered_donors = sorted(
+            donors,
+            key=lambda donor: (
+                str(donor.get("relative_path") or "").casefold(),
+                str(donor.get("doc_id") or ""),
+            ),
+        )
+        eligible_donors: list[tuple[dict[str, Any], dict[str, Any] | None]] = []
+        for donor in ordered_donors:
+            donor_id = str(donor.get("doc_id") or "")
+            annotation = self.state.get_document_annotation(donor_id)
+            annotation_current = bool(
+                annotation is not None
+                and str(annotation.get("source_sha256") or "")
+                == str(donor.get("sha256") or "")
+            )
+            manually_labelled = bool(normalize_tags(donor.get("tags", ())))
+            annotation_accepted = bool(
+                annotation_current
+                and annotation is not None
+                and annotation.get("status") == "accepted"
+            )
+            if not manually_labelled and not annotation_accepted:
+                continue
+
+            current_annotation = annotation if annotation_current else None
+            eligible_donors.append((donor, current_annotation))
+            source_doc_ids.append(donor_id)
+            source_relative_paths.append(str(donor.get("relative_path") or ""))
+        # Traverse sources first so a manual spelling/canonical form always wins
+        # over the same tag supplied by a folder name or model output.
+        for source in ("manual", "folder", "accepted_auto"):
+            for donor, annotation in eligible_donors:
+                donor_id = str(donor.get("doc_id") or "")
+                if source == "manual":
+                    values = donor.get("tags", ())
+                elif source == "folder":
+                    values = donor.get("folder_tags", ())
+                else:
+                    values = (
+                        donor.get("accepted_auto_tags", ())
+                        if annotation is not None
+                        and annotation.get("status") != "failed"
+                        else ()
+                    )
+                for tag in normalize_tags(values):
+                    blocked_category = _blocked_folder_inheritance_category(
+                        tag,
+                        annotation,
+                    )
+                    if blocked_category is not None:
+                        filtered.append(
+                            {
+                                "tag": tag,
+                                "category": blocked_category,
+                                "source": source,
+                                "source_doc_id": donor_id,
+                                "reason": "transient_category",
+                            }
+                        )
+                        continue
+                    source_tags[source].append(tag)
+                    accepted.append(tag)
+
+        return {
+            "accepted_tags": list(normalize_tags(accepted)),
+            "filtered_tags": filtered,
+            "source_doc_ids": _stable_strings(source_doc_ids),
+            "source_relative_paths": _stable_strings(source_relative_paths),
+            "source_tags": {
+                source: list(normalize_tags(values))
+                for source, values in source_tags.items()
+            },
+        }
+
+    def _update_failed_folder_inheritance(
+        self,
+        *,
+        entry: dict[str, Any],
+        annotation: dict[str, Any],
+        policy: dict[str, Any],
+        audit: dict[str, Any],
+        error: str,
+    ) -> None:
+        original_error = str(annotation.get("error") or "").strip()
+        combined_error = f"{original_error} {error}".strip()
+        self.state.set_document_annotation(
+            doc_id=str(entry["doc_id"]),
+            source_sha256=str(entry["sha256"]),
+            cache_key=annotation.get("cache_key"),
+            status="failed",
+            proposed_tags=annotation.get("proposed_tags", ()),
+            accepted_tags=entry.get("accepted_auto_tags", ()),
+            rejected_tags=annotation.get("rejected_tags", ()),
+            description=str(annotation.get("description") or ""),
+            entities=dict(annotation.get("entities") or {}),
+            warnings=annotation.get("warnings", ()),
+            structured=dict(annotation.get("structured") or {}),
+            policy={**policy, "folder_inheritance": audit},
+            error=combined_error,
+        )
+
     def review(self, decisions: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
         values = list(decisions)
         if not values:
@@ -1357,12 +1758,30 @@ class AutoTaggingCoordinator:
         proposal_ids: Iterable[str],
         accepted_tags_by_proposal: Mapping[str, Any] | None = None,
         exclude_identity_tags: bool = True,
+        acceptance_mode: str = "low_risk_only",
+        batch_confirmation: bool = False,
     ) -> dict[str, Any]:
-        """Accept only low-risk field tags and retain identity items for review."""
+        """Atomically accept a server-validated batch of current proposals.
 
-        if exclude_identity_tags is not True:
+        Legacy callers keep the original ``low_risk_only`` behaviour.  A newer
+        client can confirm one whole batch and include recommended identity
+        proposals; conflicting identities are still removed by the service,
+        regardless of what the client sends.
+        """
+
+        mode = _normalize_batch_acceptance_mode(acceptance_mode)
+        if not isinstance(exclude_identity_tags, bool):
+            raise AutoTaggingRequestError("exclude_identity_tags must be a boolean.")
+        if exclude_identity_tags != (mode == "low_risk_only"):
             raise AutoTaggingRequestError(
-                "Batch review must exclude identity tags for individual confirmation."
+                "exclude_identity_tags conflicts with acceptance_mode."
+            )
+        if not isinstance(batch_confirmation, bool):
+            raise AutoTaggingRequestError("batch_confirmation must be a boolean.")
+        if mode != "low_risk_only" and not batch_confirmation:
+            raise AutoTaggingRequestError(
+                "Identity-inclusive batch review requires one explicit batch "
+                "confirmation."
             )
         doc_ids = _validate_proposal_ids(proposal_ids)
         requested_by_id = _validate_accepted_tags_by_proposal(
@@ -1374,6 +1793,7 @@ class AutoTaggingCoordinator:
         snapshots: list[dict[str, Any]] = []
         identity_excluded: list[dict[str, Any]] = []
         accepted_tag_count = 0
+        accepted_identity_count = 0
         for doc_id in doc_ids:
             self.cancel_check()
             entry, annotation = self._current_review_document(doc_id)
@@ -1388,35 +1808,77 @@ class AutoTaggingCoordinator:
             )
             low_risk = tuple(metadata["low_risk_tags"])
             identity = tuple(metadata["identity_tags"])
-            requested = requested_by_id.get(doc_id, low_risk)
+            conflicting_identity = tuple(metadata["conflicting_identity_tags"])
+            identity_keys = {_comparison_key(tag) for tag in identity}
+            conflict_keys = {_comparison_key(tag) for tag in conflicting_identity}
+            proposed = tuple(annotation.get("proposed_tags", ()))
+            if mode == "low_risk_only":
+                default_requested = low_risk
+            elif mode == "recommended":
+                default_requested = normalize_tags(
+                    [
+                        *low_risk,
+                        *(
+                            tag
+                            for tag in identity
+                            if _comparison_key(tag) not in conflict_keys
+                        ),
+                    ]
+                )
+            else:
+                default_requested = normalize_tags(
+                    tag for tag in proposed if _comparison_key(tag) not in conflict_keys
+                )
+            requested = requested_by_id.get(doc_id, default_requested)
             requested_tags = _sanitize_review_tags(requested)
             requested_keys = {_comparison_key(tag) for tag in requested_tags}
             identity_by_key = {_comparison_key(tag): tag for tag in identity}
+            excluded_keys = (
+                requested_keys & identity_keys
+                if mode == "low_risk_only"
+                else requested_keys & conflict_keys
+            )
             excluded = [
-                identity_by_key[key] for key in requested_keys if key in identity_by_key
+                identity_by_key[key] for key in excluded_keys if key in identity_by_key
             ]
             if excluded:
                 identity_excluded.append(
-                    {"proposal_id": doc_id, "tags": _stable_strings(excluded)}
+                    {
+                        "proposal_id": doc_id,
+                        "tags": _stable_strings(excluded),
+                        "reason": (
+                            "legacy_identity_exclusion"
+                            if mode == "low_risk_only"
+                            else "identity_conflict"
+                        ),
+                    }
                 )
             selected = tuple(
                 tag
                 for tag in requested_tags
-                if _comparison_key(tag) not in identity_by_key
+                if _comparison_key(tag) not in excluded_keys
             )
             low_risk_keys = {_comparison_key(tag) for tag in low_risk}
+            proposed_keys = {_comparison_key(tag) for tag in proposed}
             already_accepted_keys = {
                 _comparison_key(tag) for tag in entry.get("accepted_auto_tags", ())
             }
+            if mode == "low_risk_only":
+                allowed_keys = low_risk_keys - identity_keys
+            elif mode == "recommended":
+                allowed_keys = low_risk_keys | (identity_keys - conflict_keys)
+            else:
+                allowed_keys = proposed_keys - conflict_keys
             invalid = [
                 tag
                 for tag in selected
-                if _comparison_key(tag) not in low_risk_keys
+                if _comparison_key(tag) not in allowed_keys
                 and _comparison_key(tag) not in already_accepted_keys
             ]
             if invalid:
                 raise AutoTaggingRequestError(
-                    "Batch review can accept only low-risk tags; invalid tags for "
+                    "Batch review contains tags that are not eligible under "
+                    f"{mode}; invalid tags for "
                     f"{doc_id}: {', '.join(invalid)}"
                 )
             newly_selected = tuple(
@@ -1447,6 +1909,9 @@ class AutoTaggingCoordinator:
             )
             snapshots.append(_review_snapshot(entry, annotation))
             accepted_tag_count += len(newly_selected)
+            accepted_identity_count += sum(
+                1 for tag in newly_selected if _comparison_key(tag) in identity_keys
+            )
 
         if not plans:
             latest = self.state.latest_auto_tag_review_batch()
@@ -1459,6 +1924,8 @@ class AutoTaggingCoordinator:
                 "failed": 0,
                 "failures": [],
                 "accepted_tag_count": 0,
+                "accepted_identity_count": 0,
+                "acceptance_mode": mode,
                 "identity_excluded": excluded_count,
                 "identity_excluded_count": excluded_count,
                 "identity_exclusions": identity_excluded,
@@ -1495,6 +1962,8 @@ class AutoTaggingCoordinator:
                 "failed": 0,
                 "failures": [],
                 "accepted_tag_count": accepted_tag_count,
+                "accepted_identity_count": accepted_identity_count,
+                "acceptance_mode": mode,
                 "identity_excluded": excluded_count,
                 "identity_excluded_count": excluded_count,
                 "identity_exclusions": identity_excluded,
@@ -1750,6 +2219,7 @@ class AutoTaggingCoordinator:
         proposed_tags: Iterable[str],
         status: str,
         manual_tags: Iterable[str] | None = None,
+        inherited_tags: Iterable[str] | None = None,
     ) -> None:
         doc_id = str(entry["doc_id"])
         vector = self.repository.fetch_vector(doc_id)
@@ -1760,11 +2230,17 @@ class AutoTaggingCoordinator:
         normalized_manual = normalize_tags(
             entry.get("tags", ()) if manual_tags is None else manual_tags
         )
+        normalized_inherited = normalize_tags(
+            entry.get("inherited_tags", ())
+            if inherited_tags is None
+            else inherited_tags
+        )
         effective_tags = normalize_tags(
             [
                 *normalized_manual,
                 *entry.get("folder_tags", ()),
                 *normalized_accepted,
+                *normalized_inherited,
             ]
         )
         succeeded, failures = self.repository.upsert_records(
@@ -1781,6 +2257,7 @@ class AutoTaggingCoordinator:
                     "tags": list(normalized_manual),
                     "folder_tags": list(entry.get("folder_tags", ())),
                     "accepted_auto_tags": list(normalized_accepted),
+                    "inherited_tags": list(normalized_inherited),
                 }
             ]
         )
@@ -1904,29 +2381,36 @@ class AutoTaggingCoordinator:
             local_structured,
             proposed_tags,
         )
-        auto_accepted_identity_tags = tuple(
-            initial_metadata["auto_accept_identity_tags"]
-        )
-        auto_accepted_keys = {
-            _comparison_key(tag) for tag in auto_accepted_identity_tags
+        identity_keys = {
+            _comparison_key(str(detail.get("tag") or ""))
+            for detail in initial_metadata["tag_details"]
+            if isinstance(detail, Mapping) and bool(detail.get("identity"))
         }
-        remaining_proposed_tags = tuple(
-            tag
-            for tag in proposed_tags
-            if _comparison_key(tag) not in auto_accepted_keys
+        auto_accepted_tags = tuple(proposed_tags)
+        auto_accepted_identity_tags = tuple(
+            tag for tag in auto_accepted_tags if _comparison_key(tag) in identity_keys
         )
+        remaining_proposed_tags: tuple[str, ...] = ()
+        rejected_keys = {_comparison_key(tag) for tag in rejected_tags}
         accepted_tags = normalize_tags(
             [
-                *entry.get("accepted_auto_tags", ()),
-                *auto_accepted_identity_tags,
+                *(
+                    tag
+                    for tag in entry.get("accepted_auto_tags", ())
+                    if _comparison_key(tag) not in rejected_keys
+                ),
+                *auto_accepted_tags,
             ]
         )
         entities = dict(local_structured.get("entities") or {})
         warnings = tuple(str(value) for value in local_structured.get("warnings", ()))
-        status = (
-            "pending_review"
-            if remaining_proposed_tags or bool(local_structured.get("requires_review"))
-            else "accepted"
+        status = "accepted"
+        local_policy.update(
+            {
+                "automatic_approval_mode": "all_valid_model_tags",
+                "auto_approved_tags": list(auto_accepted_tags),
+                "user_suppressed_tags": list(rejected_tags),
+            }
         )
         annotation_payload = {
             "cache_key": cache_key,
@@ -1937,7 +2421,7 @@ class AutoTaggingCoordinator:
             "policy": local_policy,
             "error": "",
         }
-        if auto_accepted_identity_tags:
+        if auto_accepted_tags:
             self._write_review_document(
                 entry=entry,
                 annotation=annotation_payload,
@@ -1974,15 +2458,27 @@ class AutoTaggingCoordinator:
             "source_path": self._proposal_source_path(entry),
             "manual_tags": list(entry.get("tags", ())),
             "folder_tags": list(entry.get("folder_tags", ())),
+            "accepted_auto_tags": list(accepted_tags),
+            "inherited_tags": list(entry.get("inherited_tags", ())),
             "existing_tags": tag_metadata["existing_tags"],
             "tags": list(local_structured.get("controlled_tags", ())),
             "controlled_tags": list(local_structured.get("controlled_tags", ())),
             "suggested_tags": list(local_structured.get("suggested_tags", ())),
             "proposed_tags": list(remaining_proposed_tags),
-            "tag_details": tag_metadata["tag_details"],
-            "low_risk_tags": tag_metadata["low_risk_tags"],
-            "identity_tags": tag_metadata["identity_tags"],
+            "model_proposed_tags": list(auto_accepted_tags),
+            "tag_details": initial_metadata["tag_details"],
+            "low_risk_tags": initial_metadata["low_risk_tags"],
+            "identity_tags": list(
+                normalize_tags(
+                    [
+                        *initial_metadata["identity_tags"],
+                        *auto_accepted_identity_tags,
+                    ]
+                )
+            ),
+            "auto_accepted_tags": list(auto_accepted_tags),
             "auto_accepted_identity_tags": list(auto_accepted_identity_tags),
+            "auto_accepted_tag_details": initial_metadata["tag_details"],
             "description": str(local_structured.get("description") or ""),
             "fields": dict(local_structured.get("fields") or {}),
             "entities": entities,
@@ -1997,14 +2493,23 @@ class AutoTaggingCoordinator:
             "escalated": bool(local_policy.get("escalated")),
             "structured": local_structured,
             "policy": local_policy,
+            "folder_inheritance": dict(local_policy.get("folder_inheritance") or {}),
             "status": status,
         }
 
     def _stored_proposal(self, annotation: dict[str, Any]) -> dict[str, Any]:
         doc_id = str(annotation["doc_id"])
         entry = self.state.get(doc_id)
+        policy = dict(annotation.get("policy") or {})
+        status = str(annotation.get("status") or "pending_review")
         structured = dict(annotation.get("structured") or {})
         if not structured:
+            requires_review = bool(
+                policy.get(
+                    "requires_review",
+                    status in {"pending_review", "failed"},
+                )
+            )
             structured = {
                 "description": str(annotation.get("description") or ""),
                 "fields": {},
@@ -2012,11 +2517,13 @@ class AutoTaggingCoordinator:
                 "controlled_tags": list(annotation.get("proposed_tags", ())),
                 "suggested_tags": [],
                 "warnings": list(annotation.get("warnings", ())),
-                "requires_review": True,
-                "review_reasons": ["legacy_annotation"],
+                "requires_review": requires_review,
+                "review_reasons": list(
+                    policy.get("review_reasons")
+                    or (["legacy_annotation"] if requires_review else [])
+                ),
                 "plus_recommended": False,
             }
-        policy = dict(annotation.get("policy") or {})
         proposed_tags = tuple(annotation.get("proposed_tags", ()))
         tag_metadata = _proposal_tag_metadata(entry or {}, structured, proposed_tags)
         return {
@@ -2035,6 +2542,10 @@ class AutoTaggingCoordinator:
             "identity_tags": tag_metadata["identity_tags"],
             "manual_tags": list(entry.get("tags", ())) if entry else [],
             "folder_tags": list(entry.get("folder_tags", ())) if entry else [],
+            "accepted_auto_tags": (
+                list(entry.get("accepted_auto_tags", ())) if entry else []
+            ),
+            "inherited_tags": (list(entry.get("inherited_tags", ())) if entry else []),
             "fields": dict(structured.get("fields") or {}),
             "entities": dict(structured.get("entities") or {}),
             "warnings": list(structured.get("warnings", ())),
@@ -2048,14 +2559,19 @@ class AutoTaggingCoordinator:
             "escalated": bool(policy.get("escalated")),
             "structured": structured,
             "policy": policy,
-            "status": str(annotation.get("status") or "pending_review"),
+            "folder_inheritance": dict(policy.get("folder_inheritance") or {}),
+            "status": status,
             "error": str(annotation.get("error") or ""),
             "failure_category": str(
-                policy.get("failure_category")
-                or _annotation_failure_category(
-                    str(annotation.get("error") or ""),
-                    "item",
+                (
+                    policy.get("failure_category")
+                    or _annotation_failure_category(
+                        str(annotation.get("error") or ""),
+                        "item",
+                    )
                 )
+                if status == "failed"
+                else ""
             ),
         }
 
@@ -2649,6 +3165,7 @@ def _proposal_tag_metadata(
         ("manual", entry.get("tags", ())),
         ("folder", entry.get("folder_tags", ())),
         ("accepted_auto", entry.get("accepted_auto_tags", ())),
+        ("inherited", entry.get("inherited_tags", ())),
     ):
         for tag in normalize_tags(_iter_strings(values)):
             key = _comparison_key(tag)
@@ -2712,7 +3229,7 @@ def _proposal_tag_metadata(
                 ),
             }
 
-    source_priority = ("manual", "folder", "accepted_auto")
+    source_priority = ("manual", "folder", "accepted_auto", "inherited")
     ordered_keys = list(canonical_tags)
     tag_details: list[dict[str, Any]] = []
     low_risk_tags: list[str] = []
@@ -2782,6 +3299,68 @@ def _proposal_tag_metadata(
         "auto_accept_identity_tags": list(normalize_tags(auto_accept_identity_tags)),
         "conflicting_identity_tags": list(normalize_tags(conflicting_identity_tags)),
     }
+
+
+def _folder_display_path(entry: Mapping[str, Any]) -> str:
+    configured = str(entry.get("parent_directory") or "").strip()
+    if configured:
+        return configured.replace("\\", "/").strip("/")
+    relative_path = str(entry.get("relative_path") or "").replace("\\", "/")
+    parent = PurePosixPath(relative_path).parent.as_posix()
+    return "" if parent == "." else parent.strip("/")
+
+
+def _folder_identity(entry: Mapping[str, Any]) -> tuple[str, str]:
+    return (
+        str(entry.get("root_id") or ""),
+        _comparison_key(_folder_display_path(entry)),
+    )
+
+
+def _normalized_inheritance_category(value: Any) -> str:
+    normalized = _comparison_key(str(value or "")).replace("-", "_").replace(" ", "_")
+    aliases = {
+        "actions": "action",
+        "poses": "pose",
+        "expressions": "expression",
+        "emotions": "emotion",
+        "facial_expressions": "facial_expression",
+    }
+    return aliases.get(normalized, normalized)
+
+
+def _blocked_folder_inheritance_category(
+    tag: str,
+    annotation: Mapping[str, Any] | None,
+) -> str | None:
+    """Return the transient category for a tag, if it must not be inherited."""
+
+    key = _comparison_key(tag)
+    controlled_field = _CONTROLLED_TAG_FIELDS.get(key)
+    normalized_controlled = _normalized_inheritance_category(controlled_field)
+    if normalized_controlled in FOLDER_INHERITANCE_BLOCKED_CATEGORIES:
+        return normalized_controlled
+    if annotation is None:
+        return None
+    structured = annotation.get("structured")
+    structured_mapping = structured if isinstance(structured, Mapping) else {}
+    fields = structured_mapping.get("fields")
+    fields_mapping = fields if isinstance(fields, Mapping) else {}
+    for raw_field_name, raw_field in fields_mapping.items():
+        category = _normalized_inheritance_category(raw_field_name)
+        if category not in FOLDER_INHERITANCE_BLOCKED_CATEGORIES or not isinstance(
+            raw_field, Mapping
+        ):
+            continue
+        field_tags = normalize_tags(
+            [
+                *_iter_strings(raw_field.get("labels")),
+                *_iter_strings(raw_field.get("values")),
+            ]
+        )
+        if key in {_comparison_key(value) for value in field_tags}:
+            return category
+    return None
 
 
 def _normalize_pending_filters(
@@ -2974,6 +3553,19 @@ def _validate_proposal_ids(values: Iterable[str]) -> tuple[str, ...]:
         seen.add(doc_id)
         result.append(doc_id)
     return tuple(result)
+
+
+def _normalize_batch_acceptance_mode(value: Any) -> str:
+    if not isinstance(value, str):
+        raise AutoTaggingRequestError("acceptance_mode must be a string.")
+    normalized = value.strip().lower()
+    supported = {"low_risk_only", "recommended", "all_non_conflicting"}
+    if normalized not in supported:
+        raise AutoTaggingRequestError(
+            "acceptance_mode must be low_risk_only, recommended, or "
+            "all_non_conflicting."
+        )
+    return normalized
 
 
 def _validate_accepted_tags_by_proposal(
@@ -3778,6 +4370,7 @@ def _proposed_tags(
             *_iter_strings(entry.get("tags")),
             *_iter_strings(entry.get("folder_tags")),
             *_iter_strings(entry.get("accepted_auto_tags")),
+            *_iter_strings(entry.get("inherited_tags")),
             *_iter_strings(rejected_tags),
         ]
     }

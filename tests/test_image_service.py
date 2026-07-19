@@ -503,7 +503,10 @@ class ImageVectorServiceTest(unittest.TestCase):
 
     def test_09_limits_and_error_classification(self):
         with self.assertRaises(ValueError):
-            self.service.search_by_text("red", top_k=self.config.max_top_k + 1)
+            self.service.search_by_text("red", top_k=0)
+        # The default service has no artificial result-count ceiling. Actual
+        # work is still bounded by the Collection document count.
+        self.service._validate_top_k(1_000_001)
         self.assertTrue(
             DashScopeEmbeddingClient._is_splittable_input_error(
                 400, "InvalidImage", "image format is invalid"

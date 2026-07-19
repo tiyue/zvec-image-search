@@ -19,7 +19,10 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from image_vector_service.models import normalize_cosine_distance, normalize_rrf_score
-from image_vector_service.rank_fusion import DEFAULT_SCORE_GAP
+from image_vector_service.rank_fusion import (
+    DEFAULT_SCORE_GAP,
+    MINIMUM_RESULT_CONFIDENCE,
+)
 from image_vector_service.search_quality import (
     FUSION_V1,
     FUSION_V2,
@@ -126,6 +129,44 @@ def _passes(score: float, threshold: float, semantics: str) -> bool:
     return score >= threshold
 
 
+def _offline_confidence_sort_key(
+    item: dict[str, Any],
+    case: dict[str, Any],
+    result: dict[str, Any],
+    confidence: float,
+    *,
+    mode: str,
+) -> tuple[float, float, int, str, str]:
+    """Mirror the stable production confidence ordering for captured results."""
+
+    raw_score = result.get("raw_score")
+    if (
+        isinstance(raw_score, bool)
+        or not isinstance(raw_score, (int, float))
+        or not math.isfinite(float(raw_score))
+    ):
+        raw_score_key = math.inf
+    else:
+        raw_score_key = float(raw_score)
+        if mode == "combined":
+            raw_score_key = -raw_score_key
+    source_rank = result.get("rank")
+    if (
+        isinstance(source_rank, bool)
+        or not isinstance(source_rank, int)
+        or source_rank <= 0
+    ):
+        source_rank = 2**31 - 1
+    library_id = collection_calibration.result_library_id(item, case, result) or ""
+    return (
+        -confidence,
+        raw_score_key,
+        source_rank,
+        library_id,
+        str(result.get("image_id") or ""),
+    )
+
+
 def _filtered_pairs(
     pairs: list[tuple[dict[str, Any], dict[str, Any]]],
     threshold: float,
@@ -142,33 +183,54 @@ def _filtered_pairs(
         collection_calibration_config,
         mode,
     )
+    production = _production_threshold(
+        mode,
+        {
+            "value": threshold,
+            "score_gap": score_gap,
+            "max_confidence_drop": max_confidence_drop,
+        },
+        score_field,
+    )
+    effective_minimum_confidence = max(
+        MINIMUM_RESULT_CONFIDENCE,
+        production["minimum_confidence"],
+    )
+    production_score_field = (
+        "raw_score"
+        if score_field in {"normalized_score", "confidence"}
+        else score_field
+    )
+    production_semantics = (
+        "higher_is_better"
+        if score_field in {"normalized_score", "confidence"} and mode == "combined"
+        else "lower_is_better"
+        if score_field in {"normalized_score", "confidence"}
+        else semantics
+    )
     for item, case in pairs:
         next_case = dict(case)
-        passing = [
-            result
-            for result in case["results"]
-            if _passes(
-                _result_score(result, str(case["id"]), score_field),
-                threshold,
-                semantics,
+        passing: list[tuple[dict[str, Any], float]] = []
+        for result in case["results"]:
+            # Confidence/normalized captures deploy minimum_score=0 only as a
+            # compatibility field; runtime filtering is performed on the
+            # actual raw score plus Collection-adjusted ranking confidence.
+            # Applying the original unadjusted confidence threshold here would
+            # incorrectly discard candidates that a positive null-calibration
+            # offset legitimately rescues.
+            # Older confidence-v2 captures predate additive raw_score output.
+            # Their deployed minimum_score is the documented 0.0 compatibility
+            # value, so absence means "no raw gate" rather than invalid data.
+            missing_legacy_raw_score = (
+                score_field in {"normalized_score", "confidence"}
+                and "raw_score" not in result
             )
-        ]
-        passing.sort(
-            key=lambda result: _ranking_confidence(
-                item,
-                case,
-                result,
-                mode=mode,
-                score_field=score_field,
-                configuration=collection_calibration_config,
-                collection_offsets=collection_offsets,
-            ),
-            reverse=True,
-        )
-        results: list[dict[str, Any]] = []
-        top_confidence: float | None = None
-        previous_confidence: float | None = None
-        for result in passing:
+            if not missing_legacy_raw_score and not _passes(
+                _result_score(result, str(case["id"]), production_score_field),
+                production["minimum_score"],
+                production_semantics,
+            ):
+                continue
             confidence = _ranking_confidence(
                 item,
                 case,
@@ -178,6 +240,24 @@ def _filtered_pairs(
                 configuration=collection_calibration_config,
                 collection_offsets=collection_offsets,
             )
+            # Mirror rank_fusion.sort_confidence_hits: every normal result must
+            # satisfy both the invariant 20% floor and the configured floor.
+            if confidence < effective_minimum_confidence:
+                continue
+            passing.append((result, confidence))
+        passing.sort(
+            key=lambda value: _offline_confidence_sort_key(
+                item,
+                case,
+                value[0],
+                value[1],
+                mode=mode,
+            )
+        )
+        results: list[dict[str, Any]] = []
+        top_confidence: float | None = None
+        previous_confidence: float | None = None
+        for result, confidence in passing:
             if top_confidence is None:
                 top_confidence = confidence
             elif top_confidence - confidence > max_confidence_drop + 1e-12:

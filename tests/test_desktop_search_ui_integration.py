@@ -225,7 +225,7 @@ class DesktopSearchUiIntegrationTest(unittest.TestCase):
             self.skipTest(f"tkinter unavailable: {exc}")
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.temporary.name).resolve()
         self.config_path, self.initial_manifest, self.search_manifest = (
             self._create_fixture(self.root)
         )

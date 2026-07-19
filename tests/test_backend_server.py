@@ -201,6 +201,9 @@ class MultiLibraryFakeService:
         self.block_stats = False
         self.stats_started = threading.Event()
         self.stats_release = threading.Event()
+        self.block_query = False
+        self.query_started = threading.Event()
+        self.query_release = threading.Event()
 
     def _record(self):
         self.cancel_check()
@@ -270,6 +273,9 @@ class MultiLibraryFakeService:
         self._record()
         self.query_count += 1
         self.candidate_ks.append(kwargs["candidate_k"])
+        self.query_started.set()
+        if self.block_query:
+            self.query_release.wait(timeout=2)
         shared_hash = "d" * 64 if self.library.library_id == "library-b" else "a" * 64
         if prepared.query_type == "tag":
             hit = SearchHit(
@@ -505,6 +511,10 @@ class BackendServerTest(unittest.TestCase):
         self.assertTrue(version["capabilities"]["low_confidence_override"])
         self.assertTrue(version["capabilities"]["hybrid_tag_vector_search"])
         self.assertTrue(version["capabilities"]["result_diversity"])
+        self.assertEqual(
+            version["capabilities"]["search_sort_modes"],
+            ["confidence", "relevance", "diverse", "legacy"],
+        )
         self.assertTrue(version["capabilities"]["index_and_auto_tag"])
         self.assertTrue(version["capabilities"]["auto_tag_review_batch"])
         self.assertTrue(version["capabilities"]["auto_tag_review_undo"])
@@ -910,6 +920,18 @@ class BackendServerTest(unittest.TestCase):
             self.assertEqual(operation, "index")
             self.assertEqual(call["tags"], expected_tags)
 
+    def test_execution_tuning_is_not_a_per_job_backend_contract(self):
+        for command in ("index", "sync", "index_and_auto_tag", "auto_tag"):
+            for field, value in (("concurrency", 4), ("skip_errors", True)):
+                with self.subTest(command=command, field=field):
+                    status, payload = self.request(
+                        "POST",
+                        "/v1/jobs",
+                        {"command": command, "params": {field: value}},
+                    )
+                    self.assertEqual(status, 400, payload)
+                    self.assertEqual(payload["error"]["code"], "unknown_params")
+
     def test_folder_tag_backfill_never_injects_manual_tags(self):
         job = self.submit(
             "folder_tag_backfill",
@@ -1089,6 +1111,8 @@ class BackendServerTest(unittest.TestCase):
             {"doc-1": ["Cosplay"], "doc-2": ["全身"]},
         )
         self.assertTrue(call["exclude_identity_tags"])
+        self.assertEqual(call["acceptance_mode"], "low_risk_only")
+        self.assertFalse(call["batch_confirmation"])
 
         undone = self.wait_for_job(self.submit("auto_tag_review_undo")["id"])
         self.assertEqual(undone["status"], "succeeded", undone)
@@ -1114,6 +1138,30 @@ class BackendServerTest(unittest.TestCase):
             )
             self.assertEqual(status, 400, payload)
             self.assertEqual(payload["error"]["code"], "invalid_params")
+
+    def test_batch_review_forwards_explicit_recommended_identity_mode(self):
+        completed = self.wait_for_job(
+            self.submit(
+                "auto_tag_review_batch",
+                {
+                    "proposal_ids": ["doc-1"],
+                    "accepted_tags_by_proposal": {
+                        "doc-1": ["Cosplay", "刻晴"],
+                    },
+                    "acceptance_mode": "recommended",
+                    "batch_confirmation": True,
+                    "exclude_identity_tags": False,
+                },
+            )["id"]
+        )
+
+        self.assertEqual(completed["status"], "succeeded", completed)
+        assert self.fake is not None
+        operation, call = self.fake.calls[-1]
+        self.assertEqual(operation, "auto_tag_review_batch")
+        self.assertEqual(call["acceptance_mode"], "recommended")
+        self.assertTrue(call["batch_confirmation"])
+        self.assertFalse(call["exclude_identity_tags"])
 
     def test_single_review_forwards_confirmed_identity_tags(self):
         completed = self.wait_for_job(
@@ -1176,6 +1224,33 @@ class BackendServerTest(unittest.TestCase):
             {
                 "command": "search",
                 "params": {"text": "red", "show_low_confidence": "yes"},
+            },
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error"]["code"], "invalid_params")
+
+    def test_search_sort_mode_defaults_to_confidence_and_rejects_unknown_values(self):
+        default_job = self.wait_for_job(self.submit("search", {"text": "red"})["id"])
+        self.assertEqual(default_job["status"], "succeeded", default_job)
+        assert self.fake is not None
+        self.assertEqual(self.fake.calls[-1][1]["sort_mode"], "confidence")
+
+        for sort_mode in ("relevance", "diverse", "legacy"):
+            completed = self.wait_for_job(
+                self.submit(
+                    "search",
+                    {"text": "red", "sort_mode": sort_mode},
+                )["id"]
+            )
+            self.assertEqual(completed["status"], "succeeded", completed)
+            self.assertEqual(self.fake.calls[-1][1]["sort_mode"], sort_mode)
+
+        status, payload = self.request(
+            "POST",
+            "/v1/jobs",
+            {
+                "command": "search",
+                "params": {"text": "red", "sort_mode": "normalized_score"},
             },
         )
         self.assertEqual(status, 400)
@@ -1551,6 +1626,23 @@ class MultiLibraryBackendTest(unittest.TestCase):
         self.assertEqual(manifest["ranking_mode"], "confidence")
         self.assertEqual(manifest["search_quality"]["ranking_mode"], "confidence")
 
+    def test_federated_query_starts_all_collections_before_waiting_for_results(self):
+        service_a = self.services["library-a"]
+        service_b = self.services["library-b"]
+        for service in (service_a, service_b):
+            service.block_query = True
+            self.addCleanup(service.query_release.set)
+
+        job = self.submit("search", {"text": "red"})
+
+        # If the coordinator queried Collections serially, library B could not
+        # enter its owner thread while library A is deliberately blocked here.
+        self.assertTrue(service_a.query_started.wait(timeout=1))
+        self.assertTrue(service_b.query_started.wait(timeout=1))
+        service_a.query_release.set()
+        service_b.query_release.set()
+        self.assertEqual(self.wait_for_job(job["id"])["status"], "succeeded")
+
     def test_cross_library_tag_search_uses_no_embedding_request(self):
         completed = self.wait_for_job(
             self.submit(
@@ -1597,29 +1689,43 @@ class MultiLibraryBackendTest(unittest.TestCase):
             all(hit["raw_score"] == hit["confidence"] for hit in manifest["results"])
         )
 
-    def test_federated_candidate_budget_defaults_to_fifty_and_is_configurable(self):
+    def test_federated_candidate_budget_is_dynamic_and_configurable(self):
         completed = self.wait_for_job(
             self.submit("search", {"text": "red", "candidate_k": 7})["id"]
         )
         self.assertEqual(completed["status"], "succeeded", completed)
         for service in self.services.values():
-            self.assertEqual(service.candidate_ks, [7])
+            self.assertEqual(service.candidate_ks, [10])
 
         completed = self.wait_for_job(self.submit("search", {"text": "red"})["id"])
         self.assertEqual(completed["status"], "succeeded", completed)
         for service in self.services.values():
-            self.assertEqual(service.candidate_ks, [7, 50])
+            self.assertEqual(service.candidate_ks, [10, 50])
 
-        status, payload = self.request(
-            "POST",
-            "/v1/jobs",
-            {
-                "command": "search",
-                "params": {"text": "red", "candidate_k": 101},
-            },
+        completed = self.wait_for_job(
+            self.submit("search", {"text": "red", "candidate_k": 101})["id"]
         )
-        self.assertEqual(status, 400)
-        self.assertEqual(payload["error"]["code"], "invalid_params")
+        self.assertEqual(completed["status"], "succeeded", completed)
+        for service in self.services.values():
+            self.assertEqual(service.candidate_ks[-1], 101)
+
+        completed = self.wait_for_job(
+            self.submit("search", {"text": "red", "top_k": 75})["id"]
+        )
+        self.assertEqual(completed["status"], "succeeded", completed)
+        for service in self.services.values():
+            self.assertEqual(service.candidate_ks[-1], 112)
+        result = completed["result"]
+        self.assertEqual(result["sort_mode"], "confidence")
+        self.assertFalse(result["ranking_diagnostics"]["normalized_score_used"])
+        manifest = json.loads(
+            (Path(result["output_dir"]) / "results.json").read_text("utf-8")
+        )
+        self.assertEqual(manifest["sort_mode"], "confidence")
+        self.assertEqual(
+            manifest["ranking_diagnostics"]["primary"],
+            "ranking_confidence_or_confidence_desc",
+        )
 
     def test_federated_low_confidence_override_is_recorded_in_result_and_manifest(self):
         completed = self.wait_for_job(

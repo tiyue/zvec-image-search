@@ -458,7 +458,10 @@ class IndexAndAutoTagPipelineTest(unittest.TestCase):
                 ),
             )
             self.assertEqual(mutated_annotation["status"], "failed")
-            self.assertEqual(stable_annotation["status"], "pending_review")
+            self.assertEqual(stable_annotation["status"], "accepted")
+            self.assertEqual(stable_annotation["proposed_tags"], [])
+            self.assertEqual(stable_entry["accepted_auto_tags"], ["Cosplay"])
+            self.assertIn("Cosplay", stable_entry["effective_tags"])
         finally:
             service.close()
 

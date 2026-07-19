@@ -144,7 +144,7 @@ class ImageTaskDispatcher:
             try:
                 completion(image, error)
             except tk.TclError:
-                # A result can arrive after a page or fullscreen window closed.
+                # A result can arrive after a page or application window closed.
                 if image is not None:
                     image.close()
                 continue
@@ -335,6 +335,14 @@ class AsyncImageCanvas(tk.Canvas):
 class ResponsiveGallery(ttk.Frame, Generic[GalleryItemT]):
     """A 15-item responsive gallery that scrolls when cards cannot fit."""
 
+    # Search libraries are dominated by portraits and cosplay photography.
+    # Showing the complete composition is more useful than filling every pixel
+    # at the cost of cropping a face, costume or pose out of the thumbnail.
+    _THUMBNAIL_MODE = "contain"
+    _MIN_CAPTION_HEIGHT = 40
+    _MAX_CAPTION_HEIGHT = 44
+    _LAYOUT_RETRY_MS = 25
+
     def __init__(
         self,
         master: tk.Misc,
@@ -350,18 +358,23 @@ class ResponsiveGallery(ttk.Frame, Generic[GalleryItemT]):
         self._max_columns = max_columns
         self._items: list[GalleryItemT] = []
         self._selected_index: int | None = None
+        self._hovered_index: int | None = None
         self._on_select: Callable[[int, GalleryItemT], None] | None = None
-        self._on_open: Callable[[int, GalleryItemT], None] | None = None
-        self._layout_signature: tuple[int, int, int] | None = None
+        self._layout_signature: tuple[int, int, int, bool] | None = None
         self._resize_handle: str | None = None
         self._scrollbar_visible = False
+        self._desired_scrollbar_visible = False
         self._configured_columns = 0
+        self._card_chrome: dict[
+            int,
+            tuple[tk.Frame, tk.Frame, tk.Label, tk.Label],
+        ] = {}
 
         self.rowconfigure(0, weight=1)
         self.columnconfigure(0, weight=1)
         self._canvas = tk.Canvas(
             self,
-            background=theme.surface,
+            background=theme.surface_subtle,
             highlightthickness=0,
             borderwidth=0,
         )
@@ -374,7 +387,7 @@ class ResponsiveGallery(ttk.Frame, Generic[GalleryItemT]):
         self._canvas.grid(row=0, column=0, sticky="nsew")
         self._scrollbar.grid(row=0, column=1, sticky="ns")
         self._scrollbar.grid_remove()
-        self._content = tk.Frame(self._canvas, background=theme.surface)
+        self._content = tk.Frame(self._canvas, background=theme.surface_subtle)
         self._content_window = self._canvas.create_window(
             (0, 0), window=self._content, anchor="nw"
         )
@@ -388,12 +401,11 @@ class ResponsiveGallery(ttk.Frame, Generic[GalleryItemT]):
         items: Sequence[GalleryItemT],
         *,
         on_select: Callable[[int, GalleryItemT], None],
-        on_open: Callable[[int, GalleryItemT], None],
     ) -> None:
         self._items = list(items)
         self._on_select = on_select
-        self._on_open = on_open
         self._selected_index = None
+        self._hovered_index = None
         self._layout_signature = None
         self._rebuild()
         self._canvas.yview_moveto(0.0)
@@ -415,12 +427,18 @@ class ResponsiveGallery(ttk.Frame, Generic[GalleryItemT]):
     def _update_scroll_region(self, _event: tk.Event[tk.Misc]) -> None:
         bounds = self._canvas.bbox("all")
         self._canvas.configure(scrollregion=bounds)
-        content_height = 0 if bounds is None else bounds[3] - bounds[1]
-        needs_scrollbar = content_height > self._canvas.winfo_height() + 2
-        if needs_scrollbar == self._scrollbar_visible:
+        # The content frame can report the previous grid's requested height
+        # while Tk is coalescing Configure events.  On fast CI machines that
+        # transient value used to leave a scrollbar visible after the final
+        # 5x3 layout already fitted.  The deterministic layout result is the
+        # authoritative source for scrollbar visibility.
+        self._set_scrollbar_visible(self._desired_scrollbar_visible)
+
+    def _set_scrollbar_visible(self, visible: bool) -> None:
+        if visible == self._scrollbar_visible:
             return
-        self._scrollbar_visible = needs_scrollbar
-        if needs_scrollbar:
+        self._scrollbar_visible = visible
+        if visible:
             self._scrollbar.grid()
         else:
             self._scrollbar.grid_remove()
@@ -431,28 +449,50 @@ class ResponsiveGallery(ttk.Frame, Generic[GalleryItemT]):
         self._canvas.yview_scroll(delta * 3, "units")
         return "break"
 
-    def _layout(self) -> tuple[int, int, int]:
+    def _layout(self) -> tuple[int, int, int, bool]:
         layout = calculate_gallery_layout(
             max(1, self._canvas.winfo_width()),
             max(1, self._canvas.winfo_height()),
             len(self._items),
             max_columns=self._max_columns,
         )
-        return layout.columns, layout.card_width, layout.card_height
+        return (
+            layout.columns,
+            layout.card_width,
+            layout.card_height,
+            layout.scroll_required,
+        )
 
     def _rebuild(self) -> None:
         self._resize_handle = None
+        # Do not build a temporary one-column grid before Tk has assigned a
+        # meaningful viewport.  It wastes fifteen thumbnail requests and can
+        # leak a stale scrollbar state into the first rendered frame.
+        if self._canvas.winfo_width() < 16 or self._canvas.winfo_height() < 16:
+            self._layout_signature = None
+            # A short timer lets Tk process the pending native geometry event.
+            # Re-queuing immediately with ``after_idle`` can starve that event
+            # when callers populate a gallery before the first window update.
+            self._resize_handle = self.after(
+                self._LAYOUT_RETRY_MS,
+                self._rebuild,
+            )
+            return
         signature = self._layout()
+        self._desired_scrollbar_visible = signature[3]
+        self._set_scrollbar_visible(self._desired_scrollbar_visible)
         if signature == self._layout_signature:
             return
         self._layout_signature = signature
+        self._hovered_index = None
+        self._card_chrome.clear()
         for child in self._content.winfo_children():
             child.destroy()
         if not self._items:
             label = tk.Label(
                 self._content,
                 text="暂无图片\n可打开图片文件夹，或载入最近一次搜索结果",
-                background=self._theme.surface,
+                background=self._theme.surface_subtle,
                 foreground=self._theme.text_muted,
                 font=("Microsoft YaHei UI", 11),
                 justify="center",
@@ -460,7 +500,7 @@ class ResponsiveGallery(ttk.Frame, Generic[GalleryItemT]):
             label.pack(fill="both", expand=True, padx=24, pady=80)
             return
 
-        columns, card_width, card_height = signature
+        columns, card_width, card_height, _scroll_required = signature
         self._configure_grid_columns(columns)
         for index, item in enumerate(self._items):
             row, column = divmod(index, columns)
@@ -494,74 +534,145 @@ class ResponsiveGallery(ttk.Frame, Generic[GalleryItemT]):
             height=height,
             background=self._theme.surface,
             highlightthickness=1,
-            highlightbackground=self._theme.border,
+            highlightbackground=self._theme.border_strong,
             highlightcolor=self._theme.primary,
             cursor="hand2",
         )
         card.grid_propagate(False)
         card.pack_propagate(False)
-        # Reserve enough vertical space for both title and subtitle when the
-        # normal 5x3 layout compresses cards to roughly 135 logical pixels.
-        # ``expand=True`` gives any remaining room back to the thumbnail.
-        image_height = max(64, int(height * 0.55))
+        # Keep caption chrome deliberately compact so the photograph remains
+        # the primary visual even in the normal 5x3 grid.  The fixed caption
+        # height also prevents long collection names from shrinking portraits.
+        caption_height = self._caption_height(height)
+        # Include the card border plus both widgets' vertical padding in the
+        # budget; otherwise Tk may satisfy the canvas request by clipping the
+        # caption by a few pixels in the shortest 5x3 layout.
+        image_height = max(48, height - caption_height - 12)
         image = AsyncImageCanvas(
             card,
             self._dispatcher,
-            mode="cover",
+            mode=self._THUMBNAIL_MODE,
             height=image_height,
-            background=self._theme.surface_muted,
+            background=self._theme.preview,
             placeholder="载入中…",
         )
-        image.pack(fill="both", expand=True)
+        image.pack(fill="both", expand=True, padx=3, pady=(3, 0))
         image.set_image(item.display_path)
-        caption = tk.Frame(card, background=self._theme.surface)
-        caption.pack(fill="x", padx=8, pady=(4, 5))
+        rank_badge = tk.Label(
+            image,
+            text=f"{item.rank:02d}",
+            background=self._theme.navigation,
+            foreground="white",
+            font=(self._theme.typography.family, 7, "bold"),
+            padx=5,
+            pady=2,
+        )
+        rank_badge.place(x=7, y=7, anchor="nw")
+        caption = tk.Frame(
+            card,
+            name="caption",
+            height=caption_height,
+            background=self._theme.surface,
+        )
+        caption.pack(fill="x", padx=6, pady=(2, 3))
+        caption.pack_propagate(False)
         title = tk.Label(
             caption,
-            text=f"#{item.rank}  {self._ellipsize(Path(item.name).stem, 10)}",
+            name="title",
+            text=self._ellipsize(
+                Path(item.name).stem,
+                max(12, min(24, width // 7)),
+            ),
             anchor="w",
             background=self._theme.surface,
             foreground=self._theme.text,
-            font=("Microsoft YaHei UI", 9, "bold"),
+            font=(self._theme.typography.family, 8, "bold"),
         )
         title.pack(fill="x")
         subtitle = tk.Label(
             caption,
+            name="subtitle",
             text=self._subtitle(item),
             anchor="w",
             background=self._theme.surface,
             foreground=self._theme.text_muted,
-            font=("Microsoft YaHei UI", 8),
+            font=(self._theme.typography.family, 7),
         )
-        subtitle.pack(fill="x", pady=(3, 0))
+        subtitle.pack(fill="x")
+
+        self._card_chrome[index] = (card, caption, title, subtitle)
 
         def select(_event: tk.Event[tk.Misc]) -> str:
             self.select(index)
             return "break"
 
-        def open_item(_event: tk.Event[tk.Misc]) -> str:
-            self.select(index)
-            if self._on_open is not None:
-                self._on_open(index, item)
-            return "break"
+        def hover(_event: tk.Event[tk.Misc]) -> None:
+            self._set_hovered_index(index)
 
-        for widget in (card, image, caption, title, subtitle):
+        def leave(_event: tk.Event[tk.Misc]) -> None:
+            self._clear_hovered_index(index)
+
+        for widget in (card, image, rank_badge, caption, title, subtitle):
             widget.bind("<Button-1>", select, add=True)
-            widget.bind("<Double-Button-1>", open_item, add=True)
             widget.bind("<MouseWheel>", self._on_mouse_wheel, add=True)
+            widget.bind("<Enter>", hover, add=True)
+            widget.bind("<Leave>", leave, add=True)
         return card
 
     def _update_selection_styles(self) -> None:
-        for index, child in enumerate(self._content.winfo_children()):
-            if not isinstance(child, tk.Frame):
+        for index, (card, caption, title, subtitle) in self._card_chrome.items():
+            background, border, thickness = self._card_visual_style(index)
+            try:
+                card.configure(
+                    background=background,
+                    highlightbackground=border,
+                    highlightthickness=thickness,
+                )
+                caption.configure(background=background)
+                title.configure(
+                    background=background,
+                    foreground=(
+                        self._theme.primary
+                        if index == self._selected_index
+                        else self._theme.text
+                    ),
+                )
+                subtitle.configure(background=background)
+            except tk.TclError:
+                # A resize can destroy old cards while a queued hover event is
+                # still being delivered.  The rebuilt grid receives its final
+                # style at the end of ``_rebuild``.
                 continue
-            selected = index == self._selected_index
-            child.configure(
-                highlightbackground=(
-                    self._theme.primary if selected else self._theme.border
-                ),
-                highlightthickness=2 if selected else 1,
-            )
+
+    def _set_hovered_index(self, index: int) -> None:
+        if self._hovered_index == index:
+            return
+        self._hovered_index = index
+        self._update_selection_styles()
+
+    def _clear_hovered_index(self, index: int) -> None:
+        if self._hovered_index != index:
+            return
+        self._hovered_index = None
+        self._update_selection_styles()
+
+    def _card_visual_style(self, index: int) -> tuple[str, str, int]:
+        """Return card colours with selection taking precedence over hover."""
+
+        if index == self._selected_index:
+            return self._theme.selection, self._theme.primary, 2
+        if index == self._hovered_index:
+            return self._theme.surface_subtle, self._theme.focus, 1
+        return self._theme.surface, self._theme.border_strong, 1
+
+    @classmethod
+    def _caption_height(cls, card_height: int) -> int:
+        """Scale the compact two-line caption within a narrow safe range."""
+
+        return max(
+            cls._MIN_CAPTION_HEIGHT,
+            min(cls._MAX_CAPTION_HEIGHT, round(card_height * 0.3)),
+        )
 
     @staticmethod
     def _subtitle(item: GalleryItem) -> str:
@@ -577,139 +688,3 @@ class ResponsiveGallery(ttk.Frame, Generic[GalleryItemT]):
         if len(value) <= limit:
             return value
         return value[: max(1, limit - 1)] + "…"
-
-
-class FullscreenImageViewer(tk.Toplevel):
-    """Borderless full-screen image viewer with cover/contain switching."""
-
-    def __init__(
-        self,
-        master: tk.Misc,
-        dispatcher: ImageTaskDispatcher,
-        items: Sequence[GalleryItem],
-        index: int,
-        *,
-        theme: DesktopTheme = DEFAULT_THEME,
-    ) -> None:
-        super().__init__(master)
-        self._items = list(items)
-        self._index = max(0, min(index, len(self._items) - 1))
-        self._theme = theme
-        self._mode = "cover"
-        self._fullscreen = True
-        self._cursor_handle: str | None = None
-        self.configure(background=theme.fullscreen)
-        self.attributes("-fullscreen", True)
-        self.protocol("WM_DELETE_WINDOW", self.destroy)
-
-        self._surface = AsyncImageCanvas(
-            self,
-            dispatcher,
-            mode=self._mode,
-            background=theme.fullscreen,
-            placeholder="正在载入图片…",
-        )
-        self._surface.pack(fill="both", expand=True)
-
-        controls = tk.Frame(self, background="#1B2230", padx=8, pady=6)
-        controls.place(relx=0.5, y=14, anchor="n")
-        self._title = tk.Label(
-            controls,
-            background="#1B2230",
-            foreground="white",
-            font=("Microsoft YaHei UI", 10, "bold"),
-            width=38,
-            anchor="w",
-        )
-        self._title.pack(side="left", padx=(3, 10))
-        self._mode_button = tk.Button(
-            controls,
-            text="完整显示",
-            command=self.toggle_mode,
-            relief="flat",
-            background="#39445A",
-            foreground="white",
-            activebackground="#4A5872",
-            activeforeground="white",
-            cursor="hand2",
-            takefocus=False,
-        )
-        self._mode_button.pack(side="left", padx=3)
-        close = tk.Button(
-            controls,
-            text="关闭  Esc",
-            command=self.destroy,
-            relief="flat",
-            background="#A33D45",
-            foreground="white",
-            activebackground="#BC4B55",
-            activeforeground="white",
-            cursor="hand2",
-            takefocus=False,
-        )
-        close.pack(side="left", padx=(3, 0))
-
-        self.bind("<Escape>", lambda _event: self.destroy())
-        self.bind("<KeyPress-space>", self._on_toggle_mode)
-        self.bind("<F11>", lambda _event: self.toggle_fullscreen())
-        self.bind("<Left>", lambda _event: self.previous())
-        self.bind("<Right>", lambda _event: self.next())
-        self.bind("<Double-Button-1>", lambda _event: self.destroy())
-        self.bind("<Motion>", self._show_cursor, add=True)
-        self.focus_force()
-        self._surface.focus_set()
-        self._show_current()
-        self._show_cursor()
-
-    def _on_toggle_mode(self, _event: tk.Event[tk.Misc]) -> str:
-        self.toggle_mode()
-        return "break"
-
-    def toggle_mode(self) -> None:
-        self._mode = "contain" if self._mode == "cover" else "cover"
-        self._surface.set_mode(self._mode)
-        self._mode_button.configure(
-            text="铺满屏幕" if self._mode == "contain" else "完整显示"
-        )
-
-    def toggle_fullscreen(self) -> None:
-        self._fullscreen = not self._fullscreen
-        self.attributes("-fullscreen", self._fullscreen)
-        if not self._fullscreen:
-            self.geometry("1100x760")
-
-    def previous(self) -> None:
-        if not self._items:
-            return
-        self._index = (self._index - 1) % len(self._items)
-        self._show_current()
-
-    def next(self) -> None:
-        if not self._items:
-            return
-        self._index = (self._index + 1) % len(self._items)
-        self._show_current()
-
-    def _show_current(self) -> None:
-        if not self._items:
-            self.destroy()
-            return
-        item = self._items[self._index]
-        self._title.configure(
-            text=f"{self._index + 1} / {len(self._items)}   {item.name}"
-        )
-        self._surface.set_image(item.display_path)
-
-    def _show_cursor(self, _event: tk.Event[tk.Misc] | None = None) -> None:
-        self.configure(cursor="arrow")
-        if self._cursor_handle is not None:
-            self.after_cancel(self._cursor_handle)
-        self._cursor_handle = self.after(2200, lambda: self.configure(cursor="none"))
-
-    def destroy(self) -> None:
-        if self._cursor_handle is not None:
-            with suppress(tk.TclError):
-                self.after_cancel(self._cursor_handle)
-            self._cursor_handle = None
-        with suppress(tk.TclError):
-            super().destroy()

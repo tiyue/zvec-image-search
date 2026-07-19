@@ -39,6 +39,12 @@ AutoTagScope = Literal[
 ]
 AutoTagReviewAction = Literal["accept", "edit", "reject", "manual"]
 AutoTagReviewState = Literal["all", "low_risk", "identity", "conflict", "failed"]
+BatchAcceptanceMode = Literal[
+    "low_risk_only",
+    "recommended",
+    "all_non_conflicting",
+]
+ManualTagOperation = Literal["add", "remove", "replace_manual"]
 
 DEFAULT_AUTO_TAG_MODEL = "qwen3-vl-flash"
 DEFAULT_AUTO_TAG_MAX_IMAGES = 300
@@ -49,6 +55,9 @@ _AUTO_TAG_SCOPES = frozenset(
 )
 _REVIEW_ACTIONS = frozenset({"accept", "edit", "reject", "manual"})
 _REVIEW_STATES = frozenset({"all", "low_risk", "identity", "conflict", "failed"})
+_BATCH_ACCEPTANCE_MODES = frozenset(
+    {"low_risk_only", "recommended", "all_non_conflicting"}
+)
 _TERMINAL_STATUSES = frozenset(
     {"succeeded", "partial", "needs_attention", "failed", "cancelled"}
 )
@@ -65,6 +74,10 @@ _MAX_MODEL_CHARACTERS = 128
 _MAX_LIBRARY_ID_CHARACTERS = 256
 _MAX_TAG_CHARACTERS = 4_096
 _MAX_TAG_ITEMS = 10_000
+_MAX_FOLDER_KEY_CHARACTERS = 8_192
+_MAX_FOLDER_PAGE_SIZE = 1_000
+_MAX_FOLDER_DELETE_TOKEN_CHARACTERS = 512
+_MAX_MANUAL_SELECTION_IDS = 10_000
 
 
 class LibraryTaskError(RuntimeError):
@@ -185,7 +198,12 @@ class LibrariesRequest:
 
 @dataclass(frozen=True, slots=True)
 class IndexRequest:
-    """Index one library while preserving the backend's manual-tag semantics."""
+    """Index one library while preserving the backend's manual-tag semantics.
+
+    Per-job concurrency and ``skip_errors`` are intentionally absent. Scanning
+    and embedding use the process-wide ``ServiceConfig`` limits, while isolated
+    image failures are always recorded and skipped by the index pipeline.
+    """
 
     library_id: str
     folder: str | Path | None = None
@@ -217,6 +235,13 @@ class IndexRequest:
 
 @dataclass(frozen=True, slots=True)
 class SyncRequest:
+    """Synchronize one library using the backend-wide execution policy.
+
+    Like indexing, synchronization does not accept pretend per-job concurrency
+    or error-skipping switches; those behaviours are owned by ``ServiceConfig``
+    and the failure sink.
+    """
+
     library_id: str
     folder: str | Path | None = None
     recursive: bool = True
@@ -318,6 +343,299 @@ class RootsRequest:
 
     def to_params(self) -> JsonObject:
         return {"library_id": self.library_id}
+
+
+@dataclass(frozen=True, slots=True)
+class FolderListRequest:
+    library_id: str
+    root_id: str | None = None
+    query: str = ""
+    offset: int = 0
+    limit: int = 200
+
+    command: ClassVar[str] = "folder_list"
+
+    def __post_init__(self) -> None:
+        _set_library_id(self)
+        root_id = _optional_display_text(
+            self.root_id,
+            "root_id",
+            maximum=_MAX_LIBRARY_ID_CHARACTERS,
+        )
+        object.__setattr__(self, "root_id", root_id)
+        if not isinstance(self.query, str):
+            raise _validation("query must be a string.", "query")
+        query = self.query.strip()
+        if len(query) > 256 or _contains_control(query):
+            raise _validation(
+                "query cannot exceed 256 characters or contain controls.", "query"
+            )
+        object.__setattr__(self, "query", query)
+        _bounded_integer(self.offset, "offset", minimum=0, maximum=2**63 - 1)
+        _bounded_integer(
+            self.limit,
+            "limit",
+            minimum=1,
+            maximum=_MAX_FOLDER_PAGE_SIZE,
+        )
+
+    def to_params(self) -> JsonObject:
+        return {
+            "library_id": self.library_id,
+            "root_id": self.root_id,
+            "query": self.query,
+            "offset": self.offset,
+            "limit": self.limit,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class FolderImagesRequest:
+    library_id: str
+    folder_key: str
+    include_subfolders: bool = False
+    offset: int = 0
+    limit: int = 100
+
+    command: ClassVar[str] = "folder_images"
+
+    def __post_init__(self) -> None:
+        _set_library_id(self)
+        folder_key = _required_display_text(
+            self.folder_key,
+            "folder_key",
+            maximum=_MAX_FOLDER_KEY_CHARACTERS,
+        )
+        object.__setattr__(self, "folder_key", folder_key)
+        _require_boolean(self.include_subfolders, "include_subfolders")
+        _bounded_integer(self.offset, "offset", minimum=0, maximum=2**63 - 1)
+        _bounded_integer(
+            self.limit,
+            "limit",
+            minimum=1,
+            maximum=_MAX_FOLDER_PAGE_SIZE,
+        )
+
+    def to_params(self) -> JsonObject:
+        return {
+            "library_id": self.library_id,
+            "folder_key": self.folder_key,
+            "include_subfolders": self.include_subfolders,
+            "offset": self.offset,
+            "limit": self.limit,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class FolderDeletePreviewRequest:
+    """Create an expiring, model-free snapshot before destructive work."""
+
+    library_id: str
+    folder_key: str
+    include_subfolders: bool = True
+
+    command: ClassVar[str] = "folder_delete_preview"
+
+    def __post_init__(self) -> None:
+        _set_library_id(self)
+        object.__setattr__(
+            self,
+            "folder_key",
+            _required_display_text(
+                self.folder_key,
+                "folder_key",
+                maximum=_MAX_FOLDER_KEY_CHARACTERS,
+            ),
+        )
+        _require_boolean(self.include_subfolders, "include_subfolders")
+        if not self.include_subfolders:
+            raise _validation(
+                "folder deletion must include every descendant folder.",
+                "include_subfolders",
+            )
+
+    def to_params(self) -> JsonObject:
+        return {
+            "library_id": self.library_id,
+            "folder_key": self.folder_key,
+            "include_subfolders": True,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class FolderDeleteCommitRequest:
+    """Commit exactly one valid preview after explicit user confirmation."""
+
+    library_id: str
+    operation_id: str
+    confirmation_token: str
+    confirm: bool = True
+
+    command: ClassVar[str] = "folder_delete_commit"
+
+    def __post_init__(self) -> None:
+        _set_library_id(self)
+        operation_id = _required_display_text(
+            self.operation_id,
+            "operation_id",
+            maximum=32,
+        ).lower()
+        if len(operation_id) != 32 or any(
+            character not in "0123456789abcdef" for character in operation_id
+        ):
+            raise _validation(
+                "operation_id must be a 32-character hexadecimal id.",
+                "operation_id",
+            )
+        token = _required_display_text(
+            self.confirmation_token,
+            "confirmation_token",
+            maximum=_MAX_FOLDER_DELETE_TOKEN_CHARACTERS,
+        )
+        _require_boolean(self.confirm, "confirm")
+        if not self.confirm:
+            raise _validation(
+                "explicit folder deletion confirmation is required.",
+                "confirm",
+                code="confirmation_required",
+            )
+        object.__setattr__(self, "operation_id", operation_id)
+        object.__setattr__(self, "confirmation_token", token)
+
+    def to_params(self) -> JsonObject:
+        return {
+            "library_id": self.library_id,
+            "operation_id": self.operation_id,
+            "confirmation_token": self.confirmation_token,
+            "confirm": True,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ManualTagSelection:
+    mode: Literal["selected", "folder"]
+    doc_ids: tuple[str, ...] = ()
+    folder_key: str | None = None
+    include_subfolders: bool = False
+    excluded_doc_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.mode not in {"selected", "folder"}:
+            raise _validation("mode must be selected or folder.", "selection.mode")
+        _require_boolean(self.include_subfolders, "selection.include_subfolders")
+        doc_ids = _unique_strings(
+            self.doc_ids,
+            "selection.doc_ids",
+            minimum_items=1 if self.mode == "selected" else 0,
+            maximum_items=_MAX_MANUAL_SELECTION_IDS,
+            maximum_characters=256,
+        )
+        excluded = _unique_strings(
+            self.excluded_doc_ids,
+            "selection.excluded_doc_ids",
+            minimum_items=0,
+            maximum_items=_MAX_MANUAL_SELECTION_IDS,
+            maximum_characters=256,
+        )
+        folder_key = _optional_display_text(
+            self.folder_key,
+            "selection.folder_key",
+            maximum=_MAX_FOLDER_KEY_CHARACTERS,
+        )
+        if self.mode == "selected":
+            if folder_key is not None or excluded or self.include_subfolders:
+                raise _validation("selected mode accepts only doc_ids.", "selection")
+        elif folder_key is None:
+            raise _validation(
+                "folder mode requires folder_key.", "selection.folder_key"
+            )
+        elif doc_ids:
+            raise _validation(
+                "folder mode does not accept doc_ids.", "selection.doc_ids"
+            )
+        object.__setattr__(self, "doc_ids", doc_ids)
+        object.__setattr__(self, "excluded_doc_ids", excluded)
+        object.__setattr__(self, "folder_key", folder_key)
+
+    def to_params(self) -> JsonObject:
+        if self.mode == "selected":
+            return {"mode": "selected", "doc_ids": list(self.doc_ids)}
+        return {
+            "mode": "folder",
+            "folder_key": self.folder_key,
+            "include_subfolders": self.include_subfolders,
+            "excluded_doc_ids": list(self.excluded_doc_ids),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ManualTagBatchRequest:
+    library_id: str
+    selection: ManualTagSelection
+    operation: ManualTagOperation
+    tags: tuple[str, ...]
+
+    command: ClassVar[str] = "manual_tag_batch"
+
+    def __post_init__(self) -> None:
+        _set_library_id(self)
+        if not isinstance(self.selection, ManualTagSelection):
+            raise _validation("selection must be a ManualTagSelection.", "selection")
+        if self.operation not in {"add", "remove", "replace_manual"}:
+            raise _validation(
+                "operation must be add, remove, or replace_manual.", "operation"
+            )
+        tags = _tags(self.tags, "tags")
+        if self.operation in {"add", "remove"} and not tags:
+            raise _validation(f"{self.operation} requires at least one tag.", "tags")
+        object.__setattr__(self, "tags", tags)
+
+    def to_params(self) -> JsonObject:
+        return {
+            "library_id": self.library_id,
+            "selection": self.selection.to_params(),
+            "operation": self.operation,
+            "tags": list(self.tags),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ManualTagUndoRequest:
+    library_id: str
+
+    command: ClassVar[str] = "manual_tag_undo"
+
+    def __post_init__(self) -> None:
+        _set_library_id(self)
+
+    def to_params(self) -> JsonObject:
+        return {"library_id": self.library_id}
+
+
+@dataclass(frozen=True, slots=True)
+class SearchResultsCleanupRequest:
+    library_id: str
+    keep_latest: int = 3
+    dry_run: bool = False
+
+    command: ClassVar[str] = "search_results_cleanup"
+
+    def __post_init__(self) -> None:
+        _set_library_id(self)
+        _bounded_integer(
+            self.keep_latest,
+            "keep_latest",
+            minimum=1,
+            maximum=100,
+        )
+        _require_boolean(self.dry_run, "dry_run")
+
+    def to_params(self) -> JsonObject:
+        return {
+            "library_id": self.library_id,
+            "keep_latest": self.keep_latest,
+            "dry_run": self.dry_run,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -599,11 +917,20 @@ class IdentityConfirmationRequest:
 
 @dataclass(frozen=True, slots=True)
 class LowRiskBatchReviewRequest:
-    """Accept low-risk tags while forcing identity proposals to remain pending."""
+    """Atomically accept a validated batch of model suggestions.
+
+    ``low_risk_only`` preserves the original desktop/backend contract.  Newer
+    clients may explicitly confirm one whole batch and include recommended,
+    non-conflicting identity suggestions without confirming every tag one by
+    one.  The backend remains the trust boundary and recomputes eligibility
+    from the current stored proposal.
+    """
 
     library_id: str
     proposal_ids: tuple[str, ...]
     accepted_tags_by_proposal: Mapping[str, Sequence[str]]
+    acceptance_mode: BatchAcceptanceMode = "low_risk_only"
+    batch_confirmation: bool = False
 
     command: ClassVar[str] = "auto_tag_review_batch"
 
@@ -652,19 +979,46 @@ class LowRiskBatchReviewRequest:
             "accepted_tags_by_proposal",
             MappingProxyType(normalized),
         )
+        if not isinstance(self.acceptance_mode, str):
+            raise _validation("acceptance_mode must be a string.", "acceptance_mode")
+        mode = self.acceptance_mode.strip().lower()
+        if mode not in _BATCH_ACCEPTANCE_MODES:
+            raise _validation(
+                "acceptance_mode must be low_risk_only, recommended, or "
+                "all_non_conflicting.",
+                "acceptance_mode",
+                details={"supported": sorted(_BATCH_ACCEPTANCE_MODES)},
+            )
+        object.__setattr__(self, "acceptance_mode", mode)
+        if not isinstance(self.batch_confirmation, bool):
+            raise _validation(
+                "batch_confirmation must be a boolean.", "batch_confirmation"
+            )
+        if mode != "low_risk_only" and not self.batch_confirmation:
+            raise _validation(
+                "Identity-inclusive batch review requires one explicit batch "
+                "confirmation.",
+                "batch_confirmation",
+                code="batch_confirmation_required",
+            )
 
     def to_params(self) -> JsonObject:
-        return {
+        payload: JsonObject = {
             "library_id": self.library_id,
             "proposal_ids": list(self.proposal_ids),
             "accepted_tags_by_proposal": {
                 proposal_id: list(tags)
                 for proposal_id, tags in self.accepted_tags_by_proposal.items()
             },
-            # The backend verifies these against proposal metadata and leaves
-            # every identity tag pending for individual confirmation.
-            "exclude_identity_tags": True,
+            # Preserve the legacy flag for older persistent backends.  New
+            # backends additionally validate acceptance_mode and never trust
+            # the client-provided classification of a tag.
+            "exclude_identity_tags": self.acceptance_mode == "low_risk_only",
         }
+        if self.acceptance_mode != "low_risk_only":
+            payload["acceptance_mode"] = self.acceptance_mode
+            payload["batch_confirmation"] = self.batch_confirmation
+        return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -678,6 +1032,21 @@ class AutoTagUndoRequest:
 
     def to_params(self) -> JsonObject:
         return {"library_id": self.library_id}
+
+
+@dataclass(frozen=True, slots=True)
+class AutoTagPolicyMigrateRequest:
+    library_id: str
+    dry_run: bool = False
+
+    command: ClassVar[str] = "auto_tag_policy_migrate"
+
+    def __post_init__(self) -> None:
+        _set_library_id(self)
+        _require_boolean(self.dry_run, "dry_run")
+
+    def to_params(self) -> JsonObject:
+        return {"library_id": self.library_id, "dry_run": self.dry_run}
 
 
 @dataclass(frozen=True, slots=True)
@@ -821,6 +1190,13 @@ LibraryRequest: TypeAlias = (
     | IndexAndAutoTagRequest
     | StatsRequest
     | RootsRequest
+    | FolderListRequest
+    | FolderImagesRequest
+    | FolderDeletePreviewRequest
+    | FolderDeleteCommitRequest
+    | ManualTagBatchRequest
+    | ManualTagUndoRequest
+    | SearchResultsCleanupRequest
     | AutoTagEstimateRequest
     | AutoTagRunRequest
     | AutoTagPendingRequest
@@ -828,6 +1204,7 @@ LibraryRequest: TypeAlias = (
     | IdentityConfirmationRequest
     | LowRiskBatchReviewRequest
     | AutoTagUndoRequest
+    | AutoTagPolicyMigrateRequest
     | FolderTagBackfillRequest
     | MetadataBackfillRequest
     | TagAliasListRequest
@@ -903,6 +1280,37 @@ class LibraryTaskService:
     def submit_roots(self, request: RootsRequest) -> SubmittedLibraryTask:
         return self.submit(request)
 
+    def list_folders(self, request: FolderListRequest) -> SubmittedLibraryTask:
+        return self.submit(request)
+
+    def list_folder_images(self, request: FolderImagesRequest) -> SubmittedLibraryTask:
+        return self.submit(request)
+
+    def preview_folder_delete(
+        self, request: FolderDeletePreviewRequest
+    ) -> SubmittedLibraryTask:
+        return self.submit(request)
+
+    def commit_folder_delete(
+        self, request: FolderDeleteCommitRequest
+    ) -> SubmittedLibraryTask:
+        return self.submit(request)
+
+    def submit_manual_tag_batch(
+        self, request: ManualTagBatchRequest
+    ) -> SubmittedLibraryTask:
+        return self.submit(request)
+
+    def undo_latest_manual_tag_batch(
+        self, request: ManualTagUndoRequest
+    ) -> SubmittedLibraryTask:
+        return self.submit(request)
+
+    def cleanup_search_results(
+        self, request: SearchResultsCleanupRequest
+    ) -> SubmittedLibraryTask:
+        return self.submit(request)
+
     def estimate_auto_tags(
         self, request: AutoTagEstimateRequest
     ) -> SubmittedLibraryTask:
@@ -933,6 +1341,11 @@ class LibraryTaskService:
 
     def undo_latest_auto_tag_batch(
         self, request: AutoTagUndoRequest
+    ) -> SubmittedLibraryTask:
+        return self.submit(request)
+
+    def migrate_auto_tag_policy(
+        self, request: AutoTagPolicyMigrateRequest
     ) -> SubmittedLibraryTask:
         return self.submit(request)
 
@@ -1377,10 +1790,13 @@ __all__ = [
     "AutoTagRunRequest",
     "AutoTagScope",
     "AutoTagUndoRequest",
+    "BatchAcceptanceMode",
     "DEFAULT_AUTO_TAG_BUDGET_CNY",
     "DEFAULT_AUTO_TAG_MAX_IMAGES",
     "DEFAULT_AUTO_TAG_MODEL",
     "FolderTagBackfillRequest",
+    "FolderDeleteCommitRequest",
+    "FolderDeletePreviewRequest",
     "IdentityConfirmationRequest",
     "IndexAndAutoTagRequest",
     "IndexRequest",

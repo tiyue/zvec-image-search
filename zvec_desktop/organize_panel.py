@@ -106,6 +106,36 @@ class _Completion:
     callback: Callable[[object], None]
 
 
+@dataclass(frozen=True, slots=True)
+class OrganizeResponsiveLayout:
+    """Layout decisions derived from the available organize-page width."""
+
+    filter_columns: int
+    compact_actions: bool
+    stacked_workspace: bool
+
+
+def calculate_organize_layout(width: int) -> OrganizeResponsiveLayout:
+    """Return a deterministic responsive layout for a logical-pixel width.
+
+    Six filter cells fit comfortably in the normal desktop workspace.  A
+    three-column grid produces the requested two-row layout in a narrow
+    window, while a very small host gets two columns instead of clipped input
+    fields.  Review and alias panes stack before either side becomes too thin
+    to read safely.
+    """
+
+    if not isinstance(width, int) or isinstance(width, bool):
+        raise TypeError("width must be an integer")
+    available = max(1, width)
+    filter_columns = 6 if available >= 980 else 3 if available >= 560 else 2
+    return OrganizeResponsiveLayout(
+        filter_columns=filter_columns,
+        compact_actions=available < 1050,
+        stacked_workspace=available < 900,
+    )
+
+
 def parse_tag_text(value: str) -> tuple[str, ...]:
     """Split the compact tag editor while preserving first-seen order."""
 
@@ -160,6 +190,7 @@ class OrganizePanel(ttk.Frame):
         self._last_ui_update_thread_id = self._ui_thread_id
         self._closed = False
         self._after_handle: str | None = None
+        self._layout_after_handle: str | None = None
         self._completion_queue: queue.SimpleQueue[_Completion] = queue.SimpleQueue()
         self._operation_tokens: dict[str, int] = {}
         self._busy_operations: set[str] = set()
@@ -172,12 +203,19 @@ class OrganizePanel(ttk.Frame):
         self._selected_proposal_id: str | None = None
         self._identity_variables: dict[str, tk.BooleanVar] = {}
         self._synchronizing_editor = False
+        self._responsive_layout: OrganizeResponsiveLayout | None = None
+        self._filter_items: list[ttk.Frame] = []
 
         self._status_var = tk.StringVar(value="准备就绪")
+        self._pending_var = tk.StringVar(value="待审核 0 张")
         self._page_var = tk.StringVar(value="第 0 / 0 页")
         self._progress_var = tk.StringVar(value="已审核 0 / 100")
         self._selection_var = tk.StringVar(value="低风险已选 0 张")
         self._issue_var = tk.StringVar(value="")
+        self._review_empty_title_var = tk.StringVar(value="审核队列尚未加载")
+        self._review_empty_hint_var = tk.StringVar(
+            value="刷新后会在这里显示待审核的图片建议"
+        )
         self._path_var = tk.StringVar(value="请选择待审核图片")
         self._description_var = tk.StringVar(value="")
         self._existing_var = tk.StringVar(value="现有标签：—")
@@ -197,7 +235,13 @@ class OrganizePanel(ttk.Frame):
         self._alias_canonical_var = tk.StringVar(value="")
         self._alias_values_var = tk.StringVar(value="")
         self._alias_summary_var = tk.StringVar(value="别名词典尚未加载")
+        self._alias_empty_title_var = tk.StringVar(value="别名词典尚未加载")
+        self._alias_empty_hint_var = tk.StringVar(
+            value="刷新后可维护角色、作品与人物的等价叫法"
+        )
 
+        self._configure_styles()
+        self.configure(style="Organize.App.TFrame")
         self._build()
         self._bind_shortcuts()
         self._after_handle = self.after(25, self._drain_completions)
@@ -227,6 +271,10 @@ class OrganizePanel(ttk.Frame):
     @property
     def last_ui_update_thread_id(self) -> int:
         return self._last_ui_update_thread_id
+
+    @property
+    def responsive_layout(self) -> OrganizeResponsiveLayout | None:
+        return self._responsive_layout
 
     def set_library(self, library_id: str, *, refresh: bool = True) -> None:
         self._assert_ui_thread()
@@ -283,6 +331,11 @@ class OrganizePanel(ttk.Frame):
         except Exception as exc:
             self._show_error("无法加载待审核建议", exc)
             return
+        if self._page is None:
+            self._show_review_empty(
+                "正在加载审核队列",
+                "图片较多时可能需要几秒，窗口仍可正常操作",
+            )
         self._set_status("正在加载待审核建议…")
         self._start_operation(
             "pending",
@@ -482,6 +535,11 @@ class OrganizePanel(ttk.Frame):
         except Exception as exc:
             self._show_error("无法加载别名词典", exc)
             return
+        if not self._aliases_loaded:
+            self._show_alias_empty(
+                "正在加载别名词典",
+                "正在读取已维护的规范名称和别名关系",
+            )
         self._set_status("正在加载别名词典…")
         self._start_operation("alias_list", future, self._apply_alias_payload)
 
@@ -549,6 +607,10 @@ class OrganizePanel(ttk.Frame):
             with suppress(tk.TclError):
                 self.after_cancel(self._after_handle)
             self._after_handle = None
+        if self._layout_after_handle is not None:
+            with suppress(tk.TclError):
+                self.after_cancel(self._layout_after_handle)
+            self._layout_after_handle = None
         while True:
             try:
                 self._completion_queue.get_nowait()
@@ -559,149 +621,844 @@ class OrganizePanel(ttk.Frame):
         self.close()
         super().destroy()
 
+    def _configure_styles(self) -> None:
+        """Register page-local semantic styles for embedded and standalone use."""
+
+        style = ttk.Style(self)
+        theme = self._theme
+        font = theme.typography.family
+        style.configure("Organize.App.TFrame", background=theme.window)
+        style.configure("Organize.Surface.TFrame", background=theme.surface)
+        style.configure(
+            "Organize.Panel.TFrame",
+            background=theme.surface,
+            borderwidth=0,
+            relief="flat",
+        )
+        style.configure(
+            "Organize.Flow.TFrame",
+            background=theme.primary_soft,
+            borderwidth=0,
+            relief="flat",
+        )
+        style.configure(
+            "Organize.Command.TFrame",
+            background=theme.surface_subtle,
+            borderwidth=0,
+            relief="flat",
+        )
+        style.configure(
+            "Organize.Editor.TFrame",
+            background=theme.surface_subtle,
+            borderwidth=0,
+            relief="flat",
+        )
+        style.configure(
+            "Organize.Identity.TFrame",
+            background=theme.warning_soft,
+            borderwidth=0,
+            relief="flat",
+        )
+        style.configure(
+            "Organize.Empty.TFrame",
+            background=theme.surface_subtle,
+            borderwidth=0,
+            relief="flat",
+        )
+        style.configure(
+            "Organize.Card.TFrame",
+            background=theme.surface,
+            bordercolor=theme.border,
+            lightcolor=theme.border,
+            darkcolor=theme.border,
+            borderwidth=1,
+            relief="solid",
+        )
+        style.configure(
+            "Organize.Subtle.TFrame",
+            background=theme.surface_subtle,
+        )
+        style.configure(
+            "Organize.StatusBar.TFrame",
+            background=theme.surface,
+            bordercolor=theme.border,
+            borderwidth=1,
+            relief="flat",
+        )
+        style.configure(
+            "Organize.Section.TLabel",
+            background=theme.surface,
+            foreground=theme.text,
+            font=(font, theme.typography.section, "bold"),
+        )
+        style.configure(
+            "Organize.Flow.TLabel",
+            background=theme.primary_soft,
+            foreground=theme.primary_pressed,
+            font=(font, theme.typography.control, "bold"),
+        )
+        style.configure(
+            "Organize.FlowHint.TLabel",
+            background=theme.primary_soft,
+            foreground=theme.text_muted,
+            font=(font, theme.typography.supporting),
+        )
+        style.configure(
+            "Organize.CommandSection.TLabel",
+            background=theme.surface_subtle,
+            foreground=theme.text,
+            font=(font, theme.typography.section, "bold"),
+        )
+        style.configure(
+            "Organize.CommandHint.TLabel",
+            background=theme.surface_subtle,
+            foreground=theme.text_faint,
+            font=(font, theme.typography.supporting),
+        )
+        style.configure(
+            "Organize.EditorSection.TLabel",
+            background=theme.surface_subtle,
+            foreground=theme.text,
+            font=(font, theme.typography.control, "bold"),
+        )
+        style.configure(
+            "Organize.EditorMuted.TLabel",
+            background=theme.surface_subtle,
+            foreground=theme.text_muted,
+            font=(font, theme.typography.body),
+        )
+        style.configure(
+            "Organize.EditorAccent.TLabel",
+            background=theme.surface_subtle,
+            foreground=theme.primary_pressed,
+            font=(font, theme.typography.body, "bold"),
+        )
+        style.configure(
+            "Organize.IdentityWarning.TLabel",
+            background=theme.warning_soft,
+            foreground=theme.warning,
+            font=(font, theme.typography.supporting, "bold"),
+        )
+        style.configure(
+            "Organize.EmptyTitle.TLabel",
+            background=theme.surface_subtle,
+            foreground=theme.text,
+            font=(font, theme.typography.section, "bold"),
+        )
+        style.configure(
+            "Organize.EmptyHint.TLabel",
+            background=theme.surface_subtle,
+            foreground=theme.text_faint,
+            font=(font, theme.typography.body),
+        )
+        style.configure(
+            "Organize.Muted.TLabel",
+            background=theme.surface,
+            foreground=theme.text_muted,
+            font=(font, theme.typography.body),
+        )
+        style.configure(
+            "Organize.Hint.TLabel",
+            background=theme.surface,
+            foreground=theme.text_faint,
+            font=(font, theme.typography.supporting),
+        )
+        style.configure(
+            "Organize.Subtle.TLabel",
+            background=theme.surface_subtle,
+            foreground=theme.text_muted,
+            font=(font, theme.typography.body),
+        )
+        style.configure(
+            "Organize.Accent.TLabel",
+            background=theme.surface,
+            foreground=theme.primary_pressed,
+            font=(font, theme.typography.body, "bold"),
+        )
+        style.configure(
+            "Organize.Warning.TLabel",
+            background=theme.surface,
+            foreground=theme.warning,
+            font=(font, theme.typography.supporting),
+        )
+        style.configure(
+            "Organize.Metric.TLabel",
+            background=theme.surface_muted,
+            foreground=theme.text_muted,
+            padding=(8, 4),
+            font=(font, theme.typography.supporting, "bold"),
+        )
+        style.configure(
+            "Organize.PendingMetric.TLabel",
+            background=theme.warning_soft,
+            foreground=theme.warning,
+            padding=(8, 4),
+            font=(font, theme.typography.supporting, "bold"),
+        )
+        style.configure(
+            "Organize.ProgressMetric.TLabel",
+            background=theme.success_soft,
+            foreground=theme.success,
+            padding=(8, 4),
+            font=(font, theme.typography.supporting, "bold"),
+        )
+        style.configure(
+            "Organize.SelectionMetric.TLabel",
+            background=theme.primary_soft,
+            foreground=theme.primary_pressed,
+            padding=(8, 4),
+            font=(font, theme.typography.supporting, "bold"),
+        )
+        style.configure(
+            "Organize.DiffExisting.TLabel",
+            background=theme.surface_muted,
+            foreground=theme.text_muted,
+            padding=(9, 6),
+            font=(font, theme.typography.body),
+        )
+        style.configure(
+            "Organize.DiffSuggested.TLabel",
+            background=theme.primary_soft,
+            foreground=theme.primary_pressed,
+            padding=(9, 6),
+            font=(font, theme.typography.body),
+        )
+        style.configure(
+            "Organize.DiffChange.TLabel",
+            background=theme.success_soft,
+            foreground=theme.success,
+            padding=(9, 6),
+            font=(font, theme.typography.body, "bold"),
+        )
+        style.configure(
+            "Organize.Status.TLabel",
+            background=theme.surface,
+            foreground=theme.text_muted,
+            font=(font, theme.typography.body),
+        )
+
+        for name, background, foreground, border, padding, weight in (
+            (
+                "Organize.Primary.TButton",
+                theme.primary,
+                "#FFFFFF",
+                theme.primary,
+                (15, 8),
+                "bold",
+            ),
+            (
+                "Organize.Secondary.TButton",
+                theme.primary_soft,
+                theme.primary_pressed,
+                theme.primary_soft,
+                (12, 7),
+                "bold",
+            ),
+            (
+                "Organize.Quiet.TButton",
+                theme.surface,
+                theme.text,
+                theme.border_strong,
+                (11, 7),
+                "normal",
+            ),
+            (
+                "Organize.Danger.TButton",
+                theme.surface,
+                theme.danger,
+                theme.danger_soft,
+                (11, 7),
+                "normal",
+            ),
+        ):
+            style.configure(
+                name,
+                background=background,
+                foreground=foreground,
+                bordercolor=border,
+                lightcolor=border,
+                darkcolor=border,
+                focuscolor=border,
+                borderwidth=1,
+                padding=padding,
+                font=(font, theme.typography.control, weight),
+            )
+        style.map(
+            "Organize.Primary.TButton",
+            background=[
+                ("pressed", theme.primary_pressed),
+                ("active", theme.primary_hover),
+                ("disabled", theme.surface_strong),
+            ],
+            bordercolor=[
+                ("pressed", theme.primary_pressed),
+                ("active", theme.primary_hover),
+                ("disabled", theme.surface_strong),
+            ],
+            foreground=[("disabled", theme.text_faint)],
+        )
+        style.map(
+            "Organize.Secondary.TButton",
+            background=[
+                ("active", theme.selection),
+                ("disabled", theme.surface_subtle),
+            ],
+            foreground=[("disabled", theme.text_faint)],
+        )
+        style.map(
+            "Organize.Quiet.TButton",
+            background=[
+                ("active", theme.surface_muted),
+                ("disabled", theme.surface_subtle),
+            ],
+            foreground=[("disabled", theme.text_faint)],
+        )
+        style.map(
+            "Organize.Danger.TButton",
+            background=[
+                ("active", theme.danger_soft),
+                ("disabled", theme.surface_subtle),
+            ],
+            foreground=[("disabled", theme.text_faint)],
+        )
+
+        style.configure(
+            "Organize.TEntry",
+            fieldbackground=theme.surface,
+            foreground=theme.text,
+            bordercolor=theme.border_strong,
+            lightcolor=theme.border_strong,
+            darkcolor=theme.border_strong,
+            insertcolor=theme.primary,
+            padding=(8, 6),
+            borderwidth=1,
+        )
+        style.map(
+            "Organize.TEntry",
+            bordercolor=[("focus", theme.primary)],
+            lightcolor=[("focus", theme.primary)],
+            darkcolor=[("focus", theme.primary)],
+        )
+        style.configure(
+            "Organize.TCombobox",
+            fieldbackground=theme.surface,
+            background=theme.surface,
+            foreground=theme.text,
+            arrowcolor=theme.text_muted,
+            bordercolor=theme.border_strong,
+            lightcolor=theme.border_strong,
+            darkcolor=theme.border_strong,
+            padding=(7, 6),
+        )
+        style.map(
+            "Organize.TCombobox",
+            fieldbackground=[("readonly", theme.surface)],
+            bordercolor=[("focus", theme.primary)],
+            lightcolor=[("focus", theme.primary)],
+            darkcolor=[("focus", theme.primary)],
+        )
+        style.configure(
+            "Organize.TCheckbutton",
+            background=theme.surface,
+            foreground=theme.text_muted,
+            indicatorbackground=theme.surface,
+            indicatorforeground=theme.primary,
+            padding=(2, 2),
+        )
+        style.map(
+            "Organize.TCheckbutton",
+            background=[("active", theme.surface)],
+            foreground=[("active", theme.text)],
+            indicatorbackground=[("selected", theme.primary)],
+        )
+        style.configure(
+            "Organize.Editor.TCheckbutton",
+            background=theme.surface_subtle,
+            foreground=theme.text_muted,
+            indicatorbackground=theme.surface,
+            indicatorforeground=theme.primary,
+            padding=(2, 2),
+        )
+        style.map(
+            "Organize.Editor.TCheckbutton",
+            background=[("active", theme.surface_subtle)],
+            foreground=[("active", theme.text)],
+            indicatorbackground=[("selected", theme.primary)],
+        )
+        style.configure(
+            "Organize.Identity.TCheckbutton",
+            background=theme.warning_soft,
+            foreground=theme.text,
+            indicatorbackground=theme.surface,
+            indicatorforeground=theme.primary,
+            padding=(2, 2),
+        )
+        style.map(
+            "Organize.Identity.TCheckbutton",
+            background=[("active", theme.warning_soft)],
+            foreground=[("active", theme.text)],
+            indicatorbackground=[("selected", theme.primary)],
+        )
+        style.configure(
+            "Organize.Treeview",
+            background=theme.surface,
+            fieldbackground=theme.surface,
+            foreground=theme.text,
+            bordercolor=theme.border,
+            rowheight=30,
+            font=(font, theme.typography.body),
+        )
+        style.map(
+            "Organize.Treeview",
+            background=[("selected", theme.selection)],
+            foreground=[("selected", theme.text)],
+        )
+        style.configure(
+            "Organize.Treeview.Heading",
+            background=theme.surface_muted,
+            foreground=theme.text_muted,
+            bordercolor=theme.border,
+            padding=(8, 7),
+            font=(font, theme.typography.supporting, "bold"),
+        )
+        style.map(
+            "Organize.Treeview.Heading",
+            background=[("active", theme.surface_strong)],
+        )
+        style.configure(
+            "Organize.Card.TLabelframe",
+            background=theme.surface,
+            bordercolor=theme.border,
+            lightcolor=theme.border,
+            darkcolor=theme.border,
+            borderwidth=1,
+            relief="solid",
+        )
+        style.configure(
+            "Organize.Card.TLabelframe.Label",
+            background=theme.surface,
+            foreground=theme.text,
+            font=(font, theme.typography.control, "bold"),
+        )
+        style.configure(
+            "Organize.TNotebook",
+            background=theme.window,
+            bordercolor=theme.border,
+            borderwidth=0,
+            tabmargins=(0, 0, 0, 8),
+        )
+        style.configure(
+            "Organize.TNotebook.Tab",
+            background=theme.surface_muted,
+            foreground=theme.text_muted,
+            borderwidth=0,
+            padding=(15, 8),
+            font=(font, theme.typography.control),
+        )
+        style.map(
+            "Organize.TNotebook.Tab",
+            background=[
+                ("selected", theme.primary_soft),
+                ("active", theme.surface_strong),
+            ],
+            foreground=[("selected", theme.primary_pressed)],
+        )
+        style.configure(
+            "Organize.Vertical.TScrollbar",
+            background=theme.border_strong,
+            troughcolor=theme.surface_subtle,
+            bordercolor=theme.surface_subtle,
+            arrowcolor=theme.text_muted,
+            width=12,
+        )
+
     def _build(self) -> None:
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
-        self._notebook = ttk.Notebook(self)
+        spacing = self._theme.spacing
+        self._notebook = ttk.Notebook(self, style="Organize.TNotebook")
         self._notebook.grid(row=0, column=0, sticky="nsew")
-        self._review_tab = ttk.Frame(self._notebook, padding=8)
-        self._alias_tab = ttk.Frame(self._notebook, padding=10)
+        self._review_tab = ttk.Frame(
+            self._notebook,
+            style="Organize.App.TFrame",
+            padding=spacing.sm,
+        )
+        self._alias_tab = ttk.Frame(
+            self._notebook,
+            style="Organize.App.TFrame",
+            padding=spacing.sm,
+        )
         self._notebook.add(self._review_tab, text="审核建议")
         self._notebook.add(self._alias_tab, text="别名词典")
         self._notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed, add=True)
         self._build_review_tab()
         self._build_alias_tab()
+        self.bind("<Configure>", self._on_panel_configure, add=True)
 
-        status = ttk.Frame(self, padding=(8, 5))
+        status = ttk.Frame(
+            self,
+            style="Organize.StatusBar.TFrame",
+            padding=(spacing.md, spacing.sm),
+        )
         status.grid(row=1, column=0, sticky="ew")
         status.columnconfigure(0, weight=1)
-        ttk.Label(status, textvariable=self._status_var).grid(
-            row=0, column=0, sticky="w"
-        )
         ttk.Label(
+            status,
+            textvariable=self._status_var,
+            style="Organize.Status.TLabel",
+        ).grid(row=0, column=0, sticky="w")
+        self._shortcut_label = ttk.Label(
             status,
             text="快捷键：A 接受 · E 编辑 · R 拒绝 · Space 批量勾选 · "
             "Ctrl+Enter 提交 · [ / ] 翻页",
-            foreground=self._theme.text_muted,
-        ).grid(row=0, column=1, sticky="e")
+            style="Organize.Hint.TLabel",
+        )
+        self._shortcut_label.grid(row=0, column=1, sticky="e")
+        self._apply_responsive_layout(1200)
+        self._update_controls()
 
     def _build_review_tab(self) -> None:
-        tab = self._review_tab
+        spacing = self._theme.spacing
+        host = self._review_tab
+        host.columnconfigure(0, weight=1)
+        host.rowconfigure(0, weight=1)
+        self._review_canvas = tk.Canvas(
+            host,
+            background=self._theme.window,
+            borderwidth=0,
+            highlightthickness=0,
+            takefocus=False,
+        )
+        self._review_canvas.grid(row=0, column=0, sticky="nsew")
+        self._review_scrollbar = ttk.Scrollbar(
+            host,
+            orient="vertical",
+            command=self._review_canvas.yview,
+            style="Organize.Vertical.TScrollbar",
+        )
+        self._review_scrollbar.grid(row=0, column=1, sticky="ns")
+        self._review_canvas.configure(yscrollcommand=self._review_scrollbar.set)
+        tab = ttk.Frame(
+            self._review_canvas,
+            style="Organize.App.TFrame",
+            padding=(0, 0, spacing.xs, 0),
+        )
+        self._review_content = tab
+        self._review_canvas_window = self._review_canvas.create_window(
+            (0, 0),
+            anchor="nw",
+            window=tab,
+        )
+        self._review_canvas.bind(
+            "<Configure>",
+            self._on_review_canvas_configure,
+            add=True,
+        )
+        tab.bind("<Configure>", self._on_review_content_configure, add=True)
         tab.columnconfigure(0, weight=1)
         tab.rowconfigure(2, weight=1)
 
-        filters = ttk.LabelFrame(tab, text="筛选", padding=7)
-        filters.grid(row=0, column=0, sticky="ew", pady=(0, 7))
-        for column in (2, 4, 6, 8):
-            filters.columnconfigure(column, weight=1)
+        flow = ttk.Frame(
+            tab,
+            style="Organize.Flow.TFrame",
+            padding=(spacing.md, spacing.sm),
+        )
+        flow.grid(row=0, column=0, sticky="ew", pady=(0, spacing.sm))
+        flow.columnconfigure(1, weight=1)
+        self._flow_steps = ttk.Label(
+            flow,
+            text=(
+                "1  筛选队列   →   2  审核图片   →   3  对比差异   →   "
+                "4  批量或逐项提交"
+            ),
+            style="Organize.Flow.TLabel",
+        )
+        self._flow_steps.grid(row=0, column=0, sticky="w")
+        self._flow_hint = ttk.Label(
+            flow,
+            text="身份类标签不会自动批量写入",
+            style="Organize.FlowHint.TLabel",
+        )
+        self._flow_hint.grid(row=0, column=1, sticky="e", padx=(spacing.md, 0))
+
+        filters = ttk.Frame(
+            tab,
+            style="Organize.Panel.TFrame",
+            padding=(spacing.md, spacing.sm),
+        )
+        filters.grid(row=1, column=0, sticky="ew", pady=(0, spacing.sm))
+        filters.columnconfigure(0, weight=1)
+        filters.columnconfigure(1, weight=0)
+        filter_heading = ttk.Frame(filters, style="Organize.Surface.TFrame")
+        filter_heading.grid(row=0, column=0, sticky="ew", pady=(0, spacing.sm))
+        filter_heading.columnconfigure(1, weight=1)
+        ttk.Label(
+            filter_heading,
+            text="筛选建议",
+            style="Organize.Section.TLabel",
+        ).grid(row=0, column=0, sticky="w")
+        self._filter_hint = ttk.Label(
+            filter_heading,
+            text="按来源范围、内容和审核状态快速缩小队列",
+            style="Organize.Hint.TLabel",
+        )
+        self._filter_hint.grid(row=0, column=1, sticky="w", padx=(spacing.md, 0))
+
+        self._filter_grid = ttk.Frame(filters, style="Organize.Surface.TFrame")
+        self._filter_grid.grid(row=1, column=0, columnspan=2, sticky="ew")
+        latest = ttk.Frame(self._filter_grid, style="Organize.Surface.TFrame")
+        ttk.Label(latest, text="范围", style="Organize.Muted.TLabel").grid(
+            row=0, column=0, sticky="w", pady=(0, spacing.xs)
+        )
         ttk.Checkbutton(
-            filters,
-            text="仅本次新增",
+            latest,
+            text="仅本次新增图片",
             variable=self._latest_var,
-        ).grid(row=0, column=0, padx=(0, 9), sticky="w")
-        self._filter_entry(filters, "角色", self._character_var, 1)
-        self._filter_entry(filters, "作品", self._work_var, 3)
-        self._filter_entry(filters, "动作", self._action_var, 5)
-        self._filter_entry(filters, "神态", self._expression_var, 7)
-        ttk.Label(filters, text="状态").grid(row=0, column=9, padx=(8, 3))
+            style="Organize.TCheckbutton",
+        ).grid(row=1, column=0, sticky="w")
+        character = self._filter_entry(
+            self._filter_grid,
+            "角色",
+            self._character_var,
+        )
+        work = self._filter_entry(self._filter_grid, "作品", self._work_var)
+        action = self._filter_entry(self._filter_grid, "动作", self._action_var)
+        expression = self._filter_entry(
+            self._filter_grid,
+            "神态",
+            self._expression_var,
+        )
+        state = ttk.Frame(self._filter_grid, style="Organize.Surface.TFrame")
+        state.columnconfigure(0, weight=1)
+        ttk.Label(state, text="审核状态", style="Organize.Muted.TLabel").grid(
+            row=0, column=0, sticky="w", pady=(0, spacing.xs)
+        )
         self._review_state_combo = ttk.Combobox(
-            filters,
+            state,
             textvariable=self._review_state_var,
             values=[label for label, _value in _FILTER_STATES],
             state="readonly",
-            width=10,
+            style="Organize.TCombobox",
         )
-        self._review_state_combo.grid(row=0, column=10, padx=3)
-        ttk.Button(filters, text="应用", command=self.apply_filters).grid(
-            row=0, column=11, padx=(8, 3)
+        self._review_state_combo.grid(row=1, column=0, sticky="ew")
+        self._filter_items = [latest, character, work, action, expression, state]
+
+        filter_actions = ttk.Frame(filters, style="Organize.Surface.TFrame")
+        filter_actions.grid(
+            row=0,
+            column=1,
+            sticky="e",
+            padx=(spacing.md, 0),
+            pady=(0, spacing.sm),
         )
-        ttk.Button(filters, text="清除", command=self.clear_filters).grid(
-            row=0, column=12, padx=3
+        ttk.Button(
+            filter_actions,
+            text="清除筛选",
+            command=self.clear_filters,
+            style="Organize.Quiet.TButton",
+        ).pack(side="left")
+        ttk.Button(
+            filter_actions,
+            text="应用筛选",
+            command=self.apply_filters,
+            style="Organize.Secondary.TButton",
+        ).pack(side="left", padx=(spacing.sm, 0))
+
+        actions = ttk.Frame(
+            host,
+            style="Organize.Command.TFrame",
+            padding=(spacing.md, spacing.sm),
+        )
+        actions.grid(
+            row=1,
+            column=0,
+            columnspan=2,
+            sticky="ew",
+            pady=(spacing.sm, 0),
+        )
+        actions.columnconfigure(0, weight=1)
+        actions.columnconfigure(1, weight=1)
+        self._review_toolbar = actions
+        self._toolbar_heading = ttk.Frame(actions, style="Organize.Command.TFrame")
+        self._toolbar_heading.grid(row=0, column=0, columnspan=2, sticky="ew")
+        self._toolbar_heading.columnconfigure(1, weight=1)
+        ttk.Label(
+            self._toolbar_heading,
+            text="审核进度与提交",
+            style="Organize.CommandSection.TLabel",
+        ).grid(row=0, column=0, sticky="w")
+        self._toolbar_hint = ttk.Label(
+            self._toolbar_heading,
+            text="先确认当前页，再执行批量或逐项提交；所有未提交修改都可继续调整",
+            style="Organize.CommandHint.TLabel",
+        )
+        self._toolbar_hint.grid(
+            row=0,
+            column=1,
+            sticky="w",
+            padx=(spacing.md, 0),
         )
 
-        actions = ttk.Frame(tab)
-        actions.grid(row=1, column=0, sticky="ew", pady=(0, 7))
-        self._refresh_button = ttk.Button(actions, text="刷新", command=self.refresh)
-        self._refresh_button.pack(side="left", padx=(0, 4))
-        self._previous_button = ttk.Button(
-            actions, text="上一页 [", command=self.previous_page
-        )
-        self._previous_button.pack(side="left", padx=4)
-        self._next_button = ttk.Button(actions, text="下一页 ]", command=self.next_page)
-        self._next_button.pack(side="left", padx=4)
-        ttk.Separator(actions, orient="vertical").pack(side="left", fill="y", padx=8)
-        self._select_all_button = ttk.Button(
+        self._navigation_actions = ttk.Frame(
             actions,
+            style="Organize.Command.TFrame",
+        )
+        self._refresh_button = ttk.Button(
+            self._navigation_actions,
+            text="刷新",
+            command=self.refresh,
+            style="Organize.Quiet.TButton",
+        )
+        self._refresh_button.pack(side="left")
+        self._previous_button = ttk.Button(
+            self._navigation_actions,
+            text="上一页 [",
+            command=self.previous_page,
+            style="Organize.Quiet.TButton",
+        )
+        self._previous_button.pack(side="left", padx=(spacing.sm, 0))
+        self._next_button = ttk.Button(
+            self._navigation_actions,
+            text="下一页 ]",
+            command=self.next_page,
+            style="Organize.Quiet.TButton",
+        )
+        self._next_button.pack(side="left", padx=(spacing.sm, 0))
+
+        self._review_metrics = ttk.Frame(actions, style="Organize.Command.TFrame")
+        for variable, metric_style in (
+            (self._pending_var, "Organize.PendingMetric.TLabel"),
+            (self._progress_var, "Organize.ProgressMetric.TLabel"),
+            (self._selection_var, "Organize.SelectionMetric.TLabel"),
+            (self._page_var, "Organize.Metric.TLabel"),
+        ):
+            ttk.Label(
+                self._review_metrics,
+                textvariable=variable,
+                style=metric_style,
+            ).pack(side="left", padx=(spacing.sm, 0))
+
+        self._selection_actions = ttk.Frame(
+            actions,
+            style="Organize.Command.TFrame",
+        )
+        self._select_all_button = ttk.Button(
+            self._selection_actions,
             text="全选低风险",
             command=self.select_all_low_risk,
+            style="Organize.Quiet.TButton",
         )
-        self._select_all_button.pack(side="left", padx=4)
+        self._select_all_button.pack(side="left")
         self._clear_selection_button = ttk.Button(
-            actions,
+            self._selection_actions,
             text="清除选择",
             command=self.clear_low_risk_selection,
+            style="Organize.Quiet.TButton",
         )
-        self._clear_selection_button.pack(side="left", padx=4)
+        self._clear_selection_button.pack(side="left", padx=(spacing.sm, 0))
         self._batch_button = ttk.Button(
-            actions,
+            self._selection_actions,
             text="批量接受低风险",
             command=self.submit_low_risk_batch,
+            style="Organize.Secondary.TButton",
         )
-        self._batch_button.pack(side="left", padx=4)
+        self._batch_button.pack(side="left", padx=(spacing.sm, 0))
+
+        self._commit_actions = ttk.Frame(actions, style="Organize.Command.TFrame")
         self._submit_button = ttk.Button(
-            actions,
+            self._commit_actions,
             text="提交逐项审核",
             command=self.submit_reviews,
+            style="Organize.Primary.TButton",
         )
-        self._submit_button.pack(side="left", padx=4)
+        self._submit_button.pack(side="left")
         self._undo_button = ttk.Button(
-            actions,
+            self._commit_actions,
             text="撤销最近批量",
             command=self.undo_last_batch,
+            style="Organize.Danger.TButton",
         )
-        self._undo_button.pack(side="left", padx=4)
-        ttk.Label(actions, textvariable=self._page_var).pack(side="right", padx=5)
-        ttk.Label(actions, textvariable=self._progress_var).pack(side="right", padx=8)
-        ttk.Label(actions, textvariable=self._selection_var).pack(side="right", padx=8)
+        self._undo_button.pack(side="left", padx=(spacing.sm, 0))
 
-        pane = ttk.Panedwindow(tab, orient="horizontal")
-        pane.grid(row=2, column=0, sticky="nsew")
-        list_frame = ttk.Frame(pane)
-        detail_frame = ttk.Frame(pane, padding=(10, 0, 0, 0))
-        pane.add(list_frame, weight=3)
-        pane.add(detail_frame, weight=2)
-        self._build_review_list(list_frame)
-        self._build_review_detail(detail_frame)
+        self._review_workspace = ttk.Frame(tab, style="Organize.App.TFrame")
+        self._review_workspace.grid(row=2, column=0, sticky="nsew")
+        self._review_list_card = ttk.Frame(
+            self._review_workspace,
+            style="Organize.Card.TFrame",
+            padding=spacing.md,
+        )
+        self._review_detail_card = ttk.Frame(
+            self._review_workspace,
+            style="Organize.Card.TFrame",
+            padding=spacing.md,
+        )
+        self._build_review_list(self._review_list_card)
+        self._build_review_detail(self._review_detail_card)
 
         issue = ttk.Label(
             tab,
             textvariable=self._issue_var,
-            foreground=self._theme.warning,
+            style="Organize.Warning.TLabel",
         )
-        issue.grid(row=3, column=0, sticky="w", pady=(5, 0))
+        issue.grid(row=3, column=0, sticky="w", pady=(spacing.xs, 0))
 
     def _filter_entry(
         self,
-        parent: ttk.LabelFrame,
+        parent: ttk.Frame,
         label: str,
         variable: tk.StringVar,
-        column: int,
-    ) -> None:
-        ttk.Label(parent, text=label).grid(row=0, column=column, padx=(3, 2))
-        entry = ttk.Entry(parent, textvariable=variable, width=11)
-        entry.grid(row=0, column=column + 1, sticky="ew", padx=(0, 3))
+    ) -> ttk.Frame:
+        field = ttk.Frame(parent, style="Organize.Surface.TFrame")
+        field.columnconfigure(0, weight=1)
+        ttk.Label(field, text=label, style="Organize.Muted.TLabel").grid(
+            row=0,
+            column=0,
+            sticky="w",
+            pady=(0, self._theme.spacing.xs),
+        )
+        entry = ttk.Entry(
+            field,
+            textvariable=variable,
+            style="Organize.TEntry",
+        )
+        entry.grid(row=1, column=0, sticky="ew")
         entry.bind("<Return>", lambda _event: self.apply_filters(), add=True)
+        return field
 
     def _build_review_list(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
-        parent.rowconfigure(0, weight=1)
+        parent.rowconfigure(1, weight=1)
+        heading = ttk.Frame(parent, style="Organize.Surface.TFrame")
+        heading.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        heading.columnconfigure(1, weight=1)
+        ttk.Label(
+            heading,
+            text="待审核图片",
+            style="Organize.Section.TLabel",
+        ).grid(row=0, column=0, sticky="w")
+        self._review_list_hint = ttk.Label(
+            heading,
+            text="单页最多 100 张 · 选择一行查看来源与差异",
+            style="Organize.Hint.TLabel",
+        )
+        self._review_list_hint.grid(row=0, column=1, sticky="e")
         columns = ("batch", "state", "path", "low", "identity", "difference")
         self._review_tree = ttk.Treeview(
             parent,
             columns=columns,
             show="headings",
             selectmode="browse",
+            style="Organize.Treeview",
         )
+        self._review_tree.tag_configure("accepted", foreground=self._theme.success)
+        self._review_tree.tag_configure(
+            "edited",
+            foreground=self._theme.primary_pressed,
+        )
+        self._review_tree.tag_configure("rejected", foreground=self._theme.danger)
+        self._review_tree.tag_configure("identity", foreground=self._theme.warning)
+        self._review_tree.tag_configure("failed", foreground=self._theme.danger)
+        self._review_tree.tag_configure("low_risk", foreground=self._theme.success)
         headings = {
             "batch": "批量",
             "state": "状态",
@@ -711,12 +1468,12 @@ class OrganizePanel(ttk.Frame):
             "difference": "现有 / 建议差异",
         }
         widths = {
-            "batch": 48,
-            "state": 90,
-            "path": 230,
-            "low": 155,
-            "identity": 155,
-            "difference": 230,
+            "batch": 46,
+            "state": 82,
+            "path": 190,
+            "low": 125,
+            "identity": 125,
+            "difference": 130,
         }
         for name in columns:
             self._review_tree.heading(name, text=headings[name])
@@ -726,54 +1483,115 @@ class OrganizePanel(ttk.Frame):
                 minwidth=40,
                 stretch=name in {"path", "difference"},
             )
-        scrollbar = ttk.Scrollbar(
+        self._review_tree_scrollbar = ttk.Scrollbar(
             parent,
             orient="vertical",
             command=self._review_tree.yview,
+            style="Organize.Vertical.TScrollbar",
         )
-        self._review_tree.configure(yscrollcommand=scrollbar.set)
-        self._review_tree.grid(row=0, column=0, sticky="nsew")
-        scrollbar.grid(row=0, column=1, sticky="ns")
+        self._review_tree.configure(yscrollcommand=self._review_tree_scrollbar.set)
+        self._review_tree.grid(row=1, column=0, sticky="nsew")
+        self._review_tree_scrollbar.grid(row=1, column=1, sticky="ns")
         self._review_tree.bind("<<TreeviewSelect>>", self._on_review_select, add=True)
+
+        self._review_empty = ttk.Frame(
+            parent,
+            style="Organize.Empty.TFrame",
+            padding=(self._theme.spacing.xl, self._theme.spacing.xl),
+        )
+        self._review_empty.columnconfigure(0, weight=1)
+        self._review_empty.rowconfigure(0, weight=1)
+        empty_content = ttk.Frame(
+            self._review_empty,
+            style="Organize.Empty.TFrame",
+        )
+        empty_content.grid(row=0, column=0)
+        ttk.Label(
+            empty_content,
+            textvariable=self._review_empty_title_var,
+            style="Organize.EmptyTitle.TLabel",
+        ).pack()
+        ttk.Label(
+            empty_content,
+            textvariable=self._review_empty_hint_var,
+            style="Organize.EmptyHint.TLabel",
+            justify="center",
+            wraplength=420,
+        ).pack(pady=(self._theme.spacing.xs, 0))
+        self._review_empty.grid(row=1, column=0, columnspan=2, sticky="nsew")
+        self._show_review_empty(
+            "审核队列尚未加载",
+            "刷新后会在这里显示待审核的图片建议",
+        )
 
     def _build_review_detail(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
-        parent.rowconfigure(5, weight=1)
+        parent.rowconfigure(6, weight=1)
+        detail_heading = ttk.Frame(parent, style="Organize.Surface.TFrame")
+        detail_heading.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        detail_heading.columnconfigure(1, weight=1)
+        ttk.Label(
+            detail_heading,
+            text="图片与标签差异",
+            style="Organize.Section.TLabel",
+        ).grid(row=0, column=0, sticky="w")
+        self._detail_hint = ttk.Label(
+            detail_heading,
+            text="双击预览可打开原图",
+            style="Organize.Hint.TLabel",
+        )
+        self._detail_hint.grid(row=0, column=1, sticky="e")
         self._preview = self._thumbnail_factory(
             parent,
             self._image_dispatcher,
             self._theme,
         )
-        self._preview.grid(row=0, column=0, sticky="ew")
+        self._preview.grid(row=1, column=0, sticky="ew")
         self._preview.configure(height=190)
         self._preview.bind("<Double-Button-1>", self._open_selected_image, add=True)
         ttk.Label(
             parent,
             textvariable=self._path_var,
-            font=("Microsoft YaHei UI", 10, "bold"),
+            style="Organize.Section.TLabel",
             wraplength=480,
-        ).grid(row=1, column=0, sticky="w", pady=(7, 2))
+        ).grid(row=2, column=0, sticky="w", pady=(8, 2))
         ttk.Label(
             parent,
             textvariable=self._description_var,
-            foreground=self._theme.text_muted,
+            style="Organize.Muted.TLabel",
             wraplength=480,
-        ).grid(row=2, column=0, sticky="w")
+        ).grid(row=3, column=0, sticky="w")
 
-        differences = ttk.Frame(parent)
-        differences.grid(row=3, column=0, sticky="ew", pady=(7, 5))
-        for row, variable in enumerate(
-            (self._existing_var, self._suggested_var, self._difference_var)
+        differences = ttk.Frame(
+            parent,
+            style="Organize.Surface.TFrame",
+        )
+        differences.grid(row=4, column=0, sticky="ew", pady=(8, 6))
+        differences.columnconfigure(0, weight=1)
+        for row, variable, difference_style in (
+            (0, self._existing_var, "Organize.DiffExisting.TLabel"),
+            (1, self._suggested_var, "Organize.DiffSuggested.TLabel"),
+            (2, self._difference_var, "Organize.DiffChange.TLabel"),
         ):
             ttk.Label(
                 differences,
                 textvariable=variable,
+                style=difference_style,
                 wraplength=480,
-            ).grid(row=row, column=0, sticky="w")
+            ).grid(
+                row=row,
+                column=0,
+                sticky="ew",
+                pady=(0, self._theme.spacing.xs if row < 2 else 0),
+            )
 
-        ttk.Label(parent, text="标签来源").grid(row=4, column=0, sticky="w")
-        source_frame = ttk.Frame(parent)
-        source_frame.grid(row=5, column=0, sticky="nsew", pady=(2, 6))
+        ttk.Label(
+            parent,
+            text="标签来源",
+            style="Organize.Muted.TLabel",
+        ).grid(row=5, column=0, sticky="w")
+        source_frame = ttk.Frame(parent, style="Organize.Surface.TFrame")
+        source_frame.grid(row=6, column=0, sticky="nsew", pady=(4, 8))
         source_frame.columnconfigure(0, weight=1)
         source_frame.rowconfigure(0, weight=1)
         self._source_tree = ttk.Treeview(
@@ -781,6 +1599,7 @@ class OrganizePanel(ttk.Frame):
             columns=("tag", "source", "state", "confidence"),
             show="headings",
             height=6,
+            style="Organize.Treeview",
         )
         for name, label, width in (
             ("tag", "标签", 110),
@@ -794,133 +1613,693 @@ class OrganizePanel(ttk.Frame):
             source_frame,
             orient="vertical",
             command=self._source_tree.yview,
+            style="Organize.Vertical.TScrollbar",
         )
         self._source_tree.configure(yscrollcommand=source_scroll.set)
         self._source_tree.grid(row=0, column=0, sticky="nsew")
         source_scroll.grid(row=0, column=1, sticky="ns")
 
-        editor = ttk.LabelFrame(parent, text="逐项审核", padding=7)
-        editor.grid(row=6, column=0, sticky="ew")
+        editor = ttk.Frame(
+            parent,
+            style="Organize.Editor.TFrame",
+            padding=(self._theme.spacing.md, self._theme.spacing.sm),
+        )
+        editor.grid(row=7, column=0, sticky="ew")
         editor.columnconfigure(1, weight=1)
-        ttk.Label(editor, text="写入标签").grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            editor,
+            text="逐项审核",
+            style="Organize.EditorSection.TLabel",
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            editor,
+            text="编辑普通标签；身份类标签需在下方逐项确认",
+            style="Organize.CommandHint.TLabel",
+        ).grid(row=0, column=1, sticky="e")
+        ttk.Label(
+            editor,
+            text="写入标签",
+            style="Organize.EditorMuted.TLabel",
+        ).grid(row=1, column=0, sticky="w", pady=(self._theme.spacing.sm, 0))
         self._edited_tags_entry = ttk.Entry(
             editor,
             textvariable=self._edited_tags_var,
+            style="Organize.TEntry",
         )
-        self._edited_tags_entry.grid(row=0, column=1, sticky="ew", padx=(6, 0))
+        self._edited_tags_entry.grid(
+            row=1,
+            column=1,
+            sticky="ew",
+            padx=(self._theme.spacing.sm, 0),
+            pady=(self._theme.spacing.sm, 0),
+        )
         self._edited_tags_entry.bind("<Return>", self._on_editor_return, add=True)
         self._edited_tags_entry.bind("<FocusOut>", self._on_editor_focus_out, add=True)
 
-        self._identity_frame = ttk.Frame(editor)
-        self._identity_frame.grid(
-            row=1, column=0, columnspan=2, sticky="ew", pady=(6, 2)
+        self._identity_frame = ttk.Frame(
+            editor,
+            style="Organize.Editor.TFrame",
+            padding=(self._theme.spacing.sm, self._theme.spacing.xs),
         )
-        ttk.Checkbutton(
+        self._identity_frame.grid(
+            row=2,
+            column=0,
+            columnspan=2,
+            sticky="ew",
+            pady=(self._theme.spacing.sm, self._theme.spacing.xs),
+        )
+        self._batch_check = ttk.Checkbutton(
             editor,
             text="加入低风险批量",
             variable=self._batch_var,
             command=self._on_batch_toggle,
-        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(3, 4))
-        decision_buttons = ttk.Frame(editor)
-        decision_buttons.grid(row=3, column=0, columnspan=2, sticky="ew")
-        ttk.Button(
-            decision_buttons,
+            style="Organize.Editor.TCheckbutton",
+        )
+        self._batch_check.grid(
+            row=3,
+            column=0,
+            columnspan=2,
+            sticky="w",
+            pady=(0, 4),
+        )
+        self._decision_buttons = ttk.Frame(editor, style="Organize.Editor.TFrame")
+        self._decision_buttons.grid(row=4, column=0, columnspan=2, sticky="ew")
+        for column in range(3):
+            self._decision_buttons.columnconfigure(column, weight=1)
+        self._accept_button = ttk.Button(
+            self._decision_buttons,
             text="接受 A",
             command=self.mark_selected_accept,
-        ).pack(side="left", padx=(0, 3))
-        ttk.Button(
-            decision_buttons,
+            style="Organize.Secondary.TButton",
+        )
+        self._accept_button.grid(row=0, column=0, sticky="ew", padx=(0, 3))
+        self._edit_button = ttk.Button(
+            self._decision_buttons,
             text="编辑 E",
             command=self.mark_selected_edit,
-        ).pack(side="left", padx=3)
-        ttk.Button(
-            decision_buttons,
+            style="Organize.Quiet.TButton",
+        )
+        self._edit_button.grid(row=0, column=1, sticky="ew", padx=3)
+        self._reject_button = ttk.Button(
+            self._decision_buttons,
             text="拒绝 R",
             command=self.mark_selected_reject,
-        ).pack(side="left", padx=3)
+            style="Organize.Danger.TButton",
+        )
+        self._reject_button.grid(row=0, column=2, sticky="ew", padx=(3, 0))
         self._identity_submit_button = ttk.Button(
-            decision_buttons,
+            self._decision_buttons,
             text="仅提交当前身份",
             command=self.submit_selected_identity,
+            style="Organize.Secondary.TButton",
         )
-        self._identity_submit_button.pack(side="left", padx=(10, 3))
-        ttk.Label(
-            decision_buttons,
+        self._identity_submit_button.grid(
+            row=1,
+            column=0,
+            columnspan=2,
+            sticky="w",
+            pady=(self._theme.spacing.sm, 0),
+        )
+        self._decision_label = ttk.Label(
+            self._decision_buttons,
             textvariable=self._decision_var,
-            foreground=self._theme.primary,
-        ).pack(side="right")
+            style="Organize.EditorAccent.TLabel",
+        )
+        self._decision_label.grid(
+            row=1,
+            column=2,
+            sticky="e",
+            pady=(self._theme.spacing.sm, 0),
+        )
 
     def _build_alias_tab(self) -> None:
         tab = self._alias_tab
+        spacing = self._theme.spacing
         tab.columnconfigure(0, weight=1)
         tab.rowconfigure(1, weight=1)
-        toolbar = ttk.Frame(tab)
-        toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 7))
-        ttk.Button(toolbar, text="刷新", command=self.refresh_aliases).pack(
-            side="left", padx=(0, 4)
+        toolbar = ttk.Frame(
+            tab,
+            style="Organize.Panel.TFrame",
+            padding=(spacing.md, spacing.sm),
         )
-        ttk.Button(toolbar, text="新建", command=self.new_alias).pack(
-            side="left", padx=4
+        self._alias_toolbar = toolbar
+        toolbar.grid(row=0, column=0, sticky="ew", pady=(0, spacing.sm))
+        toolbar.columnconfigure(1, weight=1)
+        title = ttk.Frame(toolbar, style="Organize.Surface.TFrame")
+        self._alias_title = title
+        title.grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            title,
+            text="别名词典",
+            style="Organize.Section.TLabel",
+        ).grid(row=0, column=0, sticky="w")
+        self._alias_title_hint = ttk.Label(
+            title,
+            text="统一角色、作品与人物的不同叫法",
+            style="Organize.Hint.TLabel",
         )
-        ttk.Label(toolbar, textvariable=self._alias_summary_var).pack(
-            side="right", padx=4
+        self._alias_title_hint.grid(
+            row=0,
+            column=1,
+            sticky="w",
+            padx=(spacing.md, 0),
         )
+        self._alias_summary_label = ttk.Label(
+            toolbar,
+            textvariable=self._alias_summary_var,
+            style="Organize.Metric.TLabel",
+        )
+        self._alias_summary_label.grid(
+            row=0,
+            column=1,
+            sticky="e",
+            padx=spacing.sm,
+        )
+        alias_actions = ttk.Frame(toolbar, style="Organize.Surface.TFrame")
+        self._alias_actions = alias_actions
+        alias_actions.grid(row=0, column=2, sticky="e")
+        ttk.Button(
+            alias_actions,
+            text="刷新",
+            command=self.refresh_aliases,
+            style="Organize.Quiet.TButton",
+        ).pack(side="left")
+        ttk.Button(
+            alias_actions,
+            text="新建关系",
+            command=self.new_alias,
+            style="Organize.Secondary.TButton",
+        ).pack(side="left", padx=(spacing.sm, 0))
 
-        body = ttk.Panedwindow(tab, orient="horizontal")
-        body.grid(row=1, column=0, sticky="nsew")
-        list_frame = ttk.Frame(body)
-        edit_frame = ttk.LabelFrame(body, text="编辑别名关系", padding=10)
-        body.add(list_frame, weight=3)
-        body.add(edit_frame, weight=2)
+        self._alias_workspace = ttk.Frame(tab, style="Organize.App.TFrame")
+        self._alias_workspace.grid(row=1, column=0, sticky="nsew")
+        list_frame = ttk.Frame(
+            self._alias_workspace,
+            style="Organize.Card.TFrame",
+            padding=spacing.md,
+        )
+        edit_frame = ttk.Frame(
+            self._alias_workspace,
+            style="Organize.Card.TFrame",
+            padding=spacing.md,
+        )
+        self._alias_list_card = list_frame
+        self._alias_edit_card = edit_frame
 
         list_frame.columnconfigure(0, weight=1)
-        list_frame.rowconfigure(0, weight=1)
+        list_frame.rowconfigure(1, weight=1)
+        list_heading = ttk.Frame(list_frame, style="Organize.Surface.TFrame")
+        list_heading.grid(
+            row=0,
+            column=0,
+            columnspan=2,
+            sticky="ew",
+            pady=(0, spacing.sm),
+        )
+        list_heading.columnconfigure(1, weight=1)
+        ttk.Label(
+            list_heading,
+            text="已维护关系",
+            style="Organize.Section.TLabel",
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            list_heading,
+            text="选择一项可编辑或删除",
+            style="Organize.Hint.TLabel",
+        ).grid(row=0, column=1, sticky="e")
         self._alias_tree = ttk.Treeview(
             list_frame,
             columns=("canonical", "aliases"),
             show="headings",
             selectmode="browse",
+            style="Organize.Treeview",
         )
         self._alias_tree.heading("canonical", text="规范名称")
         self._alias_tree.heading("aliases", text="别名")
         self._alias_tree.column("canonical", width=180)
         self._alias_tree.column("aliases", width=420)
-        alias_scroll = ttk.Scrollbar(
+        self._alias_tree_scrollbar = ttk.Scrollbar(
             list_frame,
             orient="vertical",
             command=self._alias_tree.yview,
+            style="Organize.Vertical.TScrollbar",
         )
-        self._alias_tree.configure(yscrollcommand=alias_scroll.set)
-        self._alias_tree.grid(row=0, column=0, sticky="nsew")
-        alias_scroll.grid(row=0, column=1, sticky="ns")
+        self._alias_tree.configure(yscrollcommand=self._alias_tree_scrollbar.set)
+        self._alias_tree.grid(row=1, column=0, sticky="nsew")
+        self._alias_tree_scrollbar.grid(row=1, column=1, sticky="ns")
         self._alias_tree.bind("<<TreeviewSelect>>", self._on_alias_select, add=True)
 
+        self._alias_empty = ttk.Frame(
+            list_frame,
+            style="Organize.Empty.TFrame",
+            padding=(spacing.xl, spacing.xl),
+        )
+        self._alias_empty.columnconfigure(0, weight=1)
+        self._alias_empty.rowconfigure(0, weight=1)
+        alias_empty_content = ttk.Frame(
+            self._alias_empty,
+            style="Organize.Empty.TFrame",
+        )
+        alias_empty_content.grid(row=0, column=0)
+        ttk.Label(
+            alias_empty_content,
+            textvariable=self._alias_empty_title_var,
+            style="Organize.EmptyTitle.TLabel",
+        ).pack()
+        ttk.Label(
+            alias_empty_content,
+            textvariable=self._alias_empty_hint_var,
+            style="Organize.EmptyHint.TLabel",
+            justify="center",
+            wraplength=360,
+        ).pack(pady=(spacing.xs, 0))
+        self._alias_empty.grid(row=1, column=0, columnspan=2, sticky="nsew")
+        self._show_alias_empty(
+            "别名词典尚未加载",
+            "刷新后可维护角色、作品与人物的等价叫法",
+        )
+
         edit_frame.columnconfigure(1, weight=1)
-        ttk.Label(edit_frame, text="规范名称").grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            edit_frame,
+            text="编辑别名关系",
+            style="Organize.Section.TLabel",
+        ).grid(
+            row=0,
+            column=0,
+            columnspan=2,
+            sticky="w",
+            pady=(0, spacing.sm),
+        )
+        ttk.Label(
+            edit_frame,
+            text="规范名称",
+            style="Organize.Muted.TLabel",
+        ).grid(row=1, column=0, sticky="w")
         self._alias_canonical_entry = ttk.Entry(
             edit_frame,
             textvariable=self._alias_canonical_var,
+            style="Organize.TEntry",
         )
         self._alias_canonical_entry.grid(
-            row=0, column=1, sticky="ew", padx=(7, 0), pady=3
-        )
-        ttk.Label(edit_frame, text="别名").grid(row=1, column=0, sticky="w")
-        ttk.Entry(edit_frame, textvariable=self._alias_values_var).grid(
             row=1, column=1, sticky="ew", padx=(7, 0), pady=3
         )
         ttk.Label(
             edit_frame,
+            text="别名",
+            style="Organize.Muted.TLabel",
+        ).grid(row=2, column=0, sticky="w")
+        ttk.Entry(
+            edit_frame,
+            textvariable=self._alias_values_var,
+            style="Organize.TEntry",
+        ).grid(row=2, column=1, sticky="ew", padx=(7, 0), pady=3)
+        ttk.Label(
+            edit_frame,
             text="可用空格、逗号或分号分隔，例如：雷神 影 巴尔泽布",
-            foreground=self._theme.text_muted,
+            style="Organize.Hint.TLabel",
             wraplength=360,
-        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(5, 9))
-        buttons = ttk.Frame(edit_frame)
-        buttons.grid(row=3, column=0, columnspan=2, sticky="w")
-        ttk.Button(buttons, text="保存", command=self.save_alias).pack(
-            side="left", padx=(0, 4)
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(5, 9))
+        buttons = ttk.Frame(edit_frame, style="Organize.Surface.TFrame")
+        buttons.grid(row=4, column=0, columnspan=2, sticky="e")
+        ttk.Button(
+            buttons,
+            text="删除关系",
+            command=self.delete_alias,
+            style="Organize.Danger.TButton",
+        ).pack(side="left")
+        ttk.Button(
+            buttons,
+            text="保存关系",
+            command=self.save_alias,
+            style="Organize.Primary.TButton",
+        ).pack(
+            side="left",
+            padx=(spacing.sm, 0),
         )
-        ttk.Button(buttons, text="删除", command=self.delete_alias).pack(
-            side="left", padx=4
+
+    def _on_review_canvas_configure(self, event: tk.Event[tk.Misc]) -> None:
+        if self._closed:
+            return
+        self._review_canvas.itemconfigure(
+            self._review_canvas_window,
+            width=max(1, event.width),
+        )
+        self._refresh_review_scrollregion()
+
+    def _on_review_content_configure(self, _event: tk.Event[tk.Misc]) -> None:
+        if not self._closed:
+            self._refresh_review_scrollregion()
+
+    def _refresh_review_scrollregion(self) -> None:
+        """Keep compact layouts scrollable without shrinking their controls."""
+
+        if self._closed:
+            return
+        try:
+            viewport_height = max(1, self._review_canvas.winfo_height())
+            required_height = max(1, self._review_content.winfo_reqheight())
+            target_height = max(viewport_height, required_height)
+            self._review_canvas.itemconfigure(
+                self._review_canvas_window,
+                height=target_height,
+            )
+            width = max(1, self._review_canvas.winfo_width())
+            self._review_canvas.configure(
+                scrollregion=(0, 0, width, target_height),
+            )
+        except tk.TclError:
+            if not self._closed:
+                raise
+
+    def _queue_review_scrollregion_refresh(self) -> None:
+        if self._closed:
+            return
+        if self._layout_after_handle is not None:
+            with suppress(tk.TclError):
+                self.after_cancel(self._layout_after_handle)
+        self._layout_after_handle = self.after_idle(
+            self._run_queued_scrollregion_refresh
+        )
+
+    def _run_queued_scrollregion_refresh(self) -> None:
+        self._layout_after_handle = None
+        self._refresh_review_scrollregion()
+
+    def _on_panel_configure(self, event: tk.Event[tk.Misc]) -> None:
+        """Reflow page-local controls without touching review state."""
+
+        if self._closed or event.widget is not self:
+            return
+        try:
+            self._apply_responsive_layout(event.width)
+        except tk.TclError:
+            # Configure events may already be queued while a containing page is
+            # being destroyed.  Ignore only that teardown race; live layout
+            # failures remain visible to tests and callers.
+            if not self._closed:
+                raise
+
+    def _apply_responsive_layout(self, width: int) -> None:
+        self._assert_ui_thread()
+        layout = calculate_organize_layout(width)
+        if layout == self._responsive_layout:
+            return
+        spacing = self._theme.spacing
+
+        if layout.filter_columns == 2:
+            self._flow_steps.configure(
+                text=(
+                    "1  筛选队列   →   2  审核图片\n3  对比差异   →   4  批量或逐项提交"
+                )
+            )
+        else:
+            self._flow_steps.configure(
+                text="1  筛选队列   →   2  审核图片   →   3  对比差异   →   "
+                "4  批量或逐项提交"
+            )
+        if layout.compact_actions:
+            self._flow_hint.grid_remove()
+            self._shortcut_label.grid_remove()
+            self._toolbar_hint.grid_remove()
+            for hint in (
+                self._filter_hint,
+                self._review_list_hint,
+                self._detail_hint,
+            ):
+                hint.grid_configure(
+                    row=1,
+                    column=0,
+                    columnspan=2,
+                    sticky="w",
+                    padx=0,
+                    pady=(spacing.xs, 0),
+                )
+            self._alias_title.grid_configure(columnspan=3, sticky="ew")
+            self._alias_summary_label.grid_configure(
+                row=1,
+                column=0,
+                sticky="w",
+                padx=0,
+                pady=(spacing.sm, 0),
+            )
+            self._alias_actions.grid_configure(
+                row=1,
+                column=2,
+                sticky="e",
+                pady=(spacing.sm, 0),
+            )
+            if layout.filter_columns == 2:
+                self._alias_title_hint.grid_configure(
+                    row=1,
+                    column=0,
+                    columnspan=2,
+                    sticky="w",
+                    padx=0,
+                    pady=(spacing.xs, 0),
+                )
+            else:
+                self._alias_title_hint.grid_configure(
+                    row=0,
+                    column=1,
+                    columnspan=1,
+                    sticky="w",
+                    padx=(spacing.md, 0),
+                    pady=0,
+                )
+        else:
+            self._flow_hint.grid()
+            self._shortcut_label.grid()
+            self._toolbar_hint.grid()
+            for hint in (
+                self._filter_hint,
+                self._toolbar_hint,
+            ):
+                hint.grid_configure(
+                    row=0,
+                    column=1,
+                    columnspan=1,
+                    sticky="w",
+                    padx=(spacing.md, 0),
+                    pady=0,
+                )
+            for hint in (self._review_list_hint, self._detail_hint):
+                hint.grid_configure(
+                    row=0,
+                    column=1,
+                    columnspan=1,
+                    sticky="e",
+                    padx=0,
+                    pady=0,
+                )
+            self._alias_title.grid_configure(
+                row=0,
+                column=0,
+                columnspan=1,
+                sticky="w",
+            )
+            self._alias_title_hint.grid_configure(
+                row=0,
+                column=1,
+                columnspan=1,
+                sticky="w",
+                padx=(spacing.md, 0),
+                pady=0,
+            )
+            self._alias_summary_label.grid_configure(
+                row=0,
+                column=1,
+                sticky="e",
+                padx=spacing.sm,
+                pady=0,
+            )
+            self._alias_actions.grid_configure(
+                row=0,
+                column=2,
+                sticky="e",
+                pady=0,
+            )
+
+        compact_button_text = layout.compact_actions
+        self._previous_button.configure(
+            text="上页 [" if compact_button_text else "上一页 ["
+        )
+        self._next_button.configure(
+            text="下页 ]" if compact_button_text else "下一页 ]"
+        )
+        self._clear_selection_button.configure(
+            text="清除" if compact_button_text else "清除选择"
+        )
+        self._batch_button.configure(
+            text="批量接受" if compact_button_text else "批量接受低风险"
+        )
+        self._submit_button.configure(
+            text="提交审核" if compact_button_text else "提交逐项审核"
+        )
+        self._undo_button.configure(
+            text="撤销批量" if compact_button_text else "撤销最近批量"
+        )
+
+        for column in range(6):
+            self._filter_grid.columnconfigure(
+                column,
+                weight=1 if column < layout.filter_columns else 0,
+                uniform="organize-filter" if column < layout.filter_columns else "",
+            )
+        for index, field in enumerate(self._filter_items):
+            field.grid_forget()
+            column = index % layout.filter_columns
+            field.grid(
+                row=index // layout.filter_columns,
+                column=column,
+                sticky="ew",
+                padx=(0, spacing.sm if column < layout.filter_columns - 1 else 0),
+                pady=(0, spacing.sm),
+            )
+
+        for group in (
+            self._navigation_actions,
+            self._review_metrics,
+            self._selection_actions,
+            self._commit_actions,
+        ):
+            group.grid_forget()
+        if layout.compact_actions:
+            self._review_metrics.grid(
+                row=1,
+                column=0,
+                columnspan=2,
+                sticky="w",
+                pady=(spacing.sm, 0),
+            )
+            if layout.filter_columns >= 3:
+                self._navigation_actions.grid(
+                    row=2,
+                    column=0,
+                    sticky="w",
+                    pady=(spacing.sm, 0),
+                )
+                self._commit_actions.grid(
+                    row=2,
+                    column=1,
+                    sticky="e",
+                    pady=(spacing.sm, 0),
+                )
+                self._selection_actions.grid(
+                    row=3,
+                    column=0,
+                    columnspan=2,
+                    sticky="w",
+                    pady=(spacing.sm, 0),
+                )
+            else:
+                self._navigation_actions.grid(
+                    row=2,
+                    column=0,
+                    columnspan=2,
+                    sticky="w",
+                    pady=(spacing.sm, 0),
+                )
+                self._selection_actions.grid(
+                    row=3,
+                    column=0,
+                    columnspan=2,
+                    sticky="w",
+                    pady=(spacing.sm, 0),
+                )
+                self._commit_actions.grid(
+                    row=4,
+                    column=0,
+                    columnspan=2,
+                    sticky="w",
+                    pady=(spacing.sm, 0),
+                )
+        else:
+            self._navigation_actions.grid(
+                row=1,
+                column=0,
+                sticky="w",
+                pady=(spacing.sm, 0),
+            )
+            self._review_metrics.grid(
+                row=1,
+                column=1,
+                sticky="e",
+                pady=(spacing.sm, 0),
+            )
+            self._selection_actions.grid(
+                row=2,
+                column=0,
+                sticky="w",
+                pady=(spacing.sm, 0),
+            )
+            self._commit_actions.grid(
+                row=2,
+                column=1,
+                sticky="e",
+                pady=(spacing.sm, 0),
+            )
+
+        self._layout_workspace(
+            self._review_workspace,
+            self._review_list_card,
+            self._review_detail_card,
+            stacked=layout.stacked_workspace,
+            vertical_weights=(3, 4),
+        )
+        self._layout_workspace(
+            self._alias_workspace,
+            self._alias_list_card,
+            self._alias_edit_card,
+            stacked=layout.stacked_workspace,
+            vertical_weights=(3, 2),
+        )
+        self._responsive_layout = layout
+        self._queue_review_scrollregion_refresh()
+
+    def _layout_workspace(
+        self,
+        workspace: ttk.Frame,
+        primary: ttk.Widget,
+        secondary: ttk.Widget,
+        *,
+        stacked: bool,
+        vertical_weights: tuple[int, int],
+    ) -> None:
+        """Lay out one pair of cards horizontally or vertically."""
+
+        spacing = self._theme.spacing
+        primary.grid_forget()
+        secondary.grid_forget()
+        for index in (0, 1):
+            workspace.columnconfigure(index, weight=0, uniform="")
+            workspace.rowconfigure(index, weight=0, uniform="")
+        if stacked:
+            workspace.columnconfigure(0, weight=1)
+            workspace.rowconfigure(0, weight=vertical_weights[0])
+            workspace.rowconfigure(1, weight=vertical_weights[1])
+            primary.grid(row=0, column=0, sticky="nsew")
+            secondary.grid(
+                row=1,
+                column=0,
+                sticky="nsew",
+                pady=(spacing.sm, 0),
+            )
+            return
+        workspace.rowconfigure(0, weight=1)
+        workspace.columnconfigure(0, weight=3, uniform="organize-workspace")
+        workspace.columnconfigure(1, weight=2, uniform="organize-workspace")
+        primary.grid(
+            row=0,
+            column=0,
+            sticky="nsew",
+            padx=(0, spacing.xs),
+        )
+        secondary.grid(
+            row=0,
+            column=1,
+            sticky="nsew",
+            padx=(spacing.xs, 0),
         )
 
     def _bind_shortcuts(self) -> None:
@@ -957,6 +2336,45 @@ class OrganizePanel(ttk.Frame):
     def _keyboard(callback: Callable[[], None]) -> str:
         callback()
         return "break"
+
+    def _show_review_empty(self, title: str, hint: str) -> None:
+        """Replace the blank review table with a useful, actionable state."""
+
+        self._review_empty_title_var.set(title)
+        self._review_empty_hint_var.set(hint)
+        self._review_tree.grid_remove()
+        self._review_tree_scrollbar.grid_remove()
+        self._review_empty.grid()
+
+    def _show_review_rows(self) -> None:
+        self._review_empty.grid_remove()
+        self._review_tree.grid()
+        self._review_tree_scrollbar.grid()
+
+    def _show_alias_empty(self, title: str, hint: str) -> None:
+        """Present loading and empty alias states without a blank data grid."""
+
+        self._alias_empty_title_var.set(title)
+        self._alias_empty_hint_var.set(hint)
+        self._alias_tree.grid_remove()
+        self._alias_tree_scrollbar.grid_remove()
+        self._alias_empty.grid()
+
+    def _show_alias_rows(self) -> None:
+        self._alias_empty.grid_remove()
+        self._alias_tree.grid()
+        self._alias_tree_scrollbar.grid()
+
+    def _has_active_filters(self) -> bool:
+        filters = self._read_filters()
+        return bool(
+            filters.latest_index_only
+            or filters.character
+            or filters.work
+            or filters.action
+            or filters.expression
+            or filters.review_state != "all"
+        )
 
     def _read_filters(self) -> OrganizeFilters:
         selected_label = self._review_state_var.get()
@@ -1017,8 +2435,10 @@ class OrganizePanel(ttk.Frame):
                 "end",
                 iid=row,
                 values=self._row_values(proposal),
+                tags=(self._row_visual_tag(proposal),),
             )
         if page.proposals:
+            self._show_review_rows()
             first_row = self._proposal_to_row[page.proposals[0].proposal_id]
             self._review_tree.selection_set(first_row)
             self._review_tree.focus(first_row)
@@ -1026,6 +2446,16 @@ class OrganizePanel(ttk.Frame):
             self._selected_proposal_id = page.proposals[0].proposal_id
         else:
             self._selected_proposal_id = None
+            if self._has_active_filters():
+                self._show_review_empty(
+                    "没有符合筛选条件的建议",
+                    "可以清除部分筛选条件，或刷新队列查看最新建议",
+                )
+            else:
+                self._show_review_empty(
+                    "当前没有待审核建议",
+                    "新的模型建议生成后会自动出现在这里",
+                )
         self._issue_var.set(
             ""
             if not page.issues
@@ -1056,6 +2486,25 @@ class OrganizePanel(ttk.Frame):
         )
         return batch, status, proposal.relative_path, low, identities, difference
 
+    def _row_visual_tag(self, proposal: OrganizeProposal) -> str:
+        """Map review semantics to restrained colour cues in the queue."""
+
+        session = self._require_session()
+        decision = session.state_for(proposal.proposal_id).decision
+        if decision == "accept":
+            return "accepted"
+        if decision in {"edit", "manual"}:
+            return "edited"
+        if decision == "reject":
+            return "rejected"
+        if "failed" in proposal.review_buckets or "conflict" in proposal.review_buckets:
+            return "failed"
+        if "identity" in proposal.review_buckets:
+            return "identity"
+        if "low_risk" in proposal.review_buckets:
+            return "low_risk"
+        return ""
+
     @staticmethod
     def _proposal_state_label(proposal: OrganizeProposal) -> str:
         for state in ("failed", "conflict", "identity", "low_risk", "pending"):
@@ -1083,6 +2532,7 @@ class OrganizePanel(ttk.Frame):
             child.destroy()
         self._identity_variables.clear()
         if proposal is None or self._session is None:
+            self._identity_frame.configure(style="Organize.Editor.TFrame")
             self._preview.set_image(None)
             self._path_var.set("请选择待审核图片")
             self._description_var.set("")
@@ -1147,10 +2597,11 @@ class OrganizePanel(ttk.Frame):
                 ),
             )
         if proposal.identity_choices:
+            self._identity_frame.configure(style="Organize.Identity.TFrame")
             ttk.Label(
                 self._identity_frame,
-                text="身份标签必须逐项确认：",
-                foreground=self._theme.warning,
+                text="身份标签必须逐项确认，未勾选的身份不会写入：",
+                style="Organize.IdentityWarning.TLabel",
             ).pack(anchor="w")
             for choice in proposal.identity_choices:
                 variable = tk.BooleanVar(
@@ -1169,12 +2620,14 @@ class OrganizePanel(ttk.Frame):
                     text=f"{_entity_label(choice.entity_type)}：{choice.tag}",
                     variable=variable,
                     command=toggle_identity,
+                    style="Organize.Identity.TCheckbutton",
                 ).pack(anchor="w", pady=1)
         else:
+            self._identity_frame.configure(style="Organize.Editor.TFrame")
             ttk.Label(
                 self._identity_frame,
                 text="无待确认身份标签",
-                foreground=self._theme.text_muted,
+                style="Organize.CommandHint.TLabel",
             ).pack(anchor="w")
         self._update_controls()
 
@@ -1248,7 +2701,11 @@ class OrganizePanel(ttk.Frame):
         row = self._proposal_to_row.get(proposal_id)
         proposal = self._proposal_by_id(proposal_id)
         if row is not None and proposal is not None:
-            self._review_tree.item(row, values=self._row_values(proposal))
+            self._review_tree.item(
+                row,
+                values=self._row_values(proposal),
+                tags=(self._row_visual_tag(proposal),),
+            )
         self._update_page_state()
 
     def _refresh_all_rows(self) -> None:
@@ -1261,11 +2718,13 @@ class OrganizePanel(ttk.Frame):
         page = self._page
         session = self._session
         if page is None or session is None:
+            self._pending_var.set("待审核 0 张")
             self._page_var.set("第 0 / 0 页")
             self._progress_var.set("已审核 0 / 100")
             self._selection_var.set("低风险已选 0 张")
         else:
             pagination = page.pagination
+            self._pending_var.set(f"待审核 {pagination.pending_count} 张")
             self._page_var.set(
                 f"第 {pagination.current_page} / {pagination.page_count} 页"
             )
@@ -1325,6 +2784,19 @@ class OrganizePanel(ttk.Frame):
             )
         )
         proposal = self._selected_proposal(optional=True)
+        has_selected = proposal is not None
+        decision_state = "normal" if not busy and has_selected else "disabled"
+        self._accept_button.configure(state=decision_state)
+        self._edit_button.configure(state=decision_state)
+        self._reject_button.configure(state=decision_state)
+        self._edited_tags_entry.configure(state=decision_state)
+        self._batch_check.configure(
+            state=(
+                "normal"
+                if not busy and proposal is not None and proposal.can_batch_accept
+                else "disabled"
+            )
+        )
         confirmed = (
             False
             if proposal is None or session is None
@@ -1404,6 +2876,13 @@ class OrganizePanel(ttk.Frame):
                 values=(entry.canonical_name, " · ".join(entry.aliases)),
             )
         self._alias_summary_var.set(f"共 {self._aliases.count} 组关系")
+        if self._aliases.entries:
+            self._show_alias_rows()
+        else:
+            self._show_alias_empty(
+                "还没有别名关系",
+                "点击“新建关系”，统一同一角色、作品或人物的不同叫法",
+            )
 
     def _on_alias_select(self, _event: tk.Event[tk.Misc] | None = None) -> None:
         selection = self._alias_tree.selection()
@@ -1477,6 +2956,16 @@ class OrganizePanel(ttk.Frame):
                 payload = item.future.result()
                 item.callback(payload)
             except Exception as exc:
+                if item.operation == "pending" and self._page is None:
+                    self._show_review_empty(
+                        "审核队列加载失败",
+                        "请检查后端状态后点击刷新，已完成的审核不会丢失",
+                    )
+                elif item.operation == "alias_list" and not self._aliases_loaded:
+                    self._show_alias_empty(
+                        "别名词典加载失败",
+                        "请检查后端状态后重试，现有别名关系不会被修改",
+                    )
                 self._show_error(_operation_error_title(item.operation), exc)
             finally:
                 self._update_controls()
@@ -1556,6 +3045,10 @@ class OrganizePanel(ttk.Frame):
         for row in self._review_tree.get_children():
             self._review_tree.delete(row)
         self._selected_proposal_id = None
+        self._show_review_empty(
+            "审核队列尚未加载",
+            "刷新后会在这里显示待审核的图片建议",
+        )
         self._render_selected()
         self._update_page_state()
 
@@ -1565,6 +3058,10 @@ class OrganizePanel(ttk.Frame):
         self._alias_canonical_var.set("")
         self._alias_values_var.set("")
         self._alias_summary_var.set("别名词典尚未加载")
+        self._show_alias_empty(
+            "别名词典尚未加载",
+            "刷新后可维护角色、作品与人物的等价叫法",
+        )
 
     def _default_confirm(self, title: str, message: str) -> bool:
         return bool(messagebox.askyesno(title, message, parent=self.winfo_toplevel()))

@@ -1,110 +1,164 @@
 # Zvec 图片检索
 
-Zvec 是本地图片库检索与整理工具。它使用 Zvec 保存本地索引，调用阿里云百炼模型生成向量和待审核标签，支持文字搜图、以图搜图、图文联合搜索、模糊标签搜索和跨图库查询。
+Zvec 是面向本地图库的检索与整理工具。它使用 Zvec 保存向量索引，调用阿里云百炼模型生成图片向量和结构化标签，支持文字搜图、以图搜图、图文联合、模糊标签和跨图库查询。
 
-Windows 桌面版已改为纯 Python 实现并冻结为独立程序。安装后不需要 PowerShell、.NET、Docker、WSL 或单独安装 Python。
+桌面版仅支持 Windows x64。运行时不需要 PowerShell、.NET、Docker、WSL、Node.js 或单独安装 Python。
 
 ## 下载与运行
 
-当前桌面候选只提供 Windows x64：
+Windows x64 构建采用以下命名：
 
-- 安装包：`Zvec-Desktop-Python-Preview-<version>-win-x64-unsigned-setup.exe`
-- 便携包：`Zvec-Desktop-Python-Preview-<version>-win-x64-portable.zip`
+```text
+Zvec-Desktop-<version>-win-x64-unsigned-setup.exe
+Zvec-Desktop-<version>-win-x64-portable.zip
+Zvec-Webview-Preview-<version>-win-x64-portable.zip
+Zvec-Webview-Preview-<version>-win-x64-unsigned-setup.exe
+```
 
-安装包按当前用户安装，不要求管理员权限。运行安装包，完成后从开始菜单启动 Zvec。
+安装包按当前用户安装，不要求管理员权限。便携包必须完整解压后运行，不能直接在 ZIP 内启动，也不要拆散同目录的 EXE、DLL 和 `_internal`。
 
-便携包需要先完整解压，再运行 `Zvec.Desktop.exe`。不要直接在 ZIP 内启动，也不要单独移动或删除同目录的 `zvec-backend.exe`、`zvec.exe` 和 `_internal`。
+Vue 3 界面当前以独立 Preview 交付。完整解压后运行：
 
-当前候选尚未进行 Authenticode 数字签名。Windows SmartScreen 可能显示“Windows 已保护你的电脑”。只有在下载来源和 SHA-256 校验值可信时，才选择“更多信息”→“仍要运行”。
+```text
+Zvec.WebviewPreview.exe
+```
 
-Windows ARM64 暂无原生版本；可在支持 x64 仿真的设备上试用本候选。
+Preview 复用现有 `config.json`、`models.json`、Workspace、Collection 和 Windows 凭据，不安装或覆盖旧桌面版。关闭窗口不会强制终止正在运行的索引或标注任务。
+
+当前候选未进行 Authenticode 签名。Windows SmartScreen 出现提示时，应先确认下载来源和 SHA-256，再决定是否选择“更多信息”→“仍要运行”。
+
+具体功能是否已进入某个安装包，以该包对应的 Release 说明、构建时间和 SHA-256 清单为准。
+
+## 主要功能
+
+| 页面 | 功能 |
+|---|---|
+| 图片搜索 | 文字、图片、图文联合、模糊标签、跨图库搜索；每页 15 张；显示命中标签、来源、分数和置信度 |
+| 图库任务 | 建立索引、同步、索引并标注、独立智能标注、费用估算、取消、持久任务历史和操作日志 |
+| 批量标签 | 按非空文件夹浏览；动态分页和多选；批量修改人工标签；支持撤销、标签来源、别名词典和安全文件夹清理 |
+| 设置 | 首次建库、编辑图库与结果目录、模型选择、JSON 配置和 API Key |
+
+搜索结果默认采用 5×3 画廊。小窗口自动减少列数并启用滚动。缩略图和右侧预览始终完整显示，不裁切原图。独立结果摘要栏已移除，结果数和状态收进画廊标题，查询方式、耗时和候选数进入操作日志。
+
+搜索按钮和输入框回车分别触发同一条受控搜索链路。单次本地请求默认 30 秒超时，完整搜索默认 120 秒看门狗；超时、取消或失败后按钮会自动恢复，迟到响应不会覆盖新结果。前端诊断日志位于：
+
+```text
+%LOCALAPPDATA%\zvec-image-search\logs\frontend-diagnostics.jsonl
+```
+
+日志只记录阶段、状态、耗时和计数，不记录查询正文、图片路径或 API Key。
+
+任务历史与可检索的结构化操作日志保存在：
+
+```text
+%LOCALAPPDATA%\zvec-image-search\activity.sqlite3
+```
+
+该数据库与图库 Workspace、Collection 和失败图片目录分离，使用 WAL 模式。默认保留 30 天或最多 50,000 条操作日志、10,000 条任务历史；活动任务不会被保留清理误删。API Key、Bearer Token、Cookie、密码、图片二进制和完整模型 Prompt/响应不会写入其中。
+
+交互方式：
+
+- 单击图片：查看标签和详细信息。
+- 双击图片：调用 Windows 默认程序打开原图。
+- “系统打开”：调用默认程序打开当前图片。
+- “所在文件夹”：打开 Windows Explorer 并选中该文件。
+- 左侧“清理搜索结果”：默认保留最近 3 次，只删除具备有效归属标记和结果清单的搜索结果目录。
+- 不提供应用内全屏查看。
+
+搜索结果清理不会删除缩略图缓存、查询缓存、失败图片、原图、Workspace、Collection 或用户自行创建的目录。
+
+## 智能标注与批量整理
+
+“图库任务”可对已有索引单独执行智能标注。默认范围为“未标注或源图片已变化”；已有当前标注和缓存命中的图片会跳过。该任务不会调用 `qwen3-vl-embedding`，也不会重建索引。页面提供候选数、缓存命中、预计请求、Token 和费用估算；选择“全部图片重新处理”需要额外确认。
+
+“批量标签”只列出至少有一张成功入库图片的文件夹，并按首次成功入库时间从新到旧排列。图片数量根据画廊实际宽高动态计算；窗口缩放后保留当前位置。单击选择，双击调用 Windows 默认程序打开原图。
+
+文件夹清理采用两阶段流程：
+
+1. 预览路径、图片数、文件数、大小和安全阻断项。
+2. 明确确认后，将目标暂存，再同步删除 Collection 向量和 SQLite 中的图片、标签与标注记录，最后清理暂存文件。
+
+程序异常退出后会从删除日志恢复未完成操作。清理不调用模型，不处理预览范围外的文件，也不会删除搜索结果、缓存、失败图片副本或其他用户目录。路径已变化、受保护目录、链接或状态不一致时会停止提交，而不是扩大删除范围。
 
 ## 首次使用
 
-1. 打开“设置”→“图库与路径”。
-2. 填写图库名称并选择图片文件夹。Workspace 和结果目录可使用默认值。
-3. 打开“API Key”，保存阿里云百炼 DashScope API Key。
-4. 打开“阿里云模型”，确认所用模型。
-5. 进入“图库任务”，执行“建立索引”或“建立索引并标注”。
-6. 索引完成后进入“图片搜索”。
+1. 打开“设置”，创建或编辑图库。
+2. 确认原图目录、Workspace 和结果目录互不嵌套。
+3. 保存阿里云百炼 DashScope API Key。
+4. 确认向量模型和标注模型。
+5. 在“图库任务”建立索引；已有索引可直接选择“智能标注”。
+6. 在“图片搜索”验证检索结果。
+7. 如启用智能标注，在“批量标签”查看来源、补充人工标签或维护别名。
 
-API Key 保存在当前用户的 Windows 凭据管理器中，不写入 `config.json`、`models.json` 或日志。建立索引、语义搜索和智能标注需要联网，并可能产生阿里云 API 费用。
+建议首次处理 10～50 张图片，确认目录、费用和搜索效果后再扩大批次。
 
-建议首次先处理 10～50 张图片，确认目录、搜索效果和费用，再扩大批次。
+## 模型与凭据
 
-## 四个页面
-
-| 页面 | 主要功能 |
-|---|---|
-| 图片搜索 | 文字、图片、图文联合、模糊标签和跨图库搜索；显示命中的标签与图库来源 |
-| 图库任务 | 建立索引、同步、索引并标注、统计、任务进度、取消和错误图片目录 |
-| 智能整理 | 筛选本次新增图片；审核模型建议；逐项确认身份；批量接受低风险标签；撤销最近批量操作；维护别名词典 |
-| 设置 | 首次建库、图库管理、模型选择、JSON 配置和 API Key |
-
-智能整理支持按角色、作品、动作、神态和审核状态筛选。真人身份、Cosplayer 名称、角色名和作品名优先采用人工标签、文件夹名或其他显式证据；身份标签不会随低风险标签批量写入。
-
-## 画廊、预览与全屏
-
-- 搜索结果每页显示 15 张。
-- 正常窗口自动铺成 5×3，并使用整个画廊区域。
-- 窗口较小时保留可读的卡片尺寸，自动改为纵向滚动布局。
-- 右侧预览默认完整显示图片，不裁掉边缘。
-- 双击结果或点击“全屏查看”进入全屏。
-- 全屏默认铺满屏幕；按空格在“完整显示”和“铺满屏幕”之间切换。
-- 全屏中按左右方向键切图，按 `Esc` 退出。
-
-## 后台任务与错误隔离
-
-界面、图片解码、后端轮询和模型请求分开运行。长时间索引或标注不会占用界面线程；任务执行时仍可查看结果、任务状态和日志。
-
-程序采用有界并发：
-
-- 文件扫描、校验和 SHA-256：默认并发 4。
-- `qwen3-vl-embedding`：默认并发 2。
-- 智能标注：默认并发 2。
-- 不同图库可并行处理；同一图库保持单写入者，避免损坏 Zvec 和 SQLite 状态。
-
-模型调用默认控制在每个模型 48 RPM、80,000 TPM 的安全水位，硬上限为 60 RPM、100,000 TPM。遇到 429、超时或临时网络故障时会受控退避，不会无限增加线程。
-
-单张图片失败不会终止整批任务。最终失败的图片按 SHA-256 去重复制到：
-
-```text
-<结果目录>\failed-images\blobs
-```
-
-每次任务的错误清单写入：
-
-```text
-<结果目录>\failed-images\jobs\<任务ID>.jsonl
-```
-
-鉴权、磁盘、SQLite 或 Collection 等系统性错误会暂停受影响的任务，并保留已经完成的结果；软件本身不会因此直接退出。
-
-## 模型配置
-
-默认模型均来自阿里云百炼 DashScope：
+默认模型均来自阿里云百炼：
 
 | 角色 | 默认模型 | 用途 |
 |---|---|---|
 | `embedding` | `qwen3-vl-embedding` | 图片索引、语义搜索和描述向量 |
 | `auto_tag_primary` | `qwen3-vl-flash` | 常规智能标注 |
-| `auto_tag_escalation` | `qwen3-vl-plus` | 疑难图片复核，可在设置中调整 |
+| `auto_tag_escalation` | `qwen3-vl-plus` | 疑难图片复核 |
 
-模型可在“设置”页面修改，也可编辑：
+模型可在设置页修改，也可编辑：
 
 ```text
 %LOCALAPPDATA%\zvec-image-search\models.json
 ```
 
-参考格式见 [model-catalog.default.json](./model-catalog.default.json)。只接受阿里云 DashScope 兼容模型和受支持的协议。更换标注模型不需要重建索引；更换向量模型后必须新建或重建 Collection，不能混用不同模型生成的向量。
+API Key 保存在当前用户的 Windows 凭据管理器，不写入 JSON、前端资源或日志。
 
-## 托盘与单实例
+更换标注模型不需要重建索引。更换向量模型后必须新建或重建 Collection，不能混用不同模型生成的向量。
 
-点击窗口右上角关闭按钮只会隐藏到系统托盘，后台任务继续运行。单击托盘图标或再次启动 Zvec 会恢复原窗口，不会创建第二个实例。
+通过策略校验的模型标签会自动批准，不要求逐项确认身份标签；来源和继承关系仍会保留，便于后续批量检查和修正。
 
-只有页面顶部“退出”或托盘菜单“退出 Zvec”会完整结束程序。安装、升级或卸载前，应先等待任务结束，再从上述入口退出。
+## 缓存与性能
 
-## 数据与旧版兼容
+Preview 使用两类界面缓存：
+
+- 结果清单缓存位于内存中。首次完整校验 `results.json`，后续翻页只读取当前 15 条；清单修改、替换或删除后自动失效。
+- 缩略图缓存位于：
+
+```text
+%LOCALAPPDATA%\zvec-image-search\cache\thumbnails-v1
+```
+
+缩略图缓存有容量和数量上限，可跨重启复用。程序限制同时生成缩略图的数量，避免大量高分辨率照片同时解码造成内存峰值。
+
+这些缓存只保存搜索展示数据和缩略图：
+
+- 不调用大模型。
+- 不重新生成向量。
+- 不修改 Collection、SQLite 或原图。
+
+需要清理缩略图缓存时，应先退出 Zvec，再删除 `thumbnails-v1`。程序会按需重建。CLI 的 `cache-clear` 清理的是查询向量缓存，与缩略图缓存不是同一项。
+
+## 并发与错误隔离
+
+界面、图片解码、后端任务和模型请求分开执行。不同图库可以并行，同一图库保持单写入者，避免损坏 Zvec 和 SQLite 状态。
+
+默认安全水位：
+
+- 文件扫描与哈希：并发 4。
+- `qwen3-vl-embedding`：并发 2。
+- 智能标注：并发 2。
+- 每个模型 48 RPM、80,000 TPM；不会超过 60 RPM、100,000 TPM。
+
+单张图片失败不会终止整批任务。最终失败图片按 SHA-256 去重保存到：
+
+```text
+<结果目录>\failed-images\blobs
+```
+
+任务错误清单保存到：
+
+```text
+<结果目录>\failed-images\jobs\<任务ID>.jsonl
+```
+
+## 数据与迁移
 
 用户配置默认位于：
 
@@ -112,22 +166,22 @@ API Key 保存在当前用户的 Windows 凭据管理器中，不写入 `config.
 %LOCALAPPDATA%\zvec-image-search
 ```
 
-纯 Python 桌面版继续使用原有 `config.json`、`models.json`、Workspace、搜索结果和 Windows 凭据。卸载程序不会删除这些用户数据，也不会删除原图。
+安装、升级和卸载不会删除原图、Workspace、Collection、结果目录或 Windows 凭据。
 
-原生 schema v3 配置可直接复用。旧 bind Workspace 可原地迁移并保留已有向量；旧 Docker named volume 需要在仍能访问原 volume 的环境中做一次导出。迁移和 Collection schema 升级不会重新调用模型。详见 [从 Docker 迁移](./MIGRATION_FROM_DOCKER.md)。
+原生 schema v3 配置可直接复用。旧 bind Workspace 可原地迁移；旧 Docker named volume 需要先导出。Schema migration 和 rebind-root 保留已有向量，不调用模型。详见 [MIGRATION_FROM_DOCKER.md](./MIGRATION_FROM_DOCKER.md)。
 
-迁移前先备份，并先执行预演：
+迁移前先备份并执行预演：
 
 ```text
 zvec.exe migrate-docker-workspace --dry-run --destination "D:\ZvecData\workspace"
 zvec.exe migrate-schema --dry-run
 ```
 
-确认报告后再去掉 `--dry-run`。迁移报告中的 `api_requests` 应为 `0`。
+迁移报告中的 `api_requests` 应为 `0`。
 
 ## 随包 CLI
 
-安装包和便携包都包含 `zvec.exe`。它与桌面端使用同一份配置，可用于诊断、自动化和迁移：
+安装包和便携包包含 `zvec.exe`，与桌面端共用配置：
 
 ```text
 zvec.exe help
@@ -138,30 +192,61 @@ zvec.exe search "海边日落" --tk 15
 zvec.exe stats
 ```
 
-CLI 不是桌面端的必需操作路径。普通使用只需要图形界面。
+普通使用不需要 CLI。
 
 ## 从源码开发
 
-源码开发需要 CPython 3.10+；Windows x64 安装包固定使用 CPython 3.12 构建。
+Python 后端需要 CPython 3.10+。Windows x64 发布构建固定使用 CPython 3.12。
 
 ```text
 python -m venv .venv
 .venv\Scripts\python.exe -m pip install --constraint requirements-lock.txt --editable . --requirement requirements-dev.txt
 .venv\Scripts\python.exe -m ruff check .
 .venv\Scripts\python.exe -m ruff format --check .
-.venv\Scripts\python.exe -m mypy image_vector_service zvec_desktop image_service.py zvec_launcher.py zvec_logging.py scripts/build_python_preview.py scripts/python_preview_packaging.py
+.venv\Scripts\python.exe -m mypy image_vector_service zvec_desktop zvec_webview image_service.py zvec_launcher.py zvec_logging.py scripts
 .venv\Scripts\python.exe -m unittest discover -s tests -v
-.venv\Scripts\python.exe -m zvec_desktop.app
 ```
 
-纯 Python 候选构建：
+Vue 前端开发需要 Node.js 20.19+。Node 只用于开发和构建，不进入发布包。
 
 ```text
-python -m pip install --requirement requirements-packaging.txt
-python scripts/build_python_preview.py --dry-run
-python scripts/build_python_preview.py --output-root dist\python-preview\0.4.0-win-x64 --makensis "C:\Program Files (x86)\NSIS\makensis.exe"
+cd frontend
+npm.cmd ci
+npm.cmd run typecheck
+npm.cmd test
+npm.cmd run dev
+npm.cmd run build
 ```
 
-构建脚本生成安装包、便携 ZIP 和带 SHA-256 的 payload 清单。完整发布边界见 [发布说明](./RELEASE.md)。
+`npm.cmd run build` 将经过类型检查的静态资源写入：
 
-最佳实践：Workspace 和搜索结果目录应放在原图目录之外，并单独备份。
+```text
+zvec_webview\frontend_dist
+```
+
+联调前先构建前端，再启动 Python 宿主：
+
+```text
+python -m zvec_webview.app
+```
+
+## 构建 Windows x64 Preview
+
+构建机需要 Windows x64、CPython 3.12、Node.js 20.19+ 和锁定依赖。构建脚本会依次执行 `npm ci`、类型检查、前端测试和 Vite 构建，再冻结 Python 宿主。
+
+```text
+python -m pip install --requirement requirements-webview-preview-lock.txt
+python scripts/provision_nsis.py --output-directory build/tools/nsis-3.12
+python scripts/build_webview_preview.py --dry-run
+python scripts/build_webview_preview.py --makensis build/tools/nsis-3.12/nsis-3.12/Bin/makensis.exe
+```
+
+输出位于：
+
+```text
+dist\webview-preview\<version>\win-x64
+```
+
+省略 `--makensis` 时只生成便携包。发布包只包含 `frontend_dist` 的编译产物，不包含 `frontend/src`、Node.js 或 `node_modules`。完整发布边界见 [RELEASE.md](./RELEASE.md)。
+
+最佳实践：原图、Workspace、结果目录和备份目录应彼此独立。

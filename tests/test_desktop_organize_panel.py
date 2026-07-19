@@ -24,7 +24,13 @@ from zvec_desktop.library_tasks import (
     TagAliasListRequest,
     TagAliasUpsertRequest,
 )
-from zvec_desktop.organize_panel import OrganizePanel, parse_tag_text
+from zvec_desktop.organize_panel import (
+    OrganizePanel,
+    OrganizeResponsiveLayout,
+    calculate_organize_layout,
+    parse_tag_text,
+)
+from zvec_desktop.theme import DEFAULT_THEME
 from zvec_desktop.widgets import ImageTaskDispatcher
 
 
@@ -247,6 +253,31 @@ class ParseTagTextTest(unittest.TestCase):
         )
 
 
+class OrganizeResponsiveLayoutTest(unittest.TestCase):
+    def test_normal_and_narrow_widths_have_deterministic_layouts(self) -> None:
+        self.assertEqual(
+            calculate_organize_layout(1200),
+            OrganizeResponsiveLayout(
+                filter_columns=6,
+                compact_actions=False,
+                stacked_workspace=False,
+            ),
+        )
+        self.assertEqual(
+            calculate_organize_layout(760),
+            OrganizeResponsiveLayout(
+                filter_columns=3,
+                compact_actions=True,
+                stacked_workspace=True,
+            ),
+        )
+        self.assertEqual(calculate_organize_layout(480).filter_columns, 2)
+
+    def test_width_validation_rejects_non_integer_values(self) -> None:
+        with self.assertRaises(TypeError):
+            calculate_organize_layout(760.0)  # type: ignore[arg-type]
+
+
 @unittest.skipUnless(os.name == "nt", "tkinter UI tests require Windows")
 class OrganizePanelUiTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -309,6 +340,8 @@ class OrganizePanelUiTest(unittest.TestCase):
         self._load()
 
         self.assertEqual(len(self.panel._review_tree.get_children()), 2)
+        self.assertEqual(self.panel._review_tree.winfo_manager(), "grid")
+        self.assertEqual(self.panel._review_empty.winfo_manager(), "")
         self.assertEqual(self.panel.selected_proposal_id, "proposal-000")
         self.assertEqual(self.panel._preview.mode, "contain")
         self.assertEqual(self.panel._preview.path, self.image_path)
@@ -316,7 +349,89 @@ class OrganizePanelUiTest(unittest.TestCase):
         self.assertIn("低风险新增 站姿", self.panel._difference_var.get())
         self.assertIn("身份待确认 刻晴 · 原神", self.panel._difference_var.get())
         self.assertEqual(set(self.panel._identity_variables), {"刻晴", "原神"})
+        self.assertEqual(
+            str(self.panel._identity_frame["style"]),
+            "Organize.Identity.TFrame",
+        )
+        first_row = self.panel._review_tree.get_children()[0]
+        self.assertEqual(self.panel._review_tree.item(first_row, "tags"), ("identity",))
+        self.assertEqual(self.panel._pending_var.get(), "待审核 2 张")
         self.assertEqual(self.errors, [])
+
+    def test_empty_queue_is_actionable_and_disables_review_controls(self) -> None:
+        self.operations.pending_count = 0
+        self._load()
+
+        self.assertEqual(self.panel._review_tree.winfo_manager(), "")
+        self.assertEqual(self.panel._review_empty.winfo_manager(), "grid")
+        self.assertEqual(
+            self.panel._review_empty_title_var.get(),
+            "当前没有待审核建议",
+        )
+        self.assertIn("新的模型建议", self.panel._review_empty_hint_var.get())
+        self.assertEqual(str(self.panel._accept_button["state"]), "disabled")
+        self.assertEqual(str(self.panel._edited_tags_entry["state"]), "disabled")
+        self.assertEqual(str(self.panel._batch_check["state"]), "disabled")
+
+    def test_semantic_styles_and_responsive_reflow_keep_actions_accessible(
+        self,
+    ) -> None:
+        style = ttk.Style(self.root)
+        self.assertEqual(
+            style.lookup("Organize.Primary.TButton", "background"),
+            DEFAULT_THEME.primary,
+        )
+        self.assertEqual(
+            style.lookup("Organize.PendingMetric.TLabel", "background"),
+            DEFAULT_THEME.warning_soft,
+        )
+        self.assertEqual(
+            str(self.panel._review_toolbar["style"]),
+            "Organize.Command.TFrame",
+        )
+        self.assertIs(self.panel._review_toolbar.master, self.panel._review_tab)
+        self.assertEqual(int(self.panel._review_toolbar.grid_info()["row"]), 1)
+        self.assertEqual(self.panel._review_empty.winfo_manager(), "grid")
+        self.assertEqual(
+            str(self.panel._submit_button["style"]), "Organize.Primary.TButton"
+        )
+        self.assertEqual(
+            str(self.panel._batch_button["style"]),
+            "Organize.Secondary.TButton",
+        )
+        self.assertEqual(
+            str(self.panel._undo_button["style"]), "Organize.Danger.TButton"
+        )
+        self.assertEqual(str(self.panel._review_tree["style"]), "Organize.Treeview")
+
+        self.panel._apply_responsive_layout(1200)
+        self.root.update_idletasks()
+        self.assertEqual(
+            [int(field.grid_info()["row"]) for field in self.panel._filter_items],
+            [0, 0, 0, 0, 0, 0],
+        )
+        self.assertEqual(int(self.panel._review_list_card.grid_info()["row"]), 0)
+        self.assertEqual(int(self.panel._review_detail_card.grid_info()["column"]), 1)
+        self.assertEqual(self.panel._shortcut_label.winfo_manager(), "grid")
+        self.assertEqual(self.panel._flow_hint.winfo_manager(), "grid")
+
+        self.panel._apply_responsive_layout(760)
+        self.assertEqual(
+            [int(field.grid_info()["row"]) for field in self.panel._filter_items],
+            [0, 0, 0, 1, 1, 1],
+        )
+        self.assertEqual(int(self.panel._review_list_card.grid_info()["row"]), 0)
+        self.assertEqual(int(self.panel._review_detail_card.grid_info()["row"]), 1)
+        self.assertEqual(int(self.panel._commit_actions.grid_info()["row"]), 2)
+        self.assertEqual(str(self.panel._submit_button["text"]), "提交审核")
+        self.assertEqual(self.panel._shortcut_label.winfo_manager(), "")
+        self.assertEqual(self.panel._flow_hint.winfo_manager(), "")
+        self.assertEqual(self.panel._toolbar_hint.winfo_manager(), "")
+        self.assertEqual(
+            int(self.panel._alias_title.grid_info()["columnspan"]),
+            3,
+        )
+        self.assertTrue(self.panel._review_scrollbar.winfo_manager())
 
     def test_filters_and_pagination_build_library_task_requests(self) -> None:
         self.operations.pending_count = 201
@@ -515,6 +630,10 @@ class OrganizePanelUiTest(unittest.TestCase):
 
         self.assertIn("backend offline", self.errors[0][1])
         self.assertEqual(self.errors[0][2], threading.get_ident())
+        self.assertEqual(
+            self.panel._review_empty_title_var.get(),
+            "审核队列加载失败",
+        )
 
     def test_public_ui_mutations_reject_worker_thread_calls(self) -> None:
         self._load()
@@ -610,6 +729,37 @@ class OrganizePanelWindowSmokeTest(unittest.TestCase):
                 self.assertEqual(panel._preview.mode, "contain")
                 self.assertGreater(panel.winfo_width(), 800)
                 self.assertGreater(panel.winfo_height(), 600)
+
+                root.geometry("760x600+20+20")
+                deadline = time.monotonic() + 5
+                while (
+                    panel.responsive_layout is None
+                    or not panel.responsive_layout.stacked_workspace
+                ) and time.monotonic() < deadline:
+                    root.update()
+                    time.sleep(0.01)
+                root.update_idletasks()
+                assert panel.responsive_layout is not None
+                self.assertTrue(panel.responsive_layout.stacked_workspace)
+                self.assertEqual(panel.responsive_layout.filter_columns, 3)
+                self.assertEqual(
+                    [int(field.grid_info()["row"]) for field in panel._filter_items],
+                    [0, 0, 0, 1, 1, 1],
+                )
+                self.assertEqual(int(panel._review_detail_card.grid_info()["row"]), 1)
+                scrollregion = tuple(
+                    float(value)
+                    for value in panel._review_canvas.tk.splitlist(
+                        panel._review_canvas.cget("scrollregion")
+                    )
+                )
+                self.assertGreater(scrollregion[3], panel._review_canvas.winfo_height())
+                panel._review_canvas.yview_moveto(1.0)
+                root.update_idletasks()
+                self.assertGreater(panel._review_canvas.yview()[0], 0.0)
+                self.assertTrue(panel._submit_button.winfo_ismapped())
+                self.assertTrue(panel._review_tree.winfo_ismapped())
+                self.assertTrue(panel._identity_submit_button.winfo_ismapped())
             finally:
                 panel.destroy()
                 dispatcher.close()

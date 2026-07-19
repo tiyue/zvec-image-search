@@ -11,7 +11,13 @@ from pathlib import Path
 from typing import Any
 
 from .config import ConfigurationError, ServiceConfig
-from .models import ExportedHit, FileFailure, SearchHit, SearchReport
+from .models import (
+    ExportedHit,
+    FileFailure,
+    SearchHit,
+    SearchReport,
+    SearchSortMode,
+)
 
 WINDOWS_RESERVED_NAMES = {
     "CON",
@@ -25,6 +31,10 @@ BEIJING_TIMEZONE = timezone(timedelta(hours=8))
 RESULT_OWNERSHIP_MARKER = ".zvec-search-result.json"
 RESULT_OWNERSHIP_KIND = "zvec-search-result"
 RESULT_OWNERSHIP_SCHEMA_VERSION = 1
+RESULT_DIRECTORY_NAME_PATTERN = re.compile(
+    r"^.+_(?P<timestamp>\d{8}_\d{6}_\d{3})(?:_(?P<suffix>\d{2}))?$",
+    re.UNICODE,
+)
 
 
 def _safe_name(value: str, limit: int = 60) -> str:
@@ -74,6 +84,8 @@ def export_results(
     filtered_count: int | None = None,
     latency_ms: float = 0.0,
     ranking_mode: str = "distance",
+    sort_mode: SearchSortMode = "confidence",
+    ranking_diagnostics: dict[str, object] | None = None,
     show_low_confidence: bool = False,
     low_confidence_override: bool = False,
 ) -> SearchReport:
@@ -196,6 +208,8 @@ def export_results(
         ),
         latency_ms=max(0.0, float(latency_ms)),
         ranking_mode=ranking_mode,
+        sort_mode=sort_mode,
+        ranking_diagnostics=ranking_diagnostics,
         show_low_confidence=show_low_confidence,
         low_confidence_override=low_confidence_override,
         search_quality=search_quality,
@@ -220,9 +234,13 @@ def export_results(
                 "bounded [0,1] similarity indicator; cosine uses 1 - raw/2 and "
                 "weighted RRF uses raw*(rank_constant+1)"
             ),
-            "confidence": (
-                "same bounded indicator as normalized_score; not a calibrated "
-                "probability"
+            "confidence": ("bounded relevance confidence; not a probability"),
+            "ranking_confidence": (
+                "primary ordering value; falls back to confidence when absent"
+            ),
+            "sort_order": (
+                "confidence descending, then raw_score in the documented query "
+                "direction; normalized_score is not used for ordering"
             ),
             "match_state": "high, possible, or weak according to query-type thresholds",
             "rank_source": "image, text, metadata, fused, or tag",
@@ -333,7 +351,7 @@ def clean_result_directories(
         except OSError as exc:
             skipped.append({"path": str(path), "reason": str(exc)})
             continue
-        reason = _validate_owned_result_directory(path, root)
+        reason = _validate_cleanup_candidate(path, root)
         if reason is not None:
             skipped.append({"path": str(path), "reason": reason})
             continue
@@ -342,17 +360,18 @@ def clean_result_directories(
     failures: list[dict[str, str]] = []
     if not dry_run:
         for path in candidates:
-            resolved = path.resolve()
-            if resolved.parent != root:
-                failures.append(
-                    {"path": str(path), "error": "path escaped results directory"}
-                )
-                continue
             try:
-                shutil.rmtree(resolved)
+                resolved = path.resolve(strict=True)
+                if resolved.parent != root:
+                    raise OSError("path escaped results directory")
+                reason = _validate_cleanup_candidate(resolved, root)
+                if reason is not None:
+                    skipped.append({"path": str(resolved), "reason": reason})
+                    continue
+                _delete_cleanup_candidate(resolved, root)
                 deleted.append(str(resolved))
             except OSError as exc:
-                failures.append({"path": str(resolved), "error": str(exc)})
+                failures.append({"path": str(path), "error": str(exc)})
     return {
         "results_path": str(results_path),
         "older_than_days": older_than_days,
@@ -364,3 +383,217 @@ def clean_result_directories(
         "skipped_paths": skipped,
         "failures": failures,
     }
+
+
+def cleanup_search_results(
+    results_path: Path,
+    *,
+    keep_latest: int = 3,
+    dry_run: bool = False,
+) -> dict[str, object]:
+    """Delete only conclusively owned historical search result directories.
+
+    A directory must be a direct child of ``results_path``, use the generated
+    timestamp naming contract, and contain both a valid ownership marker and a
+    self-consistent results manifest. In-progress searches do not yet have both
+    files and are therefore skipped automatically.
+    """
+
+    if isinstance(keep_latest, bool) or not isinstance(keep_latest, int):
+        raise ValueError("keep_latest must be an integer.")
+    if not 1 <= keep_latest <= 100:
+        raise ValueError("keep_latest must be between 1 and 100.")
+    if not isinstance(dry_run, bool):
+        raise ValueError("dry_run must be a boolean.")
+
+    results_path.mkdir(parents=True, exist_ok=True)
+    root = results_path.resolve()
+    owned: list[tuple[float, Path]] = []
+    skipped: list[dict[str, str]] = []
+    try:
+        children = list(results_path.iterdir())
+    except OSError as exc:
+        raise ConfigurationError(
+            f"Cannot inspect the results directory: {results_path}"
+        ) from exc
+
+    for path in children:
+        try:
+            if not path.is_dir():
+                continue
+            name_match = RESULT_DIRECTORY_NAME_PATTERN.fullmatch(path.name)
+            if name_match is None:
+                skipped.append(
+                    {
+                        "path": str(path),
+                        "reason": "directory name is not a generated search result",
+                    }
+                )
+                continue
+            reason = _validate_cleanup_candidate(path, root)
+            if reason is not None:
+                skipped.append({"path": str(path), "reason": reason})
+                continue
+            try:
+                sort_key = _result_directory_sort_key(name_match)
+            except ValueError:
+                skipped.append(
+                    {
+                        "path": str(path),
+                        "reason": "directory timestamp is invalid",
+                    }
+                )
+                continue
+            owned.append((sort_key, path))
+        except OSError as exc:
+            skipped.append({"path": str(path), "reason": str(exc)})
+
+    owned.sort(key=lambda item: (item[0], item[1].name), reverse=True)
+    retained = [path for _mtime, path in owned[:keep_latest]]
+    candidates = [path for _mtime, path in owned[keep_latest:]]
+    for path in retained:
+        skipped.append(
+            {
+                "path": str(path),
+                "reason": f"retained as one of the latest {keep_latest} searches",
+            }
+        )
+
+    deleted: list[str] = []
+    failures: list[dict[str, str]] = []
+    if not dry_run:
+        for path in candidates:
+            try:
+                resolved = path.resolve(strict=True)
+                if resolved.parent != root:
+                    raise OSError("path escaped results directory")
+                if RESULT_DIRECTORY_NAME_PATTERN.fullmatch(resolved.name) is None:
+                    skipped.append(
+                        {
+                            "path": str(resolved),
+                            "reason": "directory name changed before deletion",
+                        }
+                    )
+                    continue
+                _delete_cleanup_candidate(resolved, root)
+                deleted.append(str(resolved))
+            except OSError as exc:
+                failures.append({"path": str(path), "error": str(exc)})
+
+    return {
+        "results_path": str(results_path),
+        "keep_latest": keep_latest,
+        "dry_run": dry_run,
+        "owned": len(owned),
+        "matched": len(candidates),
+        "deleted": len(deleted),
+        "deleted_paths": deleted,
+        "would_delete_paths": [str(path) for path in candidates] if dry_run else [],
+        "retained": len(retained),
+        "retained_paths": [str(path) for path in retained],
+        "skipped": len(skipped),
+        "skipped_paths": skipped,
+        "failed": len(failures),
+        "failures": failures,
+    }
+
+
+def _result_directory_sort_key(match: re.Match[str]) -> float:
+    generated = datetime.strptime(match.group("timestamp"), "%Y%m%d_%H%M%S_%f").replace(
+        tzinfo=BEIJING_TIMEZONE
+    )
+    suffix = int(match.group("suffix") or 0)
+    return generated.timestamp() + suffix / 1_000_000
+
+
+def _validate_cleanup_candidate(path: Path, root: Path) -> str | None:
+    reason = _validate_owned_result_directory(path, root)
+    if reason is not None:
+        return reason
+    manifest_path = path / "results.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:  # pragma: no cover - base check
+        return f"missing or invalid results manifest: {exc}"
+    raw_results = manifest.get("results") if isinstance(manifest, dict) else None
+    if not isinstance(raw_results, list):  # pragma: no cover - base check
+        return "results manifest has no results array"
+
+    declared, declaration_error = _cleanup_declared_names(raw_results)
+    if declaration_error is not None:
+        return declaration_error
+
+    try:
+        children = list(path.iterdir())
+    except OSError as exc:
+        return f"could not inspect directory contents: {exc}"
+    actual = {child.name for child in children}
+    undeclared = sorted(actual - declared)
+    if undeclared:
+        return "directory contains undeclared content: " + ", ".join(undeclared[:5])
+    missing = sorted(declared - actual)
+    if missing:
+        return "directory is missing declared content: " + ", ".join(missing[:5])
+    for child in children:
+        if _is_reparse_directory(child):
+            return f"declared content is a link or junction: {child.name}"
+        try:
+            if not child.is_file():
+                return f"declared content is not a regular file: {child.name}"
+        except OSError as exc:
+            return f"could not inspect declared content {child.name}: {exc}"
+    return None
+
+
+def _cleanup_declared_names(
+    raw_results: list[Any],
+) -> tuple[set[str], str | None]:
+    declared = {RESULT_OWNERSHIP_MARKER, "results.json"}
+    for index, result in enumerate(raw_results):
+        if not isinstance(result, dict):
+            return declared, f"results[{index}] must be an object"
+        copied_file = result.get("copied_file")
+        if (
+            not isinstance(copied_file, str)
+            or not copied_file.strip()
+            or copied_file != Path(copied_file).name
+            or "/" in copied_file
+            or "\\" in copied_file
+        ):
+            return (
+                declared,
+                f"results[{index}].copied_file is not a direct file name",
+            )
+        if copied_file in declared:
+            return declared, f"results[{index}].copied_file is duplicated or reserved"
+        declared.add(copied_file)
+    return declared, None
+
+
+def _delete_cleanup_candidate(path: Path, root: Path) -> None:
+    """Delete only manifest-declared files, then remove the empty directory."""
+
+    reason = _validate_cleanup_candidate(path, root)
+    if reason is not None:
+        raise OSError(reason)
+    try:
+        manifest = json.loads((path / "results.json").read_text(encoding="utf-8"))
+        raw_results = manifest["results"]
+        declared, declaration_error = _cleanup_declared_names(raw_results)
+        if declaration_error is not None:
+            raise OSError(declaration_error)
+        # Result copies go first. Ownership evidence is removed last, so a partial
+        # filesystem failure remains recognisable and is never mistaken for a
+        # successfully deleted directory.
+        ordered = sorted(declared - {RESULT_OWNERSHIP_MARKER, "results.json"})
+        ordered.extend(("results.json", RESULT_OWNERSHIP_MARKER))
+        for name in ordered:
+            candidate = path / name
+            if _is_reparse_directory(candidate) or not candidate.is_file():
+                raise OSError(f"declared content changed before deletion: {name}")
+            candidate.unlink()
+        # If new user content appears after validation, rmdir fails rather than
+        # recursively deleting that unowned content.
+        path.rmdir()
+    except (KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise OSError(f"results manifest changed before deletion: {exc}") from exc

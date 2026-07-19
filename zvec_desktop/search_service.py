@@ -21,6 +21,7 @@ from .backend_api import JsonObject
 
 SearchQueryType = Literal["text", "image", "combined", "tag"]
 SearchMode = Literal["semantic", "tags"]
+SearchSortMode = Literal["relevance", "confidence", "diverse", "legacy"]
 TagMode = Literal["all", "any"]
 
 _TERMINAL_STATUSES = frozenset(
@@ -32,6 +33,7 @@ _MAX_TEXT_CHARACTERS = 4096
 _MAX_TAGS = 100
 _MAX_TAG_CHARACTERS = 256
 _MAX_LIBRARIES = 100
+_MAX_TECHNICAL_COUNT = 2**31 - 1
 
 
 class SearchServiceError(RuntimeError):
@@ -86,6 +88,7 @@ class SearchRequest:
     show_low_confidence: bool = False
     diversify_results: bool = True
     search_mode: SearchMode = "semantic"
+    sort_mode: SearchSortMode = "confidence"
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,6 +109,7 @@ class NormalizedSearchRequest:
     show_low_confidence: bool
     diversify_results: bool
     search_mode: SearchMode
+    sort_mode: SearchSortMode
 
 
 @dataclass(frozen=True, slots=True)
@@ -313,9 +317,10 @@ def normalize_search_request(request: SearchRequest) -> NormalizedSearchRequest:
     else:
         raise SearchValidationError("请输入搜索文字、选择查询图片，或同时提供两者。")
 
-    top_k = _bounded_integer(request.top_k, "top_k", minimum=1, maximum=500)
-    candidate_k = _bounded_integer(
-        request.candidate_k, "candidate_k", minimum=top_k, maximum=1000
+    top_k = _positive_integer(request.top_k, "top_k")
+    candidate_k = max(
+        top_k,
+        _positive_integer(request.candidate_k, "candidate_k"),
     )
     library_ids = _unique_values(
         request.library_ids,
@@ -331,6 +336,10 @@ def normalize_search_request(request: SearchRequest) -> NormalizedSearchRequest:
     )
     if request.tag_mode not in {"all", "any"}:
         raise SearchValidationError("tag_mode 必须是 all 或 any。")
+    if request.sort_mode not in {"relevance", "confidence", "diverse", "legacy"}:
+        raise SearchValidationError(
+            "sort_mode must be relevance, confidence, diverse, or legacy."
+        )
     image_weight = _non_negative_finite(request.image_weight, "image_weight")
     text_weight = _non_negative_finite(request.text_weight, "text_weight")
     if query_type == "combined":
@@ -363,6 +372,7 @@ def normalize_search_request(request: SearchRequest) -> NormalizedSearchRequest:
         show_low_confidence=request.show_low_confidence,
         diversify_results=request.diversify_results,
         search_mode=search_mode,
+        sort_mode=request.sort_mode,
     )
 
 
@@ -379,6 +389,7 @@ def _job_params(
         "show_low_confidence": request.show_low_confidence,
         "diversify_results": request.diversify_results,
         "search_mode": request.search_mode,
+        "sort_mode": request.sort_mode,
     }
     if request.text is not None:
         params["text"] = request.text
@@ -489,11 +500,14 @@ def _unique_values(
     return tuple(result)
 
 
-def _bounded_integer(value: int, name: str, *, minimum: int, maximum: int) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise SearchValidationError(f"{name} 必须是整数。")
-    if not minimum <= value <= maximum:
-        raise SearchValidationError(f"{name} 必须在 {minimum} 到 {maximum} 之间。")
+def _positive_integer(value: int, name: str) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 1
+        or value > _MAX_TECHNICAL_COUNT
+    ):
+        raise SearchValidationError(f"{name} must be a positive integer.")
     return value
 
 

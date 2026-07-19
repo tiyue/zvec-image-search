@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tkinter as tk
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -181,8 +182,21 @@ class SettingsController:
             raise SettingsPanelError(f"无法使用系统程序打开：{path}") from exc
 
 
+@dataclass(slots=True)
+class _ResponsiveFormRow:
+    """Widgets that switch between inline and stacked form layouts."""
+
+    container: ttk.Frame
+    label: ttk.Label
+    field: tk.Widget
+    action: ttk.Button | None
+    compact: bool | None = None
+
+
 class SettingsPanel(ttk.Frame):
     """Embeddable first-use and settings surface for the Python desktop."""
+
+    _FORM_COMPACT_WIDTH = 640
 
     def __init__(
         self,
@@ -194,8 +208,15 @@ class SettingsPanel(ttk.Frame):
         path_opener: PathOpener | None = None,
         on_restart_required: RestartNotice | None = None,
         on_credentials_changed: CredentialNotice | None = None,
+        embedded: bool = True,
     ) -> None:
-        super().__init__(master, padding=18)
+        spacing = DEFAULT_THEME.spacing
+        super().__init__(
+            master,
+            style="SettingsRoot.TFrame",
+            padding=0 if embedded else spacing.lg,
+        )
+        self.embedded = embedded
         self.controller = SettingsController(
             configuration_service,
             model_settings_service,
@@ -206,12 +227,19 @@ class SettingsPanel(ttk.Frame):
         self._on_credentials_changed = on_credentials_changed
         self._state: SettingsState | None = None
         self._model_maps: dict[str, dict[str, str]] = {}
+        self._header_title: ttk.Label | None = None
+        self._notebook_row = 0 if embedded else 2
+        self._responsive_rows: list[_ResponsiveFormRow] = []
+        self._tab_scrollbars: dict[tk.Canvas, ttk.Scrollbar] = {}
+        self._advanced_visible = False
+        self._add_library_visible = False
 
         self._configure_style()
-        self._build_header()
+        if not embedded:
+            self._build_header()
         self._build_notebook()
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(2, weight=1)
+        self.rowconfigure(self._notebook_row, weight=1)
         self.refresh(reload_json=True)
 
     @property
@@ -230,55 +258,582 @@ class SettingsPanel(ttk.Frame):
 
     def _configure_style(self) -> None:
         style = ttk.Style(self)
-        style.configure("SettingsTitle.TLabel", font=("Microsoft YaHei UI", 16, "bold"))
+        with suppress(tk.TclError):
+            style.theme_use("clam")
+        theme = DEFAULT_THEME
+        font = theme.typography.family
+        spacing = theme.spacing
+        style.configure("SettingsRoot.TFrame", background=theme.window)
+        style.configure("SettingsSurface.TFrame", background=theme.surface)
+        style.configure("SettingsSoft.TFrame", background=theme.surface_subtle)
+        style.configure("SettingsSuccessCard.TFrame", background=theme.success_soft)
+        style.configure("SettingsDangerZone.TFrame", background=theme.danger_soft)
+        style.configure(
+            "SettingsTitle.TLabel",
+            background=theme.window,
+            foreground=theme.text,
+            font=(font, theme.typography.page_title, "bold"),
+        )
+        style.configure(
+            "SettingsTitleMuted.TLabel",
+            background=theme.window,
+            foreground=theme.text_muted,
+            font=(font, theme.typography.body),
+        )
+        style.configure(
+            "SettingsLabel.TLabel",
+            background=theme.surface,
+            foreground=theme.text,
+            font=(font, theme.typography.body),
+        )
+        style.configure(
+            "SettingsPageTitle.TLabel",
+            background=theme.surface,
+            foreground=theme.text,
+            font=(font, theme.typography.preview_title, "bold"),
+        )
+        style.configure(
+            "SettingsPageCopy.TLabel",
+            background=theme.surface,
+            foreground=theme.text_muted,
+            font=(font, theme.typography.body),
+        )
+        style.configure(
+            "SettingsStep.TLabel",
+            background=theme.primary_soft,
+            foreground=theme.primary_pressed,
+            font=(font, theme.typography.supporting, "bold"),
+            padding=(spacing.sm, spacing.xs),
+        )
+        style.configure(
+            "SettingsSectionTitle.TLabel",
+            background=theme.surface,
+            foreground=theme.text,
+            font=(font, theme.typography.section, "bold"),
+        )
+        style.configure(
+            "SettingsSectionCopy.TLabel",
+            background=theme.surface,
+            foreground=theme.text_muted,
+            font=(font, theme.typography.supporting),
+        )
+        style.configure(
+            "SettingsSoftTitle.TLabel",
+            background=theme.surface_subtle,
+            foreground=theme.text,
+            font=(font, theme.typography.body, "bold"),
+        )
+        style.configure(
+            "SettingsSoftLabel.TLabel",
+            background=theme.surface_subtle,
+            foreground=theme.text,
+            font=(font, theme.typography.body),
+        )
+        style.configure(
+            "SettingsSoftMuted.TLabel",
+            background=theme.surface_subtle,
+            foreground=theme.text_muted,
+            font=(font, theme.typography.supporting),
+        )
+        style.configure(
+            "SettingsDangerTitle.TLabel",
+            background=theme.danger_soft,
+            foreground=theme.danger,
+            font=(font, theme.typography.body, "bold"),
+        )
+        style.configure(
+            "SettingsDangerCopy.TLabel",
+            background=theme.danger_soft,
+            foreground=theme.text_muted,
+            font=(font, theme.typography.supporting),
+        )
         style.configure(
             "SettingsMuted.TLabel",
-            foreground=DEFAULT_THEME.text_muted,
+            background=theme.surface,
+            foreground=theme.text_muted,
+            font=(font, theme.typography.supporting),
         )
         style.configure(
             "SettingsNotice.TLabel",
-            foreground=DEFAULT_THEME.warning,
+            background=theme.warning_soft,
+            foreground=theme.warning,
+            font=(font, theme.typography.body),
+            padding=(spacing.md, spacing.sm),
         )
-        style.configure("SettingsDanger.TButton", foreground=DEFAULT_THEME.danger)
+        style.configure(
+            "SettingsSuccess.TLabel",
+            background=theme.success_soft,
+            foreground=theme.success,
+            font=(font, theme.typography.body, "bold"),
+        )
+        style.configure(
+            "SettingsSuccessTitle.TLabel",
+            background=theme.success_soft,
+            foreground=theme.success,
+            font=(font, theme.typography.body, "bold"),
+        )
+        style.configure(
+            "SettingsSuccessMuted.TLabel",
+            background=theme.success_soft,
+            foreground=theme.text_muted,
+            font=(font, theme.typography.supporting),
+        )
+        style.configure(
+            "SettingsCredentialMuted.TLabel",
+            background=theme.surface_subtle,
+            foreground=theme.text_muted,
+            font=(font, theme.typography.body, "bold"),
+        )
+        style.configure(
+            "Settings.TNotebook",
+            background=theme.window,
+            bordercolor=theme.border,
+            lightcolor=theme.border,
+            darkcolor=theme.border,
+            borderwidth=0,
+            tabmargins=(0, 0, 0, 0),
+        )
+        style.configure(
+            "Settings.TNotebook.Tab",
+            background=theme.window,
+            foreground=theme.text_muted,
+            bordercolor=theme.window,
+            lightcolor=theme.window,
+            darkcolor=theme.window,
+            padding=(spacing.lg, spacing.sm + 2),
+            font=(font, theme.typography.control, "bold"),
+        )
+        style.map(
+            "Settings.TNotebook.Tab",
+            background=[
+                ("selected", theme.surface),
+                ("active", theme.primary_soft),
+            ],
+            foreground=[
+                ("selected", theme.primary_pressed),
+                ("active", theme.primary),
+            ],
+            expand=[("selected", (0, 0, 0, spacing.xs))],
+        )
+        style.configure("SettingsTab.TFrame", background=theme.surface)
+        style.configure(
+            "SettingsCard.TLabelframe",
+            background=theme.surface,
+            bordercolor=theme.border,
+            lightcolor=theme.border,
+            darkcolor=theme.border,
+            borderwidth=1,
+            relief="solid",
+        )
+        style.configure(
+            "SettingsCard.TLabelframe.Label",
+            background=theme.surface,
+            foreground=theme.text,
+            font=(font, theme.typography.section, "bold"),
+            padding=(0, 0, spacing.sm, spacing.xs),
+        )
+        style.configure(
+            "Settings.TEntry",
+            fieldbackground=theme.surface,
+            foreground=theme.text,
+            bordercolor=theme.border_strong,
+            lightcolor=theme.border_strong,
+            darkcolor=theme.border_strong,
+            insertcolor=theme.primary,
+            padding=(spacing.sm, spacing.sm),
+            borderwidth=1,
+        )
+        style.map(
+            "Settings.TEntry",
+            fieldbackground=[("readonly", theme.surface_subtle)],
+            bordercolor=[("focus", theme.focus)],
+            lightcolor=[("focus", theme.focus)],
+            darkcolor=[("focus", theme.focus)],
+        )
+        style.configure(
+            "Settings.TCombobox",
+            fieldbackground=theme.surface,
+            background=theme.surface,
+            foreground=theme.text,
+            arrowcolor=theme.text_muted,
+            bordercolor=theme.border_strong,
+            lightcolor=theme.border_strong,
+            darkcolor=theme.border_strong,
+            padding=(spacing.sm, spacing.sm),
+        )
+        style.map(
+            "Settings.TCombobox",
+            fieldbackground=[("readonly", theme.surface)],
+            bordercolor=[("focus", theme.focus)],
+            lightcolor=[("focus", theme.focus)],
+            darkcolor=[("focus", theme.focus)],
+        )
+        style.configure(
+            "SettingsPrimary.TButton",
+            background=theme.primary,
+            foreground="#FFFFFF",
+            bordercolor=theme.primary,
+            lightcolor=theme.primary,
+            darkcolor=theme.primary,
+            focuscolor=theme.primary,
+            borderwidth=1,
+            padding=(spacing.md, spacing.sm),
+            font=(font, theme.typography.control, "bold"),
+        )
+        style.map(
+            "SettingsPrimary.TButton",
+            background=[
+                ("pressed", theme.primary_pressed),
+                ("active", theme.primary_hover),
+                ("disabled", theme.surface_strong),
+            ],
+            bordercolor=[
+                ("pressed", theme.primary_pressed),
+                ("active", theme.primary_hover),
+                ("disabled", theme.surface_strong),
+            ],
+            foreground=[("disabled", theme.text_faint)],
+        )
+        style.configure(
+            "SettingsQuiet.TButton",
+            background=theme.surface,
+            foreground=theme.text,
+            bordercolor=theme.border_strong,
+            lightcolor=theme.border_strong,
+            darkcolor=theme.border_strong,
+            focuscolor=theme.focus,
+            borderwidth=1,
+            padding=(spacing.md, spacing.sm),
+            font=(font, theme.typography.control),
+        )
+        style.map(
+            "SettingsQuiet.TButton",
+            background=[
+                ("active", theme.surface_muted),
+                ("disabled", theme.surface_subtle),
+            ],
+            foreground=[("disabled", theme.text_faint)],
+        )
+        style.configure(
+            "SettingsDanger.TButton",
+            background=theme.surface,
+            foreground=theme.danger,
+            bordercolor=theme.danger_soft,
+            lightcolor=theme.danger_soft,
+            darkcolor=theme.danger_soft,
+            focuscolor=theme.danger,
+            borderwidth=1,
+            padding=(spacing.md, spacing.sm),
+            font=(font, theme.typography.control),
+        )
+        style.map(
+            "SettingsDanger.TButton",
+            background=[("active", theme.danger_soft)],
+        )
+        style.configure(
+            "Settings.Treeview",
+            background=theme.surface,
+            fieldbackground=theme.surface,
+            foreground=theme.text,
+            bordercolor=theme.border,
+            borderwidth=0,
+            relief="flat",
+            rowheight=30,
+        )
+        style.map(
+            "Settings.Treeview",
+            background=[("selected", theme.selection)],
+            foreground=[("selected", theme.text)],
+        )
+        style.configure(
+            "Settings.Treeview.Heading",
+            background=theme.surface_muted,
+            foreground=theme.text_muted,
+            bordercolor=theme.border,
+            borderwidth=0,
+            padding=(spacing.sm, spacing.sm),
+            font=(font, theme.typography.supporting, "bold"),
+        )
+        style.map(
+            "Settings.Treeview.Heading",
+            background=[("active", theme.surface_strong)],
+        )
+        for orientation in ("Vertical", "Horizontal"):
+            style.configure(
+                f"Settings.{orientation}.TScrollbar",
+                background=theme.border_strong,
+                troughcolor=theme.surface_subtle,
+                bordercolor=theme.surface_subtle,
+                arrowcolor=theme.text_muted,
+            )
 
     def _build_header(self) -> None:
-        ttk.Label(self, text="设置与首次使用", style="SettingsTitle.TLabel").grid(
-            row=0, column=0, sticky="w"
+        self._header_title = ttk.Label(
+            self,
+            text="设置与首次使用",
+            style="SettingsTitle.TLabel",
         )
+        self._header_title.grid(row=0, column=0, sticky="w")
         ttk.Label(
             self,
             text="配置只记录路径；不会移动、重建或重新计算现有 Collection。",
-            style="SettingsMuted.TLabel",
+            style="SettingsTitleMuted.TLabel",
         ).grid(row=1, column=0, sticky="w", pady=(2, 12))
 
     def _build_notebook(self) -> None:
-        self._notebook = ttk.Notebook(self)
-        self._notebook.grid(row=2, column=0, sticky="nsew")
-        self._library_tab = ttk.Frame(self._notebook, padding=14)
-        self._model_tab = ttk.Frame(self._notebook, padding=14)
-        self._credential_tab = ttk.Frame(self._notebook, padding=14)
+        spacing = DEFAULT_THEME.spacing
+        self._notebook = ttk.Notebook(self, style="Settings.TNotebook")
+        self._notebook.grid(row=self._notebook_row, column=0, sticky="nsew")
+        tab_padding = (spacing.lg, spacing.md, spacing.lg, spacing.lg)
+        self._library_tab = ttk.Frame(
+            self._notebook,
+            style="SettingsTab.TFrame",
+        )
+        self._model_tab = ttk.Frame(
+            self._notebook,
+            style="SettingsTab.TFrame",
+        )
+        self._credential_tab = ttk.Frame(
+            self._notebook,
+            style="SettingsTab.TFrame",
+        )
         self._notebook.add(self._library_tab, text="图库与路径")
         self._notebook.add(self._model_tab, text="阿里云模型")
         self._notebook.add(self._credential_tab, text="API Key")
+        self._library_page, self._library_canvas = self._scrollable_tab(
+            self._library_tab,
+            padding=tab_padding,
+        )
+        self._model_page, self._model_canvas = self._scrollable_tab(
+            self._model_tab,
+            padding=tab_padding,
+        )
+        self._credential_page, self._credential_canvas = self._scrollable_tab(
+            self._credential_tab,
+            padding=tab_padding,
+        )
         self._build_library_tab()
         self._build_model_tab()
         self._build_credential_tab()
+        self._bind_scroll_wheel(self._library_page, self._library_canvas)
+        self._bind_scroll_wheel(self._model_page, self._model_canvas)
+        self._bind_scroll_wheel(self._credential_page, self._credential_canvas)
+
+    def _scrollable_tab(
+        self,
+        host: ttk.Frame,
+        *,
+        padding: tuple[int, int, int, int],
+    ) -> tuple[ttk.Frame, tk.Canvas]:
+        """Create a borderless page whose scrollbar appears only when needed."""
+
+        host.columnconfigure(0, weight=1)
+        host.rowconfigure(0, weight=1)
+        canvas = tk.Canvas(
+            host,
+            background=DEFAULT_THEME.surface,
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        scrollbar = ttk.Scrollbar(
+            host,
+            orient="vertical",
+            command=canvas.yview,
+            style="Settings.Vertical.TScrollbar",
+        )
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        scrollbar.grid_remove()
+        self._tab_scrollbars[canvas] = scrollbar
+        page = ttk.Frame(
+            canvas,
+            style="SettingsTab.TFrame",
+            padding=padding,
+        )
+        window = canvas.create_window((0, 0), window=page, anchor="nw")
+
+        def sync_scroll_region(_event: tk.Event[tk.Misc] | None = None) -> None:
+            bounds = canvas.bbox("all")
+            canvas.configure(scrollregion=bounds)
+            needs_scroll = page.winfo_reqheight() > canvas.winfo_height() + 2
+            if needs_scroll:
+                scrollbar.grid()
+            else:
+                scrollbar.grid_remove()
+                canvas.yview_moveto(0.0)
+
+        def fit_width(event: tk.Event[tk.Misc]) -> None:
+            canvas.itemconfigure(window, width=max(1, event.width))
+            canvas.after_idle(sync_scroll_region)
+
+        page.bind("<Configure>", sync_scroll_region, add=True)
+        canvas.bind("<Configure>", fit_width, add=True)
+        return page, canvas
+
+    def _bind_scroll_wheel(self, page: ttk.Frame, canvas: tk.Canvas) -> None:
+        """Route wheel events from every current page child to its canvas."""
+
+        def scroll(event: tk.Event[tk.Misc]) -> str:
+            delta = -1 if event.delta > 0 else 1
+            canvas.yview_scroll(delta * 3, "units")
+            return "break"
+
+        def bind_tree(widget: tk.Misc) -> None:
+            # Editors and the library table keep their own scrolling.  Every
+            # other surface routes the wheel to the page so short windows do
+            # not trap users above the primary action.
+            if not isinstance(widget, (tk.Text, ttk.Treeview)):
+                widget.bind("<MouseWheel>", scroll, add=True)
+            for child in widget.winfo_children():
+                bind_tree(child)
+
+        bind_tree(page)
+
+    def _build_tab_intro(
+        self,
+        parent: ttk.Frame,
+        *,
+        row: int,
+        step: str,
+        title: str,
+        description: str,
+    ) -> ttk.Frame:
+        """Add a consistent step marker and concise page-level explanation."""
+
+        intro = ttk.Frame(parent, style="SettingsSurface.TFrame")
+        intro.grid(row=row, column=0, sticky="ew", pady=(0, 16))
+        intro.columnconfigure(1, weight=1)
+        ttk.Label(intro, text=step, style="SettingsStep.TLabel").grid(
+            row=0,
+            column=0,
+            rowspan=2,
+            sticky="n",
+            padx=(0, 12),
+        )
+        ttk.Label(intro, text=title, style="SettingsPageTitle.TLabel").grid(
+            row=0,
+            column=1,
+            sticky="w",
+        )
+        copy = ttk.Label(
+            intro,
+            text=description,
+            style="SettingsPageCopy.TLabel",
+            wraplength=240,
+            justify="left",
+        )
+        copy.grid(row=1, column=1, sticky="ew", pady=(3, 0))
+        self._bind_responsive_wrap(copy, intro, reserved=60)
+        return intro
+
+    def _section(
+        self,
+        parent: ttk.Frame,
+        *,
+        row: int,
+        title: str,
+        description: str,
+        sticky: str = "ew",
+        pady: tuple[int, int] = (0, 14),
+    ) -> tuple[ttk.Frame, ttk.Frame]:
+        """Build a borderless section with a soft content surface."""
+
+        section = ttk.Frame(parent, style="SettingsSurface.TFrame")
+        section.grid(row=row, column=0, sticky=sticky, pady=pady)
+        section.columnconfigure(0, weight=1)
+        if "n" in sticky or "s" in sticky:
+            section.rowconfigure(2, weight=1)
+        ttk.Label(
+            section,
+            text=title,
+            style="SettingsSectionTitle.TLabel",
+        ).grid(row=0, column=0, sticky="w")
+        copy = ttk.Label(
+            section,
+            text=description,
+            style="SettingsSectionCopy.TLabel",
+            wraplength=240,
+            justify="left",
+        )
+        copy.grid(row=1, column=0, sticky="ew", pady=(2, 8))
+        self._bind_responsive_wrap(copy, section)
+        body = ttk.Frame(
+            section,
+            style="SettingsSoft.TFrame",
+            padding=(14, 12),
+        )
+        body.grid(row=2, column=0, sticky=sticky)
+        body.columnconfigure(0, weight=1)
+        return section, body
+
+    @staticmethod
+    def _bind_responsive_wrap(
+        label: ttk.Label,
+        parent: tk.Misc,
+        *,
+        reserved: int = 0,
+    ) -> None:
+        """Keep explanatory copy readable instead of clipping on narrow pages."""
+
+        def resize(event: tk.Event[tk.Misc]) -> None:
+            label.configure(wraplength=max(220, event.width - reserved))
+
+        parent.bind("<Configure>", resize, add=True)
 
     def _build_library_tab(self) -> None:
-        tab = self._library_tab
+        tab = self._library_page
         tab.columnconfigure(0, weight=1)
         tab.rowconfigure(2, weight=1)
-        paths = ttk.LabelFrame(tab, text="配置文件", padding=10)
-        paths.grid(row=0, column=0, sticky="ew")
-        paths.columnconfigure(1, weight=1)
+        self._build_tab_intro(
+            tab,
+            row=0,
+            step="1",
+            title="图库与路径",
+            description="先确认配置文件位置，再创建或维护图库。程序只记录路径，不会移动图片或重新生成已有向量。",
+        )
+        self._paths_section, paths = self._section(
+            tab,
+            row=1,
+            title="配置文件",
+            description="需要手工备份或排查问题时，可直接打开对应的 JSON 文件。",
+            pady=(0, 14),
+        )
         self._config_path_var = tk.StringVar(value=str(self.controller.config_path))
         self._models_path_var = tk.StringVar(value=str(self.controller.models_path))
-        self._path_row(paths, 0, "图库配置", self._config_path_var, self._open_config)
-        self._path_row(paths, 1, "模型配置", self._models_path_var, self._open_models)
+        self._config_open_button = self._path_row(
+            paths,
+            0,
+            "图库配置",
+            self._config_path_var,
+            self._open_config,
+        )
+        self._models_open_button = self._path_row(
+            paths,
+            1,
+            "模型配置",
+            self._models_path_var,
+            self._open_models,
+        )
 
-        self._first_use = ttk.LabelFrame(tab, text="首次使用", padding=12)
-        self._first_use.grid(row=1, column=0, sticky="ew", pady=(12, 0))
-        self._first_use.columnconfigure(1, weight=1)
+        self._first_use, first_use = self._section(
+            tab,
+            row=2,
+            title="创建首个图库",
+            description="当前还没有图库。完成下面四项后即可开始索引和搜索。",
+            sticky="nsew",
+            pady=(0, 0),
+        )
+        first_use.columnconfigure(0, weight=1)
+        first_use_note = ttk.Label(
+            first_use,
+            text="空图库不会产生模型费用；建议先选择 10～50 张图片的小目录验证流程。",
+            style="SettingsSoftMuted.TLabel",
+            wraplength=240,
+            justify="left",
+        )
+        first_use_note.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        self._bind_responsive_wrap(first_use_note, first_use)
         self._initial_name = tk.StringVar()
         self._initial_images = tk.StringVar()
         self._initial_workspace = tk.StringVar()
@@ -286,28 +841,44 @@ class SettingsPanel(ttk.Frame):
             value=str(self.controller.configuration_service.config_home / "results")
         )
         self._directory_row(
-            self._first_use, 0, "图库名称", self._initial_name, directory=False
+            first_use, 1, "图库名称", self._initial_name, directory=False
         )
-        self._directory_row(self._first_use, 1, "图片根目录", self._initial_images)
-        self._directory_row(self._first_use, 2, "工作区目录", self._initial_workspace)
-        self._directory_row(self._first_use, 3, "搜索结果目录", self._initial_results)
-        ttk.Label(
-            self._first_use,
+        self._directory_row(first_use, 2, "图片根目录", self._initial_images)
+        self._directory_row(first_use, 3, "工作区目录", self._initial_workspace)
+        self._directory_row(first_use, 4, "搜索结果目录", self._initial_results)
+        workspace_note = ttk.Label(
+            first_use,
             text="工作区可选择已有 Collection；程序不会修改或迁移其中的数据。",
-            style="SettingsMuted.TLabel",
-        ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(6, 8))
-        ttk.Button(
-            self._first_use,
+            style="SettingsSoftMuted.TLabel",
+            wraplength=240,
+            justify="left",
+        )
+        workspace_note.grid(row=5, column=0, sticky="ew", pady=(6, 10))
+        self._bind_responsive_wrap(workspace_note, first_use)
+        self._create_library_button = ttk.Button(
+            first_use,
             text="创建首个图库",
             command=self._create_initial,
-        ).grid(row=5, column=2, sticky="e")
+            style="SettingsPrimary.TButton",
+        )
+        self._create_library_button.grid(row=6, column=0, sticky="e")
 
-        self._configured = ttk.Frame(tab)
-        self._configured.grid(row=2, column=0, sticky="nsew", pady=(12, 0))
-        self._configured.columnconfigure(0, weight=1)
-        self._configured.rowconfigure(0, weight=1)
-        tree_frame = ttk.Frame(self._configured)
-        tree_frame.grid(row=0, column=0, sticky="nsew")
+        self._configured, configured = self._section(
+            tab,
+            row=2,
+            title="已配置图库",
+            description="选择一项后可设为默认或调整启用状态；路径内容只读展示。",
+            sticky="nsew",
+            pady=(0, 0),
+        )
+        configured.rowconfigure(1, weight=1)
+        self._library_summary = ttk.Label(
+            configured,
+            style="SettingsSoftMuted.TLabel",
+        )
+        self._library_summary.grid(row=0, column=0, sticky="w", pady=(0, 8))
+        tree_frame = ttk.Frame(configured, style="SettingsSoft.TFrame")
+        tree_frame.grid(row=1, column=0, sticky="nsew")
         tree_frame.columnconfigure(0, weight=1)
         tree_frame.rowconfigure(0, weight=1)
         columns = ("default", "enabled", "name", "images", "workspace")
@@ -316,7 +887,8 @@ class SettingsPanel(ttk.Frame):
             columns=columns,
             show="headings",
             selectmode="browse",
-            height=8,
+            height=5,
+            style="Settings.Treeview",
         )
         headings = {
             "default": ("默认", 54),
@@ -329,10 +901,16 @@ class SettingsPanel(ttk.Frame):
             self._library_tree.heading(column, text=label)
             self._library_tree.column(column, width=width, minwidth=45)
         vertical = ttk.Scrollbar(
-            tree_frame, orient="vertical", command=self._library_tree.yview
+            tree_frame,
+            orient="vertical",
+            command=self._library_tree.yview,
+            style="Settings.Vertical.TScrollbar",
         )
         horizontal = ttk.Scrollbar(
-            tree_frame, orient="horizontal", command=self._library_tree.xview
+            tree_frame,
+            orient="horizontal",
+            command=self._library_tree.xview,
+            style="Settings.Horizontal.TScrollbar",
         )
         self._library_tree.configure(
             yscrollcommand=vertical.set,
@@ -341,35 +919,119 @@ class SettingsPanel(ttk.Frame):
         self._library_tree.grid(row=0, column=0, sticky="nsew")
         vertical.grid(row=0, column=1, sticky="ns")
         horizontal.grid(row=1, column=0, sticky="ew")
-        controls = ttk.Frame(self._configured)
-        controls.grid(row=1, column=0, sticky="ew", pady=(8, 0))
-        ttk.Button(controls, text="设为默认", command=self._set_default).pack(
-            side="left"
+        self._library_tree.bind(
+            "<<TreeviewSelect>>",
+            self._on_library_selection_changed,
+            add=True,
         )
-        ttk.Button(controls, text="启用 / 停用", command=self._toggle_library).pack(
-            side="left", padx=(8, 0)
+        controls = ttk.Frame(configured, style="SettingsSoft.TFrame")
+        controls.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        self._set_default_button = ttk.Button(
+            controls,
+            text="设为默认",
+            command=self._set_default,
+            style="SettingsQuiet.TButton",
         )
+        self._set_default_button.pack(side="left")
+        self._toggle_library_button = ttk.Button(
+            controls,
+            text="调整启用状态",
+            command=self._toggle_library,
+            style="SettingsQuiet.TButton",
+        )
+        self._toggle_library_button.pack(side="left", padx=(8, 0))
 
-        add = ttk.LabelFrame(self._configured, text="添加图库", padding=10)
-        add.grid(row=2, column=0, sticky="ew", pady=(12, 0))
-        add.columnconfigure(1, weight=1)
+        ttk.Separator(configured, orient="horizontal").grid(
+            row=3,
+            column=0,
+            sticky="ew",
+            pady=(14, 10),
+        )
+        self._add_library_teaser = ttk.Frame(
+            configured,
+            style="SettingsSoft.TFrame",
+        )
+        self._add_library_teaser.grid(row=4, column=0, sticky="ew")
+        self._add_library_teaser.columnconfigure(0, weight=1)
+        ttk.Label(
+            self._add_library_teaser,
+            text="添加另一个图库",
+            style="SettingsSoftTitle.TLabel",
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            self._add_library_teaser,
+            text="工作区可留空，程序将使用默认位置。",
+            style="SettingsSoftMuted.TLabel",
+        ).grid(row=1, column=0, sticky="w", pady=(2, 0))
+        self._add_library_toggle_button = ttk.Button(
+            self._add_library_teaser,
+            text="填写图库信息",
+            command=self._toggle_add_library_form,
+            style="SettingsQuiet.TButton",
+        )
+        self._add_library_toggle_button.grid(
+            row=0,
+            column=1,
+            rowspan=2,
+            sticky="e",
+            padx=(12, 0),
+        )
+        self._add_library_form = ttk.Frame(
+            configured,
+            style="SettingsSoft.TFrame",
+        )
+        self._add_library_form.grid(row=5, column=0, sticky="ew", pady=(8, 0))
+        self._add_library_form.columnconfigure(0, weight=1)
         self._add_name = tk.StringVar()
         self._add_images = tk.StringVar()
         self._add_workspace = tk.StringVar()
-        self._directory_row(add, 0, "图库名称", self._add_name, directory=False)
-        self._directory_row(add, 1, "图片根目录", self._add_images)
-        self._directory_row(add, 2, "工作区（可留空）", self._add_workspace)
-        ttk.Button(add, text="添加图库", command=self._add_library).grid(
-            row=3, column=2, sticky="e", pady=(8, 0)
+        self._directory_row(
+            self._add_library_form,
+            0,
+            "图库名称",
+            self._add_name,
+            directory=False,
         )
+        self._directory_row(
+            self._add_library_form,
+            1,
+            "图片根目录",
+            self._add_images,
+        )
+        self._directory_row(
+            self._add_library_form,
+            2,
+            "工作区（可留空）",
+            self._add_workspace,
+        )
+        self._add_library_button = ttk.Button(
+            self._add_library_form,
+            text="添加图库",
+            command=self._add_library,
+            style="SettingsPrimary.TButton",
+        )
+        self._add_library_button.grid(row=3, column=0, sticky="e", pady=(8, 0))
+        self._add_library_form.grid_remove()
 
     def _build_model_tab(self) -> None:
-        tab = self._model_tab
+        tab = self._model_page
         tab.columnconfigure(0, weight=1)
-        tab.rowconfigure(2, weight=1)
-        roles = ttk.LabelFrame(tab, text="当前模型角色", padding=12)
-        roles.grid(row=0, column=0, sticky="ew")
-        roles.columnconfigure(1, weight=1)
+        self._build_tab_intro(
+            tab,
+            row=0,
+            step="2",
+            title="阿里云模型",
+            description=(
+                "为向量检索和自动标注分配模型。通常只需确认三个角色，无需编辑 JSON。"
+            ),
+        )
+        self._roles_section, roles = self._section(
+            tab,
+            row=1,
+            title="模型角色",
+            description="向量模型负责检索；主标注模型处理常规图片；升级确认模型处理不确定身份。",
+            pady=(0, 10),
+        )
         self._embedding_var = tk.StringVar()
         self._primary_var = tk.StringVar()
         self._escalation_var = tk.StringVar()
@@ -378,32 +1040,101 @@ class SettingsPanel(ttk.Frame):
         self._escalation_box = self._model_row(
             roles, 2, "升级确认模型", self._escalation_var
         )
-        ttk.Button(roles, text="保存角色", command=self._save_roles).grid(
-            row=3, column=1, sticky="e", pady=(8, 0)
+        self._save_roles_button = ttk.Button(
+            roles,
+            text="保存角色",
+            command=self._save_roles,
+            style="SettingsPrimary.TButton",
         )
+        self._save_roles_button.grid(row=3, column=0, sticky="e", pady=(8, 0))
         self._restart_notice = ttk.Label(
             tab,
             text="模型设置保存后，需要等待任务结束并安全重启后端才会生效。",
             style="SettingsNotice.TLabel",
+            wraplength=240,
+            justify="left",
         )
-        self._restart_notice.grid(row=1, column=0, sticky="w", pady=(10, 8))
+        self._restart_notice.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+        self._bind_responsive_wrap(self._restart_notice, tab)
 
-        advanced = ttk.LabelFrame(tab, text="高级 models.json 编辑", padding=10)
-        advanced.grid(row=2, column=0, sticky="nsew")
-        advanced.columnconfigure(0, weight=1)
+        self._advanced_teaser = ttk.Frame(
+            tab,
+            style="SettingsSoft.TFrame",
+            padding=(14, 10),
+        )
+        self._advanced_teaser.grid(row=3, column=0, sticky="ew")
+        self._advanced_teaser.columnconfigure(0, weight=1)
+        ttk.Label(
+            self._advanced_teaser,
+            text="高级设置",
+            style="SettingsSoftTitle.TLabel",
+        ).grid(row=0, column=0, sticky="w")
+        self._advanced_teaser_copy = ttk.Label(
+            self._advanced_teaser,
+            text="仅在添加模型定义、协议或价格信息时编辑 models.json。",
+            style="SettingsSoftMuted.TLabel",
+            wraplength=240,
+            justify="left",
+        )
+        self._advanced_teaser_copy.grid(row=1, column=0, sticky="ew", pady=(2, 0))
+        self._bind_responsive_wrap(
+            self._advanced_teaser_copy,
+            self._advanced_teaser,
+            reserved=160,
+        )
+        self._advanced_toggle_button = ttk.Button(
+            self._advanced_teaser,
+            text="展开 JSON 编辑器",
+            command=self._toggle_advanced_editor,
+            style="SettingsQuiet.TButton",
+        )
+        self._advanced_toggle_button.grid(
+            row=0,
+            column=1,
+            rowspan=2,
+            sticky="e",
+            padx=(12, 0),
+        )
+
+        self._advanced_section, advanced = self._section(
+            tab,
+            row=4,
+            title="高级 models.json 编辑",
+            description="保存前会严格校验提供商、模型角色和字段格式；无效内容不会写入磁盘。",
+            sticky="nsew",
+            pady=(12, 0),
+        )
         advanced.rowconfigure(0, weight=1)
         self._model_json = tk.Text(
             advanced,
             wrap="none",
-            height=16,
+            height=12,
             undo=True,
             font="TkFixedFont",
+            background=DEFAULT_THEME.code_surface,
+            foreground=DEFAULT_THEME.code_text,
+            insertbackground=DEFAULT_THEME.primary,
+            selectbackground=DEFAULT_THEME.selection,
+            selectforeground=DEFAULT_THEME.text,
+            relief="flat",
+            borderwidth=0,
+            highlightthickness=1,
+            highlightbackground=DEFAULT_THEME.border,
+            highlightcolor=DEFAULT_THEME.focus,
+            padx=10,
+            pady=8,
         )
         json_vertical = ttk.Scrollbar(
-            advanced, orient="vertical", command=self._model_json.yview
+            advanced,
+            orient="vertical",
+            command=self._model_json.yview,
+            style="Settings.Vertical.TScrollbar",
         )
         json_horizontal = ttk.Scrollbar(
-            advanced, orient="horizontal", command=self._model_json.xview
+            advanced,
+            orient="horizontal",
+            command=self._model_json.xview,
+            style="Settings.Horizontal.TScrollbar",
         )
         self._model_json.configure(
             yscrollcommand=json_vertical.set,
@@ -412,102 +1143,352 @@ class SettingsPanel(ttk.Frame):
         self._model_json.grid(row=0, column=0, sticky="nsew")
         json_vertical.grid(row=0, column=1, sticky="ns")
         json_horizontal.grid(row=1, column=0, sticky="ew")
-        editor_buttons = ttk.Frame(advanced)
+        editor_buttons = ttk.Frame(advanced, style="SettingsSurface.TFrame")
         editor_buttons.grid(row=2, column=0, columnspan=2, sticky="e", pady=(8, 0))
         ttk.Button(
             editor_buttons,
             text="重新载入",
             command=lambda: self.refresh(reload_json=True),
+            style="SettingsQuiet.TButton",
         ).pack(side="left")
         ttk.Button(
             editor_buttons,
-            text="严格校验并保存",
+            text="校验并保存 JSON",
             command=self._save_model_json,
+            style="SettingsPrimary.TButton",
         ).pack(side="left", padx=(8, 0))
+        self._advanced_section.grid_remove()
 
     def _build_credential_tab(self) -> None:
-        tab = self._credential_tab
+        tab = self._credential_page
         tab.columnconfigure(0, weight=1)
-        card = ttk.LabelFrame(tab, text="阿里云 DashScope API Key", padding=14)
-        card.grid(row=0, column=0, sticky="ew")
-        card.columnconfigure(1, weight=1)
-        ttk.Label(card, text="保存状态").grid(row=0, column=0, sticky="w")
-        self._credential_status = ttk.Label(card, style="SettingsMuted.TLabel")
-        self._credential_status.grid(row=0, column=1, sticky="w", padx=(12, 0))
-        ttk.Label(card, text="新的 API Key").grid(
-            row=1, column=0, sticky="w", pady=(12, 0)
+        self._build_tab_intro(
+            tab,
+            row=0,
+            step="3",
+            title="API Key",
+            description=(
+                "凭据仅用于调用阿里云 DashScope。已保存的密钥不会在界面或日志中回显。"
+            ),
         )
-        self._credential_entry = ttk.Entry(card, show="●")
-        self._credential_entry.grid(
-            row=1, column=1, sticky="ew", padx=(12, 0), pady=(12, 0)
+        self._credential_card = ttk.Frame(
+            tab,
+            style="SettingsSoft.TFrame",
+            padding=(16, 14),
         )
+        self._credential_card.grid(row=1, column=0, sticky="ew", pady=(0, 14))
+        self._credential_card.columnconfigure(1, weight=1)
+        self._credential_card_title = ttk.Label(
+            self._credential_card,
+            text="凭据状态",
+            style="SettingsSoftTitle.TLabel",
+        )
+        self._credential_card_title.grid(row=0, column=0, sticky="w")
+        self._credential_status = ttk.Label(
+            self._credential_card,
+            style="SettingsCredentialMuted.TLabel",
+        )
+        self._credential_status.grid(row=0, column=1, sticky="e", padx=(12, 0))
+        self._credential_storage_note = ttk.Label(
+            self._credential_card,
+            text="保存后立即清空输入框；应用不会读取并展示完整密钥。",
+            style="SettingsSoftMuted.TLabel",
+            wraplength=240,
+            justify="left",
+        )
+        self._credential_storage_note.grid(
+            row=1,
+            column=0,
+            columnspan=2,
+            sticky="ew",
+            pady=(4, 0),
+        )
+        self._bind_responsive_wrap(
+            self._credential_storage_note,
+            self._credential_card,
+        )
+
+        self._credential_section, credential_body = self._section(
+            tab,
+            row=2,
+            title="保存新的密钥",
+            description="粘贴 DashScope API Key 后保存。新密钥会覆盖当前凭据。",
+            pady=(0, 14),
+        )
+        credential_row, credential_label = self._form_container(
+            credential_body,
+            0,
+            "新的 API Key",
+        )
+        self._credential_entry = ttk.Entry(
+            credential_row,
+            show="●",
+            style="Settings.TEntry",
+        )
+        self._credential_row = self._register_form_row(
+            credential_row,
+            credential_label,
+            self._credential_entry,
+        )
+        credential_note = ttk.Label(
+            credential_body,
+            text="密钥通常以 sk- 开头。请勿将它写入截图、日志或 Git 仓库。",
+            style="SettingsSoftMuted.TLabel",
+            wraplength=240,
+            justify="left",
+        )
+        credential_note.grid(row=1, column=0, sticky="ew", pady=(4, 10))
+        self._bind_responsive_wrap(credential_note, credential_body)
+        self._save_api_key_button = ttk.Button(
+            credential_body,
+            text="保存 API Key",
+            command=self._save_api_key,
+            style="SettingsPrimary.TButton",
+        )
+        self._save_api_key_button.grid(row=2, column=0, sticky="e")
+
+        self._danger_zone = ttk.Frame(
+            tab,
+            style="SettingsDangerZone.TFrame",
+            padding=(14, 12),
+        )
+        self._danger_zone.grid(row=3, column=0, sticky="ew")
+        self._danger_zone.columnconfigure(0, weight=1)
         ttk.Label(
-            card,
-            text="出于安全原因，已保存的密钥不会回显；输入框保存后立即清空。",
-            style="SettingsMuted.TLabel",
-        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 12))
-        buttons = ttk.Frame(card)
-        buttons.grid(row=3, column=1, sticky="e")
-        ttk.Button(buttons, text="保存", command=self._save_api_key).pack(side="left")
-        ttk.Button(
-            buttons,
+            self._danger_zone,
+            text="危险操作",
+            style="SettingsDangerTitle.TLabel",
+        ).grid(row=0, column=0, sticky="w")
+        danger_copy = ttk.Label(
+            self._danger_zone,
+            text="删除后，新的索引、搜索和标注请求将无法调用模型，直到重新保存密钥。",
+            style="SettingsDangerCopy.TLabel",
+            wraplength=240,
+            justify="left",
+        )
+        danger_copy.grid(row=1, column=0, sticky="ew", pady=(3, 0))
+        self._bind_responsive_wrap(danger_copy, self._danger_zone, reserved=170)
+        self._delete_api_key_button = ttk.Button(
+            self._danger_zone,
             text="删除已保存密钥",
             command=self._delete_api_key,
             style="SettingsDanger.TButton",
-        ).pack(side="left", padx=(8, 0))
+        )
+        self._delete_api_key_button.grid(
+            row=0,
+            column=1,
+            rowspan=2,
+            sticky="e",
+            padx=(14, 0),
+        )
 
     def _path_row(
         self,
-        parent: ttk.LabelFrame,
+        parent: tk.Misc,
         row: int,
         label: str,
         variable: tk.StringVar,
         command: Callable[[], None],
-    ) -> None:
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=2)
-        ttk.Entry(parent, textvariable=variable, state="readonly").grid(
-            row=row, column=1, sticky="ew", padx=(10, 8), pady=2
+    ) -> ttk.Button:
+        container, label_widget = self._form_container(parent, row, label)
+        field = ttk.Entry(
+            container,
+            textvariable=variable,
+            state="readonly",
+            style="Settings.TEntry",
         )
-        ttk.Button(parent, text="系统打开", command=command).grid(
-            row=row, column=2, pady=2
+        button = ttk.Button(
+            container,
+            text="打开文件",
+            command=command,
+            style="SettingsQuiet.TButton",
         )
+        self._register_form_row(container, label_widget, field, button)
+        return button
 
     def _directory_row(
         self,
-        parent: ttk.LabelFrame,
+        parent: tk.Misc,
         row: int,
         label: str,
         variable: tk.StringVar,
         *,
         directory: bool = True,
     ) -> None:
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=3)
-        ttk.Entry(parent, textvariable=variable).grid(
-            row=row, column=1, sticky="ew", padx=(10, 8), pady=3
+        container, label_widget = self._form_container(parent, row, label)
+        field = ttk.Entry(
+            container,
+            textvariable=variable,
+            style="Settings.TEntry",
         )
+        button: ttk.Button | None = None
         if directory:
-            ttk.Button(
-                parent,
+            button = ttk.Button(
+                container,
                 text="选择…",
                 command=partial(self._choose_directory, variable),
-            ).grid(row=row, column=2, pady=3)
+                style="SettingsQuiet.TButton",
+            )
+        self._register_form_row(container, label_widget, field, button)
 
-    @staticmethod
     def _model_row(
-        parent: ttk.LabelFrame,
+        self,
+        parent: tk.Misc,
         row: int,
         label: str,
         variable: tk.StringVar,
     ) -> ttk.Combobox:
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=4)
-        box = ttk.Combobox(parent, textvariable=variable, state="readonly")
-        box.grid(row=row, column=1, sticky="ew", padx=(12, 0), pady=4)
+        container, label_widget = self._form_container(parent, row, label)
+        box = ttk.Combobox(
+            container,
+            textvariable=variable,
+            state="readonly",
+            style="Settings.TCombobox",
+        )
+        self._register_form_row(container, label_widget, box)
         return box
+
+    def _form_container(
+        self,
+        parent: tk.Misc,
+        row: int,
+        label: str,
+    ) -> tuple[ttk.Frame, ttk.Label]:
+        container = ttk.Frame(parent, style="SettingsSoft.TFrame")
+        container.grid(row=row, column=0, sticky="ew", pady=3)
+        label_widget = ttk.Label(
+            container,
+            text=label,
+            style="SettingsSoftLabel.TLabel",
+        )
+        return container, label_widget
+
+    def _register_form_row(
+        self,
+        container: ttk.Frame,
+        label: ttk.Label,
+        field: tk.Widget,
+        action: ttk.Button | None = None,
+    ) -> _ResponsiveFormRow:
+        row = _ResponsiveFormRow(container, label, field, action)
+        self._responsive_rows.append(row)
+
+        def reflow(event: tk.Event[tk.Misc], item: _ResponsiveFormRow = row) -> None:
+            self._layout_form_row(item, event.width)
+
+        container.bind(
+            "<Configure>",
+            reflow,
+            add=True,
+        )
+        self._layout_form_row(row, self._FORM_COMPACT_WIDTH + 1)
+        return row
+
+    def _layout_form_row(self, row: _ResponsiveFormRow, width: int) -> None:
+        """Reflow labels above fields when the available width is narrow."""
+
+        compact = width < self._FORM_COMPACT_WIDTH
+        if row.compact == compact:
+            return
+        row.compact = compact
+        for widget in (row.label, row.field, row.action):
+            if widget is not None:
+                widget.grid_forget()
+        if compact:
+            row.container.columnconfigure(0, weight=1, minsize=0)
+            row.container.columnconfigure(1, weight=0, minsize=0)
+            row.container.columnconfigure(2, weight=0, minsize=0)
+            row.label.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
+            row.field.grid(
+                row=1,
+                column=0,
+                columnspan=1 if row.action is not None else 2,
+                sticky="ew",
+                padx=(0, 8) if row.action is not None else 0,
+            )
+            if row.action is not None:
+                row.action.grid(row=1, column=1, sticky="e")
+            return
+        row.container.columnconfigure(0, weight=0, minsize=112)
+        row.container.columnconfigure(1, weight=1, minsize=0)
+        row.container.columnconfigure(2, weight=0, minsize=0)
+        row.label.grid(row=0, column=0, sticky="w", padx=(0, 10))
+        row.field.grid(
+            row=0,
+            column=1,
+            sticky="ew",
+            padx=(0, 8) if row.action is not None else 0,
+        )
+        if row.action is not None:
+            row.action.grid(row=0, column=2, sticky="e")
+
+    def _toggle_add_library_form(self) -> None:
+        self._add_library_visible = not self._add_library_visible
+        if self._add_library_visible:
+            self._add_library_form.grid()
+            self._add_library_toggle_button.configure(text="收起图库信息")
+            return
+        self._add_library_form.grid_remove()
+        self._add_library_toggle_button.configure(text="填写图库信息")
+
+    def _toggle_advanced_editor(self) -> None:
+        self._advanced_visible = not self._advanced_visible
+        if self._advanced_visible:
+            self._advanced_section.grid()
+            self._model_page.rowconfigure(4, weight=1)
+            self._advanced_toggle_button.configure(text="收起 JSON 编辑器")
+            self._model_json.focus_set()
+            return
+        self._advanced_section.grid_remove()
+        self._model_page.rowconfigure(4, weight=0)
+        self._advanced_toggle_button.configure(text="展开 JSON 编辑器")
+
+    def _on_library_selection_changed(
+        self,
+        _event: tk.Event[tk.Misc] | None = None,
+    ) -> None:
+        """Keep library actions explicit and prevent invalid last-disable clicks."""
+
+        selected = self._library_tree.selection()
+        snapshot = self.settings_state.configuration
+        if len(selected) != 1 or snapshot is None:
+            self._set_default_button.state(["disabled"])
+            self._toggle_library_button.state(["disabled"])
+            self._toggle_library_button.configure(text="调整启用状态")
+            return
+        selected_id = selected[0]
+        library = next(
+            (item for item in snapshot.libraries if item.library_id == selected_id),
+            None,
+        )
+        if library is None:
+            self._set_default_button.state(["disabled"])
+            self._toggle_library_button.state(["disabled"])
+            return
+        default_id = snapshot.configuration.default_library_id
+        if selected_id == default_id:
+            self._set_default_button.state(["disabled"])
+        else:
+            self._set_default_button.state(["!disabled"])
+        self._toggle_library_button.configure(
+            text="停用图库" if library.enabled else "启用图库"
+        )
+        enabled_count = sum(item.enabled for item in snapshot.libraries)
+        cannot_disable_last = library.enabled and enabled_count <= 1
+        self._toggle_library_button.state(
+            ["disabled"] if cannot_disable_last else ["!disabled"]
+        )
 
     def _apply_state(self, state: SettingsState, *, reload_json: bool) -> None:
         self._state = state
         self._config_path_var.set(str(self.controller.config_path))
         self._models_path_var.set(str(self.controller.models_path))
+        self._config_open_button.state(
+            ["!disabled"] if self.controller.config_path.is_file() else ["disabled"]
+        )
+        self._models_open_button.state(
+            ["!disabled"] if self.controller.models_path.is_file() else ["disabled"]
+        )
         if state.configured:
             self._first_use.grid_remove()
             self._configured.grid()
@@ -522,7 +1503,13 @@ class SettingsPanel(ttk.Frame):
         for item in self._library_tree.get_children():
             self._library_tree.delete(item)
         if snapshot is None:
+            self._library_tree.configure(height=3)
+            self._library_summary.configure(text="尚未配置图库")
+            self._on_library_selection_changed()
             return
+        self._library_tree.configure(
+            height=max(3, min(6, len(snapshot.libraries))),
+        )
         default_id = snapshot.configuration.default_library_id
         for library in snapshot.libraries:
             self._library_tree.insert(
@@ -537,6 +1524,15 @@ class SettingsPanel(ttk.Frame):
                     str(library.workspace_directory),
                 ),
             )
+        enabled_count = sum(library.enabled for library in snapshot.libraries)
+        self._library_summary.configure(
+            text=f"共 {len(snapshot.libraries)} 个图库 · {enabled_count} 个已启用"
+        )
+        if default_id and self._library_tree.exists(default_id):
+            self._library_tree.selection_set(default_id)
+            self._library_tree.focus(default_id)
+            self._library_tree.see(default_id)
+        self._on_library_selection_changed()
 
     def _render_models(
         self, snapshot: ModelSettingsSnapshot, *, reload_json: bool
@@ -581,9 +1577,19 @@ class SettingsPanel(ttk.Frame):
         if state.credential_saved:
             storage = "Windows 安全凭据" if state.credential_persistent else "本次会话"
             text = f"已保存（{storage}）"
+            style = "SettingsSuccess.TLabel"
+            self._credential_card.configure(style="SettingsSuccessCard.TFrame")
+            self._credential_card_title.configure(style="SettingsSuccessTitle.TLabel")
+            self._credential_storage_note.configure(style="SettingsSuccessMuted.TLabel")
+            self._delete_api_key_button.state(["!disabled"])
         else:
             text = "尚未保存"
-        self._credential_status.configure(text=text)
+            style = "SettingsCredentialMuted.TLabel"
+            self._credential_card.configure(style="SettingsSoft.TFrame")
+            self._credential_card_title.configure(style="SettingsSoftTitle.TLabel")
+            self._credential_storage_note.configure(style="SettingsSoftMuted.TLabel")
+            self._delete_api_key_button.state(["disabled"])
+        self._credential_status.configure(text=text, style=style)
 
     def _choose_directory(self, variable: tk.StringVar) -> None:
         selected = filedialog.askdirectory(
@@ -799,6 +1805,7 @@ class SettingsWindow:
             configuration,
             models,
             credentials,
+            embedded=False,
         )
         self.panel.pack(fill="both", expand=True)
 

@@ -1231,25 +1231,59 @@ def _parse_proposal(value: object, path: str) -> OrganizeProposal:
         raw.get("review_reasons", []), f"{path}.review_reasons"
     )
 
-    detail_identity = tuple(detail.tag for detail in details if detail.is_identity)
-    proposed_or_low_risk_keys = {
-        _key(tag) for tag in (*proposed_tags, *explicit_low_risk)
-    }
+    existing_keys = {_key(tag) for tag in existing_tags}
+    proposed_keys = {_key(tag) for tag in proposed_tags}
+    # ``identity=True`` describes provenance, not necessarily pending risk.  A
+    # high-confidence identity can already have been accepted by the backend
+    # and still appear in tag_details as an existing low-risk entity.  Only
+    # current proposed identities that are explicitly marked for review belong
+    # in the identity bucket.
+    detail_identity = tuple(
+        detail.tag
+        for detail in details
+        if detail.is_identity
+        and not detail.already_present
+        and _key(detail.tag) in proposed_keys
+        and (
+            detail.requires_individual_confirmation
+            or _key(detail.risk) in {"identity", "conflict"}
+        )
+    )
     entity_identity = tuple(
         entity.name
         for values in entities.values()
         for entity in values
-        if entity.name and _key(entity.name) in proposed_or_low_risk_keys
+        if entity.name
+        and _key(entity.name) in proposed_keys
+        and _key(entity.name) not in existing_keys
+        and _key(entity.state) in {"suggested", "conflict"}
     )
-    identity_tags = _dedupe((*explicit_identity, *detail_identity, *entity_identity))
+    identity_tags = _dedupe(
+        (
+            *(
+                tag
+                for tag in explicit_identity
+                if _key(tag) in proposed_keys and _key(tag) not in existing_keys
+            ),
+            *detail_identity,
+            *entity_identity,
+        )
+    )
     identity_keys = {_key(tag) for tag in identity_tags}
-    existing_keys = {_key(tag) for tag in existing_tags}
+    all_identity_keys = {
+        _key(detail.tag) for detail in details if detail.is_identity
+    } | {
+        _key(entity.name)
+        for values in entities.values()
+        for entity in values
+        if entity.name
+    }
     detail_low_risk = tuple(detail.tag for detail in details if detail.is_low_risk)
     low_risk_tags = _dedupe((*explicit_low_risk, *detail_low_risk))
     batch_safe = tuple(
         tag
         for tag in low_risk_tags
-        if _key(tag) not in identity_keys and _key(tag) not in existing_keys
+        if _key(tag) not in all_identity_keys and _key(tag) not in existing_keys
     )
     proposed_additions = tuple(
         tag for tag in proposed_tags if _key(tag) not in existing_keys

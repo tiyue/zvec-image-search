@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -161,7 +162,9 @@ class BackendHostTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name)
+        # Windows runners may expose TemporaryDirectory through an 8.3 alias.
+        # Canonicalize once so fixtures and production-resolved paths agree.
+        self.root = Path(self.temporary.name).resolve()
         self.config_home = self.root / "config-home"
         self.config_home.mkdir()
         self.image_root = self.root / "人物图库"
@@ -244,8 +247,10 @@ class BackendHostTests(unittest.TestCase):
     def test_frozen_desktop_uses_sibling_backend_executable(self) -> None:
         application_directory = self.root / "frozen-app"
         application_directory.mkdir()
-        desktop_executable = application_directory / "Zvec.Desktop.exe"
-        backend_executable = application_directory / "zvec-backend.exe"
+        desktop_name = "Zvec.Desktop.exe" if os.name == "nt" else "Zvec.Desktop"
+        backend_name = "zvec-backend.exe" if os.name == "nt" else "zvec-backend"
+        desktop_executable = application_directory / desktop_name
+        backend_executable = application_directory / backend_name
         desktop_executable.write_bytes(b"desktop")
         backend_executable.write_bytes(b"backend")
 
@@ -264,19 +269,22 @@ class BackendHostTests(unittest.TestCase):
     def test_frozen_desktop_rejects_missing_sibling_backend(self) -> None:
         application_directory = self.root / "broken-frozen-app"
         application_directory.mkdir()
-        desktop_executable = application_directory / "Zvec.Desktop.exe"
+        desktop_name = "Zvec.Desktop.exe" if os.name == "nt" else "Zvec.Desktop"
+        backend_name = "zvec-backend.exe" if os.name == "nt" else "zvec-backend"
+        desktop_executable = application_directory / desktop_name
         desktop_executable.write_bytes(b"desktop")
 
         with (
             patch.object(sys, "frozen", True, create=True),
             patch.object(sys, "executable", str(desktop_executable)),
-            self.assertRaisesRegex(BackendHostError, "zvec-backend.exe"),
+            self.assertRaises(BackendHostError) as raised,
         ):
             BackendHost(
                 self.config_path,
                 config_home=self.config_home,
                 runtime_parent=self.runtime_parent,
             )
+        self.assertIn(backend_name, str(raised.exception))
 
     def test_start_generates_authenticated_runtime_manifest_and_stops_cleanly(
         self,

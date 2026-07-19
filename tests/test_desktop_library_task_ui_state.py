@@ -146,7 +146,7 @@ class TaskCenterStateTest(unittest.TestCase):
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             owned = root / "failed-images"
             owned.mkdir()
             manifest = owned / "run-1" / "failures.json"

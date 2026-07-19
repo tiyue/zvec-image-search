@@ -1,4 +1,4 @@
-"""Single frozen dispatcher shared by all Python preview executables.
+"""Single frozen dispatcher shared by all pure-Python desktop executables.
 
 PyInstaller builds one dependency graph and places three small bootloaders next
 to the same ``_internal`` directory.  Dispatching by executable name keeps the

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import tempfile
@@ -19,6 +20,7 @@ from zvec_desktop.settings_panel import (
     SettingsPanelError,
     SettingsWindow,
 )
+from zvec_desktop.theme import DEFAULT_THEME
 
 
 class _StatusOnlyCredentialStore:
@@ -49,7 +51,7 @@ class _StatusOnlyCredentialStore:
 class SettingsControllerTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.temporary.name).resolve()
         self.config_home = self.root / "config-home"
         self.config_service = DesktopConfigurationService(config_home=self.config_home)
         self.model_service = ModelSettingsService(self.config_home / "models.json")
@@ -232,6 +234,11 @@ class SettingsControllerTest(unittest.TestCase):
             [self.model_service.path, self.config_service.path],
         )
 
+    def test_panel_defaults_to_embedded_mode(self) -> None:
+        parameter = inspect.signature(SettingsPanel).parameters["embedded"]
+
+        self.assertIs(parameter.default, True)
+
 
 @unittest.skipUnless(os.name == "nt", "tkinter settings smoke is Windows-only")
 class SettingsPanelWindowSmokeTest(unittest.TestCase):
@@ -260,8 +267,15 @@ class SettingsPanelWindowSmokeTest(unittest.TestCase):
                 window.root.geometry("960x700+25+25")
                 window.root.update()
                 panel: SettingsPanel = window.panel
+                self.assertFalse(panel.embedded)
+                self.assertIsNotNone(panel._header_title)
+                self.assertEqual(panel._notebook.grid_info()["row"], 2)
                 self.assertTrue(panel._first_use.winfo_ismapped())
                 self.assertFalse(panel._configured.winfo_ismapped())
+                self.assertFalse(bool(panel._advanced_section.grid_info()))
+                self.assertFalse(bool(panel._add_library_form.grid_info()))
+                self.assertTrue(panel._delete_api_key_button.instate(["disabled"]))
+                self.assertTrue(panel._config_open_button.instate(["disabled"]))
                 model_ids = {
                     choice.model_id
                     for choice in panel.settings_state.models.embedding_choices
@@ -284,6 +298,22 @@ class SettingsPanelWindowSmokeTest(unittest.TestCase):
                 show_error.assert_not_called()
                 self.assertTrue(panel._configured.winfo_ismapped())
                 self.assertEqual(len(panel._library_tree.get_children()), 1)
+                self.assertTrue(panel._config_open_button.instate(["!disabled"]))
+                self.assertEqual(len(panel._library_tree.selection()), 1)
+                self.assertEqual(int(panel._library_tree["height"]), 3)
+                self.assertIn("共 1 个图库", str(panel._library_summary["text"]))
+                self.assertTrue(panel._set_default_button.instate(["disabled"]))
+                self.assertTrue(panel._toggle_library_button.instate(["disabled"]))
+
+                panel._toggle_add_library_form()
+                window.root.update()
+                self.assertTrue(bool(panel._add_library_form.grid_info()))
+                self.assertEqual(
+                    str(panel._add_library_toggle_button["text"]),
+                    "收起图库信息",
+                )
+                panel._toggle_add_library_form()
+                self.assertFalse(bool(panel._add_library_form.grid_info()))
 
                 secret = "sk-ui-must-clear-immediately"
                 panel._credential_entry.insert(0, secret)
@@ -294,11 +324,132 @@ class SettingsPanelWindowSmokeTest(unittest.TestCase):
                 status = str(panel._credential_status["text"])
                 self.assertIn("已保存", status)
                 self.assertNotIn(secret, status)
+                self.assertEqual(
+                    str(panel._credential_status["style"]),
+                    "SettingsSuccess.TLabel",
+                )
+                self.assertEqual(
+                    str(panel._credential_card["style"]),
+                    "SettingsSuccessCard.TFrame",
+                )
+                self.assertTrue(panel._delete_api_key_button.instate(["!disabled"]))
             except tk.TclError as exc:
                 self.skipTest(f"tkinter display is unavailable: {exc}")
             finally:
                 if window is not None:
                     window.root.destroy()
+
+    def test_embedded_panel_removes_duplicate_title_and_uses_modern_styles(
+        self,
+    ) -> None:
+        try:
+            import tkinter as tk
+        except ImportError as exc:
+            self.skipTest(f"tkinter is unavailable: {exc}")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            config_home = Path(temporary).resolve() / "config-home"
+            config = DesktopConfigurationService(config_home=config_home)
+            models = ModelSettingsService(config_home / "models.json")
+            root: tk.Tk | None = None
+            try:
+                root = tk.Tk()
+                panel = SettingsPanel(
+                    root,
+                    config,
+                    models,
+                    SessionCredentialStore(),
+                )
+                panel.pack(fill="both", expand=True)
+                root.update_idletasks()
+
+                self.assertTrue(panel.embedded)
+                self.assertIsNone(panel._header_title)
+                self.assertEqual(panel._notebook.grid_info()["row"], 0)
+                self.assertEqual(str(panel["style"]), "SettingsRoot.TFrame")
+                self.assertEqual(
+                    str(panel._notebook["style"]),
+                    "Settings.TNotebook",
+                )
+                self.assertEqual(
+                    str(panel._library_tab["style"]),
+                    "SettingsTab.TFrame",
+                )
+                self.assertEqual(
+                    str(panel._library_page["style"]),
+                    "SettingsTab.TFrame",
+                )
+                self.assertEqual(
+                    str(panel._library_tree["style"]),
+                    "Settings.Treeview",
+                )
+                self.assertEqual(
+                    str(panel._model_json["background"]),
+                    DEFAULT_THEME.code_surface,
+                )
+                self.assertEqual(
+                    str(panel._model_json["highlightcolor"]),
+                    DEFAULT_THEME.focus,
+                )
+                self.assertFalse(bool(panel._advanced_section.grid_info()))
+                panel._toggle_advanced_editor()
+                root.update_idletasks()
+                self.assertTrue(bool(panel._advanced_section.grid_info()))
+                self.assertEqual(
+                    str(panel._advanced_toggle_button["text"]),
+                    "收起 JSON 编辑器",
+                )
+                panel._toggle_advanced_editor()
+                self.assertFalse(bool(panel._advanced_section.grid_info()))
+            except tk.TclError as exc:
+                self.skipTest(f"tkinter display is unavailable: {exc}")
+            finally:
+                if root is not None:
+                    root.destroy()
+
+    def test_compact_embedded_panel_reflows_forms_and_scrolls(self) -> None:
+        try:
+            import tkinter as tk
+        except ImportError as exc:
+            self.skipTest(f"tkinter is unavailable: {exc}")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            config_home = Path(temporary).resolve() / "config-home"
+            config = DesktopConfigurationService(config_home=config_home)
+            models = ModelSettingsService(config_home / "models.json")
+            root: tk.Tk | None = None
+            try:
+                root = tk.Tk()
+                root.geometry("620x520+30+30")
+                panel = SettingsPanel(
+                    root,
+                    config,
+                    models,
+                    SessionCredentialStore(),
+                )
+                panel.pack(fill="both", expand=True)
+                for _ in range(4):
+                    root.update()
+
+                first_row = panel._responsive_rows[0]
+                self.assertTrue(first_row.compact)
+                self.assertEqual(int(first_row.label.grid_info()["row"]), 0)
+                self.assertEqual(int(first_row.field.grid_info()["row"]), 1)
+                scrollbar = panel._tab_scrollbars[panel._library_canvas]
+                self.assertTrue(scrollbar.winfo_ismapped())
+                self.assertLess(panel._library_canvas.yview()[1], 1.0)
+
+                root.geometry("1100x800+30+30")
+                for _ in range(4):
+                    root.update()
+                self.assertFalse(first_row.compact)
+                self.assertEqual(int(first_row.label.grid_info()["row"]), 0)
+                self.assertEqual(int(first_row.field.grid_info()["row"]), 0)
+            except tk.TclError as exc:
+                self.skipTest(f"tkinter display is unavailable: {exc}")
+            finally:
+                if root is not None:
+                    root.destroy()
 
 
 if __name__ == "__main__":

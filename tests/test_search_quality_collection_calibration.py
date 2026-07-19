@@ -43,6 +43,89 @@ def _case(case_id: str, results: list[tuple[str, float]]) -> dict:
     }
 
 
+def _calibration(offsets: dict[str, float]) -> dict:
+    return {
+        "mode": collection_calibration.MODE,
+        "modes": {
+            mode: {
+                "libraries": {
+                    library_id: {"offset": offset}
+                    for library_id, offset in offsets.items()
+                }
+            }
+            for mode in ("text", "image", "combined")
+        },
+    }
+
+
+def _offline_runtime_ids(
+    mode: str,
+    case: dict,
+    *,
+    offsets: dict[str, float],
+    threshold: float,
+    score_field: str,
+    semantics: str,
+    score_gap: float = 1.0,
+    max_confidence_drop: float = 1.0,
+) -> tuple[list[str], list[str]]:
+    item = _item("parity", mode, "small:relevant.jpg")
+    calibration = _calibration(offsets)
+    offline = calibrate._filtered_pairs(
+        [(item, case)],
+        threshold,
+        semantics,
+        mode=mode,
+        score_field=score_field,
+        score_gap=score_gap,
+        max_confidence_drop=max_confidence_drop,
+        collection_calibration_config=calibration,
+    )[0][1]["results"]
+    rank_source = (
+        "fused" if mode == "combined" else "image" if mode == "image" else "text"
+    )
+    hits = [
+        SearchHit(
+            doc_id=result["image_id"],
+            distance=float(result["raw_score"]),
+            fields={
+                "library_id": result["image_id"].split(":", 1)[0],
+                "sha256": result["image_id"],
+            },
+            rank=result["rank"],
+            raw_score=float(result["raw_score"]),
+            normalized_score=float(result["confidence"]),
+            confidence=float(result["confidence"]),
+            rank_source=rank_source,
+        )
+        for result in case["results"]
+    ]
+    production = calibrate._production_threshold(
+        mode,
+        {
+            "value": threshold,
+            "score_gap": score_gap,
+            "max_confidence_drop": max_confidence_drop,
+        },
+        score_field,
+    )
+    runtime = confidence_rank(
+        hits,
+        query_type="image_text" if mode == "combined" else mode,
+        top_k=10,
+        min_confidence=production["minimum_confidence"],
+        minimum_score=production["minimum_score"],
+        score_gap=production["score_gap"],
+        max_confidence_drop=production["max_confidence_drop"],
+        collection_confidence_offsets=offsets,
+    )
+    assert runtime is not None
+    return (
+        [str(result["image_id"]) for result in offline],
+        [hit.doc_id for hit in runtime.hits],
+    )
+
+
 class CollectionNullCalibrationTest(unittest.TestCase):
     def fixture(self) -> list[tuple[dict, dict]]:
         pairs: list[tuple[dict, dict]] = []
@@ -161,6 +244,12 @@ class CollectionNullCalibrationTest(unittest.TestCase):
                         for library_id, offset in offsets.items()
                     }
                 },
+                "image": {
+                    "libraries": {
+                        library_id: {"offset": offset}
+                        for library_id, offset in offsets.items()
+                    }
+                },
                 "combined": {
                     "libraries": {
                         library_id: {"offset": offset}
@@ -171,6 +260,7 @@ class CollectionNullCalibrationTest(unittest.TestCase):
         }
         for mode, query_type, score_field, semantics, threshold in (
             ("text", "text", "raw_score", "lower_is_better", 0.40),
+            ("image", "image", "raw_score", "lower_is_better", 0.40),
             ("combined", "image_text", "confidence", "higher_is_better", 0.70),
         ):
             with self.subTest(mode=mode):
@@ -179,10 +269,13 @@ class CollectionNullCalibrationTest(unittest.TestCase):
                     "parity",
                     [
                         ("large:noise.jpg", 0.90),
-                        ("small:relevant.jpg", 0.85),
+                        (
+                            "small:relevant.jpg",
+                            0.65 if mode == "combined" else 0.85,
+                        ),
                     ],
                 )
-                if mode == "text":
+                if mode in {"text", "image"}:
                     case["results"][0]["raw_score"] = 0.20
                     case["results"][1]["raw_score"] = 0.30
                 offline = calibrate._filtered_pairs(
@@ -208,7 +301,13 @@ class CollectionNullCalibrationTest(unittest.TestCase):
                         raw_score=float(result["raw_score"]),
                         normalized_score=float(result["confidence"]),
                         confidence=float(result["confidence"]),
-                        rank_source="fused" if mode == "combined" else "text",
+                        rank_source=(
+                            "fused"
+                            if mode == "combined"
+                            else "image"
+                            if mode == "image"
+                            else "text"
+                        ),
                     )
                     for result in case["results"]
                 ]
@@ -236,6 +335,126 @@ class CollectionNullCalibrationTest(unittest.TestCase):
                 self.assertEqual(
                     [result["image_id"] for result in offline],
                     [hit.doc_id for hit in runtime.hits],
+                )
+                self.assertEqual(
+                    [hit.doc_id for hit in runtime.hits],
+                    (
+                        ["small:relevant.jpg", "large:noise.jpg"]
+                        if mode == "combined"
+                        else ["small:relevant.jpg"]
+                    ),
+                )
+
+    def test_offline_and_runtime_keep_twenty_percent_boundary(self) -> None:
+        for mode in ("text", "image", "combined"):
+            with self.subTest(mode=mode):
+                if mode == "combined":
+                    case = _case(
+                        "parity",
+                        [
+                            ("large:below.jpg", 0.19),
+                            ("small:kept.jpg", 0.20),
+                        ],
+                    )
+                    threshold = 0.20
+                    score_field = "confidence"
+                    semantics = "higher_is_better"
+                else:
+                    case = _case(
+                        "parity",
+                        [
+                            ("large:below.jpg", 0.15),
+                            ("small:kept.jpg", 0.25),
+                        ],
+                    )
+                    case["results"][0]["raw_score"] = 1.70
+                    case["results"][1]["raw_score"] = 1.50
+                    threshold = 1.90
+                    score_field = "raw_score"
+                    semantics = "lower_is_better"
+
+                offline, runtime = _offline_runtime_ids(
+                    mode,
+                    case,
+                    offsets={"large": 0.0, "small": 0.0},
+                    threshold=threshold,
+                    score_field=score_field,
+                    semantics=semantics,
+                )
+
+                self.assertEqual(offline, runtime)
+                self.assertEqual(runtime, ["small:kept.jpg"])
+
+    def test_offline_and_runtime_use_same_adjusted_confidence_gap(self) -> None:
+        offsets = {"large": -0.10, "small": 0.10}
+        for mode in ("text", "image", "combined"):
+            with self.subTest(mode=mode):
+                case = _case(
+                    "parity",
+                    [
+                        ("large:tail.jpg", 0.70),
+                        ("small:top.jpg", 0.80),
+                    ],
+                )
+                if mode == "combined":
+                    threshold = 0.60
+                    score_field = "confidence"
+                    semantics = "higher_is_better"
+                else:
+                    case["results"][0]["raw_score"] = 0.60
+                    case["results"][1]["raw_score"] = 0.40
+                    threshold = 0.80
+                    score_field = "raw_score"
+                    semantics = "lower_is_better"
+
+                offline, runtime = _offline_runtime_ids(
+                    mode,
+                    case,
+                    offsets=offsets,
+                    threshold=threshold,
+                    score_field=score_field,
+                    semantics=semantics,
+                    score_gap=0.25,
+                )
+
+                self.assertEqual(offline, runtime)
+                self.assertEqual(runtime, ["small:top.jpg"])
+
+    def test_offline_and_runtime_share_raw_score_tie_breaking(self) -> None:
+        offsets = {"large": -0.10, "small": 0.10}
+        for mode in ("text", "image", "combined"):
+            with self.subTest(mode=mode):
+                case = _case(
+                    "parity",
+                    [
+                        ("small:relevant.jpg", 0.70),
+                        ("large:noise.jpg", 0.90),
+                    ],
+                )
+                if mode == "combined":
+                    threshold = 0.60
+                    score_field = "confidence"
+                    semantics = "higher_is_better"
+                else:
+                    case["results"][0]["raw_score"] = 0.60
+                    case["results"][1]["raw_score"] = 0.20
+                    threshold = 0.80
+                    score_field = "raw_score"
+                    semantics = "lower_is_better"
+
+                offline, runtime = _offline_runtime_ids(
+                    mode,
+                    case,
+                    offsets=offsets,
+                    threshold=threshold,
+                    score_field=score_field,
+                    semantics=semantics,
+                )
+
+                self.assertEqual(offline, runtime)
+                self.assertEqual(
+                    runtime,
+                    ["large:noise.jpg", "small:relevant.jpg"],
                 )
 
 
