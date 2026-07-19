@@ -758,6 +758,71 @@ class IndexState:
         )
         return [self._entry_from_row(row) for row in rows]
 
+    def iter_entries(self, *, chunk_size: int = 256) -> Iterator[list[dict[str, Any]]]:
+        """Yield the library in stable keyset pages instead of one full list."""
+
+        if isinstance(chunk_size, bool) or not isinstance(chunk_size, int):
+            raise ValueError("Entry chunk_size must be an integer.")
+        if not 1 <= chunk_size <= 1_000:
+            raise ValueError("Entry chunk_size must be between 1 and 1000.")
+        after_root = ""
+        after_path = ""
+        after_doc_id = ""
+        first = True
+        while True:
+            if first:
+                rows = self.connection.execute(
+                    "SELECT * FROM entries "
+                    "ORDER BY root_id, relative_path, doc_id LIMIT ?",
+                    (chunk_size,),
+                ).fetchall()
+                first = False
+            else:
+                rows = self.connection.execute(
+                    "SELECT * FROM entries WHERE "
+                    "root_id > ? OR (root_id = ? AND relative_path > ?) OR "
+                    "(root_id = ? AND relative_path = ? AND doc_id > ?) "
+                    "ORDER BY root_id, relative_path, doc_id LIMIT ?",
+                    (
+                        after_root,
+                        after_root,
+                        after_path,
+                        after_root,
+                        after_path,
+                        after_doc_id,
+                        chunk_size,
+                    ),
+                ).fetchall()
+            if not rows:
+                return
+            yield [self._entry_from_row(row) for row in rows]
+            last = rows[-1]
+            after_root = str(last["root_id"])
+            after_path = str(last["relative_path"])
+            after_doc_id = str(last["doc_id"])
+
+    def get_document_annotations(
+        self,
+        doc_ids: Iterable[str],
+    ) -> dict[str, dict[str, Any]]:
+        """Fetch annotations in bounded SQLite parameter batches."""
+
+        normalized = list(dict.fromkeys(str(doc_id) for doc_id in doc_ids))
+        result: dict[str, dict[str, Any]] = {}
+        for offset in range(0, len(normalized), _SQLITE_PARAMETER_CHUNK):
+            chunk = normalized[offset : offset + _SQLITE_PARAMETER_CHUNK]
+            if not chunk:
+                continue
+            placeholders = ", ".join("?" for _ in chunk)
+            rows = self.connection.execute(
+                f"SELECT * FROM document_annotations WHERE doc_id IN ({placeholders})",
+                chunk,
+            )
+            for row in rows:
+                annotation = self._document_annotation_from_row(row)
+                result[str(annotation["doc_id"])] = annotation
+        return result
+
     def list_folders(
         self,
         *,
@@ -1103,6 +1168,13 @@ class IndexState:
             "SELECT * FROM document_annotations WHERE doc_id = ?", (doc_id,)
         ).fetchone()
         return self._document_annotation_from_row(row) if row else None
+
+    def delete_document_annotation(self, doc_id: str) -> None:
+        with self.connection:
+            self.connection.execute(
+                "DELETE FROM document_annotations WHERE doc_id = ?",
+                (str(doc_id),),
+            )
 
     def list_document_annotations(
         self, status: str | None = None

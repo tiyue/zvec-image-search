@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
+from image_vector_service.search_features import SearchFeatureError, SearchFeatures
+
 CONFIG_SCHEMA_VERSION = 3
 DEFAULT_PAGE_SIZE = 15
 MAX_PAGE_SIZE = 500
@@ -93,6 +95,17 @@ class SearchResult:
     rank_agreement: float | None = None
     library_id: str = ""
     doc_id: str = ""
+    sha256: str = ""
+    ranking_model_version: str | None = None
+    ranking_score: float | None = None
+    feature_schema_version: int | None = None
+    ranking_fallback: bool = False
+    ranking_fallback_reason: str | None = None
+    calibrated_minimum_confidence: float | None = None
+    calibration_version: str | None = None
+    calibration_scope: str | None = None
+    calibration_fallback: bool = False
+    search_features: dict[str, object] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -765,6 +778,41 @@ class ResultCatalog:
             ),
             library_id=(library.library_id if library else ""),
             doc_id=_optional_text(raw.get("doc_id"), ""),
+            sha256=_optional_text(raw.get("sha256"), ""),
+            ranking_model_version=(
+                _optional_text(raw.get("ranking_model_version"), "") or None
+            ),
+            ranking_score=_optional_finite_number(
+                raw.get("ranking_score"), f"{label}.ranking_score"
+            ),
+            feature_schema_version=_optional_positive_integer(
+                raw.get("feature_schema_version"),
+                f"{label}.feature_schema_version",
+            ),
+            ranking_fallback=_optional_boolean(
+                raw.get("ranking_fallback"),
+                f"{label}.ranking_fallback",
+            ),
+            ranking_fallback_reason=(
+                _optional_text(raw.get("ranking_fallback_reason"), "") or None
+            ),
+            calibrated_minimum_confidence=_optional_finite_number(
+                raw.get("calibrated_minimum_confidence"),
+                f"{label}.calibrated_minimum_confidence",
+            ),
+            calibration_version=(
+                _optional_text(raw.get("calibration_version"), "") or None
+            ),
+            calibration_scope=(
+                _optional_text(raw.get("calibration_scope"), "") or None
+            ),
+            calibration_fallback=_optional_boolean(
+                raw.get("calibration_fallback"),
+                f"{label}.calibration_fallback",
+            ),
+            search_features=_optional_search_features(
+                raw.get("search_features"), f"{label}.search_features"
+            ),
         )
 
     def _result_library(
@@ -912,6 +960,25 @@ def _optional_positive_integer(value: Any, label: str) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise ResultCatalogError(f"{label} must be a positive integer.")
     return value
+
+
+def _optional_boolean(value: Any, label: str) -> bool:
+    if value is None:
+        return False
+    if not isinstance(value, bool):
+        raise ResultCatalogError(f"{label} must be a boolean.")
+    return value
+
+
+def _optional_search_features(value: Any, label: str) -> dict[str, object] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ResultCatalogError(f"{label} must be an object.")
+    try:
+        return SearchFeatures.from_mapping(value).to_dict()
+    except (SearchFeatureError, TypeError, ValueError) as exc:
+        raise ResultCatalogError(f"{label} is invalid: {exc}") from exc
 
 
 def _safe_relative_path(

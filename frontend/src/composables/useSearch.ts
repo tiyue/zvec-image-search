@@ -127,6 +127,10 @@ function safeImageUrl(value: unknown): string {
 function normalizeItem(raw: SearchResultWire, index: number): SearchResultItem {
   return {
     id: text(raw.id, raw.sha256, raw.document_id, `result-${index + 1}`),
+    searchSessionId: text(raw.search_session_id),
+    libraryId: text(raw.library_id),
+    docId: text(raw.doc_id, raw.document_id),
+    sha256: text(raw.sha256),
     name: text(raw.name, raw.filename, raw.relative_path, `图片 ${index + 1}`),
     relativePath: text(raw.relative_path, raw.display_path, raw.path),
     libraryName: text(raw.library_name, raw.collection_name, "未知图库"),

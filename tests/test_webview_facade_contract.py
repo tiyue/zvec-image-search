@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
 import unittest
 from collections.abc import Mapping
 from pathlib import Path
@@ -11,6 +12,11 @@ from unittest.mock import patch
 from PIL import Image
 
 from image_vector_service.config import ServiceConfig
+from image_vector_service.data_migration import (
+    DataMigrationExecutionError,
+    DataMigrationRequest,
+)
+from image_vector_service.search_learning_service import SearchLearningServiceError
 from image_vector_service.state import IndexState
 from zvec_desktop.configuration_service import DesktopConfigurationService
 from zvec_desktop.credentials import SessionCredentialStore
@@ -96,6 +102,119 @@ class _ReadyHost:
         self.is_running = False
 
 
+class _SuccessfulMigrationCoordinator:
+    def execute(self, request: object, **kwargs: object) -> dict[str, object]:
+        del request
+        on_progress = kwargs.get("on_progress")
+        if callable(on_progress):
+            on_progress(
+                {
+                    "stage": "backup_complete",
+                    "progress": 25,
+                    "message": "backup ready",
+                    "backup": {
+                        "status": "created",
+                        "destination": "C:\\Backups\\migration-test",
+                    },
+                }
+            )
+            on_progress({"stage": "complete", "progress": 100, "message": "done"})
+        return {
+            "status": "succeeded",
+            "backup": {"destination": "C:\\Backups\\migration-test"},
+            "verification": {"status": "verified"},
+            "api_requests": 0,
+        }
+
+
+class _BlockingMigrationCoordinator:
+    def __init__(self) -> None:
+        self.backup_ready = threading.Event()
+        self.release = threading.Event()
+
+    def execute(self, request: object, **kwargs: object) -> dict[str, object]:
+        del request
+        on_progress = kwargs.get("on_progress")
+        if callable(on_progress):
+            on_progress(
+                {
+                    "stage": "backup_complete",
+                    "progress": 25,
+                    "message": "backup ready",
+                    "backup": {
+                        "status": "created",
+                        "destination": "C:\\Backups\\migration-test",
+                    },
+                }
+            )
+        self.backup_ready.set()
+        if not self.release.wait(timeout=5):
+            raise RuntimeError("test migration release timed out")
+        return {
+            "status": "succeeded",
+            "backup": {"destination": "C:\\Backups\\migration-test"},
+            "verification": {"status": "verified"},
+            "api_requests": 0,
+        }
+
+
+class _RecoveryMigrationCoordinator:
+    def __init__(self, *, fail: bool = False) -> None:
+        self.fail = fail
+        self.calls: list[tuple[object, dict[str, object]]] = []
+
+    def recover(
+        self,
+        request: object,
+        backup: Mapping[str, object],
+        **kwargs: object,
+    ) -> dict[str, object]:
+        self.calls.append((request, dict(backup)))
+        on_progress = kwargs.get("on_progress")
+        if callable(on_progress):
+            on_progress({"stage": "restore", "progress": 20, "message": "restoring"})
+        if self.fail:
+            raise DataMigrationExecutionError(
+                "restore failed",
+                {
+                    "status": "needs_attention",
+                    "error": "restore failed",
+                    "backup": dict(backup),
+                    "api_requests": 0,
+                },
+            )
+        if callable(on_progress):
+            on_progress(
+                {
+                    "stage": "recovery_complete",
+                    "progress": 100,
+                    "message": "restored",
+                }
+            )
+        return {
+            "status": "restored",
+            "backup": dict(backup),
+            "api_requests": 0,
+            "model_api_requests": 0,
+        }
+
+
+class _FixedEvaluationService:
+    def __init__(self) -> None:
+        self.sources: list[str] = []
+        self.failure: SearchLearningServiceError | None = None
+
+    def install_fixed_evaluation(self, source_path: str) -> dict[str, object]:
+        self.sources.append(source_path)
+        if self.failure is not None:
+            raise self.failure
+        return {
+            "installed": True,
+            "evaluation_set_id": "human-reviewed-v1",
+            "external_api_calls": 0,
+        }
+
+
 class FacadeContractTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -137,6 +256,351 @@ class FacadeContractTests(unittest.TestCase):
             self.assertTrue(payload["service"]["error"])
         finally:
             facade.close()
+
+    def test_fixed_evaluation_import_validates_and_forwards_only_source_path(
+        self,
+    ) -> None:
+        service = _FixedEvaluationService()
+        facade = PreviewFacade(
+            self.root / "config.json",
+            backend_host=_IdleHost(),  # type: ignore[arg-type]
+            credential_store=SessionCredentialStore(),
+            search_learning_service=service,  # type: ignore[arg-type]
+        )
+        try:
+            result = facade.install_search_learning_evaluation(
+                {"source_path": "  C:\\Evaluation\\fixed-evaluation.json  "}
+            )
+
+            self.assertTrue(result["installed"])
+            self.assertEqual(result["external_api_calls"], 0)
+            self.assertEqual(
+                service.sources,
+                ["C:\\Evaluation\\fixed-evaluation.json"],
+            )
+
+            invalid_payloads = (
+                {},
+                {"source_path": "   "},
+                {"source_path": 42},
+                {"source_path": "C:\\valid.json", "unexpected": True},
+            )
+            for payload in invalid_payloads:
+                with (
+                    self.subTest(payload=payload),
+                    self.assertRaises(FacadeError) as caught,
+                ):
+                    facade.install_search_learning_evaluation(payload)
+                self.assertEqual(caught.exception.code, "invalid_request")
+            self.assertEqual(len(service.sources), 1)
+        finally:
+            facade.close()
+
+    def test_fixed_evaluation_pack_error_is_returned_as_a_safe_facade_error(
+        self,
+    ) -> None:
+        service = _FixedEvaluationService()
+        service.failure = SearchLearningServiceError(
+            "fixed_evaluation_pack_invalid",
+            "The selected evaluation pack is invalid.",
+        )
+        facade = PreviewFacade(
+            self.root / "config.json",
+            backend_host=_IdleHost(),  # type: ignore[arg-type]
+            credential_store=SessionCredentialStore(),
+            search_learning_service=service,  # type: ignore[arg-type]
+        )
+        try:
+            with self.assertRaises(FacadeError) as caught:
+                facade.install_search_learning_evaluation(
+                    {"source_path": "C:\\Evaluation\\invalid.json"}
+                )
+
+            self.assertEqual(caught.exception.code, "fixed_evaluation_pack_invalid")
+            self.assertEqual(caught.exception.status, 400)
+        finally:
+            facade.close()
+
+    def test_migration_success_with_backend_restart_failure_needs_attention(
+        self,
+    ) -> None:
+        facade = PreviewFacade(
+            self.root / "config.json",
+            backend_host=_IdleHost(),  # type: ignore[arg-type]
+            credential_store=SessionCredentialStore(),
+            data_migration_coordinator=_SuccessfulMigrationCoordinator(),  # type: ignore[arg-type]
+        )
+        try:
+            with patch.object(
+                facade,
+                "_restart_backend_after_migration",
+                return_value={
+                    "status": "degraded",
+                    "restart_required": True,
+                    "error": {
+                        "code": "backend_restart_failed",
+                        "message": "backend unavailable",
+                    },
+                },
+            ):
+                submitted = facade.submit_data_migration(
+                    {
+                        "request": {
+                            "migration_type": "schema",
+                            "source": str(self.root),
+                            "target": str(self.root),
+                            "library_id": "lib-test",
+                        },
+                        "confirmation_token": "preview-token",
+                        "confirmation_phrase": "MIGRATE",
+                    }
+                )
+                operation = facade._migration_operations[submitted["id"]]
+                assert operation.future is not None
+                operation.future.result(timeout=5)
+                result = facade.data_migration(submitted["id"])
+
+            self.assertEqual(result["status"], "needs_attention")
+            self.assertEqual(result["stage"], "backend_restart")
+            self.assertEqual(result["error"]["code"], "backend_restart_failed")
+        finally:
+            facade.close()
+
+    def test_migration_gate_stops_backend_and_persists_backup_receipt(self) -> None:
+        coordinator = _BlockingMigrationCoordinator()
+        host = _ReadyHost(_CompletedFolderDeleteClient())
+        facade = PreviewFacade(
+            self.root / "config.json",
+            backend_host=host,  # type: ignore[arg-type]
+            credential_store=SessionCredentialStore(),
+            data_migration_coordinator=coordinator,  # type: ignore[arg-type]
+        )
+        try:
+            with patch.object(
+                facade,
+                "_restart_backend_after_migration",
+                return_value={"status": "ready", "restart_required": False},
+            ):
+                submitted = facade.submit_data_migration(
+                    {
+                        "request": {
+                            "migration_type": "schema",
+                            "source": str(self.root),
+                            "target": str(self.root),
+                            "library_id": "lib-test",
+                        },
+                        "confirmation_token": "preview-token",
+                        "confirmation_phrase": "MIGRATE",
+                    }
+                )
+                self.assertTrue(coordinator.backup_ready.wait(timeout=5))
+                self.assertFalse(host.is_running)
+                recovery_marker = facade._migration_recovery.load()
+                assert recovery_marker is not None
+                self.assertEqual(recovery_marker.operation_id, submitted["id"])
+                self.assertEqual(recovery_marker.stage, "backup_complete")
+                self.assertEqual(
+                    facade.data_migration_recovery(),
+                    {"recovery": None, "migration_active": True},
+                )
+
+                for action in (
+                    lambda: facade.submit_search({}),
+                    lambda: facade.submit_job({}),
+                    lambda: facade.update_library("lib-test", {}),
+                ):
+                    with self.assertRaises(FacadeError) as blocked:
+                        action()
+                    self.assertEqual(blocked.exception.code, "data_migration_busy")
+
+                running = facade.data_migration(submitted["id"])
+                self.assertEqual(
+                    running["backup"]["destination"],
+                    "C:\\Backups\\migration-test",
+                )
+                history = facade.job_history(query=submitted["id"])
+                self.assertEqual(len(history["items"]), 1)
+                self.assertIn("backup", history["items"][0]["result_summary"])
+
+                coordinator.release.set()
+                operation = facade._migration_operations[submitted["id"]]
+                assert operation.future is not None
+                operation.future.result(timeout=5)
+                self.assertEqual(
+                    facade.data_migration(submitted["id"])["status"],
+                    "succeeded",
+                )
+        finally:
+            coordinator.release.set()
+            facade.close()
+
+    def test_pending_crash_marker_blocks_new_migrations_until_restored(self) -> None:
+        facade = PreviewFacade(
+            self.root / "config.json",
+            backend_host=_IdleHost(),  # type: ignore[arg-type]
+            credential_store=SessionCredentialStore(),
+            data_migration_coordinator=_SuccessfulMigrationCoordinator(),  # type: ignore[arg-type]
+        )
+        request = DataMigrationRequest(
+            migration_type="schema",
+            source="C:\\Zvec\\workspace",
+            target="C:\\Zvec\\workspace",
+            library_id="lib-test",
+        )
+        try:
+            facade._migration_recovery.arm(
+                "old-migration",
+                request,
+                {"destination": "C:\\Backups\\old-migration"},
+                stage="migrate",
+            )
+
+            with self.assertRaises(FacadeError) as blocked:
+                facade.submit_data_migration(
+                    {
+                        "request": request.to_dict(),
+                        "confirmation_token": "preview-token",
+                        "confirmation_phrase": "MIGRATE",
+                    }
+                )
+
+            self.assertEqual(blocked.exception.code, "migration_recovery_required")
+            self.assertFalse(facade._migration_gate)
+        finally:
+            facade.close()
+
+    def test_crash_recovery_runs_in_background_and_clears_marker(self) -> None:
+        coordinator = _RecoveryMigrationCoordinator()
+        facade = PreviewFacade(
+            self.root / "config.json",
+            backend_host=_IdleHost(),  # type: ignore[arg-type]
+            credential_store=SessionCredentialStore(),
+            data_migration_coordinator=coordinator,  # type: ignore[arg-type]
+        )
+        request = DataMigrationRequest(
+            migration_type="schema",
+            source="C:\\Zvec\\workspace",
+            target="C:\\Zvec\\workspace",
+            library_id="lib-test",
+        )
+        try:
+            facade._migration_recovery.arm(
+                "old-migration",
+                request,
+                {"destination": "C:\\Backups\\old-migration"},
+                stage="migrate",
+            )
+            with self.assertRaisesRegex(FacadeError, "RESTORE"):
+                facade.submit_data_migration_recovery(
+                    {
+                        "operation_id": "old-migration",
+                        "confirmation_phrase": "restore",
+                    }
+                )
+
+            submitted = facade.submit_data_migration_recovery(
+                {
+                    "operation_id": "old-migration",
+                    "confirmation_phrase": "RESTORE",
+                }
+            )
+            operation = facade._migration_operations[submitted["id"]]
+            assert operation.future is not None
+            operation.future.result(timeout=5)
+
+            result = facade.data_migration(submitted["id"])
+            self.assertEqual(result["status"], "succeeded")
+            self.assertEqual(result["stage"], "recovery_complete")
+            self.assertIsNone(facade.data_migration_recovery()["recovery"])
+            self.assertEqual(len(coordinator.calls), 1)
+        finally:
+            facade.close()
+
+    def test_failed_crash_recovery_keeps_marker_for_retry(self) -> None:
+        coordinator = _RecoveryMigrationCoordinator(fail=True)
+        facade = PreviewFacade(
+            self.root / "config.json",
+            backend_host=_IdleHost(),  # type: ignore[arg-type]
+            credential_store=SessionCredentialStore(),
+            data_migration_coordinator=coordinator,  # type: ignore[arg-type]
+        )
+        request = DataMigrationRequest(
+            migration_type="root",
+            source="C:\\Pictures",
+            target="D:\\Pictures",
+            workspace_directory="C:\\Zvec\\workspace",
+            library_id="lib-test",
+        )
+        try:
+            facade._migration_recovery.arm(
+                "old-migration",
+                request,
+                {"destination": "C:\\Backups\\old-migration"},
+                stage="migrate",
+            )
+            submitted = facade.submit_data_migration_recovery(
+                {
+                    "operation_id": "old-migration",
+                    "confirmation_phrase": "RESTORE",
+                }
+            )
+            operation = facade._migration_operations[submitted["id"]]
+            assert operation.future is not None
+            operation.future.result(timeout=5)
+
+            result = facade.data_migration(submitted["id"])
+            self.assertEqual(result["status"], "needs_attention")
+            self.assertEqual(
+                facade.data_migration_recovery()["recovery"]["operation_id"],
+                "old-migration",
+            )
+        finally:
+            facade.close()
+
+    def test_completed_recovery_marker_is_removed_without_restoring(self) -> None:
+        facade = PreviewFacade(
+            self.root / "config.json",
+            backend_host=_IdleHost(),  # type: ignore[arg-type]
+            credential_store=SessionCredentialStore(),
+        )
+        request = DataMigrationRequest(
+            migration_type="schema",
+            source="C:\\Zvec\\workspace",
+            target="C:\\Zvec\\workspace",
+        )
+        try:
+            facade._migration_recovery.arm(
+                "old-migration",
+                request,
+                {"destination": "C:\\Backups\\old-migration"},
+                stage="complete",
+            )
+
+            self.assertIsNone(facade.data_migration_recovery()["recovery"])
+            self.assertIsNone(facade._migration_recovery.load())
+        finally:
+            facade.close()
+
+    def test_data_migration_process_lock_blocks_a_second_facade(self) -> None:
+        first = PreviewFacade(
+            self.root / "config.json",
+            backend_host=_IdleHost(),  # type: ignore[arg-type]
+            credential_store=SessionCredentialStore(),
+        )
+        second = PreviewFacade(
+            self.root / "config.json",
+            backend_host=_IdleHost(),  # type: ignore[arg-type]
+            credential_store=SessionCredentialStore(),
+        )
+        process_lock = first._acquire_data_migration_process_lock()
+        try:
+            with self.assertRaises(FacadeError) as blocked:
+                second._acquire_data_migration_process_lock()
+            self.assertEqual(blocked.exception.code, "data_migration_busy")
+        finally:
+            process_lock.release()
+            first.close()
+            second.close()
 
     def test_library_task_contract_supports_confirmed_identity_batches(self) -> None:
         with self.assertRaisesRegex(Exception, "batch confirmation"):

@@ -45,6 +45,18 @@ BatchAcceptanceMode = Literal[
     "all_non_conflicting",
 ]
 ManualTagOperation = Literal["add", "remove", "replace_manual"]
+ClusterScope = Literal["new_or_changed", "all"]
+ClusterRunType = Literal["exact", "perceptual", "semantic", "near_duplicate"]
+ClusterType = Literal[
+    "all",
+    "exact",
+    "perceptual",
+    "semantic",
+    "single",
+    "near_duplicate",
+]
+ClusterIdentityCategory = Literal["real_person", "cosplayer", "character", "work"]
+LearningDecisionAction = Literal["accept", "reject", "edit", "skip"]
 
 DEFAULT_AUTO_TAG_MODEL = "qwen3-vl-flash"
 DEFAULT_AUTO_TAG_MAX_IMAGES = 300
@@ -58,6 +70,15 @@ _REVIEW_STATES = frozenset({"all", "low_risk", "identity", "conflict", "failed"}
 _BATCH_ACCEPTANCE_MODES = frozenset(
     {"low_risk_only", "recommended", "all_non_conflicting"}
 )
+_CLUSTER_SCOPES = frozenset({"new_or_changed", "all"})
+_CLUSTER_RUN_TYPES = frozenset({"exact", "perceptual", "semantic", "near_duplicate"})
+_CLUSTER_LIST_TYPES = frozenset(
+    {"all", "exact", "perceptual", "semantic", "single", "near_duplicate"}
+)
+_CLUSTER_IDENTITY_CATEGORIES = frozenset(
+    {"real_person", "cosplayer", "character", "work"}
+)
+_LEARNING_DECISIONS = frozenset({"accept", "reject", "edit", "skip"})
 _TERMINAL_STATUSES = frozenset(
     {"succeeded", "partial", "needs_attention", "failed", "cancelled"}
 )
@@ -78,6 +99,8 @@ _MAX_FOLDER_KEY_CHARACTERS = 8_192
 _MAX_FOLDER_PAGE_SIZE = 1_000
 _MAX_FOLDER_DELETE_TOKEN_CHARACTERS = 512
 _MAX_MANUAL_SELECTION_IDS = 10_000
+_MAX_CLUSTER_PAGE_SIZE = 500
+_MAX_LEARNING_DECISIONS = 1_000
 
 
 class LibraryTaskError(RuntimeError):
@@ -1183,6 +1206,337 @@ class TagAliasDeleteRequest:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class ClusterImagesRequest:
+    """Build or refresh local groups using hashes and existing Zvec vectors."""
+
+    library_id: str
+    scope: ClusterScope = "new_or_changed"
+    cluster_types: tuple[ClusterRunType, ...] = (
+        "exact",
+        "perceptual",
+        "semantic",
+    )
+
+    command: ClassVar[str] = "cluster_images"
+
+    def __post_init__(self) -> None:
+        _set_library_id(self)
+        if not isinstance(self.scope, str) or self.scope not in _CLUSTER_SCOPES:
+            raise _validation(
+                "scope must be new_or_changed or all.",
+                "scope",
+                details={"supported": sorted(_CLUSTER_SCOPES)},
+            )
+        values = self.cluster_types
+        if not isinstance(values, tuple) or not values:
+            raise _validation(
+                "cluster_types must contain near_duplicate and/or semantic.",
+                "cluster_types",
+            )
+        normalized = tuple(
+            dict.fromkeys(str(value).strip().lower() for value in values)
+        )
+        unknown = sorted(set(normalized) - _CLUSTER_RUN_TYPES)
+        if unknown:
+            raise _validation(
+                "cluster_types contains unsupported values.",
+                "cluster_types",
+                details={
+                    "values": unknown,
+                    "supported": sorted(_CLUSTER_RUN_TYPES),
+                },
+            )
+        object.__setattr__(self, "scope", self.scope.strip().lower())
+        object.__setattr__(self, "cluster_types", normalized)
+
+    def to_params(self) -> JsonObject:
+        return {
+            "library_id": self.library_id,
+            "scope": self.scope,
+            "cluster_types": list(self.cluster_types),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ClusterListRequest:
+    library_id: str
+    offset: int = 0
+    limit: int = 100
+    cluster_type: ClusterType | None = None
+
+    command: ClassVar[str] = "cluster_list"
+
+    def __post_init__(self) -> None:
+        _set_library_id(self)
+        _bounded_integer(self.offset, "offset", minimum=0, maximum=2**63 - 1)
+        _bounded_integer(self.limit, "limit", minimum=1, maximum=_MAX_CLUSTER_PAGE_SIZE)
+        value = self.cluster_type
+        if value is not None:
+            normalized = str(value).strip().lower()
+            if normalized not in _CLUSTER_LIST_TYPES:
+                raise _validation(
+                    "cluster_type must be all, exact, perceptual, semantic, "
+                    "single, or near_duplicate.",
+                    "cluster_type",
+                )
+            object.__setattr__(self, "cluster_type", normalized)
+
+    def to_params(self) -> JsonObject:
+        return {
+            "library_id": self.library_id,
+            "offset": self.offset,
+            "limit": self.limit,
+            "cluster_type": self.cluster_type,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ClusterDetailRequest:
+    library_id: str
+    cluster_id: str
+    offset: int = 0
+    limit: int = 20
+
+    command: ClassVar[str] = "cluster_detail"
+
+    def __post_init__(self) -> None:
+        _set_library_id(self)
+        value = _required_display_text(self.cluster_id, "cluster_id", maximum=256)
+        _bounded_integer(self.offset, "offset", minimum=0, maximum=2**63 - 1)
+        _bounded_integer(self.limit, "limit", minimum=1, maximum=2_000)
+        object.__setattr__(self, "cluster_id", value)
+
+    def to_params(self) -> JsonObject:
+        return {
+            "library_id": self.library_id,
+            "cluster_id": self.cluster_id,
+            "offset": self.offset,
+            "limit": self.limit,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ClusterMergeRequest:
+    library_id: str
+    cluster_ids: tuple[str, ...]
+
+    command: ClassVar[str] = "cluster_merge"
+
+    def __post_init__(self) -> None:
+        _set_library_id(self)
+        values = tuple(
+            _required_display_text(value, "cluster_ids", maximum=256)
+            for value in self.cluster_ids
+        )
+        if len(set(values)) != len(values):
+            raise _validation(
+                "cluster_ids must not contain duplicate values.",
+                "cluster_ids",
+            )
+        if not 2 <= len(values) <= 100:
+            raise _validation(
+                "cluster_ids must contain 2 to 100 unique values.",
+                "cluster_ids",
+            )
+        object.__setattr__(self, "cluster_ids", values)
+
+    def to_params(self) -> JsonObject:
+        return {"library_id": self.library_id, "cluster_ids": list(self.cluster_ids)}
+
+
+@dataclass(frozen=True, slots=True)
+class ClusterSplitRequest:
+    library_id: str
+    cluster_id: str
+    doc_ids: tuple[str, ...]
+
+    command: ClassVar[str] = "cluster_split"
+
+    def __post_init__(self) -> None:
+        _set_library_id(self)
+        object.__setattr__(
+            self,
+            "cluster_id",
+            _required_display_text(self.cluster_id, "cluster_id", maximum=256),
+        )
+        values = tuple(
+            _required_display_text(value, "doc_ids", maximum=1_024)
+            for value in self.doc_ids
+        )
+        if len(set(values)) != len(values):
+            raise _validation(
+                "doc_ids must not contain duplicate values.",
+                "doc_ids",
+            )
+        if not 1 <= len(values) <= 10_000:
+            raise _validation(
+                "doc_ids must contain 1 to 10000 unique values.",
+                "doc_ids",
+            )
+        object.__setattr__(self, "doc_ids", values)
+
+    def to_params(self) -> JsonObject:
+        return {
+            "library_id": self.library_id,
+            "cluster_id": self.cluster_id,
+            "doc_ids": list(self.doc_ids),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ClusterApplyIdentityRequest:
+    library_id: str
+    cluster_id: str
+    identity_category: ClusterIdentityCategory
+    identity_value: str
+
+    command: ClassVar[str] = "cluster_apply_identity"
+
+    def __post_init__(self) -> None:
+        _set_library_id(self)
+        object.__setattr__(
+            self,
+            "cluster_id",
+            _required_display_text(self.cluster_id, "cluster_id", maximum=256),
+        )
+        category = str(self.identity_category).strip().casefold()
+        if category not in _CLUSTER_IDENTITY_CATEGORIES:
+            raise _validation(
+                "identity_category must be real_person, cosplayer, character, or work.",
+                "identity_category",
+            )
+        object.__setattr__(self, "identity_category", category)
+        object.__setattr__(
+            self,
+            "identity_value",
+            _required_display_text(
+                self.identity_value,
+                "identity_value",
+                maximum=256,
+            ),
+        )
+
+    def to_params(self) -> JsonObject:
+        return {
+            "library_id": self.library_id,
+            "cluster_id": self.cluster_id,
+            "identity_category": self.identity_category,
+            "identity_value": self.identity_value,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ClusterUndoRequest:
+    library_id: str
+
+    command: ClassVar[str] = "cluster_undo"
+
+    def __post_init__(self) -> None:
+        _set_library_id(self)
+
+    def to_params(self) -> JsonObject:
+        return {"library_id": self.library_id}
+
+
+@dataclass(frozen=True, slots=True)
+class ActiveLearningQueueRequest:
+    library_id: str
+    review_budget: int = 25
+
+    command: ClassVar[str] = "active_learning_queue"
+
+    def __post_init__(self) -> None:
+        _set_library_id(self)
+        _bounded_integer(self.review_budget, "review_budget", minimum=20, maximum=30)
+
+    def to_params(self) -> JsonObject:
+        return {
+            "library_id": self.library_id,
+            "review_budget": self.review_budget,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ActiveLearningDecision:
+    doc_id: str
+    decision: LearningDecisionAction
+    labels: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        doc_id = _required_display_text(self.doc_id, "doc_id", maximum=1_024)
+        action = str(self.decision).strip().lower()
+        if action not in _LEARNING_DECISIONS:
+            raise _validation(
+                "decision must be accept, reject, edit, or skip.", "decision"
+            )
+        labels = _optional_tags(self.labels, "labels") or ()
+        if action == "edit" and not labels:
+            raise _validation("edit decisions require labels.", "labels")
+        if action != "edit" and labels:
+            raise _validation("Only edit decisions may include labels.", "labels")
+        object.__setattr__(self, "doc_id", doc_id)
+        object.__setattr__(self, "decision", action)
+        object.__setattr__(self, "labels", labels)
+
+    def to_dict(self) -> JsonObject:
+        return {
+            "doc_id": self.doc_id,
+            "decision": self.decision,
+            "labels": list(self.labels),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ActiveLearningReviewRequest:
+    library_id: str
+    queue_id: str
+    decisions: tuple[ActiveLearningDecision, ...]
+
+    command: ClassVar[str] = "active_learning_review"
+
+    def __post_init__(self) -> None:
+        _set_library_id(self)
+        queue_id = _required_display_text(self.queue_id, "queue_id", maximum=256)
+        if not isinstance(self.decisions, tuple) or not self.decisions:
+            raise _validation("decisions must be a non-empty tuple.", "decisions")
+        if len(self.decisions) > _MAX_LEARNING_DECISIONS:
+            raise _validation(
+                f"decisions can contain at most {_MAX_LEARNING_DECISIONS} items.",
+                "decisions",
+            )
+        if not all(isinstance(item, ActiveLearningDecision) for item in self.decisions):
+            raise _validation(
+                "decisions must contain ActiveLearningDecision values.", "decisions"
+            )
+        doc_ids = [item.doc_id for item in self.decisions]
+        if len(set(doc_ids)) != len(doc_ids):
+            raise _validation(
+                "decisions contains duplicate doc_id values.", "decisions"
+            )
+        object.__setattr__(self, "queue_id", queue_id)
+
+    def to_params(self) -> JsonObject:
+        return {
+            "library_id": self.library_id,
+            "queue_id": self.queue_id,
+            "decisions": [item.to_dict() for item in self.decisions],
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ActiveLearningReviewUndoRequest:
+    library_id: str
+
+    command: ClassVar[str] = "active_learning_review_undo"
+
+    def __post_init__(self) -> None:
+        _set_library_id(self)
+
+    def to_params(self) -> JsonObject:
+        return {"library_id": self.library_id}
+
+
 LibraryRequest: TypeAlias = (
     LibrariesRequest
     | IndexRequest
@@ -1210,6 +1564,16 @@ LibraryRequest: TypeAlias = (
     | TagAliasListRequest
     | TagAliasUpsertRequest
     | TagAliasDeleteRequest
+    | ClusterImagesRequest
+    | ClusterListRequest
+    | ClusterDetailRequest
+    | ClusterMergeRequest
+    | ClusterSplitRequest
+    | ClusterApplyIdentityRequest
+    | ClusterUndoRequest
+    | ActiveLearningQueueRequest
+    | ActiveLearningReviewRequest
+    | ActiveLearningReviewUndoRequest
 )
 
 
@@ -1366,6 +1730,46 @@ class LibraryTaskService:
         return self.submit(request)
 
     def delete_tag_alias(self, request: TagAliasDeleteRequest) -> SubmittedLibraryTask:
+        return self.submit(request)
+
+    def cluster_images(self, request: ClusterImagesRequest) -> SubmittedLibraryTask:
+        return self.submit(request)
+
+    def list_clusters(self, request: ClusterListRequest) -> SubmittedLibraryTask:
+        return self.submit(request)
+
+    def cluster_detail(self, request: ClusterDetailRequest) -> SubmittedLibraryTask:
+        return self.submit(request)
+
+    def merge_clusters(self, request: ClusterMergeRequest) -> SubmittedLibraryTask:
+        return self.submit(request)
+
+    def split_cluster(self, request: ClusterSplitRequest) -> SubmittedLibraryTask:
+        return self.submit(request)
+
+    def apply_cluster_identity(
+        self, request: ClusterApplyIdentityRequest
+    ) -> SubmittedLibraryTask:
+        return self.submit(request)
+
+    def undo_latest_cluster_operation(
+        self, request: ClusterUndoRequest
+    ) -> SubmittedLibraryTask:
+        return self.submit(request)
+
+    def active_learning_queue(
+        self, request: ActiveLearningQueueRequest
+    ) -> SubmittedLibraryTask:
+        return self.submit(request)
+
+    def review_active_learning(
+        self, request: ActiveLearningReviewRequest
+    ) -> SubmittedLibraryTask:
+        return self.submit(request)
+
+    def undo_latest_active_learning_review(
+        self, request: ActiveLearningReviewUndoRequest
+    ) -> SubmittedLibraryTask:
         return self.submit(request)
 
     def wait(
@@ -1780,6 +2184,10 @@ def _outcome(
 
 
 __all__ = [
+    "ActiveLearningDecision",
+    "ActiveLearningQueueRequest",
+    "ActiveLearningReviewRequest",
+    "ActiveLearningReviewUndoRequest",
     "AutoTagEstimateRequest",
     "AutoTagPendingRequest",
     "AutoTagReviewAction",
@@ -1791,6 +2199,17 @@ __all__ = [
     "AutoTagScope",
     "AutoTagUndoRequest",
     "BatchAcceptanceMode",
+    "ClusterDetailRequest",
+    "ClusterApplyIdentityRequest",
+    "ClusterIdentityCategory",
+    "ClusterImagesRequest",
+    "ClusterListRequest",
+    "ClusterMergeRequest",
+    "ClusterRunType",
+    "ClusterScope",
+    "ClusterSplitRequest",
+    "ClusterType",
+    "ClusterUndoRequest",
     "DEFAULT_AUTO_TAG_BUDGET_CNY",
     "DEFAULT_AUTO_TAG_MAX_IMAGES",
     "DEFAULT_AUTO_TAG_MODEL",
@@ -1811,6 +2230,7 @@ __all__ = [
     "LibraryTaskValidationError",
     "LibraryTaskWaitTimeout",
     "LowRiskBatchReviewRequest",
+    "LearningDecisionAction",
     "MetadataBackfillRequest",
     "ProgressCallback",
     "RootsRequest",

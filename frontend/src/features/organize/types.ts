@@ -230,6 +230,10 @@ export interface OrganizeApi {
     signal?: AbortSignal,
   ): Promise<OrganizeJobResponse>;
   job(jobId: string, signal?: AbortSignal): Promise<OrganizeJobResponse>;
+  cancelJob?(
+    jobId: string,
+    signal?: AbortSignal,
+  ): Promise<OrganizeJobResponse>;
   previewFolderDelete?(
     libraryId: string,
     folderKey: string,

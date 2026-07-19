@@ -58,6 +58,7 @@ export interface ModelSettingsWire {
 export interface SettingsResponse {
   libraries?: SettingsLibraryWire[];
   results_directory?: unknown;
+  config_path?: unknown;
   models?: ModelSettingsWire;
   model_settings?: ModelSettingsWire;
   credentials?: {

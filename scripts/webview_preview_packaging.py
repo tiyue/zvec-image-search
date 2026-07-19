@@ -297,9 +297,22 @@ def validate_static_inputs(plan: BuildPlan) -> None:
     required_files = (
         plan.repository_root / "pyproject.toml",
         plan.repository_root / "model-catalog.default.json",
+        plan.repository_root / "image_vector_service" / "active_learning.py",
+        plan.repository_root
+        / "image_vector_service"
+        / "active_learning_review_store.py",
         plan.repository_root / "image_vector_service" / "activity_store.py",
+        plan.repository_root / "image_vector_service" / "cluster_operation_store.py",
         plan.repository_root / "image_vector_service" / "folder_deletion.py",
+        plan.repository_root / "image_vector_service" / "image_clustering.py",
         plan.repository_root / "image_vector_service" / "library_browser.py",
+        plan.repository_root / "image_vector_service" / "learning_ranker.py",
+        plan.repository_root / "image_vector_service" / "search_features.py",
+        plan.repository_root / "image_vector_service" / "search_learning_config.py",
+        plan.repository_root / "image_vector_service" / "search_learning_evaluator.py",
+        plan.repository_root / "image_vector_service" / "search_learning_runtime.py",
+        plan.repository_root / "image_vector_service" / "search_learning_service.py",
+        plan.repository_root / "image_vector_service" / "search_learning_store.py",
         plan.repository_root / "zvec_webview" / "__init__.py",
         plan.repository_root / "zvec_webview" / "app.py",
         plan.repository_root / "zvec_webview" / "facade.py",

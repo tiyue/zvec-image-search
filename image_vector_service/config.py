@@ -49,9 +49,24 @@ def _default_workspace() -> Path:
     )
 
 
+def default_config_home() -> Path:
+    """Return the host configuration directory shared by desktop services."""
+
+    configured = os.getenv("ZVEC_CONFIG_HOME") or os.getenv("ZVEC_DOCKER_CONFIG_HOME")
+    if configured:
+        return Path(configured).expanduser().resolve()
+    if os.name == "nt" and os.getenv("LOCALAPPDATA"):
+        return Path(os.environ["LOCALAPPDATA"], "zvec-image-search").resolve()
+    return Path.home().joinpath(".zvec-image-search").resolve()
+
+
 @dataclass(frozen=True)
 class ServiceConfig:
     workspace: Path = field(default_factory=_default_workspace)
+    # Search-learning artifacts and other host-wide state live outside any one
+    # Collection.  Tests and embedded callers may override this explicitly.
+    config_home: Path | None = None
+    library_id: str = ""
     # Desktop library workers set this to keep annotation jobs inside the
     # selected library root even when a migrated Workspace retains old roots.
     # Standalone CLI services leave it unset and keep the historical all-roots
@@ -96,6 +111,22 @@ class ServiceConfig:
     @property
     def collection_path(self) -> Path:
         return self.workspace / "image_collection"
+
+    @property
+    def config_home_path(self) -> Path:
+        return (
+            self.config_home.expanduser().resolve()
+            if self.config_home is not None
+            else default_config_home()
+        )
+
+    @property
+    def cluster_snapshot_path(self) -> Path:
+        return self.workspace / "search-learning" / "clusters-v2.json"
+
+    @property
+    def active_learning_queue_path(self) -> Path:
+        return self.workspace / "search-learning" / "active-queue-v1.json"
 
     @property
     def model(self) -> str:

@@ -159,6 +159,35 @@ class ResultCatalogTests(unittest.TestCase):
         self.assertAlmostEqual(page.items[0].text_confidence or 0.0, 0.93)
         self.assertEqual(page.items[0].image_rank, 2)
         self.assertEqual(page.items[0].text_rank, 1)
+        self.assertEqual(page.items[0].ranking_model_version, "ranker-test-v1")
+        self.assertAlmostEqual(page.items[0].ranking_score or 0.0, 0.94)
+        self.assertEqual(page.items[0].feature_schema_version, 1)
+        self.assertEqual(page.items[0].calibration_version, "calibration-test-v1")
+        self.assertEqual(
+            page.items[0].search_features,
+            {
+                "feature_schema_version": 1,
+                "vector_raw_score": 0.18,
+                "vector_confidence": 0.92,
+                "tag_match_score": 0.72,
+                "manual_tag_matches": 1.0,
+                "folder_tag_matches": 1.0,
+                "alias_tag_matches": 0.0,
+                "model_high_confidence_tag_matches": 0.0,
+                "model_tag_matches": 1.0,
+                "vector_tag_matches": 1.0,
+                "identity_match": 1.0,
+                "work_match": 1.0,
+                "action_match": 0.0,
+                "expression_match": 0.0,
+                "scene_match": 0.0,
+                "image_text_agreement": 0.8,
+                "collection_rank": 1.0,
+                "collection_size": 2_074.0,
+                "duplicate_group_size": 1.0,
+                "query_type": "text",
+            },
+        )
         self.assertEqual(page.sort_mode, "confidence")
         self.assertEqual(
             page.ranking_diagnostics,
@@ -542,6 +571,36 @@ class ResultCatalogTests(unittest.TestCase):
                         "rank_agreement": 0.8,
                         "match_state": "high",
                         "rank_source": "text",
+                        "ranking_model_version": "ranker-test-v1",
+                        "ranking_score": 0.94,
+                        "feature_schema_version": 1,
+                        "ranking_fallback": False,
+                        "calibrated_minimum_confidence": 0.35,
+                        "calibration_version": "calibration-test-v1",
+                        "calibration_scope": "query_type:text",
+                        "calibration_fallback": False,
+                        "search_features": {
+                            "feature_schema_version": 1,
+                            "vector_raw_score": 0.18,
+                            "vector_confidence": 0.92,
+                            "tag_match_score": 0.72,
+                            "manual_tag_matches": 1.0,
+                            "folder_tag_matches": 1.0,
+                            "alias_tag_matches": 0.0,
+                            "model_high_confidence_tag_matches": 0.0,
+                            "model_tag_matches": 1.0,
+                            "vector_tag_matches": 1.0,
+                            "identity_match": 1.0,
+                            "work_match": 1.0,
+                            "action_match": 0.0,
+                            "expression_match": 0.0,
+                            "scene_match": 0.0,
+                            "image_text_agreement": 0.8,
+                            "collection_rank": 1.0,
+                            "collection_size": 2_074.0,
+                            "duplicate_group_size": 1.0,
+                            "query_type": "text",
+                        },
                     }
                 ],
             },

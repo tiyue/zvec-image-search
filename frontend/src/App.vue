@@ -14,12 +14,14 @@ import {
   useSearchResultsCleanup,
 } from "./features/cleanup/useSearchResultsCleanup";
 import { OrganizePage } from "./features/organize";
+import { canRecordFeedback, useSearchFeedback } from "./features/search-learning";
 import { SettingsPage } from "./features/settings";
 import type { SettingsLibrary } from "./features/settings";
 import { TasksPage } from "./features/tasks";
 import type {
   GalleryContextIntent,
   GallerySelectionIntent,
+  SearchResultItem,
   ToastMessage,
 } from "./types/contracts";
 
@@ -88,6 +90,7 @@ const nativeActions = useNativeImageActions({
   onError: (title, message) => addToast(title, message, "error"),
   onInfo: (title, message) => addToast(title, message, "info"),
 });
+const searchFeedback = useSearchFeedback();
 const resultsCleanup = useSearchResultsCleanup(undefined, {
   onError: (title, message) => addToast(title, message, "error"),
   onInfo: (title, message) => addToast(title, message, "info"),
@@ -101,6 +104,8 @@ const queryDropActive = ref(false);
 const selectedImageIds = ref<string[]>([]);
 const selectionAnchorId = ref("");
 const contextMenu = ref({ visible: false, x: 0, y: 0, imageId: "" });
+const knownSearchItems = new Map<string, SearchResultItem>();
+let knownFeedbackSessions = "";
 let previewMedia: MediaQueryList | null = null;
 let removeGlobalDiagnostics: (() => void) | null = null;
 
@@ -110,6 +115,14 @@ const activeActionIds = computed(() => {
   const fallback = contextMenu.value.imageId || search.selectedId.value;
   return fallback ? [fallback] : [];
 });
+const contextFeedbackItem = computed(() => searchItemForId(contextImageId()));
+const contextFeedbackEvent = computed(() =>
+  searchFeedback.feedbackFor(contextFeedbackItem.value),
+);
+const contextFeedbackAvailable = computed(() =>
+  searchFeedback.enabled.value &&
+  Boolean(contextFeedbackItem.value && canRecordFeedback(contextFeedbackItem.value)),
+);
 
 const statusLabel = computed(() => {
   if (search.status.value === "succeeded" && search.totalItems.value === 0) {
@@ -256,6 +269,7 @@ function handleGallerySelection(intent: GallerySelectionIntent): void {
     selectionAnchorId.value = intent.id;
   }
   search.select(intent.id, true);
+  recordImplicitFeedback([intent.id], "detail", "gallery_selection");
   closeContextMenu();
 }
 
@@ -295,9 +309,85 @@ function contextImageId(): string {
   return contextMenu.value.imageId || activeActionIds.value[0] || "";
 }
 
-function copySelectedImage(): void {
+function searchItemForId(imageId: string): SearchResultItem | null {
+  if (!imageId) return null;
+  return (
+    search.items.value.find((item) => item.id === imageId) ??
+    knownSearchItems.get(imageId) ??
+    null
+  );
+}
+
+function recordImplicitFeedback(
+  imageIds: string[],
+  action: "export" | "copy" | "open" | "detail",
+  source: string,
+): void {
+  for (const imageId of new Set(imageIds.filter(Boolean))) {
+    const item = searchItemForId(imageId);
+    if (item) void searchFeedback.recordImplicit(item, action, source);
+  }
+}
+
+async function openSearchImage(imageId: string): Promise<void> {
+  if (await nativeActions.open(imageId)) {
+    recordImplicitFeedback([imageId], "open", "gallery_open");
+  }
+}
+
+async function copySelectedImage(): Promise<void> {
   const imageId = activeActionIds.value.length === 1 ? activeActionIds.value[0] : "";
-  if (imageId) void nativeActions.copyImage(imageId);
+  if (imageId && await nativeActions.copyImage(imageId)) {
+    recordImplicitFeedback([imageId], "copy", "context_menu_copy_image");
+  }
+}
+
+async function copySelectedFiles(imageIds: string[], source: string): Promise<void> {
+  const ids = [...imageIds];
+  if (await nativeActions.copyFiles(ids)) {
+    recordImplicitFeedback(ids, "copy", source);
+  }
+}
+
+async function copySelectedPaths(imageIds: string[]): Promise<void> {
+  const ids = [...imageIds];
+  if (await nativeActions.copyPaths(ids)) {
+    recordImplicitFeedback(ids, "copy", "context_menu_copy_paths");
+  }
+}
+
+async function exportSelectedImages(imageIds: string[], source: string): Promise<void> {
+  const ids = [...imageIds];
+  if (await nativeActions.exportImages(ids)) {
+    recordImplicitFeedback(ids, "export", source);
+  }
+}
+
+async function markContextFeedback(action: "relevant" | "not_relevant"): Promise<void> {
+  const item = contextFeedbackItem.value;
+  if (!item) return;
+  const saved = action === "relevant"
+    ? await searchFeedback.markRelevant(item)
+    : await searchFeedback.markNotRelevant(item);
+  if (saved) {
+    addToast(
+      "反馈已保存",
+      action === "relevant" ? "已标记为相关。" : "已标记为不相关。",
+      "success",
+    );
+  } else if (searchFeedback.lastError.value) {
+    addToast("反馈未保存", searchFeedback.lastError.value, "error");
+  }
+}
+
+async function undoContextFeedback(): Promise<void> {
+  const item = contextFeedbackItem.value;
+  if (!item) return;
+  if (await searchFeedback.undo(item)) {
+    addToast("已撤销反馈", "这张图片恢复为未判断状态。", "info");
+  } else if (searchFeedback.lastError.value) {
+    addToast("无法撤销反馈", searchFeedback.lastError.value, "error");
+  }
 }
 
 function handleWindowPointerDown(event: PointerEvent): void {
@@ -430,6 +520,7 @@ onMounted(() => {
   window.addEventListener("pointerdown", handleWindowPointerDown);
   window.addEventListener("resize", handleWindowResize);
   void search.initialize();
+  void searchFeedback.initialize();
 });
 
 onBeforeUnmount(() => {
@@ -445,6 +536,28 @@ onBeforeUnmount(() => {
 watch(
   () => search.page.value,
   () => closeContextMenu(),
+);
+
+watch(
+  () => search.items.value,
+  (items) => {
+    const sessions = [...new Set(
+      items
+        .map((item) => item.searchSessionId)
+        .filter((sessionId) => sessionId && sessionId !== "latest"),
+    )].sort();
+    const sessionSignature = sessions.join("\u0000");
+    if (sessionSignature && sessionSignature !== knownFeedbackSessions) {
+      knownSearchItems.clear();
+      knownFeedbackSessions = sessionSignature;
+    } else if (items.length > 0 && !sessionSignature) {
+      knownSearchItems.clear();
+      knownFeedbackSessions = "";
+    }
+    items.forEach((item) => knownSearchItems.set(item.id, item));
+    sessions.forEach((sessionId) => void searchFeedback.loadSession(sessionId));
+  },
+  { immediate: true },
 );
 </script>
 
@@ -678,14 +791,14 @@ watch(
             <div class="gallery-operations">
               <div v-if="selectedCount" class="selection-toolbar" aria-label="批量图片操作">
                 <span>Ctrl 点击多选，Shift 点击连续选择，Ctrl+A 选择本页</span>
-                <button class="button button-quiet button-small" type="button" @click="nativeActions.copyFiles(activeActionIds)">
+                <button class="button button-quiet button-small" type="button" @click="copySelectedFiles(activeActionIds, 'selection_toolbar_copy')">
                   复制文件
                 </button>
                 <button
                   class="button button-secondary button-small"
                   type="button"
                   :disabled="nativeActions.exporting.value"
-                  @click="nativeActions.exportImages(activeActionIds)"
+                  @click="exportSelectedImages(activeActionIds, 'selection_toolbar_export')"
                 >
                   {{ nativeActions.exporting.value ? "导出中…" : "导出所选" }}
                 </button>
@@ -704,7 +817,7 @@ watch(
               :loading="search.pageLoading.value"
               :loading-text="`正在读取第 ${search.page.value} 页`"
               @select="handleGallerySelection"
-              @open="nativeActions.open"
+              @open="openSearchImage"
               @context="openContextMenu"
             />
             <PaginationBar
@@ -726,7 +839,7 @@ watch(
             :item="search.selectedItem.value"
             :high-resolution="search.highResolutionPreview.value"
             :preview-visible="previewVisible"
-            @open="nativeActions.open"
+            @open="openSearchImage"
             @reveal="nativeActions.reveal"
           />
         </div>
@@ -780,12 +893,18 @@ watch(
       :y="contextMenu.y"
       :selection-count="activeActionIds.length"
       :exporting="nativeActions.exporting.value"
-      @open="nativeActions.open(contextImageId())"
+      :feedback-available="contextFeedbackAvailable"
+      :feedback-pending="searchFeedback.isPending(contextFeedbackItem)"
+      :feedback-action="contextFeedbackEvent?.action ?? ''"
+      @open="openSearchImage(contextImageId())"
       @reveal="nativeActions.reveal(contextImageId())"
       @copy-image="copySelectedImage"
-      @copy-files="nativeActions.copyFiles(activeActionIds)"
-      @copy-paths="nativeActions.copyPaths(activeActionIds)"
-      @export="nativeActions.exportImages(activeActionIds)"
+      @copy-files="copySelectedFiles(activeActionIds, 'context_menu_copy_files')"
+      @copy-paths="copySelectedPaths(activeActionIds)"
+      @export="exportSelectedImages(activeActionIds, 'context_menu_export')"
+      @mark-relevant="markContextFeedback('relevant')"
+      @mark-not-relevant="markContextFeedback('not_relevant')"
+      @undo-feedback="undoContextFeedback"
       @clear="clearSelection"
       @close="closeContextMenu"
     />

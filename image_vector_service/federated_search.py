@@ -33,6 +33,7 @@ from .rank_fusion import (
 )
 from .result_diversity import diversify_search_hits
 from .result_exporter import export_results
+from .search_learning_config import SearchLearningBundle, load_search_learning
 
 
 @dataclass(frozen=True)
@@ -117,6 +118,7 @@ def rank_federated_hits(
     show_low_confidence: bool = False,
     diversify_results: bool = True,
     sort_mode: SearchSortMode = "confidence",
+    search_learning: SearchLearningBundle | None = None,
 ) -> FederatedRanking:
     if top_k < 1:
         raise ValueError("top_k must be positive.")
@@ -126,7 +128,10 @@ def rank_federated_hits(
     quality_configured = bool(collections) and all(
         collection.candidates.quality_configured for collection in collections
     )
-    if resolved_sort_mode == "legacy" or not quality_configured:
+    learning_configured = bool(search_learning and search_learning.configured)
+    if resolved_sort_mode == "legacy" or not (
+        quality_configured or learning_configured
+    ):
         return _legacy_ranking(
             collections,
             confidence_candidates,
@@ -196,6 +201,12 @@ def rank_federated_hits(
             else None
         ),
         sort_mode=resolved_sort_mode,
+        search_learning=search_learning if learning_configured else None,
+        default_library_id="federated",
+        collection_sizes={
+            collection.library.library_id: collection.candidates.collection_size
+            for collection in collections
+        },
     )
     if confidence_ranking is not None:
         diversity_enabled = sort_mode_uses_diversity(
@@ -207,6 +218,11 @@ def rank_federated_hits(
             top_k=top_k,
             enabled=diversity_enabled,
         )
+        learning_diagnostics = confidence_ranking.diagnostics.get("search_learning")
+        learned_applied = bool(
+            isinstance(learning_diagnostics, dict)
+            and learning_diagnostics.get("applied")
+        )
         return FederatedRanking(
             hits=diversity.hits,
             status=confidence_ranking.status,
@@ -214,7 +230,11 @@ def rank_federated_hits(
             filtered_count=confidence_ranking.filtered_count
             + max(0, len(confidence_ranking.hits) - len(diversity.hits)),
             ranking_mode=(
-                "confidence_v2" if fusion_mode == "confidence_v2" else "confidence"
+                "learned"
+                if learned_applied
+                else "confidence_v2"
+                if fusion_mode == "confidence_v2"
+                else "confidence"
             ),
             sort_mode=resolved_sort_mode,
             ranking_diagnostics={
@@ -439,6 +459,7 @@ def export_federated_search(
     diversify_results: bool = True,
     sort_mode: SearchSortMode = "confidence",
 ) -> dict:
+    search_learning = load_search_learning(config.config_home_path)
     ranking = rank_federated_hits(
         collections,
         top_k=top_k,
@@ -447,6 +468,7 @@ def export_federated_search(
         show_low_confidence=show_low_confidence,
         diversify_results=diversify_results,
         sort_mode=sort_mode,
+        search_learning=search_learning if search_learning.configured else None,
     )
     libraries = [collection.library for collection in collections]
     query: dict[str, object] = {
@@ -560,6 +582,9 @@ def _quality_diagnostics(
             for collection in collections
         },
     }
+    search_learning = ranking.ranking_diagnostics.get("search_learning")
+    if isinstance(search_learning, dict):
+        diagnostics["search_learning"] = dict(search_learning)
     if configured:
         minimum, possible, high = _quality_thresholds(collections)
         diagnostics["thresholds"] = {

@@ -10,6 +10,10 @@ export interface LibrarySummary {
 
 export interface SearchResultItem {
   id: string;
+  searchSessionId: string;
+  libraryId: string;
+  docId: string;
+  sha256: string;
   name: string;
   relativePath: string;
   libraryName: string;
@@ -75,14 +79,17 @@ export interface SearchPageResponse {
 
 export interface SearchResultWire {
   id?: string;
+  search_session_id?: string;
   sha256?: string;
   document_id?: string;
+  doc_id?: string;
   name?: string;
   filename?: string;
   relative_path?: string;
   display_path?: string;
   path?: string;
   library_name?: string;
+  library_id?: string;
   collection_name?: string;
   rank?: number;
   match_state?: string;
@@ -166,6 +173,7 @@ export interface NativeDirectorySelection extends NativeResult {
 
 export interface PywebviewApi {
   select_directory(): Promise<NativeDirectorySelection>;
+  select_json_file(): Promise<NativeDirectorySelection>;
   select_query_image(): Promise<NativeImageSelection>;
   open_image(imageId: string): Promise<NativeResult>;
   reveal_image(imageId: string): Promise<NativeResult>;

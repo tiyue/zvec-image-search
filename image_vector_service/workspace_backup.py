@@ -26,6 +26,17 @@ SMALL_STATE_FILES = (
     "search-quality.json",
 )
 MINIMUM_FREE_SPACE_RESERVE = 16 * 1024 * 1024
+_WINDOWS_RESERVED_DEVICE_NAMES = frozenset(
+    {
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        "CLOCK$",
+        *(f"COM{index}" for index in range(1, 10)),
+        *(f"LPT{index}" for index in range(1, 10)),
+    }
+)
 
 
 class WorkspaceBackupError(RuntimeError):
@@ -37,6 +48,29 @@ class WorkspaceBackupSource:
     library_id: str
     name: str
     workspace: Path
+
+
+def resolve_backup_library_directory(root: Path, library_id: str) -> Path:
+    """Return a library directory that is guaranteed to stay below ``root``.
+
+    ``library_id`` is persisted in a backup manifest and must therefore be a
+    single Windows-safe path segment.  Keep this check in the backup layer even
+    when callers validate requests so a malformed legacy config or edited
+    manifest cannot turn an identifier into a filesystem path.
+    """
+
+    normalized = validate_backup_library_id(library_id)
+    libraries_root = (root.expanduser().resolve() / "libraries").resolve()
+    candidate = (libraries_root / normalized).resolve()
+    try:
+        candidate.relative_to(libraries_root)
+    except ValueError as exc:
+        raise WorkspaceBackupError(
+            "Backup library path escapes the libraries directory."
+        ) from exc
+    if candidate == libraries_root:
+        raise WorkspaceBackupError("Backup library id must name a child directory.")
+    return candidate
 
 
 def new_backup_destination(
@@ -86,6 +120,11 @@ def plan_migration_backup(
         has_collection = (workspace / COLLECTION_DIRECTORY_NAME).is_dir()
         has_metadata = (workspace / METADATA_FILE_NAME).is_file()
         has_state = (workspace / STATE_FILE_NAME).is_file()
+
+        try:
+            validate_backup_library_id(source.library_id)
+        except WorkspaceBackupError as exc:
+            library_blockers.append(str(exc))
 
         if _paths_overlap(destination, workspace):
             library_blockers.append(
@@ -248,7 +287,7 @@ def create_migration_backup(
 
         for source in sources:
             workspace = source.workspace.expanduser().resolve()
-            target = staging / "libraries" / source.library_id
+            target = resolve_backup_library_directory(staging, source.library_id)
             target.mkdir(parents=True, exist_ok=True)
             copied: list[str] = []
             if workspace.is_dir():
@@ -428,6 +467,33 @@ def _verify_directory_writable(path: Path) -> None:
         ) from exc
     finally:
         probe.unlink(missing_ok=True)
+
+
+def validate_backup_library_id(value: str) -> str:
+    """Return one Windows-safe backup path segment or fail closed.
+
+    Windows treats device names as reserved even when their case differs, an
+    extension is present, or spaces/dots are appended to the device stem.  The
+    backup format uses ``library_id`` as a directory name, so accepting those
+    aliases would make validation platform-dependent and could redirect or
+    break filesystem operations on Windows.
+    """
+
+    if not isinstance(value, str):
+        raise WorkspaceBackupError("Backup library id must be a string.")
+    normalized = value.strip()
+    if not normalized or len(normalized) > 128:
+        raise WorkspaceBackupError("Backup library id is empty or too long.")
+    windows_stem = normalized.rstrip(" .").split(".", 1)[0].rstrip(" .").upper()
+    if windows_stem in _WINDOWS_RESERVED_DEVICE_NAMES:
+        raise WorkspaceBackupError(
+            "Backup library id uses a reserved Windows device name."
+        )
+    if normalized in {".", ".."} or normalized.endswith((".", " ")):
+        raise WorkspaceBackupError("Backup library id is not a safe path segment.")
+    if any(character in normalized for character in '/\\<>:"|?*\x00\r\n'):
+        raise WorkspaceBackupError("Backup library id is not a safe path segment.")
+    return normalized
 
 
 def _can_write_directory(path: Path) -> bool:

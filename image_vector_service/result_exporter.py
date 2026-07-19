@@ -185,6 +185,20 @@ def export_results(
                 sha256=sha256 or None,
                 library_id=str(hit.fields.get("library_id") or ""),
                 library_name=str(hit.fields.get("library_name") or ""),
+                ranking_model_version=hit.ranking_model_version,
+                ranking_score=hit.ranking_score,
+                feature_schema_version=hit.feature_schema_version,
+                ranking_fallback=hit.ranking_fallback,
+                ranking_fallback_reason=hit.ranking_fallback_reason,
+                calibrated_minimum_confidence=(hit.calibrated_minimum_confidence),
+                calibration_version=hit.calibration_version,
+                calibration_scope=hit.calibration_scope,
+                calibration_fallback=hit.calibration_fallback,
+                search_features=(
+                    dict(hit.search_features)
+                    if hit.search_features is not None
+                    else None
+                ),
             )
         )
 
@@ -237,6 +251,12 @@ def export_results(
             "confidence": ("bounded relevance confidence; not a probability"),
             "ranking_confidence": (
                 "primary ordering value; falls back to confidence when absent"
+            ),
+            "ranking_score": (
+                "versioned local ranker score; never an external model response"
+            ),
+            "calibrated_minimum_confidence": (
+                "per-candidate calibrated abstention threshold with a 0.20 hard floor"
             ),
             "sort_order": (
                 "confidence descending, then raw_score in the documented query "

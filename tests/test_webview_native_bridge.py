@@ -17,9 +17,11 @@ class _Window:
     def __init__(self, selected: Path) -> None:
         self.selected = selected
         self.dialog_type = None
+        self.dialog_kwargs: dict[str, object] = {}
 
-    def create_file_dialog(self, dialog_type, **_kwargs):
+    def create_file_dialog(self, dialog_type, **kwargs):
         self.dialog_type = dialog_type
+        self.dialog_kwargs = dict(kwargs)
         return (str(self.selected),)
 
 
@@ -54,6 +56,47 @@ class NativeBridgeTests(unittest.TestCase):
             self.assertNotIn(str(path), repr(response))
             self.assertEqual(registry.resolve(image["id"]), path.resolve())
             self.assertEqual(window.dialog_type, "open")
+
+    def test_json_selection_uses_a_single_file_filter_and_returns_the_path(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "fixed-evaluation.JSON"
+            path.write_text("{}", encoding="utf-8")
+            bridge = NativeBridge(ImageRegistry())
+            window = _Window(path)
+            bridge.attach_window(window)
+            fake_webview = SimpleNamespace(
+                FileDialog=SimpleNamespace(OPEN="open", FOLDER="folder")
+            )
+
+            with patch.dict(sys.modules, {"webview": fake_webview}):
+                response = bridge.select_json_file()
+
+            self.assertEqual(response, {"ok": True, "path": str(path)})
+            self.assertEqual(window.dialog_type, "open")
+            self.assertEqual(window.dialog_kwargs["allow_multiple"], False)
+            self.assertEqual(
+                window.dialog_kwargs["file_types"],
+                ("JSON 文件 (*.json)", "所有文件 (*.*)"),
+            )
+
+    def test_json_selection_rejects_a_non_json_file_without_raising(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "fixed-evaluation.txt"
+            path.write_text("{}", encoding="utf-8")
+            bridge = NativeBridge(ImageRegistry())
+            bridge.attach_window(_Window(path))
+            fake_webview = SimpleNamespace(
+                FileDialog=SimpleNamespace(OPEN="open", FOLDER="folder")
+            )
+
+            with patch.dict(sys.modules, {"webview": fake_webview}):
+                response = bridge.select_json_file()
+
+            self.assertFalse(response["ok"])
+            self.assertEqual(response["code"], "native_action_failed")
+            self.assertIn("JSON", response["error"])
 
     def test_open_image_uses_default_program_and_suppresses_duplicate(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

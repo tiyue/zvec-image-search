@@ -13,11 +13,35 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any, cast
 
+from PIL import Image, UnidentifiedImageError
+
 from zvec_logging import initialize_zvec
 
+from .active_learning import (
+    ActiveLearningCandidate,
+    ActiveLearningConfig,
+    ActiveLearningError,
+    ActiveLearningQueue,
+    build_active_learning_queue,
+    read_active_learning_queue,
+    record_learning_decision,
+    write_active_learning_queue,
+)
+from .active_learning_review_store import (
+    ActiveLearningReviewItem,
+    ActiveLearningReviewStore,
+    ActiveLearningReviewStoreError,
+)
 from .annotation_service import AutoTaggingCoordinator, StreamingAutoTagSession
 from .app_logging import close_app_logger, get_app_logger
 from .auto_tag_cache import SharedAutoTagCache
+from .cluster_operation_store import (
+    ClusterOperationItemInput,
+    ClusterOperationNotFound,
+    ClusterOperationStore,
+    ClusterOperationStoreUnavailable,
+    ClusterOperationValidationError,
+)
 from .config import ConfigurationError, ServiceConfig
 from .dashscope_client import (
     DashScopeEmbeddingClient,
@@ -31,6 +55,19 @@ from .hybrid_search import (
     HybridTagIntent,
     detect_hybrid_tag_intent,
     hybrid_candidate_count,
+)
+from .image_clustering import (
+    IDENTITY_CATEGORIES,
+    ClusterSnapshot,
+    IdentityEvidence,
+    ImageClusteringConfig,
+    ImageClusterInput,
+    ImageClusterService,
+    SemanticNeighbor,
+    apply_manual_cluster_rules,
+    cluster_detail,
+    read_cluster_snapshot,
+    write_cluster_snapshot,
 )
 from .image_scanner import (
     file_sha256,
@@ -82,6 +119,13 @@ from .result_exporter import (
     cleanup_search_results,
     export_results,
 )
+from .search_learning_config import (
+    ACTIVE_CONFIG_FILENAME,
+    SEARCH_LEARNING_DIRECTORY,
+    SearchLearningBundle,
+    load_search_learning,
+)
+from .search_learning_runtime import apply_search_learning
 from .search_quality import (
     QualityMode,
     annotate_search_hits,
@@ -197,6 +241,11 @@ class ImageVectorService:
         self.config = config or ServiceConfig()
         self.config.validate()
         self.search_quality = load_search_quality(self.config.workspace)
+        self.search_learning = load_search_learning(self.config.config_home_path)
+        self._search_learning_reload_lock = threading.Lock()
+        self._search_learning_manifest_signature = (
+            self._search_learning_active_signature()
+        )
         self.progress = progress or (lambda _message: None)
         self.cancel_check = cancel_check or (lambda: None)
         self._lock = ProcessLock(self.config.lock_path)
@@ -210,10 +259,40 @@ class ImageVectorService:
             self.state = IndexState(
                 self.config.state_path, legacy_path=self.config.legacy_state_path
             )
+            self.active_learning_reviews: ActiveLearningReviewStore | None = None
+            try:
+                self.active_learning_reviews = ActiveLearningReviewStore(
+                    self.config.state_path
+                )
+                recovery = self.active_learning_reviews.recover_incomplete()
+                if recovery["recovered_count"]:
+                    self.logger.warning(
+                        "active_learning_review_recovered batches=%d api_requests=0",
+                        recovery["recovered_count"],
+                    )
+            except ActiveLearningReviewStoreError as exc:
+                # Search/index remain usable when the optional local review
+                # journal cannot initialize; review commands fail explicitly.
+                self.logger.warning(
+                    "active_learning_review_store_unavailable error=%s",
+                    str(exc) or exc.__class__.__name__,
+                )
             self.state_reset = self.state.ensure_collection_uuid(
                 self.repository.collection_uuid,
                 reset_if_unbound=self.repository.created,
             )
+            self.cluster_operations: ClusterOperationStore | None = None
+            try:
+                self.cluster_operations = ClusterOperationStore(
+                    self.config.state_path,
+                    recover_interrupted=True,
+                )
+                self._import_legacy_cluster_snapshot()
+            except ClusterOperationStoreUnavailable as exc:
+                self.logger.warning(
+                    "cluster_operation_store_unavailable error=%s",
+                    str(exc) or exc.__class__.__name__,
+                )
             self._refresh_tag_catalog()
             self.source_resolver = SourcePathResolver(self.state)
             self.auto_tag_cache = SharedAutoTagCache(
@@ -2917,7 +2996,7 @@ class ImageVectorService:
                 str(item[2].get("doc_id") or ""),
             )
         )
-        return [
+        hits = [
             SearchHit(
                 doc_id=str(fields["doc_id"]),
                 distance=1.0 - confidence,
@@ -2934,6 +3013,7 @@ class ImageVectorService:
                 start=1,
             )
         ]
+        return self._attach_search_learning_evidence(hits)
 
     def _cache_key(self, modality: str, value: str) -> str:
         identity = "\0".join(
@@ -3016,6 +3096,12 @@ class ImageVectorService:
         self, show_low_confidence: bool, low_confidence_override: bool
     ) -> dict[str, object]:
         diagnostics: dict[str, object] = self.search_quality.to_dict()
+        learning = self._current_search_learning()
+        diagnostics["search_learning"] = (
+            learning.diagnostics()
+            if learning is not None
+            else {"configured": False, "enabled": False, "ranking_fallback": True}
+        )
         diagnostics["hard_minimum_confidence"] = MINIMUM_RESULT_CONFIDENCE
         if show_low_confidence:
             diagnostics = {
@@ -3050,8 +3136,8 @@ class ImageVectorService:
             diagnostics["sorting"] = dict(sorting)
         return diagnostics
 
-    @staticmethod
     def _sort_request_hits(
+        self,
         hits: list[SearchHit],
         *,
         query_type: str,
@@ -3061,6 +3147,24 @@ class ImageVectorService:
     ) -> ConfidenceRanking:
         """Apply the public confidence floor to non-calibrated/legacy hits."""
 
+        learning_diagnostics: dict[str, object] | None = None
+        search_learning = self._current_search_learning()
+        if (
+            search_learning is not None
+            and search_learning.configured
+            and sort_mode != "legacy"
+        ):
+            learning = apply_search_learning(
+                hits,
+                bundle=search_learning,
+                query_type=query_type,
+                default_library_id=self.config.library_id or "local",
+                collection_sizes={
+                    self.config.library_id or "local": self.repository.doc_count
+                },
+            )
+            hits = learning.hits
+            learning_diagnostics = learning.diagnostics
         ranking = sort_confidence_hits(
             hits,
             query_type=query_type,
@@ -3073,6 +3177,14 @@ class ImageVectorService:
             sort_mode=sort_mode,
         )
         if ranking is not None:
+            if learning_diagnostics is not None:
+                ranking = replace(
+                    ranking,
+                    diagnostics={
+                        **ranking.diagnostics,
+                        "search_learning": learning_diagnostics,
+                    },
+                )
             return ranking
         # Truly legacy records may not expose a finite confidence. Preserve
         # their previous order rather than dropping valid historical results.
@@ -3119,6 +3231,12 @@ class ImageVectorService:
             rank_source=query_type,
         )
         thresholds = self.search_quality.thresholds_for(quality_mode)
+        # Diagnostics and focused tests can use a lightweight service adapter
+        # without a complete ServiceConfig. Ranking should still degrade to a
+        # stable local library identifier in that shape.
+        config = getattr(self, "config", None)
+        library_id = str(getattr(config, "library_id", "") or "local")
+        search_learning = self._current_search_learning()
         ranking = confidence_rank(
             candidates,
             query_type=query_type,
@@ -3132,6 +3250,13 @@ class ImageVectorService:
             max_candidates=candidate_k,
             show_low_confidence=show_low_confidence,
             sort_mode=sort_mode,
+            search_learning=(
+                search_learning
+                if search_learning is not None and search_learning.configured
+                else None
+            ),
+            default_library_id=library_id,
+            collection_sizes={library_id: self.repository.doc_count},
         )
         if ranking is None:
             raise RuntimeError("Configured search candidates are missing confidence.")
@@ -3178,6 +3303,11 @@ class ImageVectorService:
             )
             candidates = image_future.result() + text_future.result()
         thresholds = self.search_quality.thresholds_for("combined")
+        # Keep combined ranking available to the same lightweight/degraded
+        # adapters instead of failing on a missing configuration attribute.
+        config = getattr(self, "config", None)
+        library_id = str(getattr(config, "library_id", "") or "local")
+        search_learning = self._current_search_learning()
         ranking = confidence_rank(
             candidates,
             query_type="image_text",
@@ -3206,6 +3336,13 @@ class ImageVectorService:
             max_candidates=candidate_k,
             show_low_confidence=show_low_confidence,
             sort_mode=sort_mode,
+            search_learning=(
+                search_learning
+                if search_learning is not None and search_learning.configured
+                else None
+            ),
+            default_library_id=library_id,
+            collection_sizes={library_id: self.repository.doc_count},
         )
         if ranking is None:
             raise RuntimeError("Configured search candidates are missing confidence.")
@@ -3377,7 +3514,9 @@ class ImageVectorService:
             hits = _exclude_content_hash(queried, exclude_sha256)
             removed = len(queried) - len(hits)
             if removed == 0 or len(hits) >= target or limit >= total:
-                return self._apply_search_quality(hits[:target], quality_mode)
+                return self._attach_search_learning_evidence(
+                    self._apply_search_quality(hits[:target], quality_mode)
+                )
             limit = min(total, limit + max(1, target - len(hits)))
 
     def _apply_search_quality(
@@ -3386,11 +3525,1662 @@ class ImageVectorService:
         thresholds = self.search_quality.thresholds_for(quality_mode)
         return annotate_search_hits(hits, thresholds)
 
+    def _attach_search_learning_evidence(
+        self, hits: list[SearchHit]
+    ) -> list[SearchHit]:
+        """Attach bounded, provenance-aware tag features for local ranking.
+
+        Private fields are consumed by ``search_learning_runtime`` and are not
+        included in the public result manifest. Unknown provenance stays in the
+        vector bucket; it is never promoted to a manual or folder match.
+        """
+
+        search_learning = self._current_search_learning()
+        if not hits or search_learning is None or not search_learning.configured:
+            return hits
+        entries = self.state.get_many(hit.doc_id for hit in hits)
+        enriched: list[SearchHit] = []
+        for hit in hits:
+            entry = entries.get(hit.doc_id, {})
+            matched = {_tag_key(value) for value in hit.matched_tags}
+            sources = {
+                "manual": _matched_source_tags(entry.get("tags"), matched),
+                "folder": _matched_source_tags(entry.get("folder_tags"), matched),
+                "alias": [],
+                "model_high_confidence": [],
+                "model": _matched_source_tags(entry.get("accepted_auto_tags"), matched),
+                "vector": [],
+            }
+            signals: dict[str, float] = {}
+            annotation = self.state.get_document_annotation(hit.doc_id)
+            if annotation is not None:
+                high_confidence, annotation_signals = _annotation_learning_evidence(
+                    annotation, matched
+                )
+                sources["model_high_confidence"] = high_confidence
+                signals.update(annotation_signals)
+            claimed = {
+                _tag_key(value)
+                for source, values in sources.items()
+                if source != "vector"
+                for value in values
+            }
+            sources["vector"] = [
+                value for value in hit.matched_tags if _tag_key(value) not in claimed
+            ]
+            fields = {
+                **hit.fields,
+                "_tag_evidence": sources,
+                **signals,
+            }
+            enriched.append(replace(hit, fields=fields))
+        return enriched
+
+    def _current_search_learning(self) -> SearchLearningBundle | None:
+        """Return the latest atomically activated learning bundle.
+
+        A native backend keeps one service instance alive per library while the
+        desktop facade activates candidates through a separate component.  A
+        cheap active-manifest stat therefore makes activate, disable, and
+        rollback visible on the next single-library search without restarting
+        the backend. Invalid artifacts still use the normal safe fallback.
+        """
+
+        current = getattr(self, "search_learning", None)
+        config = getattr(self, "config", None)
+        config_home = getattr(config, "config_home_path", None)
+        if config_home is None:
+            return current
+
+        signature = self._search_learning_active_signature()
+        cached_signature = getattr(
+            self,
+            "_search_learning_manifest_signature",
+            None,
+        )
+        if signature == cached_signature:
+            return current
+
+        reload_lock = getattr(self, "_search_learning_reload_lock", None)
+        if reload_lock is None:
+            # Focused tests and degraded adapters may construct the service
+            # without __init__; retain that lightweight supported shape.
+            reload_lock = threading.Lock()
+            self._search_learning_reload_lock = reload_lock
+        with reload_lock:
+            signature = self._search_learning_active_signature()
+            if signature == getattr(
+                self,
+                "_search_learning_manifest_signature",
+                None,
+            ):
+                return getattr(self, "search_learning", current)
+            reloaded = load_search_learning(Path(config_home))
+            self.search_learning = reloaded
+            self._search_learning_manifest_signature = (
+                self._search_learning_active_signature()
+            )
+            return reloaded
+
+    def _search_learning_active_signature(self) -> tuple[bool, int, int]:
+        config = getattr(self, "config", None)
+        config_home = getattr(config, "config_home_path", None)
+        if config_home is None:
+            return (False, 0, 0)
+        active_path = (
+            Path(config_home) / SEARCH_LEARNING_DIRECTORY / ACTIVE_CONFIG_FILENAME
+        )
+        try:
+            stat = active_path.stat()
+        except FileNotFoundError:
+            return (False, 0, 0)
+        except OSError:
+            # Moving from a valid signature to this sentinel triggers one safe
+            # fallback reload; repeated permission errors remain bounded.
+            return (True, -1, -1)
+        return (True, stat.st_mtime_ns, stat.st_size)
+
     @staticmethod
     def _next_candidate_k(candidate_k: int, collection_size: int) -> int | None:
         if candidate_k >= collection_size:
             return None
         return min(collection_size, max(candidate_k + 1, candidate_k * 2))
+
+    def _cluster_operation_store(self) -> ClusterOperationStore | None:
+        return getattr(self, "cluster_operations", None)
+
+    def _cluster_library_key(self) -> str:
+        library_id = self.config.library_id or "local"
+        collection_uuid = str(
+            getattr(self.repository, "collection_uuid", "") or "unbound"
+        )
+        return f"{library_id}@{collection_uuid}"
+
+    def _import_legacy_cluster_snapshot(self) -> None:
+        """Migrate the old JSON snapshot once without recomputing vectors."""
+
+        store = self._cluster_operation_store()
+        if store is None or not self.config.cluster_snapshot_path.is_file():
+            return
+        library_key = self._cluster_library_key()
+        if store.active_snapshot_version(library_key) is not None:
+            return
+        try:
+            snapshot = read_cluster_snapshot(self.config.cluster_snapshot_path)
+            store.save_snapshot(
+                library_key,
+                snapshot,
+                metadata={"migrated_from": self.config.cluster_snapshot_path.name},
+            )
+        except Exception as exc:
+            # A broken optional legacy snapshot must not prevent the library
+            # from opening; the next explicit clustering run replaces it.
+            self.logger.warning(
+                "legacy_cluster_snapshot_import_failed error=%s",
+                str(exc) or exc.__class__.__name__,
+            )
+
+    def _active_cluster_snapshot(self) -> ClusterSnapshot | None:
+        store = self._cluster_operation_store()
+        if store is not None:
+            record = store.active_snapshot_version(self._cluster_library_key())
+            if record is not None:
+                return store.load_snapshot(record.snapshot_version)
+        if self.config.cluster_snapshot_path.is_file():
+            return read_cluster_snapshot(self.config.cluster_snapshot_path)
+        return None
+
+    def _active_cluster_rules(self) -> list[dict[str, Any]]:
+        store = self._cluster_operation_store()
+        if store is None:
+            return []
+        rules: list[dict[str, Any]] = []
+        cursor: str | None = None
+        while True:
+            page = store.list_rules(
+                self._cluster_library_key(),
+                active_only=True,
+                cursor=cursor,
+                limit=500,
+            )
+            rules.extend(cast(list[dict[str, Any]], page["items"]))
+            if not page["has_more"]:
+                return rules
+            cursor = cast(str, page["next_cursor"])
+
+    def cluster_images(
+        self,
+        *,
+        scope: str = "new_or_changed",
+        cluster_types: Iterable[str] = ("exact", "perceptual", "semantic"),
+    ) -> dict[str, object]:
+        """Build local clusters from persisted hashes and existing vectors only."""
+
+        normalized_scope = str(scope).strip().lower()
+        if normalized_scope not in {"new_or_changed", "all"}:
+            raise ValueError("scope must be new_or_changed or all.")
+        requested_types = tuple(
+            dict.fromkeys(str(value).strip().lower() for value in cluster_types)
+        )
+        if not requested_types or set(requested_types) - {
+            "exact",
+            "perceptual",
+            "semantic",
+            "near_duplicate",
+        }:
+            raise ValueError(
+                "cluster_types must contain exact, perceptual, semantic, and/or "
+                "the legacy near_duplicate alias."
+            )
+        normalized_types = tuple(
+            dict.fromkeys(
+                expanded
+                for requested in requested_types
+                for expanded in (
+                    ("exact", "perceptual")
+                    if requested == "near_duplicate"
+                    else (requested,)
+                )
+            )
+        )
+        self.cancel_check()
+        count_entries = getattr(self.state, "count", None)
+        fallback_entries: list[dict[str, Any]] | None = None
+        if callable(count_entries):
+            total = int(count_entries())
+        else:
+            fallback_entries = self.state.list_entries()
+            total = len(fallback_entries)
+        items: list[ImageClusterInput] = []
+        preparation_failures: list[dict[str, str]] = []
+        iter_entries = getattr(self.state, "iter_entries", None)
+        entry_chunks = (
+            iter_entries(chunk_size=256)
+            if callable(iter_entries)
+            else (fallback_entries or self.state.list_entries(),)
+        )
+        processed_entries = 0
+        for entry_chunk in entry_chunks:
+            annotation_reader = getattr(
+                self.state,
+                "get_document_annotations",
+                None,
+            )
+            annotations = (
+                annotation_reader(
+                    str(entry.get("doc_id") or "") for entry in entry_chunk
+                )
+                if callable(annotation_reader)
+                else {}
+            )
+            for entry in entry_chunk:
+                self.cancel_check()
+                processed_entries += 1
+                doc_id = str(entry.get("doc_id") or "")
+                sha = str(entry.get("sha256") or "").casefold()
+                if len(sha) != 64:
+                    preparation_failures.append(
+                        {
+                            "doc_id": doc_id,
+                            "code": "missing_sha256",
+                            "message": "Indexed SHA-256 is unavailable.",
+                        }
+                    )
+                    continue
+                relative_path = str(entry.get("relative_path") or "")
+                source_path = ""
+                with suppress(OSError, ValueError, ConfigurationError):
+                    source_path = str(self.source_resolver.resolve_fields(entry))
+                perceptual_hash = None
+                if "perceptual" in normalized_types:
+                    try:
+                        source = (
+                            Path(source_path)
+                            if source_path
+                            else self.source_resolver.resolve_fields(entry)
+                        )
+                        perceptual_hash = _average_image_hash(source)
+                    except (
+                        OSError,
+                        ValueError,
+                        ConfigurationError,
+                        UnidentifiedImageError,
+                    ) as exc:
+                        # Exact SHA and semantic clustering remain usable.
+                        perceptual_hash = None
+                        preparation_failures.append(
+                            {
+                                "doc_id": doc_id,
+                                "code": "perceptual_hash_failed",
+                                "message": (
+                                    str(exc) or "The image could not be decoded."
+                                ),
+                                "relative_path": relative_path,
+                                **({"source_path": source_path} if source_path else {}),
+                            }
+                        )
+                try:
+                    annotation = (
+                        annotations.get(doc_id)
+                        if annotations
+                        else self.state.get_document_annotation(doc_id)
+                    )
+                    identity_evidence = _cluster_identity_evidence(entry, annotation)
+                except Exception as exc:
+                    # Identity evidence is optional. A broken annotation record
+                    # must not prevent hashes and vectors from being grouped.
+                    preparation_failures.append(
+                        {
+                            "doc_id": doc_id,
+                            "code": "identity_evidence_failed",
+                            "message": str(exc) or exc.__class__.__name__,
+                            "relative_path": relative_path,
+                            **({"source_path": source_path} if source_path else {}),
+                        }
+                    )
+                    identity_evidence = ()
+                items.append(
+                    ImageClusterInput(
+                        doc_id=doc_id,
+                        sha256=sha,
+                        embedding=None,
+                        perceptual_hash=perceptual_hash,
+                        identity_evidence=identity_evidence,
+                    )
+                )
+                if processed_entries == total or processed_entries % 100 == 0:
+                    self.progress(
+                        f"Preparing clustering inputs {processed_entries}/{total}"
+                    )
+
+        previous = (
+            self._active_cluster_snapshot()
+            if normalized_scope == "new_or_changed"
+            else None
+        )
+
+        semantic_enabled = "semantic" in normalized_types
+        semantic_progress = 0
+
+        def semantic_neighbors(
+            item: ImageClusterInput, top_k: int
+        ) -> list[SemanticNeighbor]:
+            nonlocal semantic_progress
+            self.cancel_check()
+            semantic_progress += 1
+            if semantic_progress % 100 == 0 or semantic_progress == len(items):
+                self.progress(
+                    f"Clustering semantic neighbours {semantic_progress}/{len(items)}"
+                )
+            vector = self.repository.fetch_vector(item.doc_id)
+            if vector is None:
+                raise ValueError("Indexed embedding is unavailable.")
+            hits = self.repository.query(vector, top_k + 1, (), "all", "image")
+            return [
+                SemanticNeighbor(hit.doc_id, min(1.0, max(-1.0, 1.0 - hit.distance)))
+                for hit in hits
+                if hit.doc_id != item.doc_id
+            ][:top_k]
+
+        runner = ImageClusterService(
+            ImageClusteringConfig(
+                embedding_version=self.config.model,
+                embedding_dimension=self.config.dimension,
+                enable_exact_hash="exact" in normalized_types,
+                enable_perceptual_hash="perceptual" in normalized_types,
+                enable_semantic=semantic_enabled,
+                external_embedding_lookup=semantic_enabled,
+            ),
+            semantic_neighbor_provider=(
+                semantic_neighbors if semantic_enabled else None
+            ),
+        )
+        result = runner.run(
+            items,
+            previous_snapshot=previous,
+            cancel_check=self.cancel_check,
+        )
+        manual_rules = self._active_cluster_rules()
+        if manual_rules:
+            result = replace(
+                result,
+                snapshot=apply_manual_cluster_rules(result.snapshot, manual_rules),
+            )
+        store = self._cluster_operation_store()
+        snapshot_version = ""
+        if store is not None:
+            snapshot_record = store.save_snapshot(
+                self._cluster_library_key(),
+                result.snapshot,
+                metadata={
+                    "scope": normalized_scope,
+                    "cluster_types": list(normalized_types),
+                },
+            )
+            snapshot_version = snapshot_record.snapshot_version
+            # Keep a small compatibility snapshot for older builds. Large
+            # libraries use normalized SQLite only and avoid the former JSON
+            # size limit and duplicate memory peak.
+            if len(result.snapshot.items) <= 10_000:
+                write_cluster_snapshot(
+                    self.config.cluster_snapshot_path,
+                    result.snapshot,
+                )
+        else:
+            write_cluster_snapshot(self.config.cluster_snapshot_path, result.snapshot)
+        payload = result.to_dict()
+        # The complete snapshot is already persisted atomically. Keeping it in
+        # the job record would duplicate a potentially large local data set and
+        # make every poll transfer it again.
+        payload.pop("snapshot", None)
+        core_failures = payload.get("failures", [])
+        failures = [
+            *preparation_failures,
+            *(core_failures if isinstance(core_failures, list) else []),
+        ]
+        payload["failures"] = failures
+        payload["failure_count"] = len(failures)
+        payload["cluster_count"] = len(result.snapshot.clusters)
+        payload["processed"] = result.clustered_count
+        payload["total"] = total
+        payload["api_requests"] = 0
+        payload["embedding_api_requests"] = 0
+        payload["qwen_api_requests"] = 0
+        payload["embedding_recomputed"] = False
+        payload["snapshot_file"] = self.config.cluster_snapshot_path.name
+        if snapshot_version:
+            payload["snapshot_version"] = snapshot_version
+            payload["snapshot_storage"] = "sqlite"
+        else:
+            payload["snapshot_storage"] = "json_compatibility"
+        return payload
+
+    def list_image_clusters(
+        self,
+        *,
+        offset: int = 0,
+        limit: int = 100,
+        cluster_type: str | None = None,
+    ) -> dict[str, object]:
+        self.cancel_check()
+        normalized_type = str(cluster_type or "").strip().lower()
+        if normalized_type not in {
+            "",
+            "all",
+            "exact",
+            "perceptual",
+            "semantic",
+            "single",
+            "near_duplicate",
+        }:
+            raise ValueError(
+                "cluster_type must be all, exact, perceptual, semantic, single, "
+                "or near_duplicate."
+            )
+        store = self._cluster_operation_store()
+        active_record = (
+            store.active_snapshot_version(self._cluster_library_key())
+            if store is not None
+            else None
+        )
+        if store is not None and active_record is not None:
+            cluster_page = store.page_clusters(
+                active_record.snapshot_version,
+                offset=offset,
+                limit=limit,
+                cluster_type=normalized_type,
+            )
+            summaries = cast(list[dict[str, Any]], cluster_page["items"])
+            representative_ids = [
+                str(item.get("representative_doc_id") or "") for item in summaries
+            ]
+            entries = self.state.get_many(representative_ids)
+            page_items: list[dict[str, object]] = []
+            for index, summary in enumerate(summaries, 1):
+                representative_id = str(summary.get("representative_doc_id") or "")
+                page_items.append(
+                    {
+                        **summary,
+                        "representative": self._cluster_image_payload(
+                            representative_id,
+                            entries.get(representative_id, {}),
+                        ),
+                    }
+                )
+                if index % 100 == 0:
+                    self.progress(f"Loading image clusters {index}/{len(summaries)}")
+            return {
+                **cluster_page,
+                "items": page_items,
+                "embedding_api_requests": 0,
+                "qwen_api_requests": 0,
+            }
+        if not self.config.cluster_snapshot_path.is_file():
+            return {
+                "total": 0,
+                "offset": offset,
+                "limit": limit,
+                "items": [],
+                "api_requests": 0,
+                "embedding_api_requests": 0,
+                "qwen_api_requests": 0,
+            }
+        snapshot = read_cluster_snapshot(self.config.cluster_snapshot_path)
+        all_clusters = tuple(
+            sorted(
+                snapshot.clusters,
+                key=lambda cluster: (-len(cluster.member_doc_ids), cluster.cluster_id),
+            )
+        )
+        clusters = [
+            cluster
+            for cluster in all_clusters
+            if (
+                normalized_type == "single"
+                and len(cluster.member_doc_ids) == 1
+                or normalized_type != "single"
+                and len(cluster.member_doc_ids) > 1
+                and (
+                    normalized_type in {"", "all"}
+                    or normalized_type == "near_duplicate"
+                    and bool({"exact", "perceptual"} & set(cluster.edge_kinds))
+                    or normalized_type in {"exact", "perceptual", "semantic"}
+                    and normalized_type in cluster.edge_kinds
+                )
+            )
+        ]
+        cluster_slice = clusters[offset : offset + limit]
+        representative_ids = [cluster.member_doc_ids[0] for cluster in cluster_slice]
+        entries = self.state.get_many(representative_ids)
+        items: list[dict[str, object]] = []
+        for index, cluster in enumerate(cluster_slice, 1):
+            self.cancel_check()
+            representative_id = cluster.member_doc_ids[0]
+            representative = self._cluster_image_payload(
+                representative_id,
+                entries.get(representative_id, {}),
+            )
+            edge_kinds = set(cluster.edge_kinds)
+            inferred_type = (
+                "single"
+                if len(cluster.member_doc_ids) == 1
+                else "exact"
+                if "exact" in edge_kinds
+                else "perceptual"
+                if "perceptual" in edge_kinds
+                else "semantic"
+            )
+            items.append(
+                {
+                    **cluster.to_dict(),
+                    "cluster_type": inferred_type,
+                    "member_count": len(cluster.member_doc_ids),
+                    "representative_doc_id": representative_id,
+                    "representative": representative,
+                }
+            )
+            if index % 100 == 0:
+                self.progress(f"Loading image clusters {index}/{len(cluster_slice)}")
+        return {
+            "total": len(clusters),
+            "offset": offset,
+            "limit": limit,
+            "items": items,
+            "api_requests": 0,
+            "embedding_api_requests": 0,
+            "qwen_api_requests": 0,
+        }
+
+    def image_cluster_detail(
+        self,
+        cluster_id: str,
+        *,
+        offset: int = 0,
+        limit: int = 256,
+        edge_offset: int = 0,
+        edge_limit: int = 1_000,
+    ) -> dict[str, object]:
+        self.cancel_check()
+        store = self._cluster_operation_store()
+        active_record = (
+            store.active_snapshot_version(self._cluster_library_key())
+            if store is not None
+            else None
+        )
+        if store is not None and active_record is not None:
+            try:
+                detail_page = store.cluster_detail(
+                    active_record.snapshot_version,
+                    cluster_id,
+                    offset=offset,
+                    limit=limit,
+                    edge_offset=edge_offset,
+                    edge_limit=edge_limit,
+                )
+            except ClusterOperationNotFound as exc:
+                raise ValueError(f"Unknown cluster: {cluster_id}") from exc
+            members_page = cast(dict[str, Any], detail_page["members"])
+            member_rows = cast(list[dict[str, Any]], members_page["items"])
+            member_ids = [str(item.get("doc_id") or "") for item in member_rows]
+            entries = self.state.get_many(member_ids)
+            member_views = [
+                {
+                    **item,
+                    **self._cluster_image_payload(
+                        str(item.get("doc_id") or ""),
+                        entries.get(str(item.get("doc_id") or ""), {}),
+                    ),
+                    "tags": list(
+                        entries.get(str(item.get("doc_id") or ""), {}).get(
+                            "effective_tags", ()
+                        )
+                    ),
+                }
+                for item in member_rows
+            ]
+            cluster = cast(dict[str, Any], detail_page["cluster"])
+            representative_id = str(cluster.get("representative_doc_id") or "")
+            representative = next(
+                (
+                    item
+                    for item in member_views
+                    if str(item.get("doc_id") or "") == representative_id
+                ),
+                self._cluster_image_payload(
+                    representative_id,
+                    self.state.get(representative_id) or {},
+                ),
+            )
+            edges_page = cast(dict[str, Any], detail_page["edges"])
+            return {
+                "cluster": {**cluster, "representative": representative},
+                "items": member_views,
+                "member_count": members_page["total_count"],
+                "offset": members_page["offset"],
+                "limit": members_page["limit"],
+                "has_more": members_page["has_more"],
+                "edges": edges_page["items"],
+                "edge_count": edges_page["total_count"],
+                "edge_offset": edges_page["offset"],
+                "edge_limit": edges_page["limit"],
+                "edge_has_more": edges_page["has_more"],
+                "api_requests": 0,
+                "embedding_api_requests": 0,
+                "qwen_api_requests": 0,
+            }
+        snapshot = read_cluster_snapshot(self.config.cluster_snapshot_path)
+        detail = cluster_detail(snapshot, cluster_id)
+        if detail is None:
+            raise ValueError(f"Unknown cluster: {cluster_id}")
+        entries = self.state.get_many(detail.cluster.member_doc_ids)
+        item_views: list[dict[str, object]] = []
+        for index, item in enumerate(detail.items, 1):
+            self.cancel_check()
+            entry = entries.get(item.doc_id, {})
+            item_views.append(
+                {
+                    **item.to_dict(),
+                    **self._cluster_image_payload(item.doc_id, entry),
+                    "tags": list(entry.get("effective_tags", ())),
+                }
+            )
+            if index % 100 == 0:
+                self.progress(f"Loading cluster members {index}/{len(detail.items)}")
+        representative = item_views[0] if item_views else {}
+        return {
+            "cluster": {
+                **detail.cluster.to_dict(),
+                "member_count": len(detail.cluster.member_doc_ids),
+                "representative": representative,
+            },
+            "items": item_views,
+            "member_count": len(item_views),
+            "edges": [edge.to_dict() for edge in detail.edges],
+            "api_requests": 0,
+            "embedding_api_requests": 0,
+            "qwen_api_requests": 0,
+        }
+
+    def _required_cluster_snapshot(
+        self,
+    ) -> tuple[ClusterOperationStore, Any, ClusterSnapshot]:
+        store = self._cluster_operation_store()
+        if store is None:
+            raise ValueError("Cluster operation history is unavailable.")
+        record = store.active_snapshot_version(self._cluster_library_key())
+        if record is None:
+            raise ValueError("Run image clustering before organizing groups.")
+        return store, record, store.load_snapshot(record.snapshot_version)
+
+    def _execute_cluster_rule_operation(
+        self,
+        *,
+        store: ClusterOperationStore,
+        source_record: Any,
+        source_snapshot: ClusterSnapshot,
+        operation_type: str,
+        rule_kind: str,
+        pairs: Sequence[tuple[str, str]],
+        metadata: Mapping[str, Any],
+    ) -> dict[str, object]:
+        operation_items = tuple(
+            ClusterOperationItemInput(
+                item_key=_cluster_rule_item_key(left, right),
+                left_doc_id=left,
+                right_doc_id=right,
+                before={"active": False},
+            )
+            for left, right in pairs
+        )
+        operation = store.create_operation(
+            library_id=self._cluster_library_key(),
+            operation_type=operation_type,
+            source_snapshot_version=source_record.snapshot_version,
+            items=operation_items,
+            before_snapshot={"snapshot_version": source_record.snapshot_version},
+            metadata=metadata,
+        )
+        operation_id = str(operation["operation_id"])
+        created_rules: list[tuple[int, dict[str, Any]]] = []
+        failures: list[dict[str, str]] = []
+        warnings: list[str] = []
+        try:
+            for index, (left, right) in enumerate(pairs):
+                self.cancel_check()
+                try:
+                    rule = store.add_rule(
+                        library_id=self._cluster_library_key(),
+                        snapshot_version=source_record.snapshot_version,
+                        rule_kind=rule_kind,
+                        left_doc_id=left,
+                        right_doc_id=right,
+                        operation_id=operation_id,
+                    )
+                    if rule["created"]:
+                        created_rules.append((index, rule))
+                    else:
+                        store.record_item_result(
+                            operation_id,
+                            index,
+                            status="skipped",
+                            after=rule,
+                        )
+                except Exception as exc:
+                    error = str(exc) or exc.__class__.__name__
+                    store.record_item_result(
+                        operation_id,
+                        index,
+                        status="failed",
+                        error_code="rule_create_failed",
+                        error_message=error,
+                    )
+                    _append_active_learning_failure(failures, f"{left}|{right}", error)
+
+            result_snapshot_version = source_record.snapshot_version
+            if created_rules:
+                try:
+                    updated = apply_manual_cluster_rules(
+                        source_snapshot,
+                        self._active_cluster_rules(),
+                    )
+                    updated_record = store.save_snapshot(
+                        self._cluster_library_key(),
+                        updated,
+                        metadata={"operation_id": operation_id},
+                    )
+                    result_snapshot_version = updated_record.snapshot_version
+                    if len(updated.items) <= 10_000:
+                        write_cluster_snapshot(
+                            self.config.cluster_snapshot_path,
+                            updated,
+                        )
+                    for index, rule in created_rules:
+                        store.record_item_result(
+                            operation_id,
+                            index,
+                            status="applied",
+                            after=rule,
+                        )
+                except Exception as exc:
+                    error = str(exc) or exc.__class__.__name__
+                    for index, rule in created_rules:
+                        with suppress(Exception):
+                            store.revoke_rule(
+                                str(rule["rule_id"]),
+                                operation_id=operation_id,
+                            )
+                        store.record_item_result(
+                            operation_id,
+                            index,
+                            status="failed",
+                            error_code="snapshot_update_failed",
+                            error_message=error,
+                        )
+                    warnings.append(error)
+            completed = store.complete_operation(
+                operation_id,
+                after_snapshot={"snapshot_version": result_snapshot_version},
+                result_snapshot_version=result_snapshot_version,
+            )
+        except BaseException as exc:
+            for _index, rule in created_rules:
+                with suppress(Exception):
+                    store.revoke_rule(str(rule["rule_id"]), operation_id=operation_id)
+            with suppress(Exception):
+                store.fail_operation(
+                    operation_id,
+                    error_code="operation_interrupted",
+                    error_message=str(exc) or exc.__class__.__name__,
+                )
+            raise
+        return self._cluster_operation_result(
+            completed,
+            failures=failures,
+            warnings=warnings,
+        )
+
+    @staticmethod
+    def _cluster_operation_result(
+        operation: Mapping[str, Any],
+        *,
+        failures: Sequence[Mapping[str, str]] = (),
+        warnings: Sequence[str] = (),
+    ) -> dict[str, object]:
+        return {
+            "operation_id": str(operation.get("operation_id") or ""),
+            "operation": str(operation.get("operation_type") or ""),
+            "status": str(operation.get("status") or ""),
+            "applied": int(operation.get("succeeded_count") or 0),
+            "failed": int(operation.get("failed_count") or 0),
+            "skipped": int(operation.get("skipped_count") or 0),
+            "failures": [dict(value) for value in failures[:100]],
+            "warnings": list(warnings),
+            "needs_attention": bool(warnings or operation.get("failed_count")),
+            "undo_available": operation.get("undo_status") == "available",
+            "api_requests": 0,
+            "embedding_api_requests": 0,
+            "qwen_api_requests": 0,
+            "embedding_recomputed": False,
+        }
+
+    @staticmethod
+    def _all_cluster_operation_items(
+        store: ClusterOperationStore,
+        operation_id: str,
+    ) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        offset = 0
+        while True:
+            page = store.operation_items(operation_id, offset=offset, limit=2_000)
+            values = cast(list[dict[str, Any]], page["items"])
+            items.extend(values)
+            if not page["has_more"]:
+                return items
+            offset += len(values)
+
+    def merge_image_clusters(self, cluster_ids: Iterable[str]) -> dict[str, object]:
+        normalized = tuple(
+            dict.fromkeys(
+                str(value).strip() for value in cluster_ids if str(value).strip()
+            )
+        )
+        if not 2 <= len(normalized) <= 100:
+            raise ValueError("cluster_ids must contain 2 to 100 unique groups.")
+        store, record, snapshot = self._required_cluster_snapshot()
+        clusters = {cluster.cluster_id: cluster for cluster in snapshot.clusters}
+        missing = [
+            cluster_id for cluster_id in normalized if cluster_id not in clusters
+        ]
+        if missing:
+            raise ValueError(f"Unknown cluster: {missing[0]}")
+        representatives = [
+            clusters[cluster_id].member_doc_ids[0] for cluster_id in normalized
+        ]
+        anchor = representatives[0]
+        pairs = tuple(
+            (anchor, representative) for representative in representatives[1:]
+        )
+        return self._execute_cluster_rule_operation(
+            store=store,
+            source_record=record,
+            source_snapshot=snapshot,
+            operation_type="merge",
+            rule_kind="must_link",
+            pairs=pairs,
+            metadata={"cluster_ids": list(normalized)},
+        )
+
+    def split_image_cluster(
+        self,
+        cluster_id: str,
+        doc_ids: Iterable[str],
+    ) -> dict[str, object]:
+        selected = tuple(
+            dict.fromkeys(str(value).strip() for value in doc_ids if str(value).strip())
+        )
+        if not selected:
+            raise ValueError("doc_ids must contain at least one image.")
+        store, record, snapshot = self._required_cluster_snapshot()
+        cluster = next(
+            (value for value in snapshot.clusters if value.cluster_id == cluster_id),
+            None,
+        )
+        if cluster is None:
+            raise ValueError(f"Unknown cluster: {cluster_id}")
+        member_set = set(cluster.member_doc_ids)
+        if any(doc_id not in member_set for doc_id in selected):
+            raise ValueError("Every split image must belong to the selected cluster.")
+        pairs = tuple(
+            sorted(
+                {
+                    tuple(sorted((selected_doc, other_doc)))
+                    for selected_doc in selected
+                    for other_doc in cluster.member_doc_ids
+                    if selected_doc != other_doc
+                }
+            )
+        )
+        if not pairs:
+            raise ValueError("A single-image cluster cannot be split.")
+        if len(pairs) > 10_000:
+            raise ValueError("The split operation would exceed 10000 constraints.")
+        return self._execute_cluster_rule_operation(
+            store=store,
+            source_record=record,
+            source_snapshot=snapshot,
+            operation_type="split",
+            rule_kind="must_not_link",
+            pairs=cast(tuple[tuple[str, str], ...], pairs),
+            metadata={"cluster_id": cluster_id, "doc_ids": list(selected)},
+        )
+
+    def apply_image_cluster_identity(
+        self,
+        cluster_id: str,
+        *,
+        identity_category: str,
+        identity_value: str,
+    ) -> dict[str, object]:
+        category = str(identity_category).strip().casefold()
+        value = str(identity_value).strip()
+        if category not in IDENTITY_CATEGORIES:
+            raise ValueError(
+                "identity_category must be real_person, cosplayer, character, or work."
+            )
+        if not value or len(value) > 256:
+            raise ValueError("identity_value must contain 1 to 256 characters.")
+        store, record, snapshot = self._required_cluster_snapshot()
+        cluster = next(
+            (
+                candidate
+                for candidate in snapshot.clusters
+                if candidate.cluster_id == cluster_id
+            ),
+            None,
+        )
+        if cluster is None:
+            raise ValueError(f"Unknown cluster: {cluster_id}")
+        if len(cluster.member_doc_ids) > 10_000:
+            raise ValueError(
+                "Identity propagation is limited to 10000 images per batch."
+            )
+        snapshots: dict[str, dict[str, Any]] = {}
+        snapshot_errors: dict[str, str] = {}
+        operation_items: list[ClusterOperationItemInput] = []
+        for doc_id in cluster.member_doc_ids:
+            try:
+                before = self.auto_tagging.cluster_identity_snapshot(doc_id)
+                snapshots[doc_id] = before
+            except Exception as exc:
+                before = {"snapshot_unavailable": True}
+                snapshot_errors[doc_id] = str(exc) or exc.__class__.__name__
+            operation_items.append(
+                ClusterOperationItemInput(
+                    item_key=f"identity-{sha256(doc_id.encode('utf-8')).hexdigest()[:24]}",
+                    doc_id=doc_id,
+                    cluster_id=cluster_id,
+                    identity_category=category,
+                    identity_value=value,
+                    before=before,
+                )
+            )
+        operation = store.create_operation(
+            library_id=self._cluster_library_key(),
+            operation_type="apply_identity",
+            source_snapshot_version=record.snapshot_version,
+            items=tuple(operation_items),
+            before_snapshot={"snapshot_version": record.snapshot_version},
+            metadata={
+                "cluster_id": cluster_id,
+                "identity_category": category,
+                "identity_value": value,
+            },
+        )
+        operation_id = str(operation["operation_id"])
+        failures: list[dict[str, str]] = []
+        applied = 0
+        warnings: list[str] = []
+        try:
+            for index, doc_id in enumerate(cluster.member_doc_ids):
+                self.cancel_check()
+                if doc_id in snapshot_errors:
+                    error = snapshot_errors[doc_id]
+                    store.record_item_result(
+                        operation_id,
+                        index,
+                        status="failed",
+                        error_code="snapshot_unavailable",
+                        error_message=error,
+                    )
+                    _append_active_learning_failure(failures, doc_id, error)
+                    continue
+                before = snapshots[doc_id]
+                try:
+                    self.auto_tagging.apply_cluster_identity(
+                        doc_id,
+                        category=category,
+                        value=value,
+                    )
+                    after = self.auto_tagging.cluster_identity_snapshot(doc_id)
+                    store.record_item_result(
+                        operation_id,
+                        index,
+                        status="applied",
+                        after=after,
+                    )
+                    applied += 1
+                except Exception as exc:
+                    error = str(exc) or exc.__class__.__name__
+                    try:
+                        self.auto_tagging.restore_cluster_identity_snapshot(before)
+                    except Exception as rollback_exc:
+                        error = (
+                            f"{error}; rollback failed: "
+                            f"{str(rollback_exc) or rollback_exc.__class__.__name__}"
+                        )
+                    store.record_item_result(
+                        operation_id,
+                        index,
+                        status="failed",
+                        error_code="identity_apply_failed",
+                        error_message=error,
+                    )
+                    _append_active_learning_failure(failures, doc_id, error)
+            if applied:
+                try:
+                    self.auto_tagging.finalize_active_learning_changes()
+                except Exception as exc:
+                    warnings.append(str(exc) or exc.__class__.__name__)
+            completed = store.complete_operation(
+                operation_id,
+                after_snapshot={"snapshot_version": record.snapshot_version},
+                result_snapshot_version=record.snapshot_version,
+            )
+        except BaseException as exc:
+            # The tag write and operation journal span separate stores.  Never
+            # leave a cancelled batch in "running"; persisted applied items can
+            # then be safely selected by the recovery undo path.
+            with suppress(Exception):
+                store.fail_operation(
+                    operation_id,
+                    error_code="operation_interrupted",
+                    error_message=str(exc) or exc.__class__.__name__,
+                )
+            raise
+        return self._cluster_operation_result(
+            completed,
+            failures=failures,
+            warnings=warnings,
+        )
+
+    def undo_latest_cluster_operation(self) -> dict[str, object]:
+        store = self._cluster_operation_store()
+        if store is None:
+            raise ValueError("Cluster operation history is unavailable.")
+        operations = store.list_operations(
+            self._cluster_library_key(), offset=0, limit=100
+        )["items"]
+        original = next(
+            (
+                item
+                for item in cast(list[dict[str, Any]], operations)
+                if item.get("operation_type") != "undo"
+                and item.get("undo_status") in {"available", "needs_attention"}
+            ),
+            None,
+        )
+        if original is None:
+            return {
+                "undone": False,
+                "operation_id": "",
+                "restored": 0,
+                "failed": 0,
+                "conflicts": 0,
+                "undo_available": False,
+                "api_requests": 0,
+            }
+        original_id = str(original["operation_id"])
+        undo = store.begin_undo(original_id)
+        undo_id = str(undo["operation_id"])
+        undo_items = self._all_cluster_operation_items(store, undo_id)
+        failures: list[dict[str, str]] = []
+        restored = 0
+        conflicts = 0
+        identity_changed = False
+        rules_changed = False
+        warnings: list[str] = []
+        try:
+            for item in undo_items:
+                self.cancel_check()
+                index = int(item["item_index"])
+                doc_id = str(item.get("doc_id") or "")
+                before = item.get("before")
+                current = before.get("current") if isinstance(before, Mapping) else None
+                restore = before.get("restore") if isinstance(before, Mapping) else None
+                try:
+                    if str(original["operation_type"]) in {"merge", "split"}:
+                        if not isinstance(current, Mapping):
+                            raise ValueError("Cluster rule undo state is incomplete.")
+                        rule_id = str(current.get("rule_id") or "")
+                        revoked = store.revoke_rule(rule_id, operation_id=undo_id)
+                        if revoked.get("revoked_by_operation_id") != undo_id:
+                            raise ActiveLearningError(
+                                "The cluster rule changed after this operation."
+                            )
+                        rules_changed = True
+                    else:
+                        if not isinstance(current, Mapping) or not isinstance(
+                            restore, Mapping
+                        ):
+                            raise ValueError("Identity undo snapshot is incomplete.")
+                        if not self.auto_tagging.cluster_identity_matches_snapshot(
+                            current
+                        ):
+                            raise ActiveLearningError(
+                                "Identity tags changed after this operation; "
+                                "newer edits were kept."
+                            )
+                        self.auto_tagging.restore_cluster_identity_snapshot(restore)
+                        identity_changed = True
+                    store.record_item_result(
+                        undo_id,
+                        index,
+                        status="undone",
+                        after=cast(Mapping[str, Any], restore or {}),
+                    )
+                    restored += 1
+                except Exception as exc:
+                    conflict = _is_cluster_operation_conflict(exc)
+                    error = str(exc) or exc.__class__.__name__
+                    store.record_item_result(
+                        undo_id,
+                        index,
+                        status="conflict" if conflict else "undo_failed",
+                        error_code=("undo_conflict" if conflict else "undo_failed"),
+                        error_message=error,
+                    )
+                    conflicts += int(conflict)
+                    _append_active_learning_failure(failures, doc_id, error)
+            result_snapshot_version = str(original["result_snapshot_version"] or "")
+            if rules_changed:
+                source = store.load_snapshot(str(original["source_snapshot_version"]))
+                updated = apply_manual_cluster_rules(
+                    source,
+                    self._active_cluster_rules(),
+                )
+                snapshot_record = store.save_snapshot(
+                    self._cluster_library_key(),
+                    updated,
+                    metadata={"undo_of_operation_id": original_id},
+                )
+                result_snapshot_version = snapshot_record.snapshot_version
+            if identity_changed:
+                try:
+                    self.auto_tagging.finalize_active_learning_changes()
+                except Exception as exc:
+                    warnings.append(str(exc) or exc.__class__.__name__)
+            if not result_snapshot_version:
+                active = store.active_snapshot_version(self._cluster_library_key())
+                result_snapshot_version = (
+                    active.snapshot_version
+                    if active
+                    else str(original["source_snapshot_version"])
+                )
+            completed = store.complete_operation(
+                undo_id,
+                after_snapshot={"snapshot_version": result_snapshot_version},
+                result_snapshot_version=result_snapshot_version,
+            )
+        except BaseException as exc:
+            # A cancelled undo may already have restored some images or rules.
+            # Persist that fact so restart/retry can continue with only the
+            # remaining items instead of stranding a running journal entry.
+            with suppress(Exception):
+                store.fail_operation(
+                    undo_id,
+                    error_code="undo_interrupted",
+                    error_message=str(exc) or exc.__class__.__name__,
+                )
+            raise
+        result = self._cluster_operation_result(
+            completed,
+            failures=failures,
+            warnings=warnings,
+        )
+        result.update(
+            {
+                "undone": completed["status"] == "succeeded",
+                "restored": restored,
+                "conflicts": conflicts,
+            }
+        )
+        return result
+
+    def build_active_learning_review_queue(
+        self, *, review_budget: int = 25
+    ) -> dict[str, object]:
+        self.cancel_check()
+        review_store = self._active_learning_review_store()
+        reviewed_doc_ids = self._active_learning_reviewed_doc_ids(review_store)
+        snapshot = self._active_cluster_snapshot()
+        if snapshot is None:
+            snapshot = (
+                ImageClusterService(
+                    ImageClusteringConfig(
+                        embedding_version=self.config.model,
+                        enable_exact_hash=False,
+                        enable_perceptual_hash=False,
+                        enable_semantic=False,
+                    )
+                )
+                .run((), cancel_check=self.cancel_check)
+                .snapshot
+            )
+        entries = self.state.get_many(item.doc_id for item in snapshot.items)
+        edge_scores: dict[str, list[float]] = defaultdict(list)
+        for edge in snapshot.edges:
+            if edge.kind == "semantic" and edge.score is not None:
+                edge_scores[edge.left_doc_id].append(float(edge.score))
+                edge_scores[edge.right_doc_id].append(float(edge.score))
+        cluster_by_id = {cluster.cluster_id: cluster for cluster in snapshot.clusters}
+        candidates: list[ActiveLearningCandidate] = []
+        for index, item in enumerate(snapshot.items, 1):
+            self.cancel_check()
+            if item.doc_id in reviewed_doc_ids:
+                continue
+            entry = entries.get(item.doc_id, {})
+            annotation = self.state.get_document_annotation(item.doc_id)
+            if not entry or annotation is None:
+                continue
+            source_sha256 = str(entry.get("sha256") or "").strip().lower()
+            if source_sha256 != str(annotation.get("source_sha256") or "").lower():
+                # A stale annotation must be regenerated instead of reviewed.
+                continue
+            cluster = cluster_by_id[item.cluster_id]
+            scores = edge_scores.get(item.doc_id, [])
+            outlier_score = (
+                min(1.0, max(0.0, 1.0 - sum(scores) / len(scores)))
+                if scores
+                else 0.65
+                if len(cluster.member_doc_ids) == 1
+                else 0.80
+            )
+            candidates.append(
+                ActiveLearningCandidate(
+                    doc_id=item.doc_id,
+                    group_id=item.cluster_id,
+                    candidate_kind="tag_review",
+                    library_id=self.config.library_id or "",
+                    source_sha256=source_sha256,
+                    tag_snapshot=normalize_tags(
+                        annotation.get("proposed_tags")
+                        or entry.get("accepted_auto_tags")
+                        or entry.get("effective_tags")
+                        or ()
+                    ),
+                    conflict_score=1.0
+                    if any(anchor.conflict for anchor in cluster.identity_anchors)
+                    else 0.0,
+                    outlier_score=outlier_score,
+                    ranking_disagreement=0.0,
+                    relative_path=str(entry.get("relative_path", "")),
+                )
+            )
+            if index % 100 == 0:
+                self.progress(
+                    "Preparing active-learning candidates "
+                    f"{index}/{len(snapshot.items)}"
+                )
+        queue = build_active_learning_queue(
+            candidates, ActiveLearningConfig(total_budget=review_budget)
+        )
+        write_active_learning_queue(self.config.active_learning_queue_path, queue)
+        return self._active_learning_queue_payload(queue)
+
+    def review_active_learning_queue(
+        self,
+        *,
+        queue_id: str,
+        decisions: Iterable[Mapping[str, object]],
+    ) -> dict[str, object]:
+        queue = read_active_learning_queue(self.config.active_learning_queue_path)
+        if queue.queue_id != queue_id:
+            raise ActiveLearningError("The active-learning queue has changed.")
+        review_store = self._active_learning_review_store()
+        review_store.recover_incomplete()
+        raw_decisions = list(decisions)
+        review_items: list[ActiveLearningReviewItem] = []
+        for decision in raw_decisions:
+            labels = decision.get("labels", ())
+            if isinstance(labels, (str, bytes)) or not isinstance(labels, Iterable):
+                raise ActiveLearningError("Decision labels must be an array.")
+            review_items.append(
+                ActiveLearningReviewItem(
+                    doc_id=str(decision.get("doc_id") or ""),
+                    decision=cast(Any, str(decision.get("decision") or "")),
+                    labels=tuple(str(value) for value in labels),
+                )
+            )
+        batch = review_store.start_batch(
+            queue_id=queue_id,
+            library_id=self._active_learning_review_library_key(),
+            items=review_items,
+            metadata={"selection_version": queue.selection_version},
+        )
+        batch_id = str(batch["batch_id"])
+        queue_items = {item.doc_id: item for item in queue.items}
+        updated = queue
+        applied = 0
+        skipped = 0
+        failed = 0
+        conflicts = 0
+        changed = False
+        failures: list[dict[str, str]] = []
+        warnings: list[str] = []
+        for decision in raw_decisions:
+            self.cancel_check()
+            doc_id = str(decision.get("doc_id") or "").strip()
+            action = str(decision.get("decision") or "").strip().lower()
+            labels = decision.get("labels", ())
+            label_values = tuple(str(value) for value in cast(Iterable[object], labels))
+            item = queue_items.get(doc_id)
+            if item is None:
+                failed += 1
+                error = "The queued image no longer exists."
+                review_store.record_entry_outcome(
+                    batch_id,
+                    doc_id,
+                    status="failed",
+                    error_code="queue_item_missing",
+                    error_message=error,
+                )
+                _append_active_learning_failure(failures, doc_id, error)
+                continue
+            if action == "skip":
+                skipped += 1
+                review_store.record_entry_outcome(
+                    batch_id,
+                    doc_id,
+                    status="skipped",
+                )
+                updated = record_learning_decision(updated, doc_id, "skip", labels=())
+                continue
+
+            before: dict[str, Any] | None = None
+            try:
+                self._validate_active_learning_queue_item(item)
+                if item.candidate_kind != "tag_review":
+                    raise ActiveLearningError(
+                        f"Unsupported active-learning candidate: {item.candidate_kind}"
+                    )
+                before = self.auto_tagging.active_learning_snapshot(doc_id)
+                review_decision: dict[str, object] = {
+                    "doc_id": doc_id,
+                    "action": action,
+                }
+                if action == "edit":
+                    review_decision["tags"] = list(label_values)
+                self.auto_tagging.apply_active_learning_decision(review_decision)
+                after = self.auto_tagging.active_learning_snapshot(doc_id)
+                review_store.record_entry_outcome(
+                    batch_id,
+                    doc_id,
+                    status="applied",
+                    before_snapshot=before,
+                    after_snapshot=after,
+                    requires_undo=before != after,
+                )
+                applied += 1
+                changed = changed or before != after
+                updated = record_learning_decision(
+                    updated,
+                    doc_id,
+                    cast(Any, action),
+                    labels=label_values,
+                )
+            except Exception as exc:
+                error = str(exc) or exc.__class__.__name__
+                conflict = _is_active_learning_conflict(exc)
+                rollback_error = ""
+                if before is not None:
+                    try:
+                        # A document update spans SQLite and Zvec. Restore the
+                        # saved snapshot when any stage fails, then continue.
+                        self.auto_tagging.restore_active_learning_snapshot(before)
+                    except Exception as restore_exc:
+                        rollback_error = (
+                            str(restore_exc) or restore_exc.__class__.__name__
+                        )
+                if rollback_error:
+                    error = f"{error}; rollback failed: {rollback_error}"
+                    warnings.append(f"{doc_id}: {rollback_error}")
+                status = "conflict" if conflict else "failed"
+                review_store.record_entry_outcome(
+                    batch_id,
+                    doc_id,
+                    status=cast(Any, status),
+                    error_code=(
+                        "review_state_conflict" if conflict else "review_apply_failed"
+                    ),
+                    error_message=error,
+                )
+                if conflict:
+                    conflicts += 1
+                else:
+                    failed += 1
+                _append_active_learning_failure(failures, doc_id, error)
+
+        if changed:
+            try:
+                self.auto_tagging.finalize_active_learning_changes()
+            except Exception as exc:
+                warning = str(exc) or exc.__class__.__name__
+                warnings.append(f"Tag catalog optimization failed: {warning}")
+        finished = review_store.finish_batch(batch_id)
+        try:
+            write_active_learning_queue(self.config.active_learning_queue_path, updated)
+        except ActiveLearningError as exc:
+            warnings.append(str(exc))
+        payload = self._active_learning_queue_payload(updated)
+        payload.update(
+            {
+                "batch_id": batch_id,
+                "status": finished["status"],
+                "applied": applied,
+                "failed": failed,
+                "skipped": skipped,
+                "conflicts": conflicts,
+                "failures": failures,
+                "warnings": warnings,
+                "needs_attention": bool(warnings or failed or conflicts),
+                "undo_available": bool(finished["undo_available"]),
+            }
+        )
+        return payload
+
+    def undo_latest_active_learning_review(self) -> dict[str, object]:
+        review_store = self._active_learning_review_store()
+        review_store.recover_incomplete()
+        library_id = self._active_learning_review_library_key()
+        batches = review_store.list_batches(library_id=library_id, limit=50)["items"]
+        target = next(
+            (item for item in batches if bool(item.get("undo_available"))),
+            None,
+        )
+        if target is None:
+            return {
+                "undone": False,
+                "batch_id": "",
+                "restored": 0,
+                "failed": 0,
+                "conflicts": 0,
+                "failures": [],
+                "undo_available": False,
+                "api_requests": 0,
+            }
+        batch_id = str(target["batch_id"])
+        undo = review_store.begin_undo(batch_id)
+        restored = 0
+        failed = 0
+        conflicts = 0
+        changed = False
+        failures: list[dict[str, str]] = []
+        for entry in undo["entries"]:
+            self.cancel_check()
+            doc_id = str(entry["doc_id"])
+            before = entry.get("before_snapshot")
+            after = entry.get("after_snapshot")
+            try:
+                if not isinstance(before, Mapping) or not isinstance(after, Mapping):
+                    raise ActiveLearningError("Review undo snapshot is incomplete.")
+                if not self.auto_tagging.active_learning_matches_snapshot(after):
+                    raise ActiveLearningError(
+                        "The image tags changed after this review; "
+                        "newer edits were kept."
+                    )
+                self.auto_tagging.restore_active_learning_snapshot(before)
+                review_store.record_undo_outcome(
+                    batch_id,
+                    doc_id,
+                    status="undone",
+                )
+                restored += 1
+                changed = True
+            except Exception as exc:
+                error = str(exc) or exc.__class__.__name__
+                conflict = _is_active_learning_conflict(exc)
+                review_store.record_undo_outcome(
+                    batch_id,
+                    doc_id,
+                    status="conflict" if conflict else "failed",
+                    error_code=(
+                        "undo_state_conflict" if conflict else "undo_restore_failed"
+                    ),
+                    error_message=error,
+                )
+                if conflict:
+                    conflicts += 1
+                else:
+                    failed += 1
+                _append_active_learning_failure(failures, doc_id, error)
+        warnings: list[str] = []
+        if changed:
+            try:
+                self.auto_tagging.finalize_active_learning_changes()
+            except Exception as exc:
+                warnings.append(str(exc) or exc.__class__.__name__)
+        finished = review_store.finish_undo(batch_id)
+        return {
+            "undone": finished["status"] == "undone",
+            "batch_id": batch_id,
+            "restored": restored,
+            "failed": failed,
+            "conflicts": conflicts,
+            "failures": failures,
+            "warnings": warnings,
+            "needs_attention": bool(warnings or failed or conflicts),
+            "undo_available": bool(finished["undo_available"]),
+            "api_requests": 0,
+            "embedding_api_requests": 0,
+            "qwen_api_requests": 0,
+        }
+
+    def _active_learning_review_store(self) -> ActiveLearningReviewStore:
+        store = getattr(self, "active_learning_reviews", None)
+        if store is None:
+            raise ActiveLearningError(
+                "Active-learning review history is unavailable for this library."
+            )
+        return store
+
+    def _active_learning_reviewed_doc_ids(
+        self,
+        store: ActiveLearningReviewStore,
+    ) -> set[str]:
+        reviewed: set[str] = set()
+        cursor: str | None = None
+        library_id = self._active_learning_review_library_key()
+        while True:
+            page = store.list_applied_doc_ids(
+                library_id=library_id,
+                limit=10_000,
+                after_doc_id=cursor,
+            )
+            reviewed.update(str(value) for value in page["items"])
+            if not page["has_more"]:
+                return reviewed
+            cursor = cast(str, page["next_cursor"])
+
+    def _active_learning_review_library_key(self) -> str:
+        library_id = self.config.library_id or "local"
+        collection_uuid = str(
+            getattr(self.repository, "collection_uuid", "") or "unbound"
+        )
+        return f"{library_id}@{collection_uuid}"
+
+    def _validate_active_learning_queue_item(
+        self,
+        item: Any,
+    ) -> None:
+        entry = self.state.get(str(item.doc_id))
+        if entry is None:
+            raise ActiveLearningError("The indexed image no longer exists.")
+        current_sha256 = str(entry.get("sha256") or "").strip().lower()
+        if item.source_sha256 and current_sha256 != item.source_sha256:
+            raise ActiveLearningError(
+                "The image changed after the review queue was generated."
+            )
+        annotation = self.state.get_document_annotation(str(item.doc_id))
+        if annotation is None:
+            raise ActiveLearningError("The image annotation no longer exists.")
+        current_tags = normalize_tags(
+            annotation.get("proposed_tags")
+            or entry.get("accepted_auto_tags")
+            or entry.get("effective_tags")
+            or ()
+        )
+        if item.tag_snapshot and current_tags != item.tag_snapshot:
+            raise ActiveLearningError(
+                "The image tags changed after the review queue was generated."
+            )
+
+    def _cluster_image_payload(
+        self,
+        doc_id: str,
+        entry: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Return one internal media record for safe WebView registration.
+
+        ``source_path`` is used only on the authenticated loopback boundary and
+        is removed by the WebView facade before the JSON reaches the browser.
+        """
+
+        relative_path = str(entry.get("relative_path") or "")
+        payload: dict[str, object] = {
+            "doc_id": doc_id,
+            "relative_path": relative_path,
+            "file_name": Path(relative_path).name if relative_path else doc_id,
+        }
+        with suppress(OSError, ValueError, ConfigurationError):
+            payload["source_path"] = str(
+                self.source_resolver.resolve_fields(dict(entry))
+            )
+        return payload
+
+    def _active_learning_queue_payload(
+        self, queue: ActiveLearningQueue
+    ) -> dict[str, object]:
+        payload = queue.to_dict()
+        entries = self.state.get_many(item.doc_id for item in queue.items)
+        enriched: list[dict[str, object]] = []
+        for index, item in enumerate(queue.items, 1):
+            self.cancel_check()
+            entry = entries.get(item.doc_id, {})
+            item_payload = item.to_dict()
+            item_payload.update(self._cluster_image_payload(item.doc_id, entry))
+            item_payload["suggested_tags"] = list(
+                item.tag_snapshot
+                or entry.get("effective_tags")
+                or entry.get("accepted_auto_tags")
+                or entry.get("tags")
+                or ()
+            )
+            enriched.append(item_payload)
+            if index % 100 == 0:
+                self.progress(
+                    f"Loading active-learning samples {index}/{len(queue.items)}"
+                )
+        payload["items"] = enriched
+        payload["processed"] = len(enriched)
+        candidate_count = payload.get("candidate_count")
+        has_candidate_count = isinstance(candidate_count, int) and not isinstance(
+            candidate_count, bool
+        )
+        payload["total"] = candidate_count if has_candidate_count else len(enriched)
+        payload["embedding_api_requests"] = 0
+        payload["qwen_api_requests"] = 0
+        payload["embedding_recomputed"] = False
+        return payload
 
     def stats(self) -> dict:
         collection_stats = self.repository.stats
@@ -3704,6 +5494,182 @@ class ImageVectorService:
         self.close()
 
 
+def _average_image_hash(path: Path) -> str:
+    """Return a small local perceptual hash without retaining decoded pixels."""
+
+    with Image.open(path) as image:
+        grayscale = image.convert("L").resize((8, 8), Image.Resampling.LANCZOS)
+        pixels = list(grayscale.tobytes())
+    average = sum(pixels) / len(pixels)
+    bits = 0
+    for value in pixels:
+        bits = (bits << 1) | int(value >= average)
+    return f"{bits:016x}"
+
+
+def _cluster_identity_evidence(
+    entry: Mapping[str, Any], annotation: Mapping[str, Any] | None
+) -> tuple[IdentityEvidence, ...]:
+    if annotation is None:
+        return ()
+    structured = annotation.get("structured")
+    if not isinstance(structured, Mapping):
+        return ()
+    raw_entities = structured.get("entities")
+    if not isinstance(raw_entities, Mapping):
+        return ()
+    sources = {
+        "manual": {_tag_key(value) for value in entry.get("tags", ())},
+        "folder": {_tag_key(value) for value in entry.get("folder_tags", ())},
+        "accepted": {_tag_key(value) for value in entry.get("accepted_auto_tags", ())},
+        "inherited": {_tag_key(value) for value in entry.get("inherited_tags", ())},
+    }
+    category_map = {
+        "real_person": "real_person",
+        "person": "real_person",
+        "cosplayer": "cosplayer",
+        "character": "character",
+        "work": "work",
+        "series": "work",
+    }
+    evidence: dict[tuple[str, str], IdentityEvidence] = {}
+    source_lookup_order = ("manual", "folder", "accepted", "inherited")
+    source_priority = ("manual", "folder", "accepted", "model", "inherited")
+    for raw_category, raw_values in raw_entities.items():
+        category = category_map.get(str(raw_category).strip().lower())
+        if category is None:
+            continue
+        if isinstance(raw_values, Mapping):
+            values: Iterable[object] = (raw_values,)
+        elif isinstance(raw_values, Iterable) and not isinstance(
+            raw_values, (str, bytes)
+        ):
+            values = raw_values
+        else:
+            continue
+        for raw_value in values:
+            if not isinstance(raw_value, Mapping):
+                continue
+            name = str(raw_value.get("name") or "").strip()
+            if not name:
+                continue
+            key = _tag_key(name)
+            source = next(
+                (
+                    candidate
+                    for candidate in source_lookup_order
+                    if key in sources[candidate]
+                ),
+                "model",
+            )
+            raw_confidence = raw_value.get("confidence", 1.0)
+            confidence = (
+                min(1.0, max(0.0, float(raw_confidence)))
+                if isinstance(raw_confidence, (int, float))
+                and not isinstance(raw_confidence, bool)
+                else 1.0
+            )
+            candidate = IdentityEvidence(category, name, source, confidence)
+            current = evidence.get((category, key))
+            if current is None or source_priority.index(source) < source_priority.index(
+                current.source
+            ):
+                evidence[(category, key)] = candidate
+    return tuple(
+        evidence[key]
+        for key in sorted(evidence, key=lambda value: (value[0], value[1]))
+    )
+
+
+def _tag_key(value: object) -> str:
+    return str(value).strip().casefold()
+
+
+def _matched_source_tags(value: object, matched: set[str]) -> list[str]:
+    if (
+        not matched
+        or isinstance(value, (str, bytes))
+        or not isinstance(value, Iterable)
+    ):
+        return []
+    return [
+        tag for raw in value if (tag := str(raw).strip()) and _tag_key(tag) in matched
+    ]
+
+
+def _annotation_learning_evidence(
+    annotation: Mapping[str, Any], matched: set[str]
+) -> tuple[list[str], dict[str, float]]:
+    if not matched:
+        return [], {}
+    structured = annotation.get("structured")
+    if not isinstance(structured, Mapping):
+        return [], {}
+    high_confidence: list[str] = []
+    signals: dict[str, float] = {}
+
+    raw_fields = structured.get("fields")
+    fields = raw_fields if isinstance(raw_fields, Mapping) else {}
+    field_signals = {
+        "action": "action_match",
+        "expression": "expression_match",
+        "scene": "scene_match",
+    }
+    for field_name, raw_field in fields.items():
+        if not isinstance(raw_field, Mapping):
+            continue
+        confidence = raw_field.get("confidence")
+        confidence_value = (
+            float(confidence)
+            if isinstance(confidence, (int, float)) and not isinstance(confidence, bool)
+            else 0.0
+        )
+        labels = _matched_source_tags(raw_field.get("labels"), matched)
+        if confidence_value >= 0.85:
+            high_confidence.extend(labels)
+        signal_name = field_signals.get(str(field_name).strip().lower())
+        if signal_name and labels:
+            signals[signal_name] = 1.0
+
+    raw_entities = structured.get("entities")
+    entities = raw_entities if isinstance(raw_entities, Mapping) else {}
+    for entity_type, raw_values in entities.items():
+        if isinstance(raw_values, Mapping):
+            values: Iterable[object] = (raw_values,)
+        elif isinstance(raw_values, Iterable) and not isinstance(
+            raw_values, (str, bytes)
+        ):
+            values = raw_values
+        else:
+            continue
+        matched_entity = False
+        for raw_entity in values:
+            if not isinstance(raw_entity, Mapping):
+                continue
+            name = str(raw_entity.get("name") or "").strip()
+            if not name or _tag_key(name) not in matched:
+                continue
+            matched_entity = True
+            confidence = raw_entity.get("confidence")
+            if (
+                isinstance(confidence, (int, float))
+                and not isinstance(confidence, bool)
+                and float(confidence) >= 0.85
+            ):
+                high_confidence.append(name)
+        normalized_type = str(entity_type).strip().lower()
+        if matched_entity and normalized_type in {
+            "real_person",
+            "person",
+            "cosplayer",
+            "character",
+        }:
+            signals["identity_match"] = 1.0
+        if matched_entity and normalized_type in {"work", "series"}:
+            signals["work_match"] = 1.0
+    return list(normalize_tags(high_confidence)), signals
+
+
 def _tag_match_confidence(
     plan: TagSearchPlan,
     matched_tags: tuple[str, ...],
@@ -3960,3 +5926,49 @@ def _append_manual_failure(
             "error": str(error),
         }
     )
+
+
+def _append_active_learning_failure(
+    failures: list[dict[str, str]],
+    doc_id: str,
+    error: str,
+) -> None:
+    if len(failures) >= 100:
+        return
+    failures.append({"doc_id": str(doc_id), "error": str(error)})
+
+
+def _is_active_learning_conflict(error: BaseException) -> bool:
+    message = (str(error) or "").casefold()
+    return isinstance(error, ActiveLearningError) and any(
+        marker in message
+        for marker in (
+            "changed after",
+            "no longer exists",
+            "queue has changed",
+            "annotation no longer exists",
+            "newer edits",
+        )
+    )
+
+
+def _is_cluster_operation_conflict(error: BaseException) -> bool:
+    message = (str(error) or "").casefold()
+    return isinstance(
+        error,
+        (ActiveLearningError, ClusterOperationValidationError),
+    ) and any(
+        marker in message
+        for marker in (
+            "changed after",
+            "newer edits",
+            "opposite manual rule",
+            "already",
+            "conflict",
+        )
+    )
+
+
+def _cluster_rule_item_key(left: str, right: str) -> str:
+    digest = sha256("\0".join((left, right)).encode()).hexdigest()[:24]
+    return f"rule-{digest}"

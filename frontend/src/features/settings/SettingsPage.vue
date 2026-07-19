@@ -1,6 +1,12 @@
 <script setup lang="ts">
 import { ref } from "vue";
 
+import {
+  SearchLearningSettingsCard,
+  type SearchLearningApi,
+} from "../search-learning";
+import DataMigrationSection from "./DataMigrationSection.vue";
+import type { DataMigrationApi } from "./migrationTypes";
 import type {
   LibraryDraft,
   ModelChoice,
@@ -12,6 +18,8 @@ import { useSettings } from "./useSettings";
 
 const props = withDefaults(defineProps<{
   api?: SettingsApi;
+  migrationApi?: DataMigrationApi;
+  learningApi?: SearchLearningApi;
   autoLoad?: boolean;
 }>(), {
   autoLoad: true,
@@ -325,6 +333,19 @@ function chooseResultsDirectory(): void {
       </div>
       <p class="save-status" aria-live="polite">{{ settings.saveStatus.value }}</p>
     </section>
+
+    <DataMigrationSection
+      :api="props.migrationApi"
+      :config-path="settings.configPath.value"
+      :libraries="settings.libraries.value"
+      @toast="(title, message, kind) => emit('toast', title, message, kind)"
+      @completed="settings.load"
+    />
+
+    <SearchLearningSettingsCard
+      :api="props.learningApi"
+      @toast="(title, message, kind) => emit('toast', title, message, kind)"
+    />
 
     <div class="settings-grid">
       <section class="settings-card panel" aria-labelledby="models-title">

@@ -6,6 +6,7 @@ import { useNativeImageActions } from "../useNativeImageActions";
 function bridge(overrides: Partial<PywebviewApi> = {}): PywebviewApi {
   return {
     select_directory: vi.fn(async () => ({ ok: true, path: null })),
+    select_json_file: vi.fn(async () => ({ ok: true, path: null })),
     select_query_image: vi.fn(async () => ({
       ok: true,
       image: { id: "query-1", name: "query.jpg" },

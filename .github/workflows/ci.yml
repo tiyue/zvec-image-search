@@ -67,8 +67,14 @@ jobs:
           scripts/assemble_python_release.py
           scripts/provision_nsis.py
           scripts/smoke_python_desktop_installer.py
+      - name: Mypy Python preview entry
+        run: >-
+          python -m mypy
           release/python_preview/frozen_entry.py
           release/python_preview/runtime_hook.py
+      - name: Mypy webview preview entry
+        run: >-
+          python -m mypy
           release/webview_preview/frozen_entry.py
           release/webview_preview/runtime_hook.py
       - name: Mypy search-quality tools

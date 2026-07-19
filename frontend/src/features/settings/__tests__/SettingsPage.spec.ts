@@ -1,6 +1,10 @@
 import { flushPromises, mount } from "@vue/test-utils";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import type {
+  SearchLearningApi,
+  SearchLearningStatus,
+} from "../../search-learning";
 import SettingsPage from "../SettingsPage.vue";
 import type { SettingsApi, SettingsResponse } from "../types";
 
@@ -64,6 +68,49 @@ function fakeApi(): SettingsApi {
     updateModels: vi.fn(async (body) => ({ ...body, provider: "aliyun", catalog: [] })),
     saveCredentials: vi.fn(async () => ({ configured: true, persistent: true })),
     deleteCredentials: vi.fn(async () => ({ configured: false, persistent: true })),
+  };
+}
+
+function fakeLearningApi(): SearchLearningApi {
+  const status: SearchLearningStatus = {
+    available: true,
+    database: "search-learning.sqlite3",
+    online_weight_updates: false,
+    fixed_evaluation_gate_required: true,
+    training_running: false,
+    settings: {
+      learning_enabled: true,
+      implicit_feedback_enabled: false,
+      save_query_text: false,
+      shadow_mode: true,
+    },
+    training_counts: {
+      query_sessions: 0,
+      explicit_samples: 0,
+      positive_samples: 0,
+      negative_samples: 0,
+    },
+    minimum_requirements: {
+      query_sessions: 100,
+      explicit_samples: 300,
+      positive_and_negative_required: true,
+    },
+  };
+  return {
+    status: vi.fn().mockResolvedValue(status),
+    updateSettings: vi.fn().mockImplementation(async (body) => ({
+      ...status.settings,
+      ...body,
+    })),
+    feedback: vi.fn(),
+    revoke: vi.fn(),
+    listFeedback: vi.fn(),
+    train: vi.fn(),
+    installEvaluation: vi.fn(),
+    activate: vi.fn(),
+    rollback: vi.fn(),
+    clear: vi.fn(),
+    exportData: vi.fn(),
   };
 }
 
@@ -168,5 +215,28 @@ describe("SettingsPage", () => {
     await flushPromises();
     expect(api.deleteCredentials).toHaveBeenCalledOnce();
     expect(wrapper.text()).toContain("未配置");
+  });
+
+  it("includes search-learning settings and forwards its action toasts", async () => {
+    const learningApi = fakeLearningApi();
+    const wrapper = mount(SettingsPage, {
+      props: { api: fakeApi(), learningApi },
+    });
+    await flushPromises();
+
+    expect(wrapper.get("#search-learning-title").text()).toBe("搜索学习");
+    const learningCard = wrapper.get(".learning-card");
+    const implicitToggle = learningCard.findAll("input[type='checkbox']")[1];
+    await implicitToggle.setValue(true);
+    await flushPromises();
+
+    expect(learningApi.updateSettings).toHaveBeenCalledWith({
+      implicit_feedback_enabled: true,
+    });
+    expect(wrapper.emitted("toast")?.at(-1)).toEqual([
+      "设置已保存",
+      "隐式反馈已开启。",
+      "success",
+    ]);
   });
 });

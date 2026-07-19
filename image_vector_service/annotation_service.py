@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import math
 import os
 import re
@@ -71,6 +72,9 @@ POLICY_VERSION = 3
 LOW_RISK_FIELD_CONFIDENCE = 0.80
 REVIEW_STATES = {"all", "low_risk", "identity", "conflict", "failed"}
 FOLDER_INHERITANCE_POLICY_VERSION = 1
+CLUSTER_IDENTITY_CATEGORIES = frozenset(
+    {"real_person", "cosplayer", "character", "work"}
+)
 FOLDER_INHERITANCE_BLOCKED_CATEGORIES = frozenset(
     {
         "action",
@@ -2170,6 +2174,233 @@ class AutoTaggingCoordinator:
         entry, annotation = self._current_review_document(doc_id)
         return _review_snapshot(entry, annotation)
 
+    def active_learning_snapshot(self, doc_id: str) -> dict[str, Any]:
+        """Capture one current, restorable review snapshot without model I/O."""
+
+        return self._current_snapshot(doc_id)
+
+    def active_learning_matches_snapshot(self, snapshot: Mapping[str, Any]) -> bool:
+        """Return whether a stored after-snapshot still matches current data."""
+
+        return self._matches_current_snapshot(snapshot)
+
+    def apply_active_learning_decision(
+        self,
+        decision: Mapping[str, Any],
+    ) -> str:
+        """Apply one human-confirmed learning decision without final optimize.
+
+        Submitting an active-learning batch is the user's single confirmation
+        for every selected tag. Identity proposals are still recomputed from
+        server-owned annotation metadata; arbitrary client labels are never
+        promoted to identity confirmations merely because the client says so.
+        """
+
+        payload = dict(decision)
+        doc_id = str(payload.get("doc_id") or "").strip()
+        action = str(payload.get("action") or "").strip().lower()
+        if action in {"accept", "edit"}:
+            entry, annotation = self._current_review_document(doc_id)
+            raw_tags = payload.get("tags")
+            if raw_tags is None:
+                raw_tags = annotation.get("proposed_tags", ())
+            selected = _sanitize_review_tags(raw_tags)
+            metadata = _proposal_tag_metadata(
+                entry,
+                dict(annotation.get("structured") or {}),
+                annotation.get("proposed_tags", ()),
+            )
+            identity_keys = {_comparison_key(tag) for tag in metadata["identity_tags"]}
+            payload["confirmed_identity_tags"] = [
+                tag for tag in selected if _comparison_key(tag) in identity_keys
+            ]
+        return self._review_one(payload)
+
+    def restore_active_learning_snapshot(
+        self,
+        snapshot: Mapping[str, Any],
+    ) -> None:
+        """Restore one validated snapshot; caller batches repository optimize."""
+
+        entry = snapshot.get("entry")
+        annotation = snapshot.get("annotation")
+        if not isinstance(entry, Mapping) or not isinstance(annotation, Mapping):
+            raise AutoTaggingRequestError("Active-learning snapshot is invalid.")
+        self._write_review_document(
+            entry=dict(entry),
+            annotation=dict(annotation),
+            accepted_tags=entry.get("accepted_auto_tags", ()),
+            rejected_tags=annotation.get("rejected_tags", ()),
+            proposed_tags=annotation.get("proposed_tags", ()),
+            status=str(annotation.get("status") or "pending_review"),
+        )
+
+    def finalize_active_learning_changes(self) -> None:
+        """Refresh the local tag catalog once after a learning batch."""
+
+        self._finalize_review_repository()
+
+    def apply_cluster_identity(
+        self,
+        doc_id: str,
+        *,
+        category: str,
+        value: str,
+    ) -> None:
+        """Persist one human-selected identity as inherited metadata.
+
+        Only the four identity categories are accepted. Action, expression and
+        other transient visual properties cannot enter this propagation path.
+        Existing vectors are reused for the Collection metadata update.
+        """
+
+        normalized_category = str(category).strip().casefold()
+        normalized_value = str(value).strip()
+        if normalized_category not in CLUSTER_IDENTITY_CATEGORIES:
+            raise AutoTaggingRequestError("Cluster identity category is unsupported.")
+        if not normalized_value:
+            raise AutoTaggingRequestError("Cluster identity value must not be empty.")
+        entry = self.state.get(str(doc_id).strip())
+        if entry is None:
+            raise AutoTaggingRequestError("The indexed image no longer exists.")
+        annotation = self.state.get_document_annotation(str(entry["doc_id"]))
+        if annotation is not None and (
+            str(annotation.get("source_sha256") or "") != str(entry["sha256"])
+        ):
+            raise AutoTaggingRequestError(
+                "The image changed after annotation; annotate it again."
+            )
+        if annotation is None:
+            annotation = {
+                "doc_id": str(entry["doc_id"]),
+                "source_sha256": str(entry["sha256"]),
+                "cache_key": None,
+                "status": "accepted",
+                "proposed_tags": [],
+                "rejected_tags": [],
+                "description": "",
+                "entities": {},
+                "warnings": [],
+                "structured": {},
+                "policy": {},
+                "error": "",
+            }
+        structured = copy.deepcopy(dict(annotation.get("structured") or {}))
+        raw_entities = structured.get("entities")
+        entities = (
+            copy.deepcopy(dict(raw_entities))
+            if isinstance(raw_entities, Mapping)
+            else {}
+        )
+        category_values = entities.get(normalized_category)
+        normalized_entities = (
+            list(category_values)
+            if isinstance(category_values, Iterable)
+            and not isinstance(category_values, (str, bytes, Mapping))
+            else []
+        )
+        if not any(
+            isinstance(entity, Mapping)
+            and _comparison_key(str(entity.get("name") or ""))
+            == _comparison_key(normalized_value)
+            for entity in normalized_entities
+        ):
+            normalized_entities.append(
+                {
+                    "name": normalized_value,
+                    "confidence": 1.0,
+                    "state": "confirmed",
+                    "source": "cluster_inherited",
+                }
+            )
+        entities[normalized_category] = normalized_entities
+        structured["entities"] = entities
+        policy = dict(annotation.get("policy") or {})
+        policy.update(
+            {
+                "cluster_identity_applied": True,
+                "requires_review": False,
+                "review_required": False,
+            }
+        )
+        annotation_to_write = {
+            **annotation,
+            "structured": structured,
+            "entities": entities,
+            "policy": policy,
+        }
+        self._write_review_document(
+            entry=entry,
+            annotation=annotation_to_write,
+            accepted_tags=entry.get("accepted_auto_tags", ()),
+            rejected_tags=annotation.get("rejected_tags", ()),
+            proposed_tags=annotation.get("proposed_tags", ()),
+            status="accepted",
+            inherited_tags=normalize_tags(
+                [*entry.get("inherited_tags", ()), normalized_value]
+            ),
+        )
+
+    def cluster_identity_snapshot(self, doc_id: str) -> dict[str, Any]:
+        entry = self.state.get(str(doc_id).strip())
+        if entry is None:
+            raise AutoTaggingRequestError("The indexed image no longer exists.")
+        annotation = self.state.get_document_annotation(str(entry["doc_id"]))
+        return {
+            "entry": dict(entry),
+            "annotation": dict(annotation) if annotation is not None else None,
+        }
+
+    def cluster_identity_matches_snapshot(
+        self,
+        snapshot: Mapping[str, Any],
+    ) -> bool:
+        entry = snapshot.get("entry")
+        if not isinstance(entry, Mapping):
+            return False
+        try:
+            current = self.cluster_identity_snapshot(str(entry.get("doc_id") or ""))
+        except AutoTaggingRequestError:
+            return False
+        return _cluster_identity_snapshot_state(current) == (
+            _cluster_identity_snapshot_state(snapshot)
+        )
+
+    def restore_cluster_identity_snapshot(
+        self,
+        snapshot: Mapping[str, Any],
+    ) -> None:
+        entry = snapshot.get("entry")
+        annotation = snapshot.get("annotation")
+        if not isinstance(entry, Mapping):
+            raise AutoTaggingRequestError("Cluster identity snapshot is invalid.")
+        if isinstance(annotation, Mapping):
+            self.restore_active_learning_snapshot(snapshot)
+            return
+        doc_id = str(entry.get("doc_id") or "")
+        vector = self.repository.fetch_vector(doc_id)
+        if vector is None:
+            raise AutoTaggingRequestError(f"The indexed vector is missing: {doc_id}")
+        restored_entry = dict(entry)
+        record = _record_from_entry(restored_entry, self.source_resolver)
+        effective_tags = normalize_tags(
+            [
+                *restored_entry.get("tags", ()),
+                *restored_entry.get("folder_tags", ()),
+                *restored_entry.get("accepted_auto_tags", ()),
+                *restored_entry.get("inherited_tags", ()),
+            ]
+        )
+        succeeded, failures = self.repository.upsert_records(
+            [record], vector, effective_tags
+        )
+        if failures or succeeded != [doc_id]:
+            raise AutoTaggingRequestError(
+                failures.get(doc_id, "Failed to restore the Collection tags.")
+            )
+        self.state.set_many([restored_entry])
+        self.state.delete_document_annotation(doc_id)
+
     def _matches_current_snapshot(self, snapshot: Mapping[str, Any]) -> bool:
         doc_id = str(snapshot.get("doc_id") or "")
         try:
@@ -3619,6 +3850,20 @@ def _semantic_review_snapshot(value: Mapping[str, Any]) -> dict[str, Any]:
     annotation = dict(raw_annotation) if isinstance(raw_annotation, Mapping) else {}
     entry.pop("effective_tags", None)
     annotation.pop("updated_at", None)
+    return {"entry": entry, "annotation": annotation}
+
+
+def _cluster_identity_snapshot_state(value: Mapping[str, Any]) -> dict[str, Any]:
+    raw_entry = value.get("entry")
+    raw_annotation = value.get("annotation")
+    entry = dict(raw_entry) if isinstance(raw_entry, Mapping) else {}
+    entry.pop("effective_tags", None)
+    annotation: dict[str, Any] | None
+    if isinstance(raw_annotation, Mapping):
+        annotation = dict(raw_annotation)
+        annotation.pop("updated_at", None)
+    else:
+        annotation = None
     return {"entry": entry, "annotation": annotation}
 
 

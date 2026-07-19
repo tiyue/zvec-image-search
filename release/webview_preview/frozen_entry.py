@@ -52,9 +52,22 @@ def _run_packaging_self_test(output_path: Path) -> int:
         import zvec
         from PIL import Image
 
+        import image_vector_service.active_learning as active_learning
+        import image_vector_service.active_learning_review_store as review_store
         import image_vector_service.activity_store as activity_store
+        import image_vector_service.cluster_operation_store as cluster_store
+        import image_vector_service.data_migration as data_migration
         import image_vector_service.folder_deletion as folder_deletion
+        import image_vector_service.image_clustering as image_clustering
+        import image_vector_service.learning_ranker as learning_ranker
         import image_vector_service.library_browser as library_browser
+        import image_vector_service.migration_recovery as migration_recovery
+        import image_vector_service.search_features as search_features
+        import image_vector_service.search_learning_config as search_learning_config
+        import image_vector_service.search_learning_evaluator as learning_evaluator
+        import image_vector_service.search_learning_runtime as search_learning_runtime
+        import image_vector_service.search_learning_service as search_learning_service
+        import image_vector_service.search_learning_store as search_learning_store
         import zvec_webview.app as preview_app
         import zvec_webview.facade as preview_facade
         import zvec_webview.frontend_assets as frontend_assets
@@ -112,6 +125,13 @@ def _run_packaging_self_test(output_path: Path) -> int:
                 raise FrozenWebviewEntryError(
                     "Frozen SQLite runtime did not provide writable WAL storage."
                 )
+            review_history = review_store.ActiveLearningReviewStore(sqlite_path)
+            review_recovery = review_history.recover_incomplete()
+            cluster_history = cluster_store.ClusterOperationStore(
+                sqlite_path,
+                recover_interrupted=False,
+            )
+            cluster_stats = cluster_history.stats()
         result = {
             "status": "ok",
             "runtime_root": str(runtime_root),
@@ -119,9 +139,22 @@ def _run_packaging_self_test(output_path: Path) -> int:
                 {
                     clr.__name__,
                     edgechromium.__name__,
+                    active_learning.__name__,
+                    review_store.__name__,
                     activity_store.__name__,
+                    cluster_store.__name__,
+                    data_migration.__name__,
+                    migration_recovery.__name__,
                     folder_deletion.__name__,
+                    image_clustering.__name__,
                     library_browser.__name__,
+                    learning_ranker.__name__,
+                    search_features.__name__,
+                    search_learning_config.__name__,
+                    learning_evaluator.__name__,
+                    search_learning_runtime.__name__,
+                    search_learning_service.__name__,
+                    search_learning_store.__name__,
                     frontend_assets.__name__,
                     Image.__name__,
                     native_bridge.__name__,
@@ -138,6 +171,11 @@ def _run_packaging_self_test(output_path: Path) -> int:
                 "module": sqlite3.__name__,
                 "journal_mode": journal_mode,
                 "row_count": row_count,
+            },
+            "persistence": {
+                "cluster_store_schema": cluster_stats["schema_version"],
+                "cluster_store_api_requests": cluster_stats["external_api_calls"],
+                "active_learning_recovered": review_recovery["recovered_count"],
             },
             "asset_count": len(required_assets) + len(frontend.files),
             "frontend": frontend.to_dict(),

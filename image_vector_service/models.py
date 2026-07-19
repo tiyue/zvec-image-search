@@ -159,6 +159,16 @@ class SearchHit:
     metadata_rank: int | None = None
     rank_agreement: float | None = None
     matched_tags: tuple[str, ...] = ()
+    ranking_model_version: str | None = None
+    ranking_score: float | None = None
+    feature_schema_version: int | None = None
+    ranking_fallback: bool = False
+    ranking_fallback_reason: str | None = None
+    calibrated_minimum_confidence: float | None = None
+    calibration_version: str | None = None
+    calibration_scope: str | None = None
+    calibration_fallback: bool = False
+    search_features: dict[str, object] | None = None
 
     def __post_init__(self) -> None:
         if self.fused_score is not None:
@@ -199,6 +209,7 @@ class SearchHit:
         )
         for name in (
             "ranking_confidence",
+            "ranking_score",
             "image_confidence",
             "text_confidence",
             "metadata_confidence",
@@ -211,6 +222,17 @@ class SearchHit:
                     name,
                     min(1.0, max(0.0, float(value))),
                 )
+        if self.calibrated_minimum_confidence is not None:
+            object.__setattr__(
+                self,
+                "calibrated_minimum_confidence",
+                min(1.0, max(0.0, float(self.calibrated_minimum_confidence))),
+            )
+        if self.feature_schema_version is not None:
+            version = int(self.feature_schema_version)
+            object.__setattr__(
+                self, "feature_schema_version", version if version > 0 else None
+            )
         for name in ("image_rank", "text_rank", "metadata_rank"):
             value = getattr(self, name)
             if value is not None:
@@ -299,6 +321,16 @@ class ExportedHit:
     matched_tags: list[str] = field(default_factory=list)
     library_id: str = ""
     library_name: str = ""
+    ranking_model_version: str | None = None
+    ranking_score: float | None = None
+    feature_schema_version: int | None = None
+    ranking_fallback: bool = False
+    ranking_fallback_reason: str | None = None
+    calibrated_minimum_confidence: float | None = None
+    calibration_version: str | None = None
+    calibration_scope: str | None = None
+    calibration_fallback: bool = False
+    search_features: dict[str, object] | None = None
 
 
 @dataclass

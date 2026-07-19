@@ -12,6 +12,10 @@ from urllib.request import Request, urlopen
 
 from PIL import Image
 
+from image_vector_service.search_learning_store import (
+    SearchCandidateRecord,
+    SearchSessionRecord,
+)
 from zvec_desktop.configuration_service import DesktopConfigurationService
 from zvec_desktop.credentials import SessionCredentialStore
 from zvec_webview.facade import FacadeError, PreviewFacade
@@ -38,6 +42,8 @@ class _Facade:
         self.frontend_activities: list[dict[str, Any]] = []
         self.frontend_activity_failure = False
         self.activity_error: FacadeError | None = None
+        self.migration_recovery_body: dict[str, Any] | None = None
+        self.fixed_evaluation_body: dict[str, Any] | None = None
 
     def bootstrap(self) -> dict[str, Any]:
         return {
@@ -80,6 +86,35 @@ class _Facade:
 
     def cancel_job(self, job_id: str) -> dict[str, Any]:
         return {"id": job_id, "status": "cancelled"}
+
+    def data_migration_recovery(self) -> dict[str, Any]:
+        return {
+            "recovery": {
+                "pending": True,
+                "operation_id": "migration-old",
+                "migration_type": "schema",
+                "backup_directory": "C:\\Backups\\migration-old",
+                "stage": "migrate",
+            }
+        }
+
+    def submit_data_migration_recovery(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self.migration_recovery_body = payload
+        return {
+            "id": "recovery-job",
+            "status": "queued",
+            "stage": "recovery_queued",
+        }
+
+    def install_search_learning_evaluation(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        self.fixed_evaluation_body = payload
+        return {
+            "installed": True,
+            "evaluation_set_id": "human-reviewed-v1",
+            "external_api_calls": 0,
+        }
 
     def job_history(
         self,
@@ -395,6 +430,23 @@ class GatewayTests(unittest.TestCase):
             urlopen(wrong, timeout=5)
         self.assertEqual(caught.exception.code, 404)
         caught.exception.close()
+
+    def test_fixed_evaluation_import_route_forwards_the_selected_source(self) -> None:
+        source_path = r"C:\Evaluation\fixed-evaluation.json"
+
+        status, _headers, payload = _json(
+            self.server.url + "api/search-learning/fixed-evaluation",
+            method="POST",
+            body={"source_path": source_path},
+        )
+
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["installed"])
+        self.assertEqual(payload["external_api_calls"], 0)
+        self.assertEqual(
+            self.facade.fixed_evaluation_body,
+            {"source_path": source_path},
+        )
 
     def test_serves_registered_images_without_path_disclosure(self) -> None:
         source = self.root / "person.jpg"
@@ -717,6 +769,31 @@ class GatewayTests(unittest.TestCase):
             },
         )
 
+    def test_data_migration_recovery_routes_are_separate_from_job_lookup(self) -> None:
+        status, _headers, payload = _json(
+            self.server.url + "api/data-migrations/recovery"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["recovery"]["operation_id"], "migration-old")
+
+        status, _headers, submitted = _json(
+            self.server.url + "api/data-migrations/recovery/restore",
+            method="POST",
+            body={
+                "operation_id": "migration-old",
+                "confirmation_phrase": "RESTORE",
+            },
+        )
+        self.assertEqual(status, 202)
+        self.assertEqual(submitted["migration"]["id"], "recovery-job")
+        self.assertEqual(
+            self.facade.migration_recovery_body,
+            {
+                "operation_id": "migration-old",
+                "confirmation_phrase": "RESTORE",
+            },
+        )
+
 
 class PersistentLibraryGatewayTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -745,6 +822,29 @@ class PersistentLibraryGatewayTests(unittest.TestCase):
         self.server.stop()
         self.facade.close(force=True)
         self.temporary.cleanup()
+
+    def test_data_migration_api_rejects_escaping_library_id(self) -> None:
+        with self.assertRaises(HTTPError) as caught:
+            _json(
+                self.server.url + "api/data-migrations/precheck",
+                method="POST",
+                body={
+                    "dry_run": True,
+                    "request": {
+                        "migration_type": "schema",
+                        "source": str(self.root),
+                        "target": str(self.root),
+                        "library_id": "../../escaped",
+                        "automatic_backup": True,
+                    },
+                },
+            )
+
+        self.assertEqual(caught.exception.code, 400)
+        payload = json.loads(caught.exception.read().decode("utf-8"))
+        caught.exception.close()
+        self.assertEqual(payload["error"]["code"], "invalid_data_migration")
+        self.assertIn("safe single-segment", payload["error"]["message"])
 
     def test_put_persists_library_paths_and_global_results_directory(self) -> None:
         replacement_images = self.root / "replacement-images"
@@ -828,6 +928,84 @@ class PersistentLibraryGatewayTests(unittest.TestCase):
         payload = json.loads(invalid_cursor.exception.read().decode("utf-8"))
         invalid_cursor.exception.close()
         self.assertEqual(payload["error"]["code"], "invalid_activity_cursor")
+
+    def test_search_learning_routes_are_strict_durable_and_separate(self) -> None:
+        self.facade._search_learning.store.record_search(  # noqa: SLF001
+            SearchSessionRecord(
+                session_id="search-feedback-route",
+                query_type="text",
+                requested_count=15,
+                returned_count=1,
+                library_ids=(self.library_id,),
+                latency_ms=12,
+                query_text="must not persist by default",
+                candidates=(
+                    SearchCandidateRecord(
+                        library_id=self.library_id,
+                        doc_id="doc-feedback-route",
+                        original_rank=1,
+                        displayed_rank=1,
+                        displayed=True,
+                        ranking_score=0.8,
+                        features={"vector_confidence": 0.8},
+                    ),
+                ),
+            )
+        )
+        status, _headers, feedback = _json(
+            self.server.url + "api/search-feedback",
+            method="POST",
+            body={
+                "session_id": "search-feedback-route",
+                "library_id": self.library_id,
+                "doc_id": "doc-feedback-route",
+                "action": "relevant",
+                "source": "context_menu",
+            },
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(feedback["feedback_weight"], 1.0)
+
+        status, _headers, learning = _json(
+            self.server.url + "api/search-learning/status"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(learning["database"], "search-learning.sqlite3")
+        self.assertEqual(learning["training_counts"]["explicit_samples"], 1)
+        self.assertFalse(learning["settings"]["save_query_text"])
+        self.assertTrue((self.root / "search-learning.sqlite3").is_file())
+        self.assertTrue((self.root / "activity.sqlite3").is_file())
+
+        status, _headers, page = _json(
+            self.server.url
+            + "api/search-feedback?session_id=search-feedback-route&limit=20"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(page["items"][0]["event_id"], feedback["event_id"])
+
+        status, _headers, revoked = _json(
+            self.server.url + f"api/search-feedback/{feedback['event_id']}",
+            method="DELETE",
+        )
+        self.assertEqual(status, 200)
+        self.assertFalse(revoked["active"])
+
+        with self.assertRaises(HTTPError) as caught:
+            _json(
+                self.server.url + "api/search-feedback",
+                method="POST",
+                body={
+                    "session_id": "search-feedback-route",
+                    "library_id": self.library_id,
+                    "doc_id": "doc-feedback-route",
+                    "action": "relevant",
+                    "feedback_weight": 99,
+                },
+            )
+        self.assertEqual(caught.exception.code, 400)
+        error = json.loads(caught.exception.read().decode("utf-8"))
+        caught.exception.close()
+        self.assertEqual(error["error"]["code"], "invalid_request")
 
 
 if __name__ == "__main__":

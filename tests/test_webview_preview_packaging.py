@@ -134,6 +134,22 @@ class WebviewPreviewSourceContractTest(unittest.TestCase):
         self.assertEqual(plan.frontend_directory.name, "frontend")
         self.assertEqual(plan.frontend_output.name, "frontend_dist")
         self.assertEqual(plan.frontend_manifest.name, "manifest.json")
+        packaging_source = (
+            plan.repository_root / "scripts" / "webview_preview_packaging.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            'plan.repository_root / "image_vector_service" '
+            '/ "search_learning_evaluator.py"',
+            packaging_source,
+        )
+        for required_source in (
+            "active_learning.py",
+            "active_learning_review_store.py",
+            "cluster_operation_store.py",
+            "image_clustering.py",
+            "search_learning_runtime.py",
+        ):
+            self.assertIn(required_source, packaging_source)
         frontend = validate_frontend_output(plan)
         self.assertEqual(frontend["manifest"], ".vite/manifest.json")
 
@@ -235,13 +251,36 @@ class WebviewPreviewSourceContractTest(unittest.TestCase):
         self.assertIn("model-catalog.default.json", spec)
         self.assertIn("Zvec.AppIcon.ico", spec)
         self.assertIn('"image_vector_service.activity_store"', spec)
+        self.assertIn('"image_vector_service.active_learning"', spec)
+        self.assertIn('"image_vector_service.active_learning_review_store"', spec)
+        self.assertIn('"image_vector_service.cluster_operation_store"', spec)
+        self.assertIn('"image_vector_service.data_migration"', spec)
+        self.assertIn('"image_vector_service.migration_recovery"', spec)
         self.assertIn('"image_vector_service.folder_deletion"', spec)
+        self.assertIn('"image_vector_service.image_clustering"', spec)
         self.assertIn('"image_vector_service.library_browser"', spec)
+        self.assertIn('"image_vector_service.search_learning_service"', spec)
+        self.assertIn('"image_vector_service.search_learning_evaluator"', spec)
+        self.assertIn('"image_vector_service.search_learning_store"', spec)
+        self.assertIn('"image_vector_service.search_learning_runtime"', spec)
         self.assertIn('name="Zvec-Webview-Preview"', spec)
         self.assertIn('"tkinter"', spec)
         self.assertIn('"pystray"', spec)
         for unsupported_platform in ("android", "cocoa", "gtk", "qt"):
             self.assertIn(f'"webview.platforms.{unsupported_platform}"', spec)
+        frozen_entry = (
+            repository_root() / "release" / "webview_preview" / "frozen_entry.py"
+        ).read_text(encoding="utf-8")
+        for runtime_module in (
+            "image_vector_service.active_learning",
+            "image_vector_service.active_learning_review_store",
+            "image_vector_service.cluster_operation_store",
+            "image_vector_service.image_clustering",
+            "image_vector_service.search_learning_runtime",
+        ):
+            self.assertIn(f"import {runtime_module}", frozen_entry)
+        self.assertIn("ClusterOperationStore(", frozen_entry)
+        self.assertIn("ActiveLearningReviewStore(", frozen_entry)
 
     def test_frozen_self_test_requires_activity_modules_and_sqlite_wal(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -253,9 +292,22 @@ class WebviewPreviewSourceContractTest(unittest.TestCase):
             modules = [
                 "PIL.Image",
                 "clr",
+                "image_vector_service.active_learning",
+                "image_vector_service.active_learning_review_store",
                 "image_vector_service.activity_store",
+                "image_vector_service.cluster_operation_store",
+                "image_vector_service.data_migration",
+                "image_vector_service.migration_recovery",
                 "image_vector_service.folder_deletion",
+                "image_vector_service.image_clustering",
                 "image_vector_service.library_browser",
+                "image_vector_service.learning_ranker",
+                "image_vector_service.search_features",
+                "image_vector_service.search_learning_evaluator",
+                "image_vector_service.search_learning_config",
+                "image_vector_service.search_learning_runtime",
+                "image_vector_service.search_learning_service",
+                "image_vector_service.search_learning_store",
                 "webview",
                 "webview.platforms.edgechromium",
                 "webview.platforms.winforms",
@@ -280,6 +332,11 @@ class WebviewPreviewSourceContractTest(unittest.TestCase):
                                 "module": "sqlite3",
                                 "journal_mode": "wal",
                                 "row_count": 1,
+                            },
+                            "persistence": {
+                                "cluster_store_schema": 1,
+                                "cluster_store_api_requests": 0,
+                                "active_learning_recovered": 0,
                             },
                             "frontend": {
                                 "manifest": ".vite/manifest.json",
@@ -306,7 +363,27 @@ class WebviewPreviewSourceContractTest(unittest.TestCase):
 
         self.assertEqual(result["sqlite"]["journal_mode"], "wal")
         self.assertIn("image_vector_service.activity_store", result["modules"])
+        self.assertIn("image_vector_service.active_learning", result["modules"])
+        self.assertIn(
+            "image_vector_service.active_learning_review_store",
+            result["modules"],
+        )
+        self.assertIn(
+            "image_vector_service.cluster_operation_store",
+            result["modules"],
+        )
+        self.assertIn("image_vector_service.data_migration", result["modules"])
+        self.assertIn("image_vector_service.migration_recovery", result["modules"])
         self.assertIn("image_vector_service.library_browser", result["modules"])
+        self.assertIn("image_vector_service.image_clustering", result["modules"])
+        self.assertIn("image_vector_service.search_learning_store", result["modules"])
+        self.assertIn(
+            "image_vector_service.search_learning_evaluator",
+            result["modules"],
+        )
+        self.assertEqual(result["persistence"]["cluster_store_schema"], 1)
+        self.assertEqual(result["persistence"]["cluster_store_api_requests"], 0)
+        self.assertEqual(result["persistence"]["active_learning_recovered"], 0)
 
     def test_frontend_pipeline_is_clean_typechecked_tested_and_built(self) -> None:
         plan = create_build_plan()

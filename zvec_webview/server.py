@@ -495,6 +495,208 @@ def _handler_type(gateway: GatewayServer) -> type[BaseHTTPRequestHandler]:
                         gateway._facade.cancel_search(segments[1]),
                     )
                     return
+            if method == "POST" and segments == ("search-feedback",):
+                self._json(
+                    HTTPStatus.CREATED,
+                    gateway._facade.record_search_feedback(self._read_json()),
+                )
+                return
+            if method == "GET" and segments == ("search-feedback",):
+                _reject_unknown_query(
+                    query_values,
+                    {"cursor", "limit", "session_id", "action", "active_only"},
+                )
+                self._json(
+                    HTTPStatus.OK,
+                    gateway._facade.search_feedback(
+                        cursor=_query_optional_text(
+                            query_values, "cursor", "", maximum=1_024
+                        )
+                        or None,
+                        limit=_query_int(query_values, "limit", 50, 1, 200),
+                        session_id=_query_optional_text(
+                            query_values, "session_id", "", maximum=160
+                        )
+                        or None,
+                        action=_query_optional_text(
+                            query_values, "action", "", maximum=64
+                        )
+                        or None,
+                        active_only=_query_bool(query_values, "active_only", True),
+                    ),
+                )
+                return
+            if (
+                method == "DELETE"
+                and len(segments) == 2
+                and segments[0] == "search-feedback"
+            ):
+                self._json(
+                    HTTPStatus.OK,
+                    gateway._facade.revoke_search_feedback(segments[1]),
+                )
+                return
+            if method == "GET" and segments == ("search-learning", "status"):
+                _reject_unknown_query(query_values, set())
+                self._json(HTTPStatus.OK, gateway._facade.search_learning_status())
+                return
+            if method == "GET" and segments == ("search-learning", "settings"):
+                _reject_unknown_query(query_values, set())
+                self._json(HTTPStatus.OK, gateway._facade.search_learning_settings())
+                return
+            if method == "PUT" and segments == ("search-learning", "settings"):
+                self._json(
+                    HTTPStatus.OK,
+                    gateway._facade.update_search_learning_settings(self._read_json()),
+                )
+                return
+            if method == "GET" and segments == ("search-learning", "sessions"):
+                _reject_unknown_query(query_values, {"cursor", "limit", "query_type"})
+                self._json(
+                    HTTPStatus.OK,
+                    gateway._facade.search_learning_sessions(
+                        cursor=_query_optional_text(
+                            query_values, "cursor", "", maximum=1_024
+                        )
+                        or None,
+                        limit=_query_int(query_values, "limit", 50, 1, 200),
+                        query_type=_query_optional_text(
+                            query_values, "query_type", "", maximum=128
+                        )
+                        or None,
+                    ),
+                )
+                return
+            if method == "POST" and segments == (
+                "search-learning",
+                "fixed-evaluation",
+            ):
+                self._json(
+                    HTTPStatus.OK,
+                    gateway._facade.install_search_learning_evaluation(
+                        self._read_json()
+                    ),
+                )
+                return
+            if method == "POST" and segments == ("search-learning", "train"):
+                body = self._read_json()
+                if body:
+                    raise FacadeError(
+                        "invalid_request",
+                        "Search-learning training does not accept fields.",
+                        details={"unknown_fields": sorted(body)},
+                    )
+                self._json(
+                    HTTPStatus.ACCEPTED,
+                    gateway._facade.train_search_learning(),
+                )
+                return
+            if len(segments) == 3 and segments[:2] == ("search-learning", "train"):
+                if method == "GET":
+                    self._json(
+                        HTTPStatus.OK,
+                        gateway._facade.search_learning_job(segments[2]),
+                    )
+                    return
+                if method == "DELETE":
+                    self._json(
+                        HTTPStatus.ACCEPTED,
+                        gateway._facade.cancel_search_learning_job(segments[2]),
+                    )
+                    return
+            if method == "POST" and segments == (
+                "search-learning",
+                "activate",
+            ):
+                self._json(
+                    HTTPStatus.OK,
+                    gateway._facade.activate_search_learning(self._read_json()),
+                )
+                return
+            if method == "POST" and segments == (
+                "search-learning",
+                "rollback",
+            ):
+                self._json(
+                    HTTPStatus.OK,
+                    gateway._facade.rollback_search_learning(self._read_json()),
+                )
+                return
+            if method == "DELETE" and segments == (
+                "search-learning",
+                "data",
+            ):
+                self._json(
+                    HTTPStatus.OK,
+                    gateway._facade.clear_search_learning(self._read_json()),
+                )
+                return
+            if method == "GET" and segments == (
+                "search-learning",
+                "export",
+            ):
+                _reject_unknown_query(query_values, set())
+                self._json(HTTPStatus.OK, gateway._facade.export_search_learning())
+                return
+            if method == "POST" and segments == (
+                "data-migrations",
+                "precheck",
+            ):
+                self._json(
+                    HTTPStatus.OK,
+                    gateway._facade.precheck_data_migration(self._read_json()),
+                )
+                return
+            if method == "POST" and segments == ("data-migrations",):
+                self._json(
+                    HTTPStatus.ACCEPTED,
+                    {
+                        "migration": gateway._facade.submit_data_migration(
+                            self._read_json()
+                        )
+                    },
+                )
+                return
+            if method == "GET" and segments == (
+                "data-migrations",
+                "recovery",
+            ):
+                self._json(
+                    HTTPStatus.OK,
+                    gateway._facade.data_migration_recovery(),
+                )
+                return
+            if method == "POST" and segments == (
+                "data-migrations",
+                "recovery",
+                "restore",
+            ):
+                self._json(
+                    HTTPStatus.ACCEPTED,
+                    {
+                        "migration": gateway._facade.submit_data_migration_recovery(
+                            self._read_json()
+                        )
+                    },
+                )
+                return
+            if len(segments) == 2 and segments[0] == "data-migrations":
+                if method == "GET":
+                    self._json(
+                        HTTPStatus.OK,
+                        {"migration": gateway._facade.data_migration(segments[1])},
+                    )
+                    return
+                if method == "DELETE":
+                    self._json(
+                        HTTPStatus.ACCEPTED,
+                        {
+                            "migration": gateway._facade.cancel_data_migration(
+                                segments[1]
+                            )
+                        },
+                    )
+                    return
             if method == "GET" and segments == ("jobs",):
                 self._json(HTTPStatus.OK, gateway._facade.list_jobs())
                 return

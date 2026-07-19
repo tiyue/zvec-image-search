@@ -23,7 +23,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from .activity_store import ActivityStore
 from .backend_instance_lock import BackendInstanceLock
-from .config import RuntimeCredentials, ServiceConfig
+from .config import RuntimeCredentials, ServiceConfig, default_config_home
 from .federated_search import LibraryCandidateSet, export_federated_search
 from .library_browser import LibraryBrowser
 from .library_config import (
@@ -90,6 +90,14 @@ _CAPABILITIES = {
     "tag_alias_list": True,
     "tag_alias_upsert": True,
     "tag_alias_delete": True,
+    "image_clustering": True,
+    "incremental_clustering": True,
+    "cluster_manual_merge_split": True,
+    "cluster_identity_propagation": True,
+    "cluster_operation_undo": True,
+    "active_learning": True,
+    "active_learning_review_undo": True,
+    "learning_external_api_requests": 0,
     "concurrent_jobs": True,
     "job_list": True,
     "partial_jobs": True,
@@ -393,6 +401,7 @@ class BackendJobManager:
             config = replace(
                 self._config,
                 workspace=library.workspace,
+                library_id=library.library_id,
                 library_image_root=library.image_root,
                 results_directory=self._catalog.federated_results_directory,
             )
@@ -502,7 +511,13 @@ class BackendJobManager:
             details: dict[str, Any] = {
                 "task_type": task_type,
                 "name": str(item.get("name") or item.get("file_name") or ""),
-                "reason": str(item.get("reason") or item.get("error") or ""),
+                "reason": str(
+                    item.get("reason")
+                    or item.get("error")
+                    or item.get("message")
+                    or item.get("code")
+                    or ""
+                ),
             }
             if relative_path:
                 details["relative_path"] = relative_path
@@ -513,6 +528,8 @@ class BackendJobManager:
                 message=str(
                     item.get("reason")
                     or item.get("error")
+                    or item.get("message")
+                    or item.get("code")
                     or "One image failed; the batch continued."
                 ),
                 library_id=library_id,
@@ -1247,6 +1264,49 @@ class BackendJobManager:
             )
         if command == "tag_alias_delete":
             return service.delete_tag_alias(params["canonical_name"])
+        if command == "cluster_images":
+            return service.cluster_images(
+                scope=params["scope"],
+                cluster_types=params["cluster_types"],
+            )
+        if command == "cluster_list":
+            return service.list_image_clusters(
+                offset=params["offset"],
+                limit=params["limit"],
+                cluster_type=params["cluster_type"],
+            )
+        if command == "cluster_detail":
+            return service.image_cluster_detail(
+                params["cluster_id"],
+                offset=params["offset"],
+                limit=params["limit"],
+            )
+        if command == "cluster_merge":
+            return service.merge_image_clusters(params["cluster_ids"])
+        if command == "cluster_split":
+            return service.split_image_cluster(
+                params["cluster_id"],
+                params["doc_ids"],
+            )
+        if command == "cluster_apply_identity":
+            return service.apply_image_cluster_identity(
+                params["cluster_id"],
+                identity_category=params["identity_category"],
+                identity_value=params["identity_value"],
+            )
+        if command == "cluster_undo":
+            return service.undo_latest_cluster_operation()
+        if command == "active_learning_queue":
+            return service.build_active_learning_review_queue(
+                review_budget=params["review_budget"]
+            )
+        if command == "active_learning_review":
+            return service.review_active_learning_queue(
+                queue_id=params["queue_id"],
+                decisions=params["decisions"],
+            )
+        if command == "active_learning_review_undo":
+            return service.undo_latest_active_learning_review()
         if command == "sync":
             folder = self._library_folder(library, params["folder"])
             return service.sync_folder(
@@ -1753,12 +1813,7 @@ def _generated_config_fingerprint(
 
 
 def _default_config_home() -> Path:
-    configured = os.getenv("ZVEC_CONFIG_HOME") or os.getenv("ZVEC_DOCKER_CONFIG_HOME")
-    if configured:
-        return Path(configured).expanduser().resolve()
-    if os.name == "nt" and os.getenv("LOCALAPPDATA"):
-        return Path(os.environ["LOCALAPPDATA"], "zvec-image-search").resolve()
-    return Path.home().joinpath(".zvec-image-search").resolve()
+    return default_config_home()
 
 
 def _resolved_instance_lock_path(value: str | Path | None) -> Path:
@@ -1798,6 +1853,15 @@ def create_backend_server(
             "activity_store and activity_config_home cannot be supplied together."
         )
     resolved_config = config or ServiceConfig()
+    if resolved_config.config_home is None:
+        resolved_config = replace(
+            resolved_config,
+            config_home=(
+                Path(activity_config_home).expanduser().resolve()
+                if activity_config_home is not None
+                else _default_config_home()
+            ),
+        )
     resolved_instance_id = _normalized_identity(
         instance_id,
         name="instance_id",
@@ -1960,6 +2024,16 @@ def _normalize_job(
         "tag_alias_list",
         "tag_alias_upsert",
         "tag_alias_delete",
+        "cluster_images",
+        "cluster_list",
+        "cluster_detail",
+        "cluster_merge",
+        "cluster_split",
+        "cluster_apply_identity",
+        "cluster_undo",
+        "active_learning_queue",
+        "active_learning_review",
+        "active_learning_review_undo",
     }
     if command not in supported:
         raise BackendRequestError(
@@ -2533,6 +2607,221 @@ def _normalize_job(
             "canonical_name": canonical_name,
             "aliases": aliases,
         }
+    if command == "cluster_images":
+        _reject_unknown(params, {"library_id", "scope", "cluster_types"})
+        raw_scope = params.get("scope", "new_or_changed")
+        scope = raw_scope.strip().lower() if isinstance(raw_scope, str) else ""
+        if scope not in {"new_or_changed", "all"}:
+            raise BackendRequestError(
+                "invalid_params", "scope must be new_or_changed or all."
+            )
+        raw_types = params.get("cluster_types", ["exact", "perceptual", "semantic"])
+        if not isinstance(raw_types, list) or not raw_types:
+            raise BackendRequestError(
+                "invalid_params", "cluster_types must be a non-empty array."
+            )
+        if not all(isinstance(item, str) and item.strip() for item in raw_types):
+            raise BackendRequestError(
+                "invalid_params", "cluster_types must contain non-empty strings."
+            )
+        cluster_types = list(dict.fromkeys(item.strip().lower() for item in raw_types))
+        supported_types = {"exact", "perceptual", "semantic", "near_duplicate"}
+        unknown_types = sorted(set(cluster_types) - supported_types)
+        if unknown_types:
+            raise BackendRequestError(
+                "invalid_params",
+                "cluster_types contains unsupported values.",
+                details={
+                    "values": unknown_types,
+                    "supported": sorted(supported_types),
+                },
+            )
+        return command, {
+            "library_id": _optional_string(params, "library_id"),
+            "scope": scope,
+            "cluster_types": cluster_types,
+        }
+    if command == "cluster_list":
+        _reject_unknown(params, {"library_id", "offset", "limit", "cluster_type"})
+        raw_type = params.get("cluster_type")
+        cluster_type = None
+        if raw_type is not None:
+            cluster_type = raw_type.strip().lower() if isinstance(raw_type, str) else ""
+            if cluster_type not in {
+                "all",
+                "exact",
+                "perceptual",
+                "semantic",
+                "single",
+                "near_duplicate",
+            }:
+                raise BackendRequestError(
+                    "invalid_params",
+                    "cluster_type must be all, exact, perceptual, semantic, "
+                    "single, or near_duplicate.",
+                )
+        return command, {
+            "library_id": _optional_string(params, "library_id"),
+            "offset": _non_negative_integer(params, "offset", 0),
+            "limit": _bounded_positive_integer(params, "limit", 100, 500),
+            "cluster_type": cluster_type,
+        }
+    if command == "cluster_detail":
+        _reject_unknown(params, {"library_id", "cluster_id", "offset", "limit"})
+        cluster_id = _required_string(params, "cluster_id")
+        if len(cluster_id) > 256:
+            raise BackendRequestError(
+                "invalid_params", "cluster_id must be at most 256 characters."
+            )
+        return command, {
+            "library_id": _optional_string(params, "library_id"),
+            "cluster_id": cluster_id,
+            "offset": _non_negative_integer(params, "offset", 0),
+            "limit": _bounded_positive_integer(params, "limit", 20, 2_000),
+        }
+    if command == "cluster_merge":
+        _reject_unknown(params, {"library_id", "cluster_ids"})
+        cluster_ids = _bounded_unique_strings(
+            params.get("cluster_ids"),
+            "cluster_ids",
+            minimum=2,
+            maximum=100,
+            maximum_characters=256,
+        )
+        return command, {
+            "library_id": _optional_string(params, "library_id"),
+            "cluster_ids": cluster_ids,
+        }
+    if command == "cluster_split":
+        _reject_unknown(params, {"library_id", "cluster_id", "doc_ids"})
+        cluster_id = _required_string(params, "cluster_id")
+        if len(cluster_id) > 256:
+            raise BackendRequestError(
+                "invalid_params", "cluster_id must be at most 256 characters."
+            )
+        doc_ids = _bounded_unique_strings(
+            params.get("doc_ids"),
+            "doc_ids",
+            minimum=1,
+            maximum=10_000,
+            maximum_characters=1_024,
+        )
+        return command, {
+            "library_id": _optional_string(params, "library_id"),
+            "cluster_id": cluster_id,
+            "doc_ids": doc_ids,
+        }
+    if command == "cluster_apply_identity":
+        _reject_unknown(
+            params,
+            {
+                "library_id",
+                "cluster_id",
+                "identity_category",
+                "identity_value",
+            },
+        )
+        cluster_id = _required_string(params, "cluster_id")
+        if len(cluster_id) > 256:
+            raise BackendRequestError(
+                "invalid_params", "cluster_id must be at most 256 characters."
+            )
+        category = _required_string(params, "identity_category").casefold()
+        if category not in {"real_person", "cosplayer", "character", "work"}:
+            raise BackendRequestError(
+                "invalid_params",
+                "identity_category must be real_person, cosplayer, character, or work.",
+            )
+        value = _required_string(params, "identity_value")
+        if len(value) > 256:
+            raise BackendRequestError(
+                "invalid_params", "identity_value must be at most 256 characters."
+            )
+        return command, {
+            "library_id": _optional_string(params, "library_id"),
+            "cluster_id": cluster_id,
+            "identity_category": category,
+            "identity_value": value,
+        }
+    if command == "cluster_undo":
+        _reject_unknown(params, {"library_id"})
+        return command, {
+            "library_id": _optional_string(params, "library_id"),
+        }
+    if command == "active_learning_queue":
+        _reject_unknown(params, {"library_id", "review_budget"})
+        review_budget = _bounded_positive_integer(params, "review_budget", 25, 30)
+        if review_budget < 20:
+            raise BackendRequestError(
+                "invalid_params", "review_budget must be between 20 and 30."
+            )
+        return command, {
+            "library_id": _optional_string(params, "library_id"),
+            "review_budget": review_budget,
+        }
+    if command == "active_learning_review":
+        _reject_unknown(params, {"library_id", "queue_id", "decisions"})
+        queue_id = _required_string(params, "queue_id")
+        if len(queue_id) > 256:
+            raise BackendRequestError(
+                "invalid_params", "queue_id must be at most 256 characters."
+            )
+        raw_decisions = params.get("decisions")
+        if not isinstance(raw_decisions, list) or not raw_decisions:
+            raise BackendRequestError(
+                "invalid_params", "decisions must be a non-empty array."
+            )
+        if len(raw_decisions) > 1_000 or not all(
+            isinstance(item, dict) for item in raw_decisions
+        ):
+            raise BackendRequestError(
+                "invalid_params", "decisions must contain at most 1000 objects."
+            )
+        learning_decisions: list[dict[str, Any]] = []
+        seen_doc_ids: set[str] = set()
+        for index, raw_decision in enumerate(raw_decisions):
+            assert isinstance(raw_decision, dict)
+            _reject_unknown(raw_decision, {"doc_id", "decision", "labels"})
+            doc_id = _required_string(raw_decision, "doc_id")
+            if len(doc_id) > 1_024:
+                raise BackendRequestError(
+                    "invalid_params",
+                    f"decisions[{index}].doc_id is too long.",
+                )
+            if doc_id in seen_doc_ids:
+                raise BackendRequestError(
+                    "invalid_params", "decisions contains duplicate doc_id values."
+                )
+            seen_doc_ids.add(doc_id)
+            raw_action = raw_decision.get("decision")
+            action = raw_action.strip().lower() if isinstance(raw_action, str) else ""
+            if action not in {"accept", "reject", "edit", "skip"}:
+                raise BackendRequestError(
+                    "invalid_params",
+                    f"decisions[{index}].decision is unsupported.",
+                )
+            labels = _tags(raw_decision.get("labels"))
+            if action == "edit" and not labels:
+                raise BackendRequestError(
+                    "invalid_params", "edit decisions require labels."
+                )
+            if action != "edit" and labels:
+                raise BackendRequestError(
+                    "invalid_params", "Only edit decisions may include labels."
+                )
+            learning_decisions.append(
+                {"doc_id": doc_id, "decision": action, "labels": labels}
+            )
+        return command, {
+            "library_id": _optional_string(params, "library_id"),
+            "queue_id": queue_id,
+            "decisions": learning_decisions,
+        }
+    if command == "active_learning_review_undo":
+        _reject_unknown(params, {"library_id"})
+        return command, {
+            "library_id": _optional_string(params, "library_id"),
+        }
     if command == "sync":
         _reject_unknown(
             params,
@@ -2739,6 +3028,47 @@ def _optional_string(params: dict[str, Any], name: str) -> str | None:
             "invalid_params", f"{name} must be a non-empty string or null."
         )
     return value.strip()
+
+
+def _bounded_unique_strings(
+    value: Any,
+    name: str,
+    *,
+    minimum: int,
+    maximum: int,
+    maximum_characters: int,
+) -> list[str]:
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise BackendRequestError(
+            "invalid_params", f"{name} must be an array of strings."
+        )
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw in value:
+        item = raw.strip()
+        if (
+            not item
+            or len(item) > maximum_characters
+            or any(ord(character) < 32 for character in item)
+        ):
+            raise BackendRequestError(
+                "invalid_params",
+                f"{name} values must contain 1 to {maximum_characters} "
+                "characters without control characters.",
+            )
+        if item not in seen:
+            seen.add(item)
+            normalized.append(item)
+        else:
+            raise BackendRequestError(
+                "invalid_params", f"{name} must not contain duplicate values."
+            )
+    if not minimum <= len(normalized) <= maximum:
+        raise BackendRequestError(
+            "invalid_params",
+            f"{name} must contain {minimum} to {maximum} unique values.",
+        )
+    return normalized
 
 
 def _optional_model(value: Any) -> str | None:

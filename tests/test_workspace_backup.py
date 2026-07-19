@@ -169,6 +169,69 @@ class WorkspaceBackupTest(unittest.TestCase):
             )
         self.assertFalse(destination.exists())
 
+    def test_library_id_cannot_escape_backup_staging_directory(self) -> None:
+        escaped = self.root / "escaped"
+        malicious = [WorkspaceBackupSource("../../escaped", "Unsafe", self.workspace)]
+
+        plan = plan_migration_backup(
+            config_path=self.config,
+            sources=malicious,
+            destination=self.destination,
+            full_backup=True,
+        )
+        self.assertEqual(plan["status"], "blocked")
+        self.assertTrue(any("safe path segment" in item for item in plan["blockers"]))
+
+        with self.assertRaisesRegex(WorkspaceBackupError, "safe path segment"):
+            create_migration_backup(
+                config_path=self.config,
+                sources=malicious,
+                destination=self.destination,
+                full_backup=True,
+            )
+
+        self.assertFalse(escaped.exists())
+        self.assertFalse(self.destination.exists())
+
+    def test_windows_device_library_ids_are_rejected_before_staging(self) -> None:
+        device_names = (
+            "CON",
+            "con.txt",
+            "con.",
+            "PrN.backup",
+            "AUX ",
+            "nul.json",
+            "CLOCK$",
+            "com1",
+            "CoM9.bin",
+            "lpt1",
+            "LPT9.log",
+            "CON .txt",
+        )
+        for library_id in device_names:
+            with self.subTest(library_id=library_id):
+                source = [WorkspaceBackupSource(library_id, "Unsafe", self.workspace)]
+                plan = plan_migration_backup(
+                    config_path=self.config,
+                    sources=source,
+                    destination=self.destination,
+                    full_backup=True,
+                )
+                self.assertEqual(plan["status"], "blocked")
+                self.assertTrue(
+                    any("reserved Windows device" in item for item in plan["blockers"])
+                )
+                with self.assertRaisesRegex(
+                    WorkspaceBackupError, "reserved Windows device"
+                ):
+                    create_migration_backup(
+                        config_path=self.config,
+                        sources=source,
+                        destination=self.destination,
+                        full_backup=True,
+                    )
+                self.assertFalse(self.destination.exists())
+
     def test_active_workspace_writer_blocks_consistent_snapshot(self) -> None:
         lock = ProcessLock(self.workspace / ".image_collection.lock")
         lock.acquire()

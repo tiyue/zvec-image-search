@@ -9,6 +9,10 @@ from typing import Any
 
 from image_vector_service.backend_server import _normalize_job
 from zvec_desktop.library_tasks import (
+    ActiveLearningDecision,
+    ActiveLearningQueueRequest,
+    ActiveLearningReviewRequest,
+    ActiveLearningReviewUndoRequest,
     AutoTagEstimateRequest,
     AutoTagPendingRequest,
     AutoTagReviewDecision,
@@ -16,6 +20,13 @@ from zvec_desktop.library_tasks import (
     AutoTagReviewRequest,
     AutoTagRunRequest,
     AutoTagUndoRequest,
+    ClusterApplyIdentityRequest,
+    ClusterDetailRequest,
+    ClusterImagesRequest,
+    ClusterListRequest,
+    ClusterMergeRequest,
+    ClusterSplitRequest,
+    ClusterUndoRequest,
     FolderDeleteCommitRequest,
     FolderDeletePreviewRequest,
     FolderTagBackfillRequest,
@@ -145,6 +156,25 @@ class LibraryTaskRequestContractTest(unittest.TestCase):
                 aliases=("雷神", "影"),
             ),
             TagAliasDeleteRequest("library-a", canonical_name="雷电将军"),
+            ClusterImagesRequest("library-a"),
+            ClusterListRequest("library-a", offset=5, limit=50),
+            ClusterDetailRequest("library-a", "semantic-001", offset=40, limit=60),
+            ClusterMergeRequest("library-a", ("semantic-001", "semantic-002")),
+            ClusterSplitRequest("library-a", "semantic-001", ("doc-1", "doc-2")),
+            ClusterApplyIdentityRequest(
+                "library-a", "semantic-001", "character", "雷电将军"
+            ),
+            ClusterUndoRequest("library-a"),
+            ActiveLearningQueueRequest("library-a", review_budget=25),
+            ActiveLearningReviewRequest(
+                "library-a",
+                "queue-001",
+                decisions=(
+                    ActiveLearningDecision("doc-1", "accept"),
+                    ActiveLearningDecision("doc-2", "edit", ("刻晴",)),
+                ),
+            ),
+            ActiveLearningReviewUndoRequest("library-a"),
         )
 
         for request in requests:
@@ -428,6 +458,71 @@ class TagAliasRequestTest(unittest.TestCase):
         with self.assertRaises(LibraryTaskValidationError):
             TagAliasDeleteRequest("library-a", "x" * 257)
 
+    def test_clustering_and_active_learning_validate_safe_bounds(self) -> None:
+        with self.assertRaises(LibraryTaskValidationError):
+            ClusterImagesRequest("library-a", cluster_types=())
+        with self.assertRaises(LibraryTaskValidationError):
+            ClusterListRequest("library-a", limit=501)
+        with self.assertRaises(LibraryTaskValidationError):
+            ActiveLearningQueueRequest("library-a", review_budget=31)
+        with self.assertRaises(LibraryTaskValidationError):
+            ActiveLearningDecision("doc-1", "edit")
+        with self.assertRaises(LibraryTaskValidationError):
+            ActiveLearningReviewRequest(
+                "library-a",
+                "queue-1",
+                decisions=(
+                    ActiveLearningDecision("doc-1", "accept"),
+                    ActiveLearningDecision("doc-1", "reject"),
+                ),
+            )
+
+    def test_cluster_manual_operations_validate_identity_uniqueness_and_pages(
+        self,
+    ) -> None:
+        detail = ClusterDetailRequest(
+            "library-a", "cluster-a", offset=2_000, limit=2_000
+        )
+        self.assertEqual(detail.to_params()["offset"], 2_000)
+        self.assertEqual(detail.to_params()["limit"], 2_000)
+
+        for category in ("real_person", "cosplayer", "character", "work"):
+            with self.subTest(category=category):
+                request = ClusterApplyIdentityRequest(
+                    "library-a", "cluster-a", category, "身份值"
+                )
+                self.assertEqual(request.to_params()["identity_category"], category)
+
+        invalid_requests = (
+            lambda: ClusterDetailRequest("library-a", "cluster-a", limit=2_001),
+            lambda: ClusterMergeRequest("library-a", ("a", "a")),
+            lambda: ClusterMergeRequest(
+                "library-a", tuple(f"cluster-{index}" for index in range(101))
+            ),
+            lambda: ClusterSplitRequest("library-a", "a", ("doc-1", "doc-1")),
+            lambda: ClusterSplitRequest(
+                "library-a", "a", tuple(f"doc-{index}" for index in range(10_001))
+            ),
+            lambda: ClusterApplyIdentityRequest(
+                "library-a",
+                "a",
+                "action",
+                "站立",  # type: ignore[arg-type]
+            ),
+            lambda: ClusterApplyIdentityRequest(
+                "library-a",
+                "a",
+                "expression",
+                "微笑",  # type: ignore[arg-type]
+            ),
+        )
+        for constructor in invalid_requests:
+            with (
+                self.subTest(constructor=constructor),
+                self.assertRaises(LibraryTaskValidationError),
+            ):
+                constructor()
+
 
 class LibraryTaskServiceTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -496,6 +591,36 @@ class LibraryTaskServiceTest(unittest.TestCase):
             lambda: self.service.delete_tag_alias(
                 TagAliasDeleteRequest("library-a", "雷电将军")
             ),
+            lambda: self.service.cluster_images(ClusterImagesRequest("library-a")),
+            lambda: self.service.list_clusters(ClusterListRequest("library-a")),
+            lambda: self.service.cluster_detail(
+                ClusterDetailRequest("library-a", "semantic-001")
+            ),
+            lambda: self.service.merge_clusters(
+                ClusterMergeRequest("library-a", ("semantic-001", "semantic-002"))
+            ),
+            lambda: self.service.split_cluster(
+                ClusterSplitRequest("library-a", "semantic-001", ("doc-1",))
+            ),
+            lambda: self.service.apply_cluster_identity(
+                ClusterApplyIdentityRequest("library-a", "semantic-001", "work", "原神")
+            ),
+            lambda: self.service.undo_latest_cluster_operation(
+                ClusterUndoRequest("library-a")
+            ),
+            lambda: self.service.active_learning_queue(
+                ActiveLearningQueueRequest("library-a")
+            ),
+            lambda: self.service.review_active_learning(
+                ActiveLearningReviewRequest(
+                    "library-a",
+                    "queue-001",
+                    decisions=(ActiveLearningDecision("doc-1", "accept"),),
+                )
+            ),
+            lambda: self.service.undo_latest_active_learning_review(
+                ActiveLearningReviewUndoRequest("library-a")
+            ),
         )
 
         submissions = [method() for method in methods]
@@ -520,6 +645,16 @@ class LibraryTaskServiceTest(unittest.TestCase):
                 "tag_alias_list",
                 "tag_alias_upsert",
                 "tag_alias_delete",
+                "cluster_images",
+                "cluster_list",
+                "cluster_detail",
+                "cluster_merge",
+                "cluster_split",
+                "cluster_apply_identity",
+                "cluster_undo",
+                "active_learning_queue",
+                "active_learning_review",
+                "active_learning_review_undo",
             ],
         )
         self.assertEqual(

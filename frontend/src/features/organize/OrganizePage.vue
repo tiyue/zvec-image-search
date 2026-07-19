@@ -9,10 +9,12 @@ import {
 } from "vue";
 
 import PaginationBar from "../../components/PaginationBar.vue";
+import ActiveLearningPanel from "./ActiveLearningPanel.vue";
 import {
   calculateOrganizeGalleryCapacity,
   type OrganizeGalleryCapacity,
 } from "./galleryCapacity";
+import SimilarityGroupsPanel from "./SimilarityGroupsPanel.vue";
 
 import type {
   ManualTagOperation,
@@ -50,6 +52,10 @@ const galleryCapacity = ref<OrganizeGalleryCapacity>(
 const editorOpen = ref(false);
 const deleteConfirmation = ref("");
 const deleteTargetKey = ref("");
+const activeWorkspaceTab = ref<"batch" | "clusters" | "learning">("batch");
+const visitedWorkspaceTabs = ref<Set<"batch" | "clusters" | "learning">>(
+  new Set(["batch"]),
+);
 let galleryObserver: ResizeObserver | null = null;
 let galleryResizeTimer: number | null = null;
 let initialLoadStarted = false;
@@ -68,6 +74,12 @@ const galleryLayoutStyle = computed(() => ({
 
 function changeLibrary(event: Event): void {
   void organize.selectLibrary((event.target as HTMLSelectElement).value);
+}
+
+function selectWorkspaceTab(tab: "batch" | "clusters" | "learning"): void {
+  activeWorkspaceTab.value = tab;
+  visitedWorkspaceTabs.value = new Set([...visitedWorkspaceTabs.value, tab]);
+  if (tab !== "batch") editorOpen.value = false;
 }
 
 function handleImageClick(image: OrganizeImage, event: MouseEvent): void {
@@ -245,7 +257,37 @@ onBeforeUnmount(() => {
       </div>
     </header>
 
-    <div class="batch-tag-workspace">
+    <nav class="workspace-tabs" aria-label="智能整理功能">
+      <button
+        type="button"
+        :class="{ active: activeWorkspaceTab === 'batch' }"
+        :aria-pressed="activeWorkspaceTab === 'batch'"
+        @click="selectWorkspaceTab('batch')"
+      >
+        <strong>批量标签</strong>
+        <small>按文件夹手工整理</small>
+      </button>
+      <button
+        type="button"
+        :class="{ active: activeWorkspaceTab === 'clusters' }"
+        :aria-pressed="activeWorkspaceTab === 'clusters'"
+        @click="selectWorkspaceTab('clusters')"
+      >
+        <strong>相似分组</strong>
+        <small>重复图与语义近邻</small>
+      </button>
+      <button
+        type="button"
+        :class="{ active: activeWorkspaceTab === 'learning' }"
+        :aria-pressed="activeWorkspaceTab === 'learning'"
+        @click="selectWorkspaceTab('learning')"
+      >
+        <strong>待学习样本</strong>
+        <small>优先审核高价值图片</small>
+      </button>
+    </nav>
+
+    <div v-show="activeWorkspaceTab === 'batch'" class="batch-tag-workspace">
       <aside class="folder-panel panel" aria-labelledby="folder-panel-title">
         <header class="panel-heading">
           <div>
@@ -671,6 +713,26 @@ onBeforeUnmount(() => {
       </aside>
     </div>
 
+    <SimilarityGroupsPanel
+      v-if="visitedWorkspaceTabs.has('clusters')"
+      v-show="activeWorkspaceTab === 'clusters'"
+      class="organize-intelligence-workspace"
+      :api="props.api"
+      :library-id="organize.selectedLibraryId.value"
+      @toast="(title, message, kind) => emit('toast', title, message, kind)"
+      @open-image="(imageId) => emit('openImage', imageId)"
+    />
+
+    <ActiveLearningPanel
+      v-if="visitedWorkspaceTabs.has('learning')"
+      v-show="activeWorkspaceTab === 'learning'"
+      class="organize-intelligence-workspace"
+      :api="props.api"
+      :library-id="organize.selectedLibraryId.value"
+      @toast="(title, message, kind) => emit('toast', title, message, kind)"
+      @open-image="(imageId) => emit('openImage', imageId)"
+    />
+
     <button
       v-if="editorOpen"
       class="editor-backdrop"
@@ -730,7 +792,7 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
-.organize-page { display: grid; height: 100%; min-height: 0; grid-template-rows: auto minmax(0,1fr); gap: 14px; overflow: hidden; color: #17203a; }
+.organize-page { display: grid; height: 100%; min-height: 0; grid-template-rows: auto auto minmax(0,1fr); gap: 12px; overflow: hidden; color: #17203a; }
 .page-heading, .heading-actions, .panel-heading, .gallery-heading, .selection-toolbar, .selection-actions, .pagination-bar, .progress-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .page-heading { align-items: flex-end; padding: 2px 2px 4px; }
 .page-heading h1 { margin: 2px 0 0; font-size: clamp(23px, 2vw, 31px); line-height: 1.15; }
@@ -748,6 +810,11 @@ textarea { resize: vertical; line-height: 1.5; }
 .primary { color: white; background: linear-gradient(135deg, #7364eb, #5b4bd6); }
 .secondary { color: #5647ce; background: #efedff; }
 .danger-soft { color: #a74755; background: #fff0f2; }
+.workspace-tabs { display: inline-flex; width: max-content; max-width: 100%; gap: 5px; padding: 4px; border: 1px solid #e1e4ee; border-radius: 13px; background: rgba(246,247,251,.94); }
+.workspace-tabs button { display: grid; min-width: 150px; gap: 1px; padding: 7px 13px; border: 0; border-radius: 9px; color: #6c7589; background: transparent; text-align: left; cursor: pointer; }
+.workspace-tabs button strong { font-size: 11px; }.workspace-tabs button small { font-size: 9px; opacity: .78; }
+.workspace-tabs button.active { color: #5143c2; background: #fff; box-shadow: 0 3px 12px rgba(53,59,86,.1); }
+.organize-intelligence-workspace { min-height: 0; }
 .batch-tag-workspace { display: grid; height: 100%; min-height: 0; grid-template-columns: 320px minmax(0,1fr) 380px; gap: 14px; }
 .folder-panel { display: grid; grid-template-rows: auto auto auto minmax(0,1fr) auto; padding: 14px; overflow: hidden; }
 .tag-editor { padding: 14px; overflow: auto; }
@@ -911,5 +978,7 @@ textarea { resize: vertical; line-height: 1.5; }
   .gallery-panel { min-height: 680px; }
   .selection-actions { justify-content: flex-start; }
   .delete-modal dl { grid-template-columns: repeat(2,minmax(0,1fr)); }
+  .workspace-tabs { display: grid; width: 100%; grid-template-columns: repeat(3,minmax(0,1fr)); }
+  .workspace-tabs button { min-width: 0; padding-inline: 8px; }
 }
 </style>

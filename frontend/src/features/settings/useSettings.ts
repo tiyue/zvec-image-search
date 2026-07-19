@@ -83,6 +83,7 @@ export function useSettings(api: SettingsApi = settingsApi, events: SettingsEven
   });
   const showAddLibrary = ref(false);
   const resultsDirectory = ref("");
+  const configPath = ref("");
   const modelCatalog = shallowRef<ModelChoice[]>([]);
   const models = reactive({
     provider: "aliyun",
@@ -139,6 +140,7 @@ export function useSettings(api: SettingsApi = settingsApi, events: SettingsEven
   function applySettings(payload: SettingsResponse): void {
     applyLibraries(payload.libraries);
     resultsDirectory.value = text(payload.results_directory, resultsDirectory.value);
+    configPath.value = text(payload.config_path, configPath.value);
     applyModels(payload);
     const credentialState = payload.credentials ?? {};
     credentialsConfigured.value = Boolean(
@@ -437,6 +439,7 @@ export function useSettings(api: SettingsApi = settingsApi, events: SettingsEven
     newLibrary,
     showAddLibrary,
     resultsDirectory,
+    configPath,
     modelCatalog,
     models,
     embeddingChoices,

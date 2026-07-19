@@ -15,6 +15,8 @@ from .models import (
     classify_match_state,
     normalize_rrf_score,
 )
+from .search_learning_config import SearchLearningBundle
+from .search_learning_runtime import apply_search_learning
 
 DEFAULT_CONFIDENCE_CANDIDATES = 50
 # Backwards-compatible import name. This value is now a default pool size, not
@@ -182,6 +184,9 @@ def confidence_rank(
     show_low_confidence: bool = False,
     collection_confidence_offsets: Mapping[str, float] | None = None,
     sort_mode: SearchSortMode = "confidence",
+    search_learning: SearchLearningBundle | None = None,
+    default_library_id: str = "local",
+    collection_sizes: Mapping[str, int] | None = None,
 ) -> ConfidenceRanking | None:
     """Rank comparable confidence scores, or request the legacy fallback.
 
@@ -240,7 +245,18 @@ def confidence_rank(
         )
         for hit in fused
     ]
-    return sort_confidence_hits(
+    learning_diagnostics: dict[str, object] | None = None
+    if search_learning is not None:
+        learning = apply_search_learning(
+            fused,
+            bundle=search_learning,
+            query_type=query_type,
+            default_library_id=default_library_id,
+            collection_sizes=collection_sizes,
+        )
+        fused = learning.hits
+        learning_diagnostics = learning.diagnostics
+    ranking = sort_confidence_hits(
         fused,
         query_type=query_type,
         top_k=top_k,
@@ -253,6 +269,15 @@ def confidence_rank(
         collection_confidence_offsets=resolved_collection_offsets,
         sort_mode=resolved_sort_mode,
     )
+    if ranking is not None and learning_diagnostics is not None:
+        ranking = replace(
+            ranking,
+            diagnostics={
+                **ranking.diagnostics,
+                "search_learning": learning_diagnostics,
+            },
+        )
+    return ranking
 
 
 def sort_confidence_hits(
@@ -339,7 +364,7 @@ def sort_confidence_hits(
     hard_floor_passing = [
         hit
         for hit in distinct
-        if _ranking_confidence(hit, offsets) >= MINIMUM_RESULT_CONFIDENCE
+        if _filtering_confidence(hit, offsets) >= MINIMUM_RESULT_CONFIDENCE
     ]
     hard_floor_filtered = candidate_count - len(hard_floor_passing)
     effective_minimum = max(MINIMUM_RESULT_CONFIDENCE, min_confidence)
@@ -370,7 +395,13 @@ def sort_confidence_hits(
     for hit in hard_floor_passing:
         if not _passes_minimum_score(hit, query_type, minimum_score):
             continue
-        if _ranking_confidence(hit, offsets) < effective_minimum:
+        required_minimum = max(
+            effective_minimum,
+            hit.calibrated_minimum_confidence
+            if hit.calibrated_minimum_confidence is not None
+            else effective_minimum,
+        )
+        if _filtering_confidence(hit, offsets) < required_minimum:
             continue
         passing.append(hit)
 
@@ -804,6 +835,17 @@ def _required_confidence(hit: SearchHit) -> float:
     if value is None:
         raise ValueError("Search hit is missing a finite confidence score.")
     return value
+
+
+def _filtering_confidence(
+    hit: SearchHit, collection_confidence_offsets: Mapping[str, float]
+) -> float:
+    # Learned ranking scores may reorder candidates, but abstention remains on
+    # calibrated relevance confidence. Legacy candidates retain their previous
+    # collection-offset behavior.
+    if hit.calibrated_minimum_confidence is not None:
+        return _required_confidence(hit)
+    return _ranking_confidence(hit, collection_confidence_offsets)
 
 
 def _passes_minimum_score(

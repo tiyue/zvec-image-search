@@ -54,6 +54,11 @@ export const organizeApi: OrganizeApi = {
     requestJson<OrganizeJobResponse>(`api/jobs/${encodeURIComponent(jobId)}`, {
       signal,
     }),
+  cancelJob: (jobId, signal) =>
+    requestJson<OrganizeJobResponse>(`api/jobs/${encodeURIComponent(jobId)}`, {
+      method: "DELETE",
+      signal,
+    }),
   previewFolderDelete: (libraryId, folderKey, includeSubfolders, signal) =>
     requestJson<FolderDeletePreviewWire>(
       `api/libraries/${encodeURIComponent(libraryId)}/folder-delete/preview`,

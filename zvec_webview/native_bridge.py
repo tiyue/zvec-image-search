@@ -71,6 +71,18 @@ class NativeBridge:
         except Exception as exc:
             return _bridge_error(exc)
 
+    def select_json_file(self) -> dict[str, Any]:
+        """Select one local JSON configuration file for an explicit import."""
+
+        try:
+            result = self._create_dialog("json")
+            path = _first_dialog_path(result)
+            if path is not None and path.suffix.casefold() != ".json":
+                raise ValueError("请选择 JSON 文件。")
+            return {"ok": True, "path": str(path) if path is not None else None}
+        except Exception as exc:
+            return _bridge_error(exc)
+
     def select_query_image(self) -> dict[str, Any]:
         """Return an opaque image ID; the browser never receives its path."""
 
@@ -358,13 +370,18 @@ class NativeBridge:
         ) or getattr(webview, "OPEN_DIALOG", None)
         if dialog_type is None:
             raise RuntimeError("当前 pywebview 不支持文件选择。")
+        file_types = (
+            ("JSON 文件 (*.json)", "所有文件 (*.*)")
+            if kind == "json"
+            else (
+                "图片 (*.jpg;*.jpeg;*.png;*.webp;*.bmp;*.gif;*.tif;*.tiff)",
+                "所有文件 (*.*)",
+            )
+        )
         return window.create_file_dialog(
             dialog_type,
             allow_multiple=False,
-            file_types=(
-                "图片 (*.jpg;*.jpeg;*.png;*.webp;*.bmp;*.gif;*.tif;*.tiff)",
-                "所有文件 (*.*)",
-            ),
+            file_types=file_types,
         )
 
     def _claim_native_action(

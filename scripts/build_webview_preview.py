@@ -205,9 +205,22 @@ def _run_frozen_self_test(plan: BuildPlan) -> dict[str, object]:
         required_modules = {
             "PIL.Image",
             "clr",
+            "image_vector_service.active_learning",
+            "image_vector_service.active_learning_review_store",
             "image_vector_service.activity_store",
+            "image_vector_service.cluster_operation_store",
+            "image_vector_service.data_migration",
+            "image_vector_service.migration_recovery",
             "image_vector_service.folder_deletion",
+            "image_vector_service.image_clustering",
             "image_vector_service.library_browser",
+            "image_vector_service.learning_ranker",
+            "image_vector_service.search_features",
+            "image_vector_service.search_learning_evaluator",
+            "image_vector_service.search_learning_config",
+            "image_vector_service.search_learning_runtime",
+            "image_vector_service.search_learning_service",
+            "image_vector_service.search_learning_store",
             "webview",
             "webview.platforms.edgechromium",
             "webview.platforms.winforms",
@@ -222,6 +235,16 @@ def _run_frozen_self_test(plan: BuildPlan) -> dict[str, object]:
         if not isinstance(modules, list) or not required_modules.issubset(modules):
             raise WebviewPreviewPackagingError(
                 "Frozen WebView2 self-test did not import its full runtime closure."
+            )
+        persistence = payload.get("persistence")
+        if (
+            not isinstance(persistence, dict)
+            or persistence.get("cluster_store_schema") != 1
+            or persistence.get("cluster_store_api_requests") != 0
+            or persistence.get("active_learning_recovered") != 0
+        ):
+            raise WebviewPreviewPackagingError(
+                "Frozen WebView2 self-test did not validate local learning storage."
             )
         sqlite = payload.get("sqlite")
         if (

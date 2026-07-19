@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 import threading
 import time
-from collections.abc import Collection, Mapping, Sequence
+import uuid
+from collections.abc import Callable, Collection, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
 from contextlib import suppress
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from importlib import metadata
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, TypeVar, cast
@@ -20,7 +23,40 @@ from image_vector_service.activity_store import (
     InvalidActivityCursor,
 )
 from image_vector_service.config import ConfigurationError, ServiceConfig
+from image_vector_service.data_migration import (
+    DataMigrationCancelled,
+    DataMigrationCoordinator,
+    DataMigrationExecutionError,
+    DataMigrationRequest,
+    DataMigrationValidationError,
+    WindowsNativeMigrationOperations,
+)
 from image_vector_service.library_browser import LibraryBrowser
+from image_vector_service.migration_recovery import (
+    MigrationRecoveryError,
+    MigrationRecoveryRecord,
+    MigrationRecoveryStore,
+)
+from image_vector_service.process_lock import ProcessLock
+from image_vector_service.search_features import (
+    FEATURE_SCHEMA_VERSION,
+    NUMERIC_FEATURE_NAMES,
+)
+from image_vector_service.search_learning_evaluator import (
+    LocalFixedEvaluationEvaluator,
+)
+from image_vector_service.search_learning_service import (
+    SearchLearningService,
+    SearchLearningServiceError,
+)
+from image_vector_service.search_learning_store import (
+    InvalidSearchLearningCursor,
+    SearchCandidateRecord,
+    SearchLearningStore,
+    SearchLearningStoreUnavailable,
+    SearchLearningValidationError,
+    SearchSessionRecord,
+)
 from zvec_desktop.backend_api import BackendApiError, JsonObject
 from zvec_desktop.backend_host import BackendBusyError, BackendHost, BackendRuntime
 from zvec_desktop.configuration_service import (
@@ -30,6 +66,10 @@ from zvec_desktop.configuration_service import (
 )
 from zvec_desktop.credentials import CredentialStore, default_credential_store
 from zvec_desktop.library_tasks import (
+    ActiveLearningDecision,
+    ActiveLearningQueueRequest,
+    ActiveLearningReviewRequest,
+    ActiveLearningReviewUndoRequest,
     AutoTagEstimateRequest,
     AutoTagPendingRequest,
     AutoTagPolicyMigrateRequest,
@@ -42,6 +82,13 @@ from zvec_desktop.library_tasks import (
     AutoTagScope,
     AutoTagUndoRequest,
     BatchAcceptanceMode,
+    ClusterApplyIdentityRequest,
+    ClusterDetailRequest,
+    ClusterImagesRequest,
+    ClusterListRequest,
+    ClusterMergeRequest,
+    ClusterSplitRequest,
+    ClusterUndoRequest,
     FolderDeleteCommitRequest,
     FolderDeletePreviewRequest,
     FolderTagBackfillRequest,
@@ -213,6 +260,7 @@ class _SearchOperation:
     error: JsonObject | None = None
     finished_at: float | None = None
     future: Future[Any] | None = None
+    learning_recorded: bool = False
 
 
 @dataclass(slots=True)
@@ -228,6 +276,27 @@ class _TaskOperation:
     error: JsonObject | None = None
     finished_at: float | None = None
     future: Future[Any] | None = None
+
+
+@dataclass(slots=True)
+class _MigrationOperation:
+    operation_id: str
+    request: DataMigrationRequest
+    confirmation_token: str
+    confirmation_phrase: str
+    submitted_at: float
+    status: str = "queued"
+    stage: str = "queued"
+    progress: int = 0
+    message: str = "迁移任务已排队。"
+    result: JsonObject | None = None
+    error: JsonObject | None = None
+    finished_at: float | None = None
+    future: Future[Any] | None = None
+    cancel_event: threading.Event = field(default_factory=threading.Event)
+    process_lock: ProcessLock | None = None
+    recovery_backup: JsonObject | None = None
+    recovery_marker_id: str = ""
 
 
 @dataclass(slots=True)
@@ -252,6 +321,8 @@ class PreviewFacade:
         image_registry: ImageRegistry | None = None,
         executor: ThreadPoolExecutor | None = None,
         activity_store: ActivityStore | None = None,
+        search_learning_service: SearchLearningService | None = None,
+        data_migration_coordinator: DataMigrationCoordinator | None = None,
         observer_job_history_fallback: bool = False,
     ) -> None:
         if not isinstance(observer_job_history_fallback, bool):
@@ -278,6 +349,46 @@ class PreviewFacade:
             recover_interrupted=False,
         )
         self._owns_activity = activity_store is None
+        if search_learning_service is None:
+            learning_store = SearchLearningStore(
+                self._configuration.config_home,
+                redactions=activity_redactions,
+            )
+            self._search_learning = SearchLearningService(
+                self._configuration.config_home,
+                store=learning_store,
+                evaluator=LocalFixedEvaluationEvaluator(
+                    self._configuration.config_home
+                ),
+            )
+            self._owns_search_learning = True
+        else:
+            self._search_learning = search_learning_service
+            self._owns_search_learning = False
+        if data_migration_coordinator is None:
+            try:
+                configured = self._configuration.load(optional=True)
+            except Exception:
+                configured = None
+            results_directory = (
+                configured.configuration.results_directory
+                if configured is not None
+                else self._configuration.config_home / "results"
+            )
+            migration_operations = WindowsNativeMigrationOperations(
+                config_home=self._configuration.config_home,
+                config_path=self._configuration.path,
+                results_directory=results_directory,
+            )
+            self._data_migrations = DataMigrationCoordinator(migration_operations)
+        else:
+            self._data_migrations = data_migration_coordinator
+        self._migration_recovery = MigrationRecoveryStore(
+            self._configuration.config_home
+        )
+        self._migration_process_lock_path = (
+            self._configuration.config_home / "data-migration.lock"
+        )
         self._observer_job_history_fallback = observer_job_history_fallback
         self._executor = executor or ThreadPoolExecutor(
             max_workers=8,
@@ -293,6 +404,8 @@ class PreviewFacade:
         self._task_service: LibraryTaskService | None = None
         self._searches: dict[str, _SearchOperation] = {}
         self._tasks: dict[str, _TaskOperation] = {}
+        self._migration_operations: dict[str, _MigrationOperation] = {}
+        self._migration_gate = False
         self._organize = _OrganizeCache()
         self._result_catalog: ResultCatalog | None = None
         self._result_catalog_version: tuple[int, int] | None = None
@@ -404,6 +517,171 @@ class PreviewFacade:
                 "activity_store_unavailable",
                 "操作日志暂时不可用，主任务仍可继续执行。",
                 status=503,
+            ) from exc
+
+    def search_learning_status(self) -> JsonObject:
+        """Return privacy settings, sample readiness, jobs, and model versions."""
+
+        return self._learning_call(self._search_learning.status)
+
+    def search_learning_settings(self) -> JsonObject:
+        return self._learning_call(self._search_learning.settings)
+
+    def update_search_learning_settings(self, payload: Mapping[str, Any]) -> JsonObject:
+        return self._learning_call(
+            lambda: self._search_learning.update_settings(payload)
+        )
+
+    def record_search_feedback(self, payload: Mapping[str, Any]) -> JsonObject:
+        return self._learning_call(lambda: self._search_learning.feedback(payload))
+
+    def revoke_search_feedback(self, event_id: str) -> JsonObject:
+        return self._learning_call(
+            lambda: self._search_learning.revoke_feedback(event_id)
+        )
+
+    def search_feedback(
+        self,
+        *,
+        cursor: str | None = None,
+        limit: int = 50,
+        session_id: str | None = None,
+        action: str | None = None,
+        active_only: bool = True,
+    ) -> JsonObject:
+        return self._learning_call(
+            lambda: self._search_learning.list_feedback(
+                cursor=cursor,
+                limit=limit,
+                session_id=session_id,
+                action=action,
+                active_only=active_only,
+            )
+        )
+
+    def search_learning_sessions(
+        self,
+        *,
+        cursor: str | None = None,
+        limit: int = 50,
+        query_type: str | None = None,
+    ) -> JsonObject:
+        return self._learning_call(
+            lambda: self._search_learning.list_sessions(
+                cursor=cursor,
+                limit=limit,
+                query_type=query_type,
+            )
+        )
+
+    def train_search_learning(self) -> JsonObject:
+        return self._learning_call(self._search_learning.train)
+
+    def install_search_learning_evaluation(
+        self, payload: Mapping[str, Any]
+    ) -> JsonObject:
+        unknown = sorted(set(payload) - {"source_path"})
+        if unknown:
+            raise FacadeError(
+                "invalid_request",
+                "Fixed evaluation import contains unsupported fields.",
+                details={"unknown_fields": unknown},
+            )
+        source_path = payload.get("source_path")
+        if not isinstance(source_path, str) or not source_path.strip():
+            raise FacadeError("invalid_request", "source_path must not be empty.")
+        return self._learning_call(
+            lambda: self._search_learning.install_fixed_evaluation(source_path.strip())
+        )
+
+    def search_learning_job(self, job_id: str) -> JsonObject:
+        return self._learning_call(lambda: self._search_learning.training_job(job_id))
+
+    def cancel_search_learning_job(self, job_id: str) -> JsonObject:
+        return self._learning_call(
+            lambda: self._search_learning.cancel_training(job_id)
+        )
+
+    def activate_search_learning(self, payload: Mapping[str, Any]) -> JsonObject:
+        unknown = sorted(set(payload) - {"model_version", "shadow_mode"})
+        if unknown:
+            raise FacadeError(
+                "invalid_request",
+                "Search-learning activation contains unsupported fields.",
+                details={"unknown_fields": unknown},
+            )
+        model_version = payload.get("model_version")
+        if not isinstance(model_version, str) or not model_version.strip():
+            raise FacadeError("invalid_request", "model_version must not be empty.")
+        shadow_mode = payload.get("shadow_mode", True)
+        if not isinstance(shadow_mode, bool):
+            raise FacadeError("invalid_request", "shadow_mode must be a boolean.")
+        return self._learning_call(
+            lambda: self._search_learning.activate(
+                model_version.strip(), shadow_mode=shadow_mode
+            )
+        )
+
+    def rollback_search_learning(self, payload: Mapping[str, Any]) -> JsonObject:
+        if payload:
+            raise FacadeError(
+                "invalid_request",
+                "Search-learning rollback does not accept fields.",
+                details={"unknown_fields": sorted(payload)},
+            )
+        return self._learning_call(self._search_learning.rollback)
+
+    def clear_search_learning(self, payload: Mapping[str, Any]) -> JsonObject:
+        unknown = sorted(set(payload) - {"confirm"})
+        if unknown:
+            raise FacadeError(
+                "invalid_request",
+                "Search-learning cleanup contains unsupported fields.",
+                details={"unknown_fields": unknown},
+            )
+        confirm = payload.get("confirm", False)
+        if not isinstance(confirm, bool):
+            raise FacadeError("invalid_request", "confirm must be a boolean.")
+        return self._learning_call(
+            lambda: self._search_learning.clear(confirmed=confirm)
+        )
+
+    def export_search_learning(self) -> JsonObject:
+        return self._learning_call(self._search_learning.anonymous_export)
+
+    def _learning_call(self, operation: Callable[[], JsonObject]) -> JsonObject:
+        try:
+            return operation()
+        except InvalidSearchLearningCursor as exc:
+            raise FacadeError(
+                "invalid_search_learning_cursor", str(exc), status=400
+            ) from exc
+        except SearchLearningStoreUnavailable as exc:
+            raise FacadeError(
+                "search_learning_unavailable",
+                "Local search learning is unavailable; normal search can continue.",
+                status=503,
+            ) from exc
+        except SearchLearningServiceError as exc:
+            conflict_codes = {
+                "evaluation_gate_not_passed",
+                "insufficient_training_data",
+                "rollback_unavailable",
+                "training_already_running",
+                "training_running",
+            }
+            not_found_codes = {"model_not_found", "search_feedback_not_found"}
+            status = (
+                409
+                if exc.code in conflict_codes
+                else 404
+                if exc.code in not_found_codes
+                else 400
+            )
+            raise FacadeError(exc.code, str(exc), status=status) from exc
+        except SearchLearningValidationError as exc:
+            raise FacadeError(
+                "invalid_search_learning_request", str(exc), status=400
             ) from exc
 
     def record_frontend_activity(self, payload: Mapping[str, Any]) -> bool:
@@ -701,6 +979,144 @@ class PreviewFacade:
             details=details,
         )
 
+    def _record_search_learning_session(self, operation: _SearchOperation) -> None:
+        """Capture bounded ranking features without affecting search success."""
+
+        with self._lock:
+            if operation.learning_recorded:
+                return
+            operation.learning_recorded = True
+        outcome = operation.outcome
+        if outcome is None or outcome.manifest_path is None:
+            return
+        try:
+            catalog = self._catalog()
+            first_page = catalog.load_manifest(
+                outcome.manifest_path,
+                page=1,
+                page_size=500,
+            )
+            pages = [first_page]
+            if first_page.total_pages > 1:
+                pages.append(
+                    catalog.load_manifest(
+                        outcome.manifest_path,
+                        page=2,
+                        page_size=500,
+                    )
+                )
+            query_library_ids = operation.query.get("library_ids")
+            library_ids = (
+                tuple(str(value) for value in query_library_ids if str(value))
+                if isinstance(query_library_ids, Sequence)
+                and not isinstance(query_library_ids, (str, bytes, bytearray))
+                else ()
+            )
+            diagnostics = first_page.ranking_diagnostics or {}
+            raw_learning_diagnostics = diagnostics.get("search_learning")
+            learning_diagnostics = (
+                raw_learning_diagnostics
+                if isinstance(raw_learning_diagnostics, Mapping)
+                else {}
+            )
+            candidates: list[SearchCandidateRecord] = []
+            ranking_model_version: str | None = None
+            calibration_version: str | None = None
+            for page in pages:
+                for result in page.items:
+                    library_id = result.library_id or (
+                        library_ids[0] if len(library_ids) == 1 else "unknown"
+                    )
+                    doc_id = result.doc_id or _anonymous_doc_id(
+                        library_id, result.relative_path
+                    )
+                    ranking_model_version = (
+                        ranking_model_version or result.ranking_model_version
+                    )
+                    calibration_version = (
+                        calibration_version or result.calibration_version
+                    )
+                    if result.search_features is not None:
+                        features = dict(result.search_features)
+                    else:
+                        # Old manifests remain learnable with an explicit,
+                        # conservative approximation. New manifests always carry
+                        # the exact feature row produced by the ranking runtime.
+                        features = {name: 0.0 for name in NUMERIC_FEATURE_NAMES}
+                        features.update(
+                            {
+                                "vector_raw_score": float(result.raw_score),
+                                "vector_confidence": float(
+                                    result.ranking_confidence
+                                    if result.ranking_confidence is not None
+                                    else result.confidence
+                                ),
+                                "tag_match_score": float(
+                                    result.metadata_confidence or 0.0
+                                ),
+                                "image_text_agreement": float(
+                                    result.rank_agreement or 0.0
+                                ),
+                                "collection_rank": float(result.rank),
+                                "duplicate_group_size": 1.0,
+                            }
+                        )
+                    candidates.append(
+                        SearchCandidateRecord(
+                            library_id=library_id,
+                            doc_id=doc_id,
+                            sha256=result.sha256 or None,
+                            original_rank=result.rank,
+                            displayed_rank=(result.rank if result.rank <= 15 else None),
+                            feature_schema_version=(
+                                result.feature_schema_version or FEATURE_SCHEMA_VERSION
+                            ),
+                            features=features,
+                            ranking_score=float(
+                                result.ranking_score
+                                if result.ranking_score is not None
+                                else result.ranking_confidence
+                                if result.ranking_confidence is not None
+                                else result.confidence
+                            ),
+                            displayed=result.rank <= 15,
+                        )
+                    )
+            self._search_learning.store.try_record_search(
+                SearchSessionRecord(
+                    session_id=operation.operation_id,
+                    created_at=datetime.fromtimestamp(
+                        operation.submitted_at, tz=timezone.utc
+                    ),
+                    query_type=first_page.query_type or "text",
+                    requested_count=_first_int(operation.query, "top_k", "page_size"),
+                    returned_count=first_page.total_items,
+                    library_ids=library_ids,
+                    latency_ms=_elapsed_ms(
+                        operation.submitted_at, operation.finished_at
+                    )
+                    or 0,
+                    ranking_model_version=(
+                        ranking_model_version
+                        or _optional_diagnostic_identifier(
+                            learning_diagnostics.get("ranking_model_version")
+                        )
+                    ),
+                    calibration_version=(
+                        calibration_version
+                        or _optional_diagnostic_identifier(
+                            learning_diagnostics.get("calibration_version")
+                        )
+                    ),
+                    query_text=str(operation.query.get("text") or "") or None,
+                    candidates=tuple(candidates),
+                )
+            )
+        except Exception:
+            # A read-only/full ConfigHome, stale result, or malformed optional
+            # diagnostic must never change the already completed search.
+            return
+
     def start_backend_async(self) -> Future[Any] | None:
         """Start the persistent backend once without blocking the webview page."""
 
@@ -819,6 +1235,7 @@ class PreviewFacade:
         )
 
     def submit_search(self, payload: Mapping[str, Any]) -> JsonObject:
+        self._ensure_migration_not_active()
         service = self._ready_search_service()
         request_payload = dict(payload)
         query_image_id = request_payload.pop("query_image_id", None)
@@ -937,6 +1354,272 @@ class PreviewFacade:
         self._record_search_operation(operation)
         return self.search(normalized)
 
+    def precheck_data_migration(self, payload: Mapping[str, Any]) -> JsonObject:
+        """Run the authoritative dry-run while no backend owns the Workspace."""
+
+        unknown = sorted(set(payload) - {"request", "dry_run"})
+        if unknown:
+            raise FacadeError(
+                "invalid_data_migration",
+                "数据迁移预检查包含不支持的字段。",
+                details={"unknown_fields": unknown},
+            )
+        if payload.get("dry_run", True) is not True:
+            raise FacadeError(
+                "invalid_data_migration",
+                "预检查必须以 dry-run 模式执行。",
+            )
+        request = self._data_migration_request(payload.get("request"))
+        self._reserve_migration_gate()
+        backend_was_running = False
+        process_lock: ProcessLock | None = None
+        try:
+            self._ensure_no_pending_migration_recovery()
+            if self.has_active_jobs(include_migrations=False):
+                raise FacadeError(
+                    "migration_backend_busy",
+                    "当前仍有搜索或图库任务，完成后才能预检查迁移。",
+                    status=409,
+                )
+            process_lock = self._acquire_data_migration_process_lock()
+            backend_was_running = self._stop_backend_for_migration()
+            preview = self._data_migrations.preview(request)
+            response = preview.to_dict()
+            response["backend_was_running"] = backend_was_running
+            return {"preview": response}
+        except FacadeError:
+            raise
+        except (DataMigrationValidationError, ValueError) as exc:
+            raise FacadeError(
+                "invalid_data_migration",
+                str(exc),
+                status=400,
+            ) from exc
+        except Exception as exc:
+            raise _facade_error(exc, code="data_migration_precheck_failed") from exc
+        finally:
+            restart = self._restart_backend_after_migration(
+                required=backend_was_running
+            )
+            if process_lock is not None:
+                process_lock.release()
+            with self._lock:
+                self._migration_gate = False
+            if backend_was_running and restart.get("status") == "degraded":
+                self._activity_log(
+                    level="error",
+                    category="migration",
+                    event="migration_precheck_restart_failed",
+                    message="迁移预检查后未能恢复本地后端。",
+                    details=restart,
+                )
+
+    def submit_data_migration(self, payload: Mapping[str, Any]) -> JsonObject:
+        unknown = sorted(
+            set(payload) - {"request", "confirmation_token", "confirmation_phrase"}
+        )
+        if unknown:
+            raise FacadeError(
+                "invalid_data_migration",
+                "数据迁移请求包含不支持的字段。",
+                details={"unknown_fields": unknown},
+            )
+        request = self._data_migration_request(payload.get("request"))
+        confirmation_token = _required_string(
+            payload, "confirmation_token", maximum=512
+        )
+        confirmation_phrase = _required_string(
+            payload, "confirmation_phrase", maximum=32
+        )
+        self._reserve_migration_gate()
+        process_lock: ProcessLock | None = None
+        try:
+            self._ensure_no_pending_migration_recovery()
+            if self.has_active_jobs(include_migrations=False):
+                raise FacadeError(
+                    "migration_backend_busy",
+                    "当前仍有搜索或图库任务，完成后才能开始迁移。",
+                    status=409,
+                )
+            process_lock = self._acquire_data_migration_process_lock()
+            operation = _MigrationOperation(
+                operation_id=uuid.uuid4().hex,
+                request=request,
+                confirmation_token=confirmation_token,
+                confirmation_phrase=confirmation_phrase,
+                submitted_at=time.time(),
+                process_lock=process_lock,
+            )
+            with self._lock:
+                self._migration_operations[operation.operation_id] = operation
+                self._trim_migration_operations_locked()
+                try:
+                    operation.future = self._executor.submit(
+                        self._run_data_migration_worker,
+                        operation.operation_id,
+                    )
+                except Exception:
+                    self._migration_operations.pop(operation.operation_id, None)
+                    raise
+            process_lock = None  # The background operation now owns the handle.
+            self._record_migration_snapshot(operation)
+            return self._data_migration_view(operation)
+        except Exception:
+            if process_lock is not None:
+                process_lock.release()
+            with self._lock:
+                if not self._active_migration_locked():
+                    self._migration_gate = False
+            raise
+
+    def data_migration(self, operation_id: str) -> JsonObject:
+        normalized = _operation_id(operation_id)
+        with self._lock:
+            operation = self._migration_operations.get(normalized)
+            if operation is None:
+                raise FacadeError(
+                    "data_migration_not_found",
+                    "数据迁移任务不存在或已经过期。",
+                    status=404,
+                )
+            return self._data_migration_view(operation)
+
+    def cancel_data_migration(self, operation_id: str) -> JsonObject:
+        normalized = _operation_id(operation_id)
+        with self._lock:
+            operation = self._migration_operations.get(normalized)
+            if operation is None:
+                raise FacadeError(
+                    "data_migration_not_found",
+                    "数据迁移任务不存在或已经过期。",
+                    status=404,
+                )
+            if operation.status not in {
+                "succeeded",
+                "failed",
+                "failed_recovered",
+                "needs_attention",
+                "cancelled",
+            }:
+                operation.cancel_event.set()
+                operation.status = "cancelling"
+                operation.message = "正在等待安全取消点。"
+            view = self._data_migration_view(operation)
+        self._record_migration_snapshot(operation)
+        return view
+
+    def data_migration_recovery(self) -> JsonObject:
+        """Return an unfinished migration marker without exposing source paths."""
+
+        try:
+            recovery = self._pending_migration_recovery()
+        except MigrationRecoveryError as exc:
+            raise FacadeError(
+                "migration_recovery_invalid",
+                "检测到损坏的数据迁移恢复记录，请保留备份并查看操作日志。",
+                status=409,
+                details={"error": str(exc)},
+            ) from exc
+        if recovery is not None:
+            with self._lock:
+                live_owner = any(
+                    operation.status
+                    not in {
+                        "succeeded",
+                        "failed",
+                        "failed_recovered",
+                        "needs_attention",
+                        "cancelled",
+                    }
+                    and (
+                        operation.operation_id == recovery.operation_id
+                        or operation.recovery_marker_id == recovery.operation_id
+                    )
+                    for operation in self._migration_operations.values()
+                )
+            if live_owner:
+                return {"recovery": None, "migration_active": True}
+        return {"recovery": recovery.public_view() if recovery else None}
+
+    def submit_data_migration_recovery(self, payload: Mapping[str, Any]) -> JsonObject:
+        unknown = sorted(set(payload) - {"operation_id", "confirmation_phrase"})
+        if unknown:
+            raise FacadeError(
+                "invalid_data_migration_recovery",
+                "恢复请求包含不支持的字段。",
+                details={"unknown_fields": unknown},
+            )
+        marker_id = _required_string(payload, "operation_id", maximum=128)
+        confirmation_phrase = _required_string(
+            payload, "confirmation_phrase", maximum=32
+        )
+        if confirmation_phrase != "RESTORE":
+            raise FacadeError(
+                "invalid_data_migration_recovery",
+                "必须输入 RESTORE 才能恢复完整备份。",
+                status=400,
+            )
+        try:
+            recovery = self._pending_migration_recovery()
+            if recovery is None:
+                raise MigrationRecoveryError(
+                    "No unfinished data migration requires recovery."
+                )
+            if recovery.operation_id != marker_id:
+                raise MigrationRecoveryError(
+                    "The recovery marker belongs to a different migration."
+                )
+        except MigrationRecoveryError as exc:
+            raise FacadeError(
+                "migration_recovery_invalid",
+                str(exc),
+                status=409,
+            ) from exc
+
+        self._reserve_migration_gate()
+        process_lock: ProcessLock | None = None
+        try:
+            if self.has_active_jobs(include_migrations=False):
+                raise FacadeError(
+                    "migration_backend_busy",
+                    "当前仍有搜索或图库任务，完成后才能恢复迁移备份。",
+                    status=409,
+                )
+            process_lock = self._acquire_data_migration_process_lock()
+            operation = _MigrationOperation(
+                operation_id=uuid.uuid4().hex,
+                request=recovery.request,
+                confirmation_token="",
+                confirmation_phrase="RESTORE",
+                submitted_at=time.time(),
+                stage="recovery_queued",
+                message="完整备份恢复任务已排队。",
+                process_lock=process_lock,
+                recovery_backup=_copy_object(recovery.backup),
+                recovery_marker_id=recovery.operation_id,
+            )
+            with self._lock:
+                self._migration_operations[operation.operation_id] = operation
+                self._trim_migration_operations_locked()
+                try:
+                    operation.future = self._executor.submit(
+                        self._run_data_migration_recovery_worker,
+                        operation.operation_id,
+                    )
+                except Exception:
+                    self._migration_operations.pop(operation.operation_id, None)
+                    raise
+            process_lock = None
+            self._record_migration_snapshot(operation)
+            return self._data_migration_view(operation)
+        except Exception:
+            if process_lock is not None:
+                process_lock.release()
+            with self._lock:
+                if not self._active_migration_locked():
+                    self._migration_gate = False
+            raise
+
     def list_jobs(self) -> JsonObject:
         client = self._ready_client()
         try:
@@ -956,6 +1639,7 @@ class PreviewFacade:
         return {"jobs": views}
 
     def submit_job(self, payload: Mapping[str, Any]) -> JsonObject:
+        self._ensure_migration_not_active()
         service = self._ready_task_service()
         request_payload = dict(payload)
         if (
@@ -1149,6 +1833,7 @@ class PreviewFacade:
         }
 
     def add_library(self, payload: Mapping[str, Any]) -> JsonObject:
+        self._ensure_migration_not_active()
         unknown = sorted(set(payload) - _LIBRARY_CREATE_FIELDS)
         if unknown:
             raise FacadeError(
@@ -1242,6 +1927,7 @@ class PreviewFacade:
         }
 
     def set_library_enabled(self, library_id: str, enabled: bool) -> JsonObject:
+        self._ensure_migration_not_active()
         if not isinstance(enabled, bool):
             raise FacadeError("invalid_request", "enabled 必须是布尔值。")
         try:
@@ -1262,6 +1948,7 @@ class PreviewFacade:
         return {"libraries": _libraries_view(updated), "restart_required": True}
 
     def set_default_library(self, library_id: str) -> JsonObject:
+        self._ensure_migration_not_active()
         try:
             updated = self._configuration.set_default_library(library_id)
         except Exception as exc:
@@ -1282,6 +1969,7 @@ class PreviewFacade:
     def update_library(self, library_id: str, payload: Mapping[str, Any]) -> JsonObject:
         """Apply a partial library/settings update without restarting jobs."""
 
+        self._ensure_migration_not_active()
         unknown = sorted(set(payload) - _LIBRARY_UPDATE_FIELDS)
         if unknown:
             raise FacadeError(
@@ -1563,6 +2251,564 @@ class PreviewFacade:
         state_path = ServiceConfig(workspace=library.workspace_directory).state_path
         return LibraryBrowser(library_id=normalized, state_path=state_path)
 
+    def _data_migration_request(self, value: object) -> DataMigrationRequest:
+        if not isinstance(value, Mapping):
+            raise FacadeError(
+                "invalid_data_migration",
+                "request 必须是数据迁移参数对象。",
+            )
+        try:
+            request = DataMigrationRequest.from_mapping(value)
+        except DataMigrationValidationError as exc:
+            raise FacadeError(
+                "invalid_data_migration",
+                str(exc),
+                status=400,
+            ) from exc
+        if request.migration_type == "legacy_config":
+            try:
+                target = Path(request.target).expanduser().resolve()
+                expected = self._configuration.path.expanduser().resolve()
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise FacadeError(
+                    "invalid_data_migration",
+                    "旧配置迁移目标路径无效。",
+                    status=400,
+                ) from exc
+            if target != expected:
+                raise FacadeError(
+                    "invalid_data_migration",
+                    "旧配置迁移必须写入当前软件使用的 config.json。",
+                    status=400,
+                    details={"expected_target": str(expected)},
+                )
+        return request
+
+    def _reserve_migration_gate(self) -> None:
+        with self._lock:
+            if self._migration_gate or self._active_migration_locked():
+                raise FacadeError(
+                    "data_migration_busy",
+                    "已有数据迁移正在预检查或执行。",
+                    status=409,
+                )
+            self._migration_gate = True
+
+    def _pending_migration_recovery(self) -> MigrationRecoveryRecord | None:
+        recovery = self._migration_recovery.load()
+        if recovery is not None and recovery.stage in {
+            "complete",
+            "restore_complete",
+            "recovery_complete",
+        }:
+            # These stages are durably written only after verification or a
+            # complete restore. A crash before normal cleanup must not offer a
+            # stale destructive restore action on the next launch.
+            self._migration_recovery.clear(recovery.operation_id)
+            return None
+        return recovery
+
+    def _ensure_no_pending_migration_recovery(self) -> None:
+        try:
+            recovery = self._pending_migration_recovery()
+        except MigrationRecoveryError as exc:
+            raise FacadeError(
+                "migration_recovery_invalid",
+                "数据迁移恢复记录损坏，必须先处理恢复记录。",
+                status=409,
+                details={"error": str(exc)},
+            ) from exc
+        if recovery is not None:
+            raise FacadeError(
+                "migration_recovery_required",
+                "检测到上次迁移未完整结束，请先从完整备份恢复。",
+                status=409,
+                details=recovery.public_view(),
+            )
+
+    def _acquire_data_migration_process_lock(self) -> ProcessLock:
+        """Serialize migration and recovery across every desktop instance."""
+
+        process_lock = ProcessLock(self._migration_process_lock_path)
+        try:
+            process_lock.acquire()
+        except ConfigurationError as exc:
+            raise FacadeError(
+                "data_migration_busy",
+                "另一个软件实例正在预检查、迁移或恢复数据。",
+                status=409,
+            ) from exc
+        except OSError as exc:
+            raise FacadeError(
+                "data_migration_lock_unavailable",
+                "无法创建数据迁移互斥锁，请检查应用配置目录权限。",
+                status=503,
+            ) from exc
+        return process_lock
+
+    def _active_migration_locked(self) -> bool:
+        terminal = {
+            "succeeded",
+            "failed",
+            "failed_recovered",
+            "needs_attention",
+            "cancelled",
+        }
+        return any(
+            operation.status not in terminal
+            for operation in self._migration_operations.values()
+        )
+
+    def _ensure_migration_not_active(self) -> None:
+        with self._lock:
+            if self._migration_gate or self._active_migration_locked():
+                raise FacadeError(
+                    "data_migration_busy",
+                    "数据迁移期间不能提交新的搜索或图库任务。",
+                    status=409,
+                )
+
+    def _stop_backend_for_migration(self) -> bool:
+        """Stop only the child backend; keep facade, executor, and logs alive."""
+
+        with self._lock:
+            state = self._backend_state
+            start_future = self._backend_future
+        if state == "starting" and start_future is not None:
+            try:
+                start_future.result(timeout=90)
+            except FutureTimeout as exc:
+                raise FacadeError(
+                    "migration_backend_stop_failed",
+                    "后端仍在启动，暂时无法安全迁移。",
+                    status=409,
+                ) from exc
+        if self.has_active_jobs(include_migrations=False):
+            raise FacadeError(
+                "migration_backend_busy",
+                "后端仍有活动任务，未停止也未修改任何文件。",
+                status=409,
+            )
+        with self._lock:
+            was_running = self._backend_state in {"starting", "ready"} or bool(
+                self._host.is_running
+            )
+        if was_running:
+            try:
+                self._host.stop(force=False)
+            except BackendBusyError as exc:
+                raise FacadeError(
+                    "migration_backend_busy",
+                    "后端仍有活动任务，未停止也未修改任何文件。",
+                    status=409,
+                ) from exc
+            except Exception as exc:
+                raise _facade_error(exc, code="migration_backend_stop_failed") from exc
+        with self._lock:
+            self._backend_state = "stopped"
+            self._backend_error = None
+            self._backend_runtime = None
+            self._backend_future = None
+            self._search_service = None
+            self._task_service = None
+        return was_running
+
+    def _restart_backend_after_migration(self, *, required: bool) -> JsonObject:
+        if not required:
+            return {"status": "not_required", "restart_required": False}
+        try:
+            future = self.start_backend_async()
+            if future is not None:
+                future.result(timeout=120)
+        except Exception as exc:
+            return {
+                "status": "degraded",
+                "restart_required": True,
+                "error": _error_payload(exc, "backend_restart_failed"),
+            }
+        with self._lock:
+            state = self._backend_state
+            error = _copy_object(self._backend_error)
+        return {
+            "status": state,
+            "restart_required": state != "ready",
+            **({"error": error} if error else {}),
+        }
+
+    def _run_data_migration_worker(self, operation_id: str) -> None:
+        with self._lock:
+            operation = self._migration_operations.get(operation_id)
+            if operation is None:
+                return
+            operation.status = "running"
+            operation.stage = "backend_stop"
+            operation.progress = 1
+            operation.message = "正在安全停止常驻后端。"
+        self._record_migration_snapshot(operation)
+        backend_was_running = False
+        restart_required = False
+        clear_recovery_marker = False
+        try:
+            backend_was_running = self._stop_backend_for_migration()
+            restart_required = backend_was_running or self._configuration.path.is_file()
+
+            def progress(payload: dict[str, object]) -> None:
+                marker_stage = ""
+                marker_backup: Mapping[str, object] | None = None
+                with self._lock:
+                    current = self._migration_operations.get(operation_id)
+                    if current is None:
+                        return
+                    current.stage = str(payload.get("stage") or current.stage)
+                    raw_progress = payload.get("progress")
+                    if isinstance(raw_progress, int) and not isinstance(
+                        raw_progress, bool
+                    ):
+                        current.progress = max(0, min(100, raw_progress))
+                    current.message = str(payload.get("message") or current.message)
+                    backup = payload.get("backup")
+                    if isinstance(backup, Mapping):
+                        current_result = dict(current.result or {})
+                        current_result["backup"] = _json_safe(backup)
+                        current.result = current_result
+                        marker_backup = backup
+                    snapshot = current
+                    require_persisted = current.stage == "backup_complete"
+                    marker_stage = current.stage
+                if marker_stage == "backup_complete":
+                    if marker_backup is None:
+                        raise RuntimeError(
+                            "Migration backup completed without a recovery receipt."
+                        )
+                    self._migration_recovery.arm(
+                        operation_id,
+                        operation.request,
+                        marker_backup,
+                        stage=marker_stage,
+                    )
+                elif marker_stage in {
+                    "migrate",
+                    "verify",
+                    "complete",
+                    "restore",
+                    "restore_complete",
+                }:
+                    self._migration_recovery.update_stage(
+                        operation_id,
+                        marker_stage,
+                    )
+                self._record_migration_snapshot(
+                    snapshot,
+                    announce=False,
+                    require_persisted=require_persisted,
+                )
+
+            result = self._data_migrations.execute(
+                operation.request,
+                confirmation_token=operation.confirmation_token,
+                confirmation_phrase=operation.confirmation_phrase,
+                cancel_event=operation.cancel_event,
+                on_progress=progress,
+            )
+            with self._lock:
+                current = self._migration_operations.get(operation_id)
+                if current is not None:
+                    current.status = "succeeded"
+                    current.stage = "complete"
+                    current.progress = 100
+                    current.message = "迁移与本地搜索验证已完成。"
+                    current.result = _json_safe(result)
+                    current.finished_at = time.time()
+            clear_recovery_marker = True
+        except DataMigrationCancelled as exc:
+            with self._lock:
+                current = self._migration_operations.get(operation_id)
+                if current is not None:
+                    current.status = "cancelled"
+                    current.stage = "cancelled"
+                    current.message = str(exc)
+                    current.finished_at = time.time()
+            clear_recovery_marker = True
+        except DataMigrationExecutionError as exc:
+            report = _json_safe(exc.report)
+            status = str(report.get("status") or "failed")
+            with self._lock:
+                current = self._migration_operations.get(operation_id)
+                if current is not None:
+                    current.status = status
+                    current.stage = "restore"
+                    current.message = "迁移失败，已记录恢复结果。"
+                    current.result = report
+                    current.error = {
+                        "code": "data_migration_failed",
+                        "message": str(exc),
+                    }
+                    current.finished_at = time.time()
+            clear_recovery_marker = status in {"failed", "failed_recovered"}
+        except Exception as exc:
+            with self._lock:
+                current = self._migration_operations.get(operation_id)
+                if current is not None:
+                    current.status = "failed"
+                    current.stage = "failed"
+                    current.message = "迁移未执行完成。"
+                    current.error = _error_payload(exc, "data_migration_failed")
+                    current.finished_at = time.time()
+        finally:
+            if clear_recovery_marker:
+                try:
+                    self._migration_recovery.clear(operation_id)
+                except MigrationRecoveryError as exc:
+                    with self._lock:
+                        current = self._migration_operations.get(operation_id)
+                        if current is not None:
+                            current.status = "needs_attention"
+                            current.stage = "recovery_marker_cleanup"
+                            current.message = (
+                                "迁移已结束，但恢复标记无法清理，请勿重复恢复。"
+                            )
+                            current.error = {
+                                "code": "migration_recovery_marker_cleanup_failed",
+                                "message": str(exc),
+                            }
+            self._finish_data_migration_worker(
+                operation_id,
+                restart_required=restart_required,
+            )
+
+    def _run_data_migration_recovery_worker(self, operation_id: str) -> None:
+        with self._lock:
+            operation = self._migration_operations.get(operation_id)
+            if operation is None:
+                return
+            operation.status = "running"
+            operation.stage = "backend_stop"
+            operation.progress = 1
+            operation.message = "正在安全停止常驻后端并准备恢复。"
+        self._record_migration_snapshot(operation)
+        restart_required = False
+        try:
+            backend_was_running = self._stop_backend_for_migration()
+            restart_required = backend_was_running or self._configuration.path.is_file()
+
+            def progress(payload: dict[str, object]) -> None:
+                with self._lock:
+                    current = self._migration_operations.get(operation_id)
+                    if current is None:
+                        return
+                    current.stage = str(payload.get("stage") or current.stage)
+                    raw_progress = payload.get("progress")
+                    if isinstance(raw_progress, int) and not isinstance(
+                        raw_progress, bool
+                    ):
+                        current.progress = max(0, min(100, raw_progress))
+                    current.message = str(payload.get("message") or current.message)
+                    snapshot = current
+                    marker_id = current.recovery_marker_id
+                    marker_stage = current.stage
+                self._migration_recovery.update_stage(marker_id, marker_stage)
+                self._record_migration_snapshot(snapshot, announce=False)
+
+            if operation.recovery_backup is None or not operation.recovery_marker_id:
+                raise MigrationRecoveryError(
+                    "The recovery operation has no durable backup marker."
+                )
+            result = self._data_migrations.recover(
+                operation.request,
+                operation.recovery_backup,
+                on_progress=progress,
+            )
+            self._migration_recovery.clear(operation.recovery_marker_id)
+            with self._lock:
+                current = self._migration_operations.get(operation_id)
+                if current is not None:
+                    current.status = "succeeded"
+                    current.stage = "recovery_complete"
+                    current.progress = 100
+                    current.message = "迁移前完整备份已恢复。"
+                    current.result = _json_safe(result)
+                    current.finished_at = time.time()
+        except DataMigrationExecutionError as exc:
+            report = _json_safe(exc.report)
+            with self._lock:
+                current = self._migration_operations.get(operation_id)
+                if current is not None:
+                    current.status = "needs_attention"
+                    current.stage = "restore"
+                    current.message = "完整备份恢复失败，恢复标记已保留。"
+                    current.result = report
+                    current.error = {
+                        "code": "data_migration_recovery_failed",
+                        "message": str(exc),
+                    }
+                    current.finished_at = time.time()
+        except Exception as exc:
+            with self._lock:
+                current = self._migration_operations.get(operation_id)
+                if current is not None:
+                    current.status = "needs_attention"
+                    current.stage = "restore"
+                    current.message = "完整备份恢复未完成，恢复标记已保留。"
+                    current.error = _error_payload(
+                        exc, "data_migration_recovery_failed"
+                    )
+                    current.finished_at = time.time()
+        finally:
+            self._finish_data_migration_worker(
+                operation_id,
+                restart_required=restart_required,
+            )
+
+    def _finish_data_migration_worker(
+        self,
+        operation_id: str,
+        *,
+        restart_required: bool,
+    ) -> None:
+        """Restart the backend, persist the terminal state, and release locks."""
+
+        restart = self._restart_backend_after_migration(required=restart_required)
+        final_snapshot: _MigrationOperation | None
+        process_lock: ProcessLock | None = None
+        with self._lock:
+            current = self._migration_operations.get(operation_id)
+            if current is not None:
+                result = dict(current.result or {})
+                result["restart"] = restart
+                result["restart_required"] = bool(restart.get("restart_required"))
+                current.result = result
+                restart_ok = restart.get("status") in {
+                    "ready",
+                    "not_required",
+                } and not bool(restart.get("restart_required"))
+                if not restart_ok:
+                    # Migrated or restored data is not usable until the local
+                    # backend can open it again. Never report a false success.
+                    current.status = "needs_attention"
+                    current.stage = "backend_restart"
+                    current.message = (
+                        "数据操作已结束，但常驻后端未能恢复，请查看错误后重试。"
+                    )
+                    restart_error = restart.get("error")
+                    if current.error is None:
+                        current.error = (
+                            _copy_object(restart_error)
+                            if isinstance(restart_error, Mapping)
+                            else {
+                                "code": "backend_restart_failed",
+                                "message": "数据操作后常驻后端未能恢复。",
+                            }
+                        )
+                    else:
+                        current.error = {
+                            **current.error,
+                            "restart": _json_safe(restart_error),
+                        }
+                process_lock = current.process_lock
+                current.process_lock = None
+                final_snapshot = current
+            else:
+                final_snapshot = None
+        try:
+            if final_snapshot is not None:
+                self._record_migration_snapshot(final_snapshot)
+        finally:
+            try:
+                if process_lock is not None:
+                    process_lock.release()
+            finally:
+                with self._lock:
+                    self._migration_gate = False
+
+    def _data_migration_view(self, operation: _MigrationOperation) -> JsonObject:
+        result = _copy_object(operation.result)
+        verification = (
+            result.get("verification") if isinstance(result, Mapping) else None
+        )
+        backup = result.get("backup") if isinstance(result, Mapping) else None
+        return {
+            "id": operation.operation_id,
+            "migration_id": operation.operation_id,
+            "status": operation.status,
+            "stage": operation.stage,
+            "progress": operation.progress,
+            "message": operation.message,
+            "request": {
+                "migration_type": operation.request.migration_type,
+                "library_id": operation.request.library_id,
+            },
+            "submitted_at": operation.submitted_at,
+            "finished_at": operation.finished_at,
+            "result": result,
+            "verification": _json_safe(verification),
+            "backup": _json_safe(backup),
+            "error": _copy_object(operation.error),
+            "error_message": str((operation.error or {}).get("message") or ""),
+        }
+
+    def _record_migration_snapshot(
+        self,
+        operation: _MigrationOperation,
+        *,
+        announce: bool = True,
+        require_persisted: bool = False,
+    ) -> None:
+        job: JsonObject = {
+            "id": operation.operation_id,
+            "command": "data_migration",
+            "task_type": "data_migration",
+            "params": {
+                "library_id": operation.request.library_id,
+                "migration_type": operation.request.migration_type,
+            },
+            "status": operation.status,
+            "submitted_at": operation.submitted_at,
+            "finished_at": operation.finished_at,
+            "progress": {
+                "percent": operation.progress,
+                "message": operation.message,
+                "stage": operation.stage,
+            },
+            "result": _copy_object(operation.result),
+            "error": _copy_object(operation.error),
+        }
+        # Data migrations are owned by the facade rather than the backend
+        # process. Persist every stage authoritatively so the recovery receipt
+        # written at ``backup_complete`` survives a crash before mutation.
+        persisted = False
+        try:
+            persisted = self._activity.record_job(job)
+        except Exception:
+            persisted = False
+        if require_persisted and (
+            not persisted or not self._activity.flush(timeout=5.0)
+        ):
+            raise RuntimeError(
+                "Migration backup receipt could not be durably persisted."
+            )
+        self._record_job_snapshot(job, announce=announce)
+
+    def _trim_migration_operations_locked(self) -> None:
+        if len(self._migration_operations) <= _MAX_OPERATIONS:
+            return
+        terminal = {
+            "succeeded",
+            "failed",
+            "failed_recovered",
+            "needs_attention",
+            "cancelled",
+        }
+        removable = sorted(
+            (
+                operation
+                for operation in self._migration_operations.values()
+                if operation.status in terminal
+            ),
+            key=lambda operation: operation.finished_at or operation.submitted_at,
+        )
+        for operation in removable[: len(self._migration_operations) - _MAX_OPERATIONS]:
+            self._migration_operations.pop(operation.operation_id, None)
+
     def _configuration_restart_state(self) -> tuple[bool, JsonObject]:
         """Describe whether a saved configuration needs a process restart."""
 
@@ -1592,8 +2838,10 @@ class PreviewFacade:
             "reason": restart_reason,
         }
 
-    def has_active_jobs(self) -> bool:
+    def has_active_jobs(self, *, include_migrations: bool = True) -> bool:
         with self._lock:
+            if include_migrations and self._active_migration_locked():
+                return True
             if self._backend_state != "ready":
                 return False
             if any(
@@ -1664,6 +2912,8 @@ class PreviewFacade:
                 self._activity.flush(timeout=1.0)
                 if self._owns_activity:
                     self._activity.close(timeout=2.0)
+                if self._owns_search_learning:
+                    self._search_learning.close()
                 self._registry.close()
                 self._invalidate_catalog()
                 if self._owns_executor:
@@ -1809,6 +3059,7 @@ class PreviewFacade:
                 current.finished_at = time.time()
         if current is not None:
             self._record_search_operation(current)
+            self._record_search_learning_session(current)
 
     def _wait_task_worker(self, operation_id: str) -> None:
         with self._lock:
@@ -1949,9 +3200,45 @@ class PreviewFacade:
         elapsed_ms: int | None,
     ) -> JsonObject:
         items: list[JsonObject] = []
+        query_library_ids = query.get("library_ids")
+        fallback_library_id = (
+            str(query_library_ids[0])
+            if isinstance(query_library_ids, Sequence)
+            and not isinstance(query_library_ids, (str, bytes, bytearray))
+            and len(query_library_ids) == 1
+            else ""
+        )
         for result in page.items:
             try:
-                items.append(self._search_result_view(result))
+                item = self._search_result_view(result)
+                item["search_session_id"] = operation_id
+                library_id = str(item.get("library_id") or fallback_library_id)
+                doc_id = str(item.get("doc_id") or "") or _anonymous_doc_id(
+                    library_id or "unknown", result.relative_path
+                )
+                item["library_id"] = library_id
+                item["doc_id"] = doc_id
+                items.append(item)
+                if operation_id != "latest" and library_id:
+                    with suppress(Exception):
+                        self._search_learning.store.ensure_candidate(
+                            session_id=operation_id,
+                            library_id=library_id,
+                            doc_id=doc_id,
+                            original_rank=result.rank,
+                            ranking_score=float(
+                                result.ranking_score
+                                if result.ranking_score is not None
+                                else result.ranking_confidence
+                                if result.ranking_confidence is not None
+                                else result.confidence
+                            ),
+                            sha256=result.sha256 or None,
+                            feature_schema_version=(
+                                result.feature_schema_version or FEATURE_SCHEMA_VERSION
+                            ),
+                            features=result.search_features or {},
+                        )
             except ImageRegistryError:
                 # A moved/deleted result should not make the entire gallery fail.
                 continue
@@ -1983,6 +3270,8 @@ class PreviewFacade:
             "relative_path": result.relative_path,
             "library_id": result.library_id,
             "library_name": result.library_name,
+            "doc_id": result.doc_id,
+            "sha256": result.sha256,
             "rank": result.rank,
             "match_state": result.match_state,
             "rank_source": result.rank_source,
@@ -1997,6 +3286,15 @@ class PreviewFacade:
             "text_rank": result.text_rank,
             "metadata_rank": result.metadata_rank,
             "rank_agreement": result.rank_agreement,
+            "ranking_model_version": result.ranking_model_version,
+            "ranking_score": result.ranking_score,
+            "feature_schema_version": result.feature_schema_version,
+            "ranking_fallback": result.ranking_fallback,
+            "ranking_fallback_reason": result.ranking_fallback_reason,
+            "calibrated_minimum_confidence": (result.calibrated_minimum_confidence),
+            "calibration_version": result.calibration_version,
+            "calibration_scope": result.calibration_scope,
+            "calibration_fallback": result.calibration_fallback,
             "tags": list(result.tags),
             "matched_tags": list(result.matched_tags),
             "width": metadata.width,
@@ -2100,7 +3398,11 @@ class PreviewFacade:
             "finished_at": job.get("finished_at"),
             "error": _json_safe(job.get("error")),
         }
-        public_result = _public_job_result(result_map)
+        public_result = _public_job_result(
+            result_map,
+            command=command,
+            registry=self._registry,
+        )
         if public_result:
             view["result"] = public_result
             if "undo_available" in public_result:
@@ -2597,6 +3899,134 @@ def _library_request(
             library_id,
             _required_string(payload, "canonical_name", maximum=256),
         )
+    elif task_type == "cluster_images":
+        request = ClusterImagesRequest(
+            library_id=library_id,
+            scope=_choice(
+                payload.get("scope"),
+                "scope",
+                supported=("new_or_changed", "all"),
+                default="new_or_changed",
+            ),
+            cluster_types=cast(
+                Any,
+                _string_tuple(
+                    payload.get("cluster_types", ("exact", "perceptual", "semantic")),
+                    "cluster_types",
+                ),
+            ),
+        )
+    elif task_type == "cluster_list":
+        cluster_type = _choice(
+            payload.get("cluster_type"),
+            "cluster_type",
+            supported=(
+                "all",
+                "exact",
+                "perceptual",
+                "semantic",
+                "single",
+                "near_duplicate",
+            ),
+            default="all",
+        )
+        request = ClusterListRequest(
+            library_id=library_id,
+            offset=_bounded_int(payload.get("offset", 0), "offset", 0, 2**63 - 1),
+            limit=_bounded_int(payload.get("limit", 100), "limit", 1, 500),
+            cluster_type=cast(Any, cluster_type),
+        )
+    elif task_type == "cluster_detail":
+        request = ClusterDetailRequest(
+            library_id=library_id,
+            cluster_id=_required_string(payload, "cluster_id", maximum=256),
+            offset=_bounded_int(payload.get("offset", 0), "offset", 0, 2**63 - 1),
+            limit=_bounded_int(payload.get("limit", 20), "limit", 1, 2_000),
+        )
+    elif task_type == "cluster_merge":
+        request = ClusterMergeRequest(
+            library_id=library_id,
+            cluster_ids=_string_tuple(payload.get("cluster_ids"), "cluster_ids"),
+        )
+    elif task_type == "cluster_split":
+        request = ClusterSplitRequest(
+            library_id=library_id,
+            cluster_id=_required_string(payload, "cluster_id", maximum=256),
+            doc_ids=_string_tuple(payload.get("doc_ids"), "doc_ids"),
+        )
+    elif task_type == "cluster_apply_identity":
+        request = ClusterApplyIdentityRequest(
+            library_id=library_id,
+            cluster_id=_required_string(payload, "cluster_id", maximum=256),
+            identity_category=cast(
+                Any,
+                _choice(
+                    payload.get("identity_category"),
+                    "identity_category",
+                    supported=("real_person", "cosplayer", "character", "work"),
+                    default="",
+                ),
+            ),
+            identity_value=_required_string(
+                payload,
+                "identity_value",
+                maximum=256,
+            ),
+        )
+    elif task_type == "cluster_undo":
+        request = ClusterUndoRequest(library_id=library_id)
+    elif task_type == "active_learning_queue":
+        request = ActiveLearningQueueRequest(
+            library_id=library_id,
+            review_budget=_bounded_int(
+                payload.get("review_budget", 25), "review_budget", 20, 30
+            ),
+        )
+    elif task_type == "active_learning_review":
+        raw_decisions = payload.get("decisions")
+        if not isinstance(raw_decisions, Sequence) or isinstance(
+            raw_decisions, (str, bytes)
+        ):
+            raise FacadeError("invalid_request", "decisions must be an array.")
+        if not raw_decisions:
+            raise FacadeError(
+                "invalid_request", "At least one learning decision is required."
+            )
+        if len(raw_decisions) > 1_000:
+            raise FacadeError(
+                "invalid_request", "decisions can contain at most 1000 items."
+            )
+        learning_decisions: list[ActiveLearningDecision] = []
+        for index, raw_decision in enumerate(raw_decisions):
+            if not isinstance(raw_decision, Mapping):
+                raise FacadeError(
+                    "invalid_request", f"decisions[{index}] must be an object."
+                )
+            learning_decisions.append(
+                ActiveLearningDecision(
+                    doc_id=_required_string(raw_decision, "doc_id", maximum=1_024),
+                    decision=cast(
+                        Any,
+                        _choice(
+                            raw_decision.get("decision"),
+                            f"decisions[{index}].decision",
+                            supported=("accept", "reject", "edit", "skip"),
+                            default="accept",
+                        ),
+                    ),
+                    labels=_string_tuple(
+                        raw_decision.get("labels"),
+                        f"decisions[{index}].labels",
+                    ),
+                )
+            )
+        request = ActiveLearningReviewRequest(
+            library_id=library_id,
+            queue_id=_required_string(payload, "queue_id", maximum=256),
+            decisions=tuple(learning_decisions),
+        )
+    elif task_type == "active_learning_review_undo":
+        request = ActiveLearningReviewUndoRequest(library_id=library_id)
     elif task_type == "organize_refresh":
         filters = AutoTagReviewFilters(
             latest_index_only=_boolean(
@@ -2766,7 +4196,13 @@ def _error_images(
             continue
         view: JsonObject = {
             "name": str(item.get("name") or item.get("file_name") or ""),
-            "reason": str(item.get("reason") or item.get("error") or ""),
+            "reason": str(
+                item.get("reason")
+                or item.get("error")
+                or item.get("message")
+                or item.get("code")
+                or ""
+            ),
         }
         relative_path = _safe_relative_path(item.get("relative_path"))
         if relative_path:
@@ -2804,6 +4240,11 @@ _PUBLIC_JOB_COUNT_KEYS = frozenset(
         "unchanged_count",
         "failed",
         "failed_count",
+        "applied",
+        "applied_count",
+        "restored",
+        "conflicts",
+        "conflict_count",
         "matched",
         "matched_count",
         "deleted",
@@ -2821,12 +4262,28 @@ _PUBLIC_JOB_COUNT_KEYS = frozenset(
         "api_request_count",
         "estimated_input_tokens",
         "estimated_output_tokens",
+        "input_count",
+        "clustered_count",
+        "new_or_changed_count",
+        "removed_count",
+        "reused_edge_count",
+        "semantic_query_count",
+        "cluster_count",
+        "failure_count",
+        "selected_count",
+        "embedding_api_requests",
+        "qwen_api_requests",
     }
 )
-_PUBLIC_JOB_TEXT_KEYS = frozenset({"batch_id", "operation", "status"})
+_PUBLIC_JOB_TEXT_KEYS = frozenset({"batch_id", "operation_id", "operation", "status"})
 
 
-def _public_job_result(result: Mapping[str, Any]) -> JsonObject:
+def _public_job_result(
+    result: Mapping[str, Any],
+    *,
+    command: str = "",
+    registry: ImageRegistry | None = None,
+) -> JsonObject:
     """Expose UI summaries while keeping local paths and snapshots private."""
 
     output: JsonObject = {}
@@ -2838,7 +4295,14 @@ def _public_job_result(result: Mapping[str, Any]) -> JsonObject:
         raw = result.get(key)
         if isinstance(raw, str) and raw and len(raw) <= 256:
             output[key] = raw
-    for key in ("undo_available", "dry_run", "needs_attention", "over_budget"):
+    for key in (
+        "undo_available",
+        "dry_run",
+        "needs_attention",
+        "over_budget",
+        "embedding_recomputed",
+        "undone",
+    ):
         raw = result.get(key)
         if isinstance(raw, bool):
             output[key] = raw
@@ -2849,7 +4313,287 @@ def _public_job_result(result: Mapping[str, Any]) -> JsonObject:
         and math.isfinite(float(estimated_cost))
     ):
         output["estimated_cost_cny"] = max(0.0, float(estimated_cost))
+    if registry is not None:
+        if command == "cluster_list":
+            output.update(_cluster_list_result_view(result, registry))
+        elif command == "cluster_detail":
+            output.update(_cluster_detail_result_view(result, registry))
+        elif command in {
+            "active_learning_queue",
+            "active_learning_review",
+            "active_learning_review_undo",
+        }:
+            output.update(_active_learning_result_view(result, registry))
     return output
+
+
+def _cluster_list_result_view(
+    result: Mapping[str, Any], registry: ImageRegistry
+) -> JsonObject:
+    items = result.get("items")
+    return {
+        "total": _bounded_public_int(result.get("total")),
+        "offset": _bounded_public_int(result.get("offset")),
+        "limit": _bounded_public_int(result.get("limit")),
+        "items": [
+            view
+            for raw in (items if isinstance(items, list) else [])[:500]
+            if isinstance(raw, Mapping)
+            and (view := _cluster_record_view(raw, registry)) is not None
+        ],
+    }
+
+
+def _cluster_detail_result_view(
+    result: Mapping[str, Any], registry: ImageRegistry
+) -> JsonObject:
+    raw_cluster = result.get("cluster")
+    cluster = (
+        _cluster_record_view(raw_cluster, registry)
+        if isinstance(raw_cluster, Mapping)
+        else None
+    )
+    raw_items = result.get("items")
+    items = [
+        _intelligence_image_view(raw, registry)
+        for raw in (raw_items if isinstance(raw_items, list) else [])[:10_000]
+        if isinstance(raw, Mapping)
+    ]
+    payload: JsonObject = {
+        "items": items,
+        "members": items,
+        "offset": _bounded_public_int(result.get("offset")),
+        "limit": _bounded_public_int(result.get("limit"), fallback=len(items)),
+        "total": _bounded_public_int(result.get("member_count"), fallback=len(items)),
+        "member_count": _bounded_public_int(
+            result.get("member_count"), fallback=len(items)
+        ),
+        "edge_count": _bounded_public_int(result.get("edge_count")),
+        "edge_offset": _bounded_public_int(result.get("edge_offset")),
+        "edge_limit": _bounded_public_int(result.get("edge_limit")),
+    }
+    has_more = result.get("has_more")
+    if isinstance(has_more, bool):
+        payload["has_more"] = has_more
+    edge_has_more = result.get("edge_has_more")
+    if isinstance(edge_has_more, bool):
+        payload["edge_has_more"] = edge_has_more
+    if cluster is not None:
+        if not isinstance(cluster.get("representative"), Mapping) and items:
+            cluster["representative"] = items[0]
+        payload["cluster"] = cluster
+    return payload
+
+
+def _active_learning_result_view(
+    result: Mapping[str, Any], registry: ImageRegistry
+) -> JsonObject:
+    payload: JsonObject = {}
+    for key in ("queue_id", "selection_version"):
+        value = result.get(key)
+        if isinstance(value, str) and value.strip() and len(value) <= 256:
+            payload[key] = value.strip()
+    for key in ("schema_version", "candidate_count", "selected_count"):
+        if isinstance(result.get(key), int) and not isinstance(result.get(key), bool):
+            payload[key] = _bounded_public_int(result.get(key))
+    raw_items = result.get("items")
+    payload["items"] = [
+        _intelligence_image_view(raw, registry)
+        for raw in (raw_items if isinstance(raw_items, list) else [])[:30]
+        if isinstance(raw, Mapping)
+    ]
+    raw_decisions = result.get("decisions")
+    decisions: list[JsonObject] = []
+    for raw in (raw_decisions if isinstance(raw_decisions, list) else [])[:1_000]:
+        if not isinstance(raw, Mapping):
+            continue
+        doc_id = str(raw.get("doc_id") or "").strip()
+        action = str(raw.get("decision") or "").strip().lower()
+        if (
+            not doc_id
+            or len(doc_id) > 1_024
+            or action
+            not in {
+                "accept",
+                "reject",
+                "edit",
+                "skip",
+            }
+        ):
+            continue
+        decisions.append(
+            {
+                "doc_id": doc_id,
+                "decision": action,
+                "labels": _public_string_list(raw.get("labels"), maximum=100),
+            }
+        )
+    payload["decisions"] = decisions
+    raw_failures = result.get("failures")
+    payload["failures"] = [
+        {
+            "doc_id": str(raw.get("doc_id") or "")[:1_024],
+            "error": str(
+                raw.get("error") or raw.get("message") or raw.get("code") or ""
+            )[:2_000],
+        }
+        for raw in (raw_failures if isinstance(raw_failures, list) else [])[:100]
+        if isinstance(raw, Mapping)
+    ]
+    return payload
+
+
+def _cluster_record_view(
+    raw: Mapping[str, Any], registry: ImageRegistry
+) -> JsonObject | None:
+    cluster_id = str(raw.get("cluster_id") or raw.get("id") or "").strip()
+    if not cluster_id or len(cluster_id) > 256:
+        return None
+    edge_kinds = [
+        value
+        for value in _public_string_list(raw.get("edge_kinds"), maximum=4)
+        if value in {"exact", "perceptual", "semantic", "legacy"}
+    ]
+    cluster_type = str(raw.get("cluster_type") or raw.get("type") or "").strip()
+    payload: JsonObject = {
+        "cluster_id": cluster_id,
+        "member_count": _bounded_public_int(
+            raw.get("member_count"),
+            fallback=len(raw.get("member_doc_ids", []))
+            if isinstance(raw.get("member_doc_ids"), list)
+            else 0,
+        ),
+        "edge_kinds": edge_kinds,
+        "identity_anchors": _identity_anchor_views(raw.get("identity_anchors")),
+    }
+    if cluster_type in {"single", "exact", "perceptual", "semantic"}:
+        payload["cluster_type"] = cluster_type
+    representative = raw.get("representative")
+    if isinstance(representative, Mapping):
+        payload["representative"] = _intelligence_image_view(representative, registry)
+    return payload
+
+
+def _intelligence_image_view(
+    raw: Mapping[str, Any], registry: ImageRegistry
+) -> JsonObject:
+    doc_id = str(raw.get("doc_id") or raw.get("id") or "").strip()
+    relative_path = _safe_relative_path(raw.get("relative_path"))
+    file_name = str(
+        raw.get("file_name")
+        or raw.get("filename")
+        or raw.get("name")
+        or (PurePosixPath(relative_path).name if relative_path else doc_id)
+    ).strip()
+    view: JsonObject = {
+        "doc_id": doc_id[:1_024],
+        "file_name": file_name[:1_024],
+        "relative_path": relative_path,
+        "image_available": False,
+    }
+    for key in ("rank",):
+        value = raw.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            view[key] = max(0, value)
+    for key in (
+        "uncertainty_score",
+        "conflict_score",
+        "outlier_score",
+        "ranking_disagreement",
+    ):
+        value = raw.get(key)
+        if (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+        ):
+            view[key] = max(0.0, min(1.0, float(value)))
+    for key in ("group_id", "query_id", "cluster_id", "candidate_kind"):
+        value = raw.get(key)
+        if isinstance(value, str) and len(value.strip()) <= 1_024:
+            view[key] = value.strip()
+    for key, maximum in (
+        ("reasons", 8),
+        ("suggested_tags", 100),
+        ("tags", 100),
+    ):
+        view[key] = _public_string_list(raw.get(key), maximum=maximum)
+    path = _first_path(raw)
+    if path is not None:
+        try:
+            metadata = registry.register(path)
+        except ImageRegistryError:
+            pass
+        else:
+            view.update(
+                {
+                    "id": metadata.image_id,
+                    "image_id": metadata.image_id,
+                    "thumbnail_url": (
+                        f"api/image/{metadata.image_id}?variant=thumbnail"
+                    ),
+                    "image_url": f"api/image/{metadata.image_id}?variant=preview",
+                    "image_available": True,
+                    "width": metadata.width,
+                    "height": metadata.height,
+                    "size_bytes": metadata.size_bytes,
+                }
+            )
+    return view
+
+
+def _identity_anchor_views(value: Any) -> list[JsonObject]:
+    if not isinstance(value, list):
+        return []
+    output: list[JsonObject] = []
+    for raw in value[:100]:
+        if not isinstance(raw, Mapping):
+            continue
+        category = str(raw.get("category") or "").strip()
+        anchor = str(raw.get("value") or "").strip()
+        if not category or not anchor:
+            continue
+        confidence = raw.get("confidence")
+        confidence_value = (
+            max(0.0, min(1.0, float(confidence)))
+            if isinstance(confidence, (int, float))
+            and not isinstance(confidence, bool)
+            and math.isfinite(float(confidence))
+            else 0.0
+        )
+        output.append(
+            {
+                "category": category[:128],
+                "value": anchor[:4_096],
+                "source": str(raw.get("source") or "")[:128],
+                "confidence": confidence_value,
+                "support": _bounded_public_int(raw.get("support")),
+                "conflict": raw.get("conflict") is True,
+            }
+        )
+    return output
+
+
+def _public_string_list(value: Any, *, maximum: int) -> list[str]:
+    if not isinstance(value, (list, tuple)):
+        return []
+    output: list[str] = []
+    seen: set[str] = set()
+    for raw in value[:maximum]:
+        if not isinstance(raw, str):
+            continue
+        normalized = raw.strip()
+        if not normalized or len(normalized) > 4_096 or normalized in seen:
+            continue
+        seen.add(normalized)
+        output.append(normalized)
+    return output
+
+
+def _bounded_public_int(value: Any, *, fallback: int = 0) -> int:
+    if isinstance(value, int) and not isinstance(value, bool):
+        return max(0, min(_MAX_TECHNICAL_COUNT, value))
+    return max(0, min(_MAX_TECHNICAL_COUNT, fallback))
 
 
 def _progress_percent(progress: Mapping[str, Any], processed: int, total: int) -> float:
@@ -2874,6 +4618,28 @@ def _first_int(value: Mapping[str, Any], *keys: str) -> int:
 def _elapsed_ms(started: float, finished: float | None) -> int:
     end = time.time() if finished is None else finished
     return max(0, round((end - started) * 1000))
+
+
+def _anonymous_doc_id(library_id: str, relative_path: str) -> str:
+    """Create a stable opaque fallback without persisting a relative path."""
+
+    digest = hashlib.sha256(
+        f"{library_id}\0{relative_path}".encode("utf-8", errors="surrogatepass")
+    ).hexdigest()
+    return f"anon-{digest}"
+
+
+def _optional_diagnostic_identifier(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    if not normalized or len(normalized) > 128:
+        return None
+    if any(
+        not (character.isalnum() or character in "_.:-") for character in normalized
+    ):
+        return None
+    return normalized
 
 
 def _file_stat_version(path: Path) -> tuple[int, int]:

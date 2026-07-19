@@ -1,11 +1,18 @@
 <script setup lang="ts">
-defineProps<{
+withDefaults(defineProps<{
   visible: boolean;
   x: number;
   y: number;
   selectionCount: number;
   exporting: boolean;
-}>();
+  feedbackAvailable?: boolean;
+  feedbackPending?: boolean;
+  feedbackAction?: string;
+}>(), {
+  feedbackAvailable: false,
+  feedbackPending: false,
+  feedbackAction: "",
+});
 
 const emit = defineEmits<{
   open: [];
@@ -14,6 +21,9 @@ const emit = defineEmits<{
   copyFiles: [];
   copyPaths: [];
   export: [];
+  markRelevant: [];
+  markNotRelevant: [];
+  undoFeedback: [];
   clear: [];
   close: [];
 }>();
@@ -37,6 +47,39 @@ const emit = defineEmits<{
       <button type="button" role="menuitem" @click="emit('open'); emit('close')">系统打开</button>
       <button type="button" role="menuitem" @click="emit('reveal'); emit('close')">所在文件夹</button>
       <hr />
+      <template v-if="feedbackAvailable">
+        <button
+          class="feedback-positive"
+          type="button"
+          role="menuitemradio"
+          :aria-checked="feedbackAction === 'relevant'"
+          :disabled="selectionCount !== 1 || feedbackPending"
+          @click="emit('markRelevant'); emit('close')"
+        >
+          {{ feedbackAction === "relevant" ? "✓ 已标记为相关" : "标记为相关" }}
+        </button>
+        <button
+          class="feedback-negative"
+          type="button"
+          role="menuitemradio"
+          :aria-checked="feedbackAction === 'not_relevant'"
+          :disabled="selectionCount !== 1 || feedbackPending"
+          @click="emit('markNotRelevant'); emit('close')"
+        >
+          {{ feedbackAction === "not_relevant" ? "✓ 已标记为不相关" : "标记为不相关" }}
+        </button>
+        <button
+          v-if="feedbackAction"
+          class="is-muted"
+          type="button"
+          role="menuitem"
+          :disabled="feedbackPending"
+          @click="emit('undoFeedback'); emit('close')"
+        >
+          撤销反馈
+        </button>
+        <hr />
+      </template>
       <button
         type="button"
         role="menuitem"
@@ -126,6 +169,14 @@ const emit = defineEmits<{
 
 .gallery-context-menu button.is-muted {
   color: var(--muted, #596478);
+}
+
+.gallery-context-menu button.feedback-positive:not(:disabled) {
+  color: #21684d;
+}
+
+.gallery-context-menu button.feedback-negative:not(:disabled) {
+  color: #a12c3c;
 }
 
 .gallery-context-menu hr {
