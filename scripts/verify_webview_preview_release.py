@@ -38,6 +38,10 @@ _ALLOWED_NSIS_SUPPORT_FILES = frozenset(
         "$PLUGINSDIR/nsDialogs.dll",
         "$PLUGINSDIR/nsExec.dll",
         "$PLUGINSDIR/System.dll",
+        # WriteUninstaller creates this installer-owned file at install time.
+        # Newer 7-Zip NSIS readers expose it during archive extraction, while
+        # older releases omit it from the extracted inventory.
+        "Uninstall.exe",
     }
 )
 
