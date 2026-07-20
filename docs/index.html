@@ -1,0 +1,622 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="Zvec 是面向 Windows 的本地优先智能图片库，支持多模态搜索、跨图库检索、AI 标注、批量整理与大图库后台任务。">
+  <title>Zvec 智能图片库 — 搜索、标注与整理</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: { sans: ['Inter', 'system-ui', 'sans-serif'] },
+          colors: {
+            brand: {
+              50: '#ecfeff',
+              100: '#cffafe',
+              200: '#a5f3fc',
+              300: '#67e8f9',
+              400: '#22d3ee',
+              500: '#06b6d4',
+              600: '#0891b2',
+              700: '#0e7490',
+              800: '#155e75',
+              900: '#164e63',
+              950: '#083344'
+            },
+            surface: {
+              900: '#07141a',
+              800: '#0b1b23',
+              700: '#102832',
+              600: '#173743'
+            }
+          },
+          animation: {
+            'float': 'float 6s ease-in-out infinite',
+            'pulse-slow': 'pulse 4s cubic-bezier(0.4, 0, 0.6, 1) infinite',
+            'slide-up': 'slideUp 0.8s ease-out forwards',
+            'fade-in': 'fadeIn 1s ease-out forwards'
+          },
+          keyframes: {
+            float: {
+              '0%, 100%': { transform: 'translateY(0px)' },
+              '50%': { transform: 'translateY(-20px)' }
+            },
+            slideUp: {
+              '0%': { opacity: '0', transform: 'translateY(30px)' },
+              '100%': { opacity: '1', transform: 'translateY(0)' }
+            },
+            fadeIn: {
+              '0%': { opacity: '0' },
+              '100%': { opacity: '1' }
+            }
+          }
+        }
+      }
+    };
+  </script>
+  <style>
+    body { font-family: 'Inter', system-ui, sans-serif; }
+    .accent-cyan { color: #67e8f9; }
+    .accent-orange { color: #fb923c; }
+    .hero-glow {
+      background: rgba(6,182,212,0.07);
+      clip-path: ellipse(46% 30% at 50% 0%);
+    }
+    .card-glass {
+      background: rgba(255,255,255,0.03);
+      backdrop-filter: blur(20px);
+      border: 1px solid rgba(255,255,255,0.06);
+    }
+    .noise { position: relative; }
+    .noise::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noiseFilter'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noiseFilter)'/%3E%3C/svg%3E");
+      opacity: 0.02;
+      pointer-events: none;
+      z-index: 1;
+    }
+    .reveal {
+      opacity: 0;
+      transform: translateY(24px);
+      transition: all 0.8s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+    .reveal.visible {
+      opacity: 1;
+      transform: translateY(0);
+    }
+    .feature-card:hover {
+      transform: translateY(-4px);
+      border-color: rgba(34,211,238,0.28);
+      box-shadow: 0 20px 40px -15px rgba(6,182,212,0.16);
+    }
+    .tab-active {
+      background: rgba(6,182,212,0.14);
+      color: #67e8f9;
+      border-color: rgba(34,211,238,0.3);
+    }
+    .screenshot-shadow {
+      box-shadow: 0 0 0 1px rgba(255,255,255,0.1), 0 25px 50px -12px rgba(0,0,0,0.8);
+    }
+  </style>
+</head>
+<body class="bg-surface-900 text-white antialiased overflow-x-hidden">
+
+<nav class="fixed top-0 w-full z-50 border-b border-white/5 bg-surface-900/80 backdrop-blur-xl">
+  <div class="max-w-7xl mx-auto px-6 h-16 flex items-center justify-between">
+    <div class="flex items-center gap-3">
+      <div class="w-8 h-8 rounded-lg bg-brand-600 border border-cyan-300/20 flex items-center justify-center font-bold text-white">Z</div>
+      <span class="font-semibold text-lg tracking-tight">Zvec</span>
+    </div>
+    <div class="hidden md:flex items-center gap-8 text-sm text-gray-400">
+      <a href="#features" class="hover:text-white transition-colors">核心能力</a>
+      <a href="#showcase" class="hover:text-white transition-colors">产品工作流</a>
+      <a href="#tech" class="hover:text-white transition-colors">技术架构</a>
+      <a href="#privacy" class="hover:text-white transition-colors">数据边界</a>
+    </div>
+    <a href="#download" class="hidden md:inline-flex h-9 px-5 bg-brand-600 hover:bg-brand-500 text-white text-sm font-medium rounded-lg transition-all items-center gap-2">
+      Windows x64
+      <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>
+    </a>
+  </div>
+</nav>
+
+<section class="relative pt-32 pb-20 lg:pt-48 lg:pb-32 noise">
+  <div class="hero-glow absolute inset-0 pointer-events-none"></div>
+  <div class="max-w-7xl mx-auto px-6 relative z-10">
+    <div class="text-center max-w-4xl mx-auto">
+      <div class="inline-flex items-center gap-2 px-4 py-1.5 rounded-full bg-orange-500/10 border border-orange-400/20 text-orange-200 text-sm mb-8 animate-fade-in">
+        <span class="w-2 h-2 rounded-full bg-orange-400 animate-pulse-slow"></span>
+        v0.4.0 候选版 · Windows x64 · 无需 Docker
+      </div>
+
+      <h1 class="text-5xl md:text-7xl font-bold tracking-tight leading-[1.1] mb-6">
+        <span class="accent-cyan">看懂图片内容</span><br>
+        再把大图库管起来
+      </h1>
+
+      <p class="text-lg md:text-xl text-gray-400 max-w-3xl mx-auto mb-10 leading-relaxed">
+        面向人物摄影、Cosplay、写真、动漫角色和二次元收藏的智能图片库。
+        <span class="text-white font-medium">用文字、图片、标签或图文组合搜索，在后台完成索引、标注与批量整理。</span>
+      </p>
+
+      <div class="flex flex-col sm:flex-row items-center justify-center gap-4 mb-16">
+        <a href="#download" class="h-12 px-8 bg-brand-600 hover:bg-brand-500 text-white font-semibold rounded-xl transition-all flex items-center gap-2 shadow-lg shadow-brand-900/50">
+          <svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>
+          查看 Windows 版本
+        </a>
+        <a href="#showcase" class="h-12 px-8 bg-white/5 hover:bg-white/10 border border-white/10 text-white font-medium rounded-xl transition-all flex items-center gap-2">
+          了解完整工作流
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M9 5l7 7-7 7"/></svg>
+        </a>
+      </div>
+
+      <div class="relative max-w-6xl mx-auto animate-slide-up">
+        <div class="absolute -inset-1 bg-cyan-500/10 rounded-2xl blur-2xl"></div>
+        <div class="relative screenshot-shadow rounded-xl overflow-hidden border border-white/10">
+          <img src="https://images.unsplash.com/photo-1544005313-94ddf0286df2?w=1600&h=900&fit=crop" alt="人物摄影图库功能示意" class="w-full opacity-80" width="1600" height="900">
+          <div class="absolute inset-0 bg-surface-900/45"></div>
+          <div class="absolute top-5 left-5 right-5 flex items-center justify-between gap-4">
+            <div class="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-black/40 backdrop-blur-md border border-white/10">
+              <div class="w-2 h-2 rounded-full bg-cyan-300"></div>
+              <span class="text-xs text-white/80">原生后端已就绪 · 后台任务可持续运行</span>
+            </div>
+            <div class="hidden sm:flex items-center gap-2 px-3 py-1.5 rounded-lg bg-black/40 backdrop-blur-md border border-white/10 text-xs text-white/70">
+              文字 · 图片 · 图文 · 标签
+            </div>
+          </div>
+          <div class="absolute bottom-6 left-6 right-6 text-left">
+            <div class="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-brand-600/80 backdrop-blur-md border border-brand-300/20 text-sm font-medium">
+              搜索“夜景中的红色和服角色”
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+            </div>
+            <p class="text-xs text-white/60 mt-3">功能示意 · 实际界面以当前 Windows 客户端为准</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="border-y border-white/5 bg-white/[0.02]">
+  <div class="max-w-7xl mx-auto px-6 py-10">
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-8">
+      <div class="text-center border-t-2 border-cyan-400/50 pt-5">
+        <div class="text-3xl md:text-4xl font-bold text-white mb-1">4 种</div>
+        <div class="text-sm text-gray-500">图片检索方式</div>
+      </div>
+      <div class="text-center border-t-2 border-orange-400/50 pt-5">
+        <div class="text-3xl md:text-4xl font-bold text-white mb-1">15 张</div>
+        <div class="text-sm text-gray-500">每页按需加载</div>
+      </div>
+      <div class="text-center border-t-2 border-cyan-400/50 pt-5">
+        <div class="text-3xl md:text-4xl font-bold text-white mb-1">256 条</div>
+        <div class="text-sm text-gray-500">索引批量提交</div>
+      </div>
+      <div class="text-center border-t-2 border-cyan-400/50 pt-5">
+        <div class="text-3xl md:text-4xl font-bold text-white mb-1">0 次</div>
+        <div class="text-sm text-gray-500">本地学习额外模型调用</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="features" class="py-24 noise">
+  <div class="max-w-7xl mx-auto px-6">
+    <div class="text-center max-w-3xl mx-auto mb-16 reveal">
+      <h2 class="text-3xl md:text-5xl font-bold tracking-tight mb-4">
+        从“找到图片”到<span class="accent-orange">真正管好图库</span>
+      </h2>
+      <p class="text-gray-400 text-lg">不是另一个文件浏览器，而是一套覆盖检索、标注、审核、整理和迁移的完整桌面工作流</p>
+    </div>
+
+    <div class="grid md:grid-cols-2 lg:grid-cols-3 gap-6">
+      <div class="feature-card card-glass rounded-2xl p-6 transition-all duration-300 reveal">
+        <div class="w-12 h-12 rounded-xl bg-brand-500/10 border border-brand-500/20 flex items-center justify-center mb-5">
+          <svg class="w-6 h-6 text-brand-400" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+        </div>
+        <h3 class="text-lg font-semibold mb-2">多模态与跨图库搜索</h3>
+        <p class="text-gray-400 text-sm leading-relaxed">支持文字、图片、图文联合和模糊标签检索。多个 Collection 可以统一召回、去重和排序；置信度低于阈值的结果不会为了凑数而返回。</p>
+      </div>
+
+      <div class="feature-card card-glass rounded-2xl p-6 transition-all duration-300 reveal">
+        <div class="w-12 h-12 rounded-xl bg-orange-500/10 border border-orange-500/20 flex items-center justify-center mb-5">
+          <svg class="w-6 h-6 text-orange-400" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M7 7h.01M7 3h5c.512 0 1.024.195 1.414.586l7 7a2 2 0 010 2.828l-7 7a2 2 0 01-2.828 0l-7-7A1.994 1.994 0 013 12V7a4 4 0 014-4z"/></svg>
+        </div>
+        <h3 class="text-lg font-semibold mb-2">可估算、可缓存的智能标注</h3>
+        <p class="text-gray-400 text-sm leading-relaxed">使用 qwen3-vl-flash 生成真人、Cosplayer、角色、作品、服装和场景等结构化标签。运行前可估算候选数、缓存命中、Token 与费用；已有当前标注会自动跳过。</p>
+      </div>
+
+      <div class="feature-card card-glass rounded-2xl p-6 transition-all duration-300 reveal">
+        <div class="w-12 h-12 rounded-xl bg-teal-500/10 border border-teal-500/20 flex items-center justify-center mb-5">
+          <svg class="w-6 h-6 text-teal-300" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M22 11.08V12a10 10 0 11-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+        </div>
+        <h3 class="text-lg font-semibold mb-2">文件夹驱动的批量标签</h3>
+        <p class="text-gray-400 text-sm leading-relaxed">按图库、根目录和文件夹筛选，多选图片后批量添加、移除或替换多个标签。人工、文件夹、模型和继承标签都有来源标识，并支持撤销最近一次批量操作。</p>
+      </div>
+
+      <div class="feature-card card-glass rounded-2xl p-6 transition-all duration-300 reveal">
+        <div class="w-12 h-12 rounded-xl bg-amber-500/10 border border-amber-500/20 flex items-center justify-center mb-5">
+          <svg class="w-6 h-6 text-amber-400" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></svg>
+        </div>
+        <h3 class="text-lg font-semibold mb-2">相似分组与别名治理</h3>
+        <p class="text-gray-400 text-sm leading-relaxed">利用 SHA-256、感知哈希和已有向量整理重复图、近似图与内容相似图。可维护“雷电将军 / 雷神 / 影”等别名关系，并只在安全身份类别中进行整组传播。</p>
+      </div>
+
+      <div class="feature-card card-glass rounded-2xl p-6 transition-all duration-300 reveal">
+        <div class="w-12 h-12 rounded-xl bg-cyan-500/10 border border-cyan-500/20 flex items-center justify-center mb-5">
+          <svg class="w-6 h-6 text-cyan-300" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4"/></svg>
+        </div>
+        <h3 class="text-lg font-semibold mb-2">面向大图库的后台任务</h3>
+        <p class="text-gray-400 text-sm leading-relaxed">分页读取、有界队列、磁盘结果集和批量写入避免一次装入全部数据。搜索优先于长任务；单图失败会跳过并记录，不会让整批索引或标注直接终止。</p>
+      </div>
+
+      <div class="feature-card card-glass rounded-2xl p-6 transition-all duration-300 reveal">
+        <div class="w-12 h-12 rounded-xl bg-cyan-500/10 border border-cyan-500/20 flex items-center justify-center mb-5">
+          <svg class="w-6 h-6 text-cyan-400" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>
+        </div>
+        <h3 class="text-lg font-semibold mb-2">可恢复迁移与安全清理</h3>
+        <p class="text-gray-400 text-sm leading-relaxed">设置页集中处理路径重绑、Schema 迁移和旧工作区兼容，已有向量无需重新生成。文件夹删除采用预览、暂存、数据库提交、最终清理的两阶段流程。</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="showcase" class="py-24 border-t border-white/5">
+  <div class="max-w-7xl mx-auto px-6">
+    <div class="text-center max-w-3xl mx-auto mb-16 reveal">
+      <h2 class="text-3xl md:text-5xl font-bold tracking-tight mb-4">一套界面，覆盖<span class="accent-cyan">完整图片工作流</span></h2>
+      <p class="text-gray-400 text-lg">搜索、后台任务、批量整理与设置迁移各司其职，长任务不占用界面线程</p>
+    </div>
+
+    <div class="flex flex-wrap justify-center gap-2 mb-10 reveal" role="tablist" aria-label="功能示意">
+      <button onclick="showScreenshot('search')" id="btn-search" type="button" role="tab" aria-selected="true" class="tab-btn tab-active px-5 py-2.5 rounded-lg text-sm font-medium border border-white/10 transition-all">图片搜索</button>
+      <button onclick="showScreenshot('tasks')" id="btn-tasks" type="button" role="tab" aria-selected="false" class="tab-btn px-5 py-2.5 rounded-lg text-sm font-medium border border-white/10 text-gray-400 hover:text-white transition-all">任务与日志</button>
+      <button onclick="showScreenshot('organize')" id="btn-organize" type="button" role="tab" aria-selected="false" class="tab-btn px-5 py-2.5 rounded-lg text-sm font-medium border border-white/10 text-gray-400 hover:text-white transition-all">批量整理</button>
+      <button onclick="showScreenshot('settings')" id="btn-settings" type="button" role="tab" aria-selected="false" class="tab-btn px-5 py-2.5 rounded-lg text-sm font-medium border border-white/10 text-gray-400 hover:text-white transition-all">设置与迁移</button>
+    </div>
+
+    <div class="relative reveal">
+      <div class="absolute -inset-4 bg-orange-500/5 rounded-3xl blur-3xl"></div>
+      <div class="relative rounded-2xl overflow-hidden border border-white/10 screenshot-shadow">
+        <img id="screenshot-img" src="https://images.unsplash.com/photo-1488426862026-3ee34a7d66df?w=1600&h=900&fit=crop" alt="图片搜索功能示意" class="w-full transition-opacity duration-500 opacity-75" width="1600" height="900">
+        <div class="absolute inset-0 bg-surface-900/50"></div>
+        <div class="absolute bottom-0 left-0 right-0 p-6 md:p-8">
+          <div id="screenshot-info" aria-live="polite">
+            <h3 class="text-2xl font-bold mb-2">搜索结果只加载当前页</h3>
+            <p class="text-gray-300 max-w-2xl">输入任意正整数决定本次搜索数量。结果按置信度为主、原始分数为辅排序，默认每页显示 15 张；双击打开原图，也可以定位文件夹、复制、多选和导出。</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="py-24 border-t border-white/5 bg-white/[0.02]">
+  <div class="max-w-7xl mx-auto px-6">
+    <div class="text-center max-w-3xl mx-auto mb-16 reveal">
+      <h2 class="text-3xl md:text-5xl font-bold tracking-tight mb-4">三步建立<span class="accent-cyan">可持续维护的图库</span></h2>
+      <p class="text-gray-400 text-lg">先小批量验证配置和费用，再逐步扩展到完整图库</p>
+    </div>
+
+    <div class="grid md:grid-cols-3 gap-8">
+      <div class="relative reveal">
+        <div class="absolute top-8 left-full w-full h-px bg-brand-500/30 hidden md:block"></div>
+        <div class="text-6xl font-bold text-white/5 mb-4">01</div>
+        <h3 class="text-xl font-semibold mb-3">创建图库并确认数据边界</h3>
+        <p class="text-gray-400 text-sm leading-relaxed">选择原图目录、Workspace 和结果目录，配置阿里云百炼 API Key。路径会进行安全校验，凭据不会写入 JSON、前端或日志。</p>
+      </div>
+
+      <div class="relative reveal">
+        <div class="absolute top-8 left-full w-full h-px bg-brand-500/30 hidden md:block"></div>
+        <div class="text-6xl font-bold text-white/5 mb-4">02</div>
+        <h3 class="text-xl font-semibold mb-3">增量索引，按需智能标注</h3>
+        <p class="text-gray-400 text-sm leading-relaxed">先用 qwen3-vl-embedding 建立可复用的本地向量索引，再决定是否运行独立智能标注。标注可先估算费用，缓存命中不会重复调用模型。</p>
+      </div>
+
+      <div class="relative reveal">
+        <div class="text-6xl font-bold text-white/5 mb-4">03</div>
+        <h3 class="text-xl font-semibold mb-3">搜索、整理并持续学习</h3>
+        <p class="text-gray-400 text-sm leading-relaxed">跨图库搜索后批量整理标签、别名和相似分组。相关/不相关反馈保存在本机，候选排序必须通过固定评测门禁才能启用。</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="tech" class="py-24 border-t border-white/5 noise">
+  <div class="max-w-7xl mx-auto px-6">
+    <div class="grid lg:grid-cols-2 gap-16 items-center">
+      <div class="reveal">
+        <h2 class="text-3xl md:text-4xl font-bold tracking-tight mb-6">
+          前端轻交互，后端重任务<br><span class="accent-cyan">Windows 原生运行</span>
+        </h2>
+        <p class="text-gray-400 text-lg mb-8 leading-relaxed">
+          Zvec 将窗口与业务彻底分层：Vue 负责界面，pywebview 管理 Windows 窗口与生命周期，Python 原生后端负责检索、模型调用、任务调度和持久化。用户运行时不需要 Docker、Node.js、PowerShell、.NET 或单独安装 Python。
+        </p>
+
+        <div class="space-y-4">
+          <div class="flex items-start gap-4">
+            <div class="w-10 h-10 rounded-lg bg-blue-500/10 border border-blue-500/20 flex items-center justify-center shrink-0">
+              <svg class="w-5 h-5 text-blue-400" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>
+            </div>
+            <div>
+              <h4 class="font-semibold mb-1">Vue 3 + TypeScript + Vite</h4>
+              <p class="text-sm text-gray-400">搜索、任务、批量标签、学习评测和设置迁移采用组件化前端；发布包只携带编译后的静态资源。</p>
+            </div>
+          </div>
+
+          <div class="flex items-start gap-4">
+            <div class="w-10 h-10 rounded-lg bg-yellow-500/10 border border-yellow-500/20 flex items-center justify-center shrink-0">
+              <svg class="w-5 h-5 text-yellow-400" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"/></svg>
+            </div>
+            <div>
+              <h4 class="font-semibold mb-1">Python + Zvec + SQLite WAL</h4>
+              <p class="text-sm text-gray-400">Zvec 保存图片向量；SQLite 承担图片状态、标签、分页结果、任务历史、结构化日志、本地学习和可恢复写入。</p>
+            </div>
+          </div>
+
+          <div class="flex items-start gap-4">
+            <div class="w-10 h-10 rounded-lg bg-green-500/10 border border-green-500/20 flex items-center justify-center shrink-0">
+              <svg class="w-5 h-5 text-green-400" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/></svg>
+            </div>
+            <div>
+              <h4 class="font-semibold mb-1">有界并发 + Outbox 恢复</h4>
+              <p class="text-sm text-gray-400">每个图库保持单写入者，不同图库可并行；队列满时返回可重试状态。Collection 写入异常后可从 Outbox 恢复，已有向量不必重新生成。</p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="relative reveal">
+        <div class="absolute -inset-4 bg-cyan-500/10 rounded-3xl blur-3xl"></div>
+        <div class="relative card-glass rounded-2xl p-6 border border-white/10">
+          <div class="flex items-center gap-2 mb-6">
+            <div class="w-3 h-3 rounded-full bg-red-500"></div>
+            <div class="w-3 h-3 rounded-full bg-yellow-500"></div>
+            <div class="w-3 h-3 rounded-full bg-green-500"></div>
+            <span class="ml-2 text-xs text-gray-500">current_architecture.py</span>
+          </div>
+          <pre class="text-sm font-mono leading-relaxed text-gray-300 overflow-x-auto"><code><span class="text-cyan-300">class</span> <span class="text-orange-300">ZvecDesktop</span>:
+    <span class="text-gray-500"># 显示层：只负责界面与交互</span>
+    <span class="text-cyan-300">frontend</span> = [
+        <span class="text-orange-300">"Vue 3.5"</span>,
+        <span class="text-orange-300">"TypeScript 5.9"</span>,
+        <span class="text-orange-300">"Vite 8"</span>
+    ]
+
+    <span class="text-gray-500"># Windows 窗口与本地网关</span>
+    <span class="text-cyan-300">desktop_shell</span> = <span class="text-orange-300">"pywebview + WebView2"</span>
+    <span class="text-cyan-300">backend</span> = <span class="text-orange-300">"Python 3.10+"</span>
+
+    <span class="text-gray-500"># 本地持久层</span>
+    <span class="text-cyan-300">storage</span> = [
+        <span class="text-orange-300">"Zvec Collection"</span>,
+        <span class="text-orange-300">"SQLite WAL"</span>,
+        <span class="text-orange-300">"Collection Outbox"</span>
+    ]
+
+    <span class="text-gray-500"># 按需调用阿里云百炼</span>
+    <span class="text-cyan-300">embedding</span> = <span class="text-orange-300">"qwen3-vl-embedding"</span>
+    <span class="text-cyan-300">auto_tag</span> = <span class="text-orange-300">"qwen3-vl-flash"</span>
+
+    <span class="text-gray-500"># 发布目标</span>
+    <span class="text-cyan-300">target</span> = <span class="text-orange-300">"Windows x64"</span></code></pre>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="privacy" class="py-24 border-t border-white/5">
+  <div class="max-w-7xl mx-auto px-6">
+    <div class="grid lg:grid-cols-2 gap-16 items-center">
+      <div class="order-2 lg:order-1 relative reveal">
+        <div class="absolute -inset-4 bg-orange-500/10 rounded-3xl blur-3xl"></div>
+        <div class="relative grid grid-cols-2 gap-4">
+          <div class="card-glass rounded-2xl p-5 border border-white/10">
+            <div class="w-10 h-10 rounded-xl bg-cyan-500/10 border border-cyan-500/20 flex items-center justify-center mb-4">
+              <svg class="w-5 h-5 text-cyan-300" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/></svg>
+            </div>
+            <div class="text-2xl font-bold text-white mb-1">本地保存</div>
+            <div class="text-sm text-gray-400">原图、索引、标签、任务、日志与学习记录由本机管理</div>
+          </div>
+          <div class="card-glass rounded-2xl p-5 border border-white/10 mt-8">
+            <div class="w-10 h-10 rounded-xl bg-orange-500/10 border border-orange-500/20 flex items-center justify-center mb-4">
+              <svg class="w-5 h-5 text-orange-300" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/></svg>
+            </div>
+            <div class="text-2xl font-bold text-white mb-1">凭据隔离</div>
+            <div class="text-sm text-gray-400">API Key 保存在 Windows 凭据管理器，不进入配置和日志</div>
+          </div>
+          <div class="card-glass rounded-2xl p-5 border border-white/10">
+            <div class="w-10 h-10 rounded-xl bg-cyan-500/10 border border-cyan-500/20 flex items-center justify-center mb-4">
+              <svg class="w-5 h-5 text-cyan-300" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636"/></svg>
+            </div>
+            <div class="text-2xl font-bold text-white mb-1">按需联网</div>
+            <div class="text-sm text-gray-400">只在向量生成、查询向量或智能标注时调用配置的模型</div>
+          </div>
+          <div class="card-glass rounded-2xl p-5 border border-white/10 mt-8">
+            <div class="w-10 h-10 rounded-xl bg-orange-500/10 border border-orange-500/20 flex items-center justify-center mb-4">
+              <svg class="w-5 h-5 text-orange-300" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/><path d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/></svg>
+            </div>
+            <div class="text-2xl font-bold text-white mb-1">过程可查</div>
+            <div class="text-sm text-gray-400">结构化任务历史与脱敏日志保存在本机，便于追踪失败原因</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="order-1 lg:order-2 reveal">
+        <h2 class="text-3xl md:text-4xl font-bold tracking-tight mb-6">
+          本地优先，不做<br><span class="accent-orange">模糊的隐私承诺</span>
+        </h2>
+        <p class="text-gray-400 text-lg mb-6 leading-relaxed">
+          Zvec 的本地与云端边界是明确的：日常文件管理、标签搜索、分页查看、日志、学习反馈和多数整理操作在本机完成；需要模型理解图片时，相关图片或查询内容会发送到你配置的阿里云百炼服务。
+        </p>
+        <ul class="space-y-4">
+          <li class="flex items-start gap-3">
+            <svg class="w-5 h-5 text-cyan-300 shrink-0 mt-0.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg>
+            <span class="text-gray-300">原始图库位置由你决定，删除软件不会自动删除原图</span>
+          </li>
+          <li class="flex items-start gap-3">
+            <svg class="w-5 h-5 text-cyan-300 shrink-0 mt-0.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg>
+            <span class="text-gray-300">已有向量可重复使用，迁移 Schema 和重绑路径无需再次调用模型</span>
+          </li>
+          <li class="flex items-start gap-3">
+            <svg class="w-5 h-5 text-cyan-300 shrink-0 mt-0.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg>
+            <span class="text-gray-300">智能标注前显示候选、缓存、Token 与费用估算，全部重跑需要额外确认</span>
+          </li>
+          <li class="flex items-start gap-3">
+            <svg class="w-5 h-5 text-cyan-300 shrink-0 mt-0.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg>
+            <span class="text-gray-300">日志会清理密钥、Token、Cookie、密码、图片数据和完整模型输入输出</span>
+          </li>
+          <li class="flex items-start gap-3">
+            <svg class="w-5 h-5 text-cyan-300 shrink-0 mt-0.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg>
+            <span class="text-gray-300">模型、预算、并发和结果目录都可以在设置页集中维护</span>
+          </li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="download" class="py-24 border-t border-white/5 relative overflow-hidden">
+  <div class="absolute inset-0 bg-brand-950/20"></div>
+  <div class="max-w-4xl mx-auto px-6 text-center relative z-10">
+    <div class="reveal">
+      <h2 class="text-4xl md:text-6xl font-bold tracking-tight mb-6">
+        先用一小批图片<br><span class="accent-orange">验证你的工作流</span>
+      </h2>
+      <p class="text-gray-400 text-lg mb-10 max-w-2xl mx-auto">
+        当前项目面向 Windows 10/11 x64。建议首次先处理 10～50 张图片，确认检索效果、标签策略和模型费用后，再扩大到完整图库。
+      </p>
+
+      <div class="flex flex-col sm:flex-row items-center justify-center gap-4 mb-8">
+        <a href="https://github.com/tiyue/zvec-image-search/releases" target="_blank" rel="noopener noreferrer" class="h-14 px-10 bg-brand-600 hover:bg-brand-500 text-white text-lg font-semibold rounded-xl transition-all flex items-center gap-3 shadow-xl shadow-brand-900/50">
+          <svg class="w-6 h-6" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>
+          查看 Windows 发布包
+        </a>
+        <a href="https://github.com/tiyue/zvec-image-search" target="_blank" rel="noopener noreferrer" class="h-14 px-10 bg-white/5 hover:bg-white/10 border border-white/10 text-white font-medium rounded-xl transition-all flex items-center gap-3">
+          <svg class="w-6 h-6" fill="currentColor" viewBox="0 0 24 24"><path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/></svg>
+          GitHub 源码
+        </a>
+      </div>
+
+      <div class="flex flex-wrap items-center justify-center gap-6 text-sm text-gray-500">
+        <div class="flex items-center gap-2">
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+          Windows x64
+        </div>
+        <div class="flex items-center gap-2">
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+          无需 Docker
+        </div>
+        <div class="flex items-center gap-2">
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+          自包含运行环境
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer class="border-t border-white/5 py-12">
+  <div class="max-w-7xl mx-auto px-6">
+    <div class="flex flex-col md:flex-row items-center justify-between gap-6">
+      <div class="flex items-center gap-3">
+        <div class="w-8 h-8 rounded-lg bg-brand-600 border border-cyan-300/20 flex items-center justify-center font-bold text-white">Z</div>
+        <span class="font-semibold">Zvec 智能图片库</span>
+      </div>
+      <div class="flex items-center gap-6 text-sm text-gray-500">
+        <a href="https://github.com/tiyue/zvec-image-search#readme" target="_blank" rel="noopener noreferrer" class="hover:text-white transition-colors">README</a>
+        <a href="https://github.com/tiyue/zvec-image-search/releases" target="_blank" rel="noopener noreferrer" class="hover:text-white transition-colors">发布记录</a>
+        <a href="https://github.com/tiyue/zvec-image-search/issues" target="_blank" rel="noopener noreferrer" class="hover:text-white transition-colors">问题反馈</a>
+        <a href="https://github.com/tiyue/zvec-image-search" target="_blank" rel="noopener noreferrer" class="hover:text-white transition-colors">GitHub</a>
+      </div>
+      <div class="text-sm text-gray-600">&copy; 2026 Zvec. 本地优先，边界透明。</div>
+    </div>
+  </div>
+</footer>
+
+<script>
+const observerOptions = {
+  root: null,
+  rootMargin: '0px',
+  threshold: 0.1
+};
+
+const observer = new IntersectionObserver((entries) => {
+  entries.forEach((entry) => {
+    if (entry.isIntersecting) {
+      entry.target.classList.add('visible');
+    }
+  });
+}, observerOptions);
+
+document.querySelectorAll('.reveal').forEach((element) => {
+  observer.observe(element);
+});
+
+const screenshots = {
+  search: {
+    img: 'https://images.unsplash.com/photo-1488426862026-3ee34a7d66df?w=1600&h=900&fit=crop',
+    alt: '图片搜索功能示意',
+    title: '搜索结果只加载当前页',
+    desc: '输入任意正整数决定本次搜索数量。结果按置信度为主、原始分数为辅排序，默认每页显示 15 张；双击打开原图，也可以定位文件夹、复制、多选和导出。'
+  },
+  tasks: {
+    img: 'https://images.unsplash.com/photo-1551288049-bebda4e38f71?w=1600&h=900&fit=crop',
+    alt: '任务与日志功能示意',
+    title: '后台任务持续运行，失败项单独处理',
+    desc: '索引、同步、智能标注和索引并标注进入有界任务队列。任务历史与操作日志跨重启保留，单图失败不会中断整批，取消或网络失败后按钮会恢复。'
+  },
+  organize: {
+    img: 'https://images.unsplash.com/photo-1529139574466-a303027c1d8b?w=1600&h=900&fit=crop',
+    alt: '批量整理功能示意',
+    title: '按文件夹批量设置多标签',
+    desc: '以文件夹为筛选依据，对当前页、选中图片或整文件夹执行人工标签操作。模型标签自动批准，来源清晰可见；相似分组、别名词典和撤销能力降低重复劳动。'
+  },
+  settings: {
+    img: 'https://images.unsplash.com/photo-1555949963-ff9fe0c870eb?w=1600&h=900&fit=crop',
+    alt: '设置与数据迁移功能示意',
+    title: '模型、路径和迁移集中管理',
+    desc: '在设置页维护阿里云模型、预算、并发、结果目录和图库路径。迁移先检查、再执行、最后验证文档数与搜索可用性，已有向量不会被无意义地重新计算。'
+  }
+};
+
+function showScreenshot(key) {
+  const data = screenshots[key];
+  if (!data) return;
+
+  const image = document.getElementById('screenshot-img');
+  const info = document.getElementById('screenshot-info');
+
+  image.style.opacity = '0';
+  window.setTimeout(() => {
+    image.src = data.img;
+    image.alt = data.alt;
+    image.style.opacity = '0.75';
+  }, 200);
+
+  info.innerHTML = `
+    <h3 class="text-2xl font-bold mb-2">${data.title}</h3>
+    <p class="text-gray-300 max-w-2xl">${data.desc}</p>
+  `;
+
+  document.querySelectorAll('.tab-btn').forEach((button) => {
+    button.classList.remove('tab-active');
+    button.classList.add('text-gray-400');
+    button.setAttribute('aria-selected', 'false');
+  });
+
+  const activeButton = document.getElementById(`btn-${key}`);
+  activeButton.classList.add('tab-active');
+  activeButton.classList.remove('text-gray-400');
+  activeButton.setAttribute('aria-selected', 'true');
+}
+</script>
+
+</body>
+</html>
