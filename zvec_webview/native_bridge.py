@@ -118,7 +118,7 @@ class NativeBridge:
                 return _duplicate_action_error()
             succeeded = False
             try:
-                os.startfile(path)
+                _windows_startfile(path)
                 succeeded = True
                 return {"ok": True, "action": "open"}
             finally:
@@ -141,7 +141,7 @@ class NativeBridge:
                 if not selected:
                     # Shell selection can be unavailable under unusual Explorer
                     # policies. Opening the verified parent is a safe fallback.
-                    os.startfile(path.parent)
+                    _windows_startfile(path.parent)
                     message = "无法自动选中文件，已打开所在文件夹。"
                 succeeded = True
                 response: dict[str, Any] = {
@@ -475,8 +475,8 @@ def _set_windows_clipboard_data(format_id: int, payload: bytes) -> None:
         raise OSError("此 Preview 仅支持 Windows x64。")
     if not payload:
         raise ValueError("剪贴板内容不能为空。")
-    user32 = ctypes.windll.user32
-    kernel32 = ctypes.windll.kernel32
+    user32 = _windows_dll("user32")
+    kernel32 = _windows_dll("kernel32")
     kernel32.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
     kernel32.GlobalAlloc.restype = ctypes.c_void_p
     kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
@@ -517,8 +517,8 @@ def _select_file_with_shell(path: Path) -> bool:
 
     if os.name != "nt":
         raise OSError("此 Preview 仅支持 Windows x64。")
-    shell32 = ctypes.windll.shell32
-    ole32 = ctypes.windll.ole32
+    shell32 = _windows_dll("shell32")
+    ole32 = _windows_dll("ole32")
     shell32.SHParseDisplayName.argtypes = [
         ctypes.c_wchar_p,
         ctypes.c_void_p,
@@ -567,6 +567,24 @@ def _select_file_with_shell(path: Path) -> bool:
             ole32.CoTaskMemFree(full_pidl)
         if should_uninitialize:
             ole32.CoUninitialize()
+
+
+def _windows_startfile(path: Path) -> None:
+    """Call the Windows shell opener without exposing it to Unix type stubs."""
+
+    startfile = getattr(os, "startfile", None)
+    if startfile is None:
+        raise OSError("此 Preview 仅支持 Windows x64。")
+    startfile(path)
+
+
+def _windows_dll(name: str) -> Any:
+    """Resolve one WinDLL lazily so cross-platform static checks stay valid."""
+
+    loader = getattr(ctypes, "windll", None)
+    if loader is None:
+        raise OSError("此 Preview 仅支持 Windows x64。")
+    return getattr(loader, name)
 
 
 def _normalize_image_ids(image_ids: list[str]) -> tuple[str, ...]:

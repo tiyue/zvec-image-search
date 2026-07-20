@@ -181,7 +181,10 @@ def _report_startup_error(message: str) -> None:
     try:
         import ctypes
 
-        ctypes.windll.user32.MessageBoxW(
+        loader = getattr(ctypes, "windll", None)
+        if loader is None:
+            raise OSError("Windows user32 is unavailable")
+        loader.user32.MessageBoxW(
             None,
             message,
             "Zvec Preview",
