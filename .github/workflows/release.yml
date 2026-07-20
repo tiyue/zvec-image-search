@@ -421,12 +421,14 @@ jobs:
             --constraint requirements-lock.txt "${wheels[0]}"
           "$venv/bin/zvec" help | grep -F "Docker is not required"
           cp requirements-lock.txt "$output/requirements-lock.txt"
+          checksum="$RUNNER_TEMP/zvec-native-SHA256SUMS.txt"
           (
             cd "$output"
             find . -maxdepth 1 -type f ! -name SHA256SUMS.txt -printf '%f\0' \
               | sort -z \
-              | xargs -0 sha256sum > SHA256SUMS.txt
-          )
+              | xargs -0 sha256sum
+          ) > "$checksum"
+          mv "$checksum" "$output/SHA256SUMS.txt"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: native-${{ inputs.version }}-wheel

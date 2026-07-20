@@ -415,6 +415,15 @@ class WebviewPreviewSourceContractTest(unittest.TestCase):
 
     def test_frontend_pipeline_is_clean_typechecked_tested_and_built(self) -> None:
         plan = create_build_plan()
+        attributes = (plan.repository_root / ".gitattributes").read_text(
+            encoding="utf-8"
+        )
+        vite_config = (plan.frontend_directory / "vite.config.ts").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("frontend/** text eol=lf", attributes)
+        self.assertIn("zvec_webview/frontend_dist/** text eol=lf", attributes)
+        self.assertIn('componentIdGenerator: "filepath"', vite_config)
         expected = {"manifest": ".vite/manifest.json"}
         with (
             patch.object(

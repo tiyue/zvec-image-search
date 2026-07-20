@@ -8,7 +8,14 @@ import { defineConfig } from "vite";
 export default defineConfig({
   // Relative asset URLs keep the frozen pywebview build independent of its port.
   base: "./",
-  plugins: [vue()],
+  plugins: [
+    vue({
+      features: {
+        // Keep production scope IDs stable across LF and CRLF checkouts.
+        componentIdGenerator: "filepath",
+      },
+    }),
+  ],
   resolve: {
     alias: {
       "@": fileURLToPath(new URL("./src", import.meta.url)),
