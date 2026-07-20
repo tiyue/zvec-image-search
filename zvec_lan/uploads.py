@@ -275,7 +275,6 @@ class QueryImageStore:
             )
             for image in expired:
                 self._images.pop(image.query_image_id, None)
-            active_parts = frozenset(self._active_parts)
         removed = 0
         for image in expired:
             with suppress(OSError):
@@ -284,10 +283,10 @@ class QueryImageStore:
         cutoff = now - self._stale_after
         for pattern in ("zvec-query-*.part", "zvec-query-*.bin"):
             for candidate in self._root.glob(pattern):
-                if candidate in active_parts:
-                    continue
                 with self._lock:
-                    if any(image.path == candidate for image in self._images.values()):
+                    if candidate in self._active_parts or any(
+                        image.path == candidate for image in self._images.values()
+                    ):
                         continue
                 try:
                     if pattern.endswith(".part") or candidate.stat().st_mtime <= cutoff:

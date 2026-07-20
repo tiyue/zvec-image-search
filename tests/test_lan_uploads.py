@@ -6,6 +6,7 @@ import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest.mock import patch
 
 from zvec_lan import (
     InvalidUpload,
@@ -148,6 +149,33 @@ class QueryImageStoreTests(unittest.TestCase):
             )
             store.close()
             self.assertEqual(list(Path(directory).glob("*.bin")), [])
+
+    def test_cleanup_rechecks_parts_that_become_active_during_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = QueryImageStore(directory)
+            root = Path(directory)
+            partial = root / "zvec-query-concurrent-cleanup-race.part"
+            original_glob = Path.glob
+            injected = False
+
+            def racing_glob(path: Path, pattern: str):
+                nonlocal injected
+                if path == root and pattern == "zvec-query-*.part" and not injected:
+                    injected = True
+                    partial.write_bytes(b"active upload")
+                    with store._lock:
+                        store._active_parts.add(partial)
+                    return iter((partial,))
+                return original_glob(path, pattern)
+
+            with patch.object(Path, "glob", autospec=True, side_effect=racing_glob):
+                self.assertEqual(store.cleanup_stale(), 0)
+
+            self.assertTrue(partial.exists())
+            with store._lock:
+                store._active_parts.discard(partial)
+            partial.unlink()
+            store.close()
 
     def test_known_lengths_are_reserved_atomically_across_parallel_uploads(
         self,

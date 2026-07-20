@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import tempfile
 import threading
@@ -512,6 +513,7 @@ class WorkspaceInspectionTests(unittest.TestCase):
         )
 
 
+@unittest.skipUnless(os.name == "nt", "Windows-native migration test")
 class WindowsNativeMigrationOperationsTests(unittest.TestCase):
     def test_native_config_docker_target_must_match_selected_workspace(self) -> None:
         import zvec_launcher
