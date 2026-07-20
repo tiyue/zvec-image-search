@@ -276,7 +276,18 @@ class DesktopWindowSmokeTests(unittest.TestCase):
                     "Badge.TLabel",
                 )
                 self.assertEqual(window._task_empty_state.winfo_manager(), "place")
-                self.assertFalse(window._search_preview_collapsed)
+                # The hosted Windows runner can clamp the requested 1280-pixel
+                # outer window to its smaller desktop.  Navigation, window
+                # chrome and DPI scaling then leave the search workspace on
+                # either side of the 1000-pixel responsive breakpoint.  Check
+                # the final viewport-driven state instead of assuming the
+                # requested outer geometry was preserved.
+                search_workspace = window._gallery.master.master
+                self.assertIsNotNone(search_workspace)
+                self.assertEqual(
+                    window._search_preview_collapsed,
+                    search_workspace.winfo_width() < 1000,
+                )
                 self.assertEqual(window._page_title_text.get(), "图片搜索")
                 self.assertTrue(window._header_search_actions.winfo_ismapped())
                 self.assertFalse(window._retry_backend_button.winfo_ismapped())

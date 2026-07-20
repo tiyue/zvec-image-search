@@ -298,7 +298,12 @@ def provision_nsis(
             _download_archive(selected_archive)
         identity = verify_archive(selected_archive)
 
-        staging = Path(tempfile.mkdtemp(prefix=f".{output.name}-", dir=output.parent))
+        # tempfile may return an 8.3 DOS alias on Windows while resolving an
+        # extracted child expands the same directory to its long name.  Make
+        # the atomic staging root canonical before deriving relative paths.
+        staging = Path(
+            tempfile.mkdtemp(prefix=f".{output.name}-", dir=output.parent)
+        ).resolve(strict=True)
         try:
             makensis = extract_archive(selected_archive, staging / "payload")
             relative = makensis.relative_to(staging).as_posix()

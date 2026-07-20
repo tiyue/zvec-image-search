@@ -20,8 +20,12 @@ class DesktopResourceTest(unittest.TestCase):
                 mock.patch.object(resources.sys, "_MEIPASS", str(root), create=True),
                 mock.patch.object(resources.sys, "frozen", False, create=True),
             ):
+                found = resources.find_resource("assets/test-resource.bin")
+                self.assertIsNotNone(found)
+                assert found is not None
                 self.assertEqual(
-                    resources.find_resource("assets/test-resource.bin"), resource
+                    found.resolve(),
+                    resource.resolve(),
                 )
 
     def test_missing_icon_is_safe_and_traversal_is_rejected(self) -> None:

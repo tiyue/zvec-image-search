@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import stat
+import subprocess
+import sys
 import tempfile
 import unittest
 import zipfile
@@ -35,6 +37,25 @@ def _identity(path: Path) -> ArchiveIdentity:
 
 
 class NsisProvisionTest(unittest.TestCase):
+    def test_script_help_runs_without_an_installed_project(self) -> None:
+        repository = Path(__file__).resolve().parents[1]
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(repository / "scripts" / "provision_nsis.py"),
+                "--help",
+            ],
+            cwd=repository,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("Provision the pinned portable NSIS", completed.stdout)
+
     def test_archive_identity_is_verified_before_extraction(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             archive = Path(temporary) / "nsis.zip"
@@ -128,6 +149,39 @@ class NsisProvisionTest(unittest.TestCase):
                 (output / ".zvec-nsis-provision.json").read_text(encoding="utf-8")
             )
             self.assertEqual(marker["archive_sha256"], identity.sha256)
+
+    def test_provision_canonicalizes_an_aliased_staging_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            physical_parent = root / "long-parent-name"
+            aliased_parent = root / "alias"
+            physical_parent.mkdir()
+            try:
+                aliased_parent.symlink_to(physical_parent, target_is_directory=True)
+            except OSError as exc:
+                self.skipTest(f"directory aliases are unavailable: {exc}")
+
+            archive = root / "nsis.zip"
+            executable = _write_archive(archive)
+            identity = _identity(archive)
+            output = aliased_parent / "toolchain"
+
+            with (
+                patch(
+                    "scripts.provision_nsis.verify_archive",
+                    return_value=identity,
+                ),
+                patch.multiple(
+                    "scripts.provision_nsis",
+                    NSIS_ARCHIVE_SIZE=identity.size,
+                    NSIS_ARCHIVE_MD5=identity.md5,
+                    NSIS_ARCHIVE_SHA256=identity.sha256,
+                ),
+            ):
+                result = provision_nsis(output, archive_path=archive)
+
+            self.assertEqual(result.output_directory, output.resolve())
+            self.assertEqual(result.makensis_path.read_bytes(), executable)
 
     def test_unverified_existing_output_is_never_replaced(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

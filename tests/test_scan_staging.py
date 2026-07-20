@@ -136,7 +136,10 @@ class ScanStagingContractTests(unittest.TestCase):
             self.assertEqual(path_stats.select_count, 3)
             self.assertEqual(path_stats.max_materialized_rows, 2)
             rebuilt = path_records[0].to_image_record(self.root)
-            self.assertEqual(Path(rebuilt.absolute_path), self.root / "0000000.jpg")
+            self.assertEqual(
+                Path(rebuilt.absolute_path).resolve(),
+                (self.root / "0000000.jpg").resolve(),
+            )
         finally:
             staging.discard()
 
