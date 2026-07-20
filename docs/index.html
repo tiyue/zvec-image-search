@@ -5,104 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="description" content="Zvec 是面向 Windows 的本地优先智能图片库，支持多模态搜索、跨图库检索、AI 标注、批量整理与大图库后台任务。">
   <title>Zvec 智能图片库 — 搜索、标注与整理</title>
-  <script src="https://cdn.tailwindcss.com"></script>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
-  <script>
-    tailwind.config = {
-      theme: {
-        extend: {
-          fontFamily: { sans: ['Inter', 'system-ui', 'sans-serif'] },
-          colors: {
-            brand: {
-              50: '#ecfeff',
-              100: '#cffafe',
-              200: '#a5f3fc',
-              300: '#67e8f9',
-              400: '#22d3ee',
-              500: '#06b6d4',
-              600: '#0891b2',
-              700: '#0e7490',
-              800: '#155e75',
-              900: '#164e63',
-              950: '#083344'
-            },
-            surface: {
-              900: '#07141a',
-              800: '#0b1b23',
-              700: '#102832',
-              600: '#173743'
-            }
-          },
-          animation: {
-            'float': 'float 6s ease-in-out infinite',
-            'pulse-slow': 'pulse 4s cubic-bezier(0.4, 0, 0.6, 1) infinite',
-            'slide-up': 'slideUp 0.8s ease-out forwards',
-            'fade-in': 'fadeIn 1s ease-out forwards'
-          },
-          keyframes: {
-            float: {
-              '0%, 100%': { transform: 'translateY(0px)' },
-              '50%': { transform: 'translateY(-20px)' }
-            },
-            slideUp: {
-              '0%': { opacity: '0', transform: 'translateY(30px)' },
-              '100%': { opacity: '1', transform: 'translateY(0)' }
-            },
-            fadeIn: {
-              '0%': { opacity: '0' },
-              '100%': { opacity: '1' }
-            }
-          }
-        }
-      }
-    };
-  </script>
-  <style>
-    body { font-family: 'Inter', system-ui, sans-serif; }
-    .accent-cyan { color: #67e8f9; }
-    .accent-orange { color: #fb923c; }
-    .hero-glow {
-      background: rgba(6,182,212,0.07);
-      clip-path: ellipse(46% 30% at 50% 0%);
-    }
-    .card-glass {
-      background: rgba(255,255,255,0.03);
-      backdrop-filter: blur(20px);
-      border: 1px solid rgba(255,255,255,0.06);
-    }
-    .noise { position: relative; }
-    .noise::before {
-      content: "";
-      position: absolute;
-      inset: 0;
-      background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noiseFilter'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noiseFilter)'/%3E%3C/svg%3E");
-      opacity: 0.02;
-      pointer-events: none;
-      z-index: 1;
-    }
-    .reveal {
-      opacity: 0;
-      transform: translateY(24px);
-      transition: all 0.8s cubic-bezier(0.16, 1, 0.3, 1);
-    }
-    .reveal.visible {
-      opacity: 1;
-      transform: translateY(0);
-    }
-    .feature-card:hover {
-      transform: translateY(-4px);
-      border-color: rgba(34,211,238,0.28);
-      box-shadow: 0 20px 40px -15px rgba(6,182,212,0.16);
-    }
-    .tab-active {
-      background: rgba(6,182,212,0.14);
-      color: #67e8f9;
-      border-color: rgba(34,211,238,0.3);
-    }
-    .screenshot-shadow {
-      box-shadow: 0 0 0 1px rgba(255,255,255,0.1), 0 25px 50px -12px rgba(0,0,0,0.8);
-    }
-  </style>
+  <link href="./assets/app.css" rel="stylesheet">
 </head>
 <body class="bg-surface-900 text-white antialiased overflow-x-hidden">
 
@@ -118,7 +21,7 @@
       <a href="#tech" class="hover:text-white transition-colors">技术架构</a>
       <a href="#privacy" class="hover:text-white transition-colors">数据边界</a>
     </div>
-    <a href="#download" class="hidden md:inline-flex h-9 px-5 bg-brand-600 hover:bg-brand-500 text-white text-sm font-medium rounded-lg transition-all items-center gap-2">
+    <a href="https://github.com/tiyue/zvec-image-search/releases/download/v0.4.0/Zvec-Webview-Preview-0.4.0-win-x64-portable.zip" class="hidden md:inline-flex h-9 px-5 bg-brand-600 hover:bg-brand-500 text-white text-sm font-medium rounded-lg transition-all items-center gap-2">
       Windows x64
       <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>
     </a>
@@ -145,7 +48,7 @@
       </p>
 
       <div class="flex flex-col sm:flex-row items-center justify-center gap-4 mb-16">
-        <a href="#download" class="h-12 px-8 bg-brand-600 hover:bg-brand-500 text-white font-semibold rounded-xl transition-all flex items-center gap-2 shadow-lg shadow-brand-900/50">
+        <a href="https://github.com/tiyue/zvec-image-search/releases/download/v0.4.0/Zvec-Webview-Preview-0.4.0-win-x64-portable.zip" class="h-12 px-8 bg-brand-600 hover:bg-brand-500 text-white font-semibold rounded-xl transition-all flex items-center gap-2 shadow-lg shadow-brand-900/50">
           <svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>
           查看 Windows 版本
         </a>
@@ -158,8 +61,8 @@
       <div class="relative max-w-6xl mx-auto animate-slide-up">
         <div class="absolute -inset-1 bg-cyan-500/10 rounded-2xl blur-2xl"></div>
         <div class="relative screenshot-shadow rounded-xl overflow-hidden border border-white/10">
-          <img src="https://images.unsplash.com/photo-1544005313-94ddf0286df2?w=1600&h=900&fit=crop" alt="人物摄影图库功能示意" class="w-full opacity-80" width="1600" height="900">
-          <div class="absolute inset-0 bg-surface-900/45"></div>
+          <img src="./assets/images/hero-portrait.webp" alt="人物摄影图库功能示意" class="w-full opacity-80" width="1600" height="900" fetchpriority="high">
+          <div class="absolute inset-0 bg-surface-900/50"></div>
           <div class="absolute top-5 left-5 right-5 flex items-center justify-between gap-4">
             <div class="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-black/40 backdrop-blur-md border border-white/10">
               <div class="w-2 h-2 rounded-full bg-cyan-300"></div>
@@ -283,7 +186,7 @@
     <div class="relative reveal">
       <div class="absolute -inset-4 bg-orange-500/5 rounded-3xl blur-3xl"></div>
       <div class="relative rounded-2xl overflow-hidden border border-white/10 screenshot-shadow">
-        <img id="screenshot-img" src="https://images.unsplash.com/photo-1488426862026-3ee34a7d66df?w=1600&h=900&fit=crop" alt="图片搜索功能示意" class="w-full transition-opacity duration-500 opacity-75" width="1600" height="900">
+        <img id="screenshot-img" src="./assets/images/showcase-search.webp" alt="图片搜索功能示意" class="w-full transition-opacity duration-500 opacity-75" width="1600" height="900" loading="lazy">
         <div class="absolute inset-0 bg-surface-900/50"></div>
         <div class="absolute bottom-0 left-0 right-0 p-6 md:p-8">
           <div id="screenshot-info" aria-live="polite">
@@ -561,25 +464,25 @@ document.querySelectorAll('.reveal').forEach((element) => {
 
 const screenshots = {
   search: {
-    img: 'https://images.unsplash.com/photo-1488426862026-3ee34a7d66df?w=1600&h=900&fit=crop',
+    img: './assets/images/showcase-search.webp',
     alt: '图片搜索功能示意',
     title: '搜索结果只加载当前页',
     desc: '输入任意正整数决定本次搜索数量。结果按置信度为主、原始分数为辅排序，默认每页显示 15 张；双击打开原图，也可以定位文件夹、复制、多选和导出。'
   },
   tasks: {
-    img: 'https://images.unsplash.com/photo-1551288049-bebda4e38f71?w=1600&h=900&fit=crop',
+    img: './assets/images/showcase-tasks.webp',
     alt: '任务与日志功能示意',
     title: '后台任务持续运行，失败项单独处理',
     desc: '索引、同步、智能标注和索引并标注进入有界任务队列。任务历史与操作日志跨重启保留，单图失败不会中断整批，取消或网络失败后按钮会恢复。'
   },
   organize: {
-    img: 'https://images.unsplash.com/photo-1529139574466-a303027c1d8b?w=1600&h=900&fit=crop',
+    img: './assets/images/showcase-organize.webp',
     alt: '批量整理功能示意',
     title: '按文件夹批量设置多标签',
     desc: '以文件夹为筛选依据，对当前页、选中图片或整文件夹执行人工标签操作。模型标签自动批准，来源清晰可见；相似分组、别名词典和撤销能力降低重复劳动。'
   },
   settings: {
-    img: 'https://images.unsplash.com/photo-1555949963-ff9fe0c870eb?w=1600&h=900&fit=crop',
+    img: './assets/images/showcase-settings.webp',
     alt: '设置与数据迁移功能示意',
     title: '模型、路径和迁移集中管理',
     desc: '在设置页维护阿里云模型、预算、并发、结果目录和图库路径。迁移先检查、再执行、最后验证文档数与搜索可用性，已有向量不会被无意义地重新计算。'
