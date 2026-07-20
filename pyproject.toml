@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "zvec-image-search"
-version = "0.4.0"
+version = "0.5.0-rc.1"
 description = "Local multimodal image search with Alibaba Cloud Model Studio and Zvec"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -25,7 +25,7 @@ py-modules = ["image_service", "zvec_launcher", "zvec_logging"]
 include-package-data = false
 
 [tool.setuptools.packages.find]
-include = ["image_vector_service*", "zvec_desktop*", "zvec_webview*"]
+include = ["image_vector_service*", "zvec_desktop*", "zvec_lan*", "zvec_webview*"]
 namespaces = false
 
 [tool.setuptools.package-data]

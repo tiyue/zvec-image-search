@@ -1,4 +1,4 @@
-# Zvec Desktop 0.4.0 候选版
+# Zvec 0.5.0-rc.1 Android 局域网预览版
 
 本版提供 Windows x64 原生 Python 后端和 Vue 3 桌面界面。发布包冻结 Python、WebView2 桥接和前端静态资源；用户运行时不需要 Node.js、PowerShell、.NET、Docker、WSL 或单独安装 Python。
 
@@ -13,6 +13,16 @@
 - 四个页面统一为现代化响应式布局：图片搜索、图库任务、批量标签和设置。
 - 发布包仅包含编译后的 HTML、CSS 和 JavaScript，不包含 Node.js、源码或 `node_modules`。
 - 所有页面资源随包提供，不加载 CDN、远程字体或示例图片。
+
+### Android 局域网查看（Debug Preview）
+
+- 新增 Android 8.0 及以上局域网客户端。Windows 继续保存图库、运行 Zvec 和调用模型。
+- 支持 UDP 自动发现和手工私网 IP；配对无需二维码，两端核对相同 6 位验证码后由 Windows 批准。
+- 支持选择图库、文字/标签/图片/图文搜索、分页查看、原图预览、保存和分享。
+- 查询图片不设固定文件大小上限，按流上传；原图支持 Range、断点续传和多路并发流式传输。
+- 对外 LAN 网关与本机控制接口隔离，只开放配对、搜索和原图读取，不开放设置、索引、迁移或图库删除。
+- 撤销或重新配对会先持久化旧 Token 的哈希拒绝记录；即使凭据文件写入失败并重启，旧 Token 也不会恢复有效。
+- 本次 APK 使用 Android debug 签名，仅作 Preview。工作流不创建、保存或冒充正式发布私钥。
 
 ### 搜索与图片操作
 
@@ -128,11 +138,14 @@
 以下是完成最终构建和校验后采用的文件名。本说明不代表这些文件已经由当前源码重新生成；实际交付必须同时提供 SHA-256 和验证报告。
 
 ```text
-Zvec-Desktop-0.4.0-win-x64-unsigned-setup.exe
-Zvec-Desktop-0.4.0-win-x64-portable.zip
-Zvec-Webview-Preview-0.4.0-win-x64-portable.zip
-Zvec-Webview-Preview-0.4.0-win-x64-unsigned-setup.exe
+Zvec-Desktop-0.5.0-rc.1-win-x64-unsigned-setup.exe
+Zvec-Desktop-0.5.0-rc.1-win-x64-portable.zip
+Zvec-Webview-Preview-0.5.0-rc.1-win-x64-portable.zip
+Zvec-Webview-Preview-0.5.0-rc.1-win-x64-unsigned-setup.exe
+Zvec-LAN-Viewer-0.5.0-rc.1-android-debug-preview.apk
 ```
+
+候选包只要包含该 debug APK，发布装配策略就会将 `effective_prerelease` 设为 `true`。触发 GitHub Release 时必须使用带预发布后缀的 SemVer；本次使用 `0.5.0-rc.1`，不能把 debug APK 挂在稳定版标签下。
 
 Vue Preview 使用独立入口：
 
@@ -180,7 +193,7 @@ python -m venv .venv
 .venv\Scripts\python.exe -m pip install --constraint requirements-lock.txt --editable . --requirement requirements-dev.txt
 .venv\Scripts\python.exe -m ruff check .
 .venv\Scripts\python.exe -m ruff format --check .
-.venv\Scripts\python.exe -m mypy image_vector_service zvec_desktop zvec_webview image_service.py zvec_launcher.py zvec_logging.py scripts
+.venv\Scripts\python.exe -m mypy image_vector_service zvec_desktop zvec_lan zvec_webview image_service.py zvec_launcher.py zvec_logging.py scripts
 .venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
@@ -193,6 +206,15 @@ npm.cmd run typecheck
 npm.cmd test
 npm.cmd run build
 ```
+
+Android：
+
+```text
+cd android
+gradlew.bat testDebugUnitTest assembleDebug lintDebug
+```
+
+Android 构建使用 JDK 17、SDK Platform 34 和 Build Tools 34.0.0。CI 与候选发布只生成明确标记为 `debug-preview` 的 APK 和 SHA-256，不接触正式签名密钥。
 
 完整 Windows x64 Preview 构建：
 
@@ -208,7 +230,10 @@ python scripts/build_webview_preview.py --makensis build/tools/nsis-3.12-python/
 ## 已知限制
 
 - 当前产物未签名，SmartScreen 可能提示风险。
-- 只发布 Windows x64；不提供 macOS、Linux、ARM64 或 x86 版本。
+- 桌面端只发布 Windows x64；不提供 macOS、Linux、ARM64 或 x86 版本。
+- Android 客户端目前只有 debug-signed Preview，没有应用商店正式签名、自动更新或 iOS 版本。
+- Android 局域网 Preview 当前使用未加密 HTTP，不提供端到端传输加密；只应在用户自己控制的家庭专用网络使用。
+- Android 与电脑必须位于可互访的私网；访客 Wi-Fi、AP 隔离、VPN 或防火墙可能阻止自动发现，手工 IP 可作为备用。
 - 尚无自动更新。
 - 阿里云模型需要网络、有效 API Key 和可用额度。
 - Node.js 只属于开发与构建环境，不属于用户运行环境。

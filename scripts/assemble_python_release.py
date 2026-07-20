@@ -1,4 +1,4 @@
-"""Assemble verified desktop, WebView Preview, and wheel release artifacts."""
+"""Assemble verified desktop, WebView, wheel, and Android preview artifacts."""
 
 from __future__ import annotations
 
@@ -102,11 +102,27 @@ def _verify_checksum_directory(source: Path) -> None:
         )
 
 
+def _validate_android_directory(source: Path, version: str) -> str:
+    expected_name = f"Zvec-LAN-Viewer-{version}-android-debug-preview.apk"
+    artifacts = {
+        path.name
+        for path in source.iterdir()
+        if path.is_file() and path.name != "SHA256SUMS.txt"
+    }
+    if artifacts != {expected_name}:
+        raise ReleaseAssemblyError(
+            "Android artifact directory must contain only the expected debug-preview "
+            f"APK: {expected_name}"
+        )
+    return expected_name
+
+
 def assemble_release(
     *,
     desktop_directory: Path,
     webview_directory: Path,
     native_directory: Path,
+    android_directory: Path,
     output_directory: Path,
     version: str,
     revision: str,
@@ -125,6 +141,8 @@ def assemble_release(
     _verify_checksum_directory(desktop_directory)
     _verify_checksum_directory(webview_directory)
     _verify_checksum_directory(native_directory)
+    _verify_checksum_directory(android_directory)
+    android_apk_name = _validate_android_directory(android_directory, version)
     assets.mkdir(parents=True)
 
     reasons: list[str] = []
@@ -138,6 +156,7 @@ def assemble_release(
         reasons.append("the workflow ref is not the exact v<version> tag")
     if not search_quality_certified:
         reasons.append("search quality is explicitly uncertified")
+    reasons.append("the Android client is a debug-signed preview")
     effective_prerelease = bool(reasons)
     if signing_status != "authenticode" and not effective_prerelease:
         raise ReleaseAssemblyError("Unsigned artifacts cannot enter the stable channel")
@@ -154,9 +173,11 @@ def assemble_release(
     _copy_checksum(desktop_directory, assets / "DESKTOP-SHA256SUMS.txt")
     _copy_checksum(webview_directory, assets / "WEBVIEW-SHA256SUMS.txt")
     _copy_checksum(native_directory, assets / "NATIVE-SHA256SUMS.txt")
+    _copy_checksum(android_directory, assets / "ANDROID-SHA256SUMS.txt")
     _copy_unique_files(desktop_directory, assets)
     _copy_unique_files(webview_directory, assets)
     _copy_unique_files(native_directory, assets)
+    _copy_unique_files(android_directory, assets)
 
     policy = {
         "schema_version": 2,
@@ -184,6 +205,14 @@ def assemble_release(
             "powershell_required": False,
             "dotnet_required": False,
             "docker_required": False,
+        },
+        "android_client": {
+            "implementation": "Kotlin / Jetpack Compose",
+            "target": "Android 8.0 (API 26) or later",
+            "channel": "debug preview",
+            "signing_status": "android-debug",
+            "production_signed": False,
+            "artifact": android_apk_name,
         },
     }
     _write_json(assets / "RELEASE-POLICY.json", policy)
@@ -214,6 +243,10 @@ def assemble_release(
         "Desktop: pure Python win-x64 payload and installer verification passed",
         "WebView Preview: frozen payload, ZIP, and NSIS inventory verification passed",
         "Native CLI: isolated Python 3.12 wheel install and command smoke passed",
+        (
+            "Android LAN Viewer: unit tests, lint, and debug APK assembly passed; "
+            "the APK is preview-only and is not production signed"
+        ),
     ]
     if reasons:
         notes.extend(["", "Preview reasons:", "", *(f"- {item}" for item in reasons)])
@@ -237,6 +270,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--desktop-directory", type=Path, required=True)
     parser.add_argument("--webview-directory", type=Path, required=True)
     parser.add_argument("--native-directory", type=Path, required=True)
+    parser.add_argument("--android-directory", type=Path, required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
     parser.add_argument("--version", required=True)
     parser.add_argument("--revision", required=True)
@@ -260,6 +294,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             desktop_directory=args.desktop_directory.resolve(),
             webview_directory=args.webview_directory.resolve(),
             native_directory=args.native_directory.resolve(),
+            android_directory=args.android_directory.resolve(),
             output_directory=args.output_directory,
             version=args.version,
             revision=args.revision,

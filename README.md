@@ -135,7 +135,7 @@ Zvec 是一款面向 Windows 的本地图片管理与智能检索软件，适合
 
 ## 安装与启动
 
-软件仅提供 Windows x64 版本，推荐使用 Windows 10 或 Windows 11。
+桌面端仅提供 Windows x64 版本，推荐使用 Windows 10 或 Windows 11。配套局域网查看端支持 Android 8.0 及以上版本。
 
 ### 安装版
 
@@ -148,6 +148,20 @@ Zvec 是一款面向 Windows 的本地图片管理与智能检索软件，适合
 将 ZIP 压缩包完整解压到一个固定目录，然后运行其中的 Zvec 主程序。
 
 不要直接在压缩包内启动，也不要只单独复制 EXE 文件，否则软件可能找不到前端资源或本地运行组件。
+
+### Android 局域网查看
+
+Android 平板或手机可以在同一局域网内搜索 Windows 电脑上的图库、翻页查看结果，并打开或保存原图。电脑继续负责图库、索引和模型，Android 端不会修改桌面设置、建立索引或删除图库。
+
+1. 在 Windows Zvec 的“设置 → 局域网访问”中选择私网 IP，保存并启用服务。
+2. 安装 `Zvec-LAN-Viewer-*-android-debug-preview.apk`，让设备与电脑连接同一 Wi-Fi。
+3. Android 端通常会自动发现电脑；发现失败时可手工填写电脑的私网 IP 和端口 `38522`。
+4. 两端核对相同的 6 位验证码，再在 Windows 上批准配对。
+5. 在 Android 端选择图库并搜索。查询图片采用流式上传，原图采用流式并发传输。
+
+配对不要求二维码。当前 Preview 使用未加密 HTTP，只适合你自己控制的家庭专用网络，不要在公共、共享或不可信 Wi-Fi 使用。Windows 防火墙首次提示时只允许“专用网络”；访客 Wi-Fi、AP 隔离或 VPN 可能阻止自动发现，此时应先尝试手工 IP。使用期间电脑必须保持开机，Zvec 必须继续运行。
+
+当前 APK 使用 Android debug 签名，仅供局域网预览和测试，不等同于应用商店正式签名版本。Android 可能要求允许“安装未知应用”。
 
 ## 首次使用
 
@@ -203,6 +217,15 @@ python scripts/run_large_library_gates.py --profile nightly --million --json-rep
 ```
 
 运行器会输出每个门禁的耗时、单行摘要和 JSON 报告；任何选中测试被跳过都会使门禁失败。Ruff、Mypy 和全量单元测试仍由主 CI 独立执行。
+
+Android：
+
+```powershell
+cd android
+.\gradlew.bat testDebugUnitTest assembleDebug lintDebug
+```
+
+构建需要 JDK 17、Android SDK Platform 34 和 Build Tools 34.0.0。APK 位于 `android/app/build/outputs/apk/debug/app-debug.apk`；Gradle Wrapper 不读取或生成正式发布签名密钥。
 
 ## 使用建议
 

@@ -6,6 +6,7 @@ import type {
   SearchLearningStatus,
 } from "../../search-learning";
 import SettingsPage from "../SettingsPage.vue";
+import type { LanAccessApi } from "../lanTypes";
 import type { SettingsApi, SettingsResponse } from "../types";
 
 function settingsPayload(overrides: Partial<SettingsResponse> = {}): SettingsResponse {
@@ -114,6 +115,29 @@ function fakeLearningApi(): SearchLearningApi {
   };
 }
 
+function fakeLanApi(): LanAccessApi {
+  const status = {
+    enabled: false,
+    running: false,
+    bind_host: "192.168.1.20",
+    port: 38522,
+    display_name: "Zvec 图片库",
+    discovery_port: 38521,
+    available_hosts: [{ address: "192.168.1.20", label: "以太网" }],
+    pending_pairings: [],
+    device: null,
+  };
+  return {
+    status: vi.fn(async () => status),
+    update: vi.fn(async () => status),
+    start: vi.fn(async () => ({ ...status, enabled: true, running: true })),
+    stop: vi.fn(async () => status),
+    approve: vi.fn(async () => status),
+    reject: vi.fn(async () => status),
+    revokeDevice: vi.fn(async () => status),
+  };
+}
+
 function buttonWithText(wrapper: ReturnType<typeof mount>, label: string) {
   const button = wrapper.findAll("button").find((item) => item.text().includes(label));
   if (!button) throw new Error(`button not found: ${label}`);
@@ -124,7 +148,7 @@ describe("SettingsPage", () => {
   beforeEach(() => vi.clearAllMocks());
 
   it("loads editable library fields while never displaying the stored API key", async () => {
-    const wrapper = mount(SettingsPage, { props: { api: fakeApi() } });
+    const wrapper = mount(SettingsPage, { props: { api: fakeApi(), lanApi: fakeLanApi() } });
     await flushPromises();
 
     expect(wrapper.get('.library-editor input[name="name"]').element).toHaveProperty("value", "人物图库");
@@ -138,7 +162,7 @@ describe("SettingsPage", () => {
 
   it("validates and saves all editable library fields plus the global results directory", async () => {
     const api = fakeApi();
-    const wrapper = mount(SettingsPage, { props: { api } });
+    const wrapper = mount(SettingsPage, { props: { api, lanApi: fakeLanApi() } });
     await flushPromises();
 
     await wrapper.get('.library-editor input[name="name"]').setValue("Cosplay 图库");
@@ -164,7 +188,7 @@ describe("SettingsPage", () => {
 
   it("rejects relative Windows paths without sending a save request", async () => {
     const api = fakeApi();
-    const wrapper = mount(SettingsPage, { props: { api } });
+    const wrapper = mount(SettingsPage, { props: { api, lanApi: fakeLanApi() } });
     await flushPromises();
 
     await wrapper.get('.library-editor input[name="image_root"]').setValue("relative/images");
@@ -178,7 +202,7 @@ describe("SettingsPage", () => {
 
   it("saves the global result directory through the default library endpoint", async () => {
     const api = fakeApi();
-    const wrapper = mount(SettingsPage, { props: { api } });
+    const wrapper = mount(SettingsPage, { props: { api, lanApi: fakeLanApi() } });
     await flushPromises();
 
     await wrapper.get('.results-form input[name="results_directory"]').setValue("F:\\SearchResults");
@@ -192,7 +216,7 @@ describe("SettingsPage", () => {
 
   it("updates three model roles and clears credentials before or after every write", async () => {
     const api = fakeApi();
-    const wrapper = mount(SettingsPage, { props: { api } });
+    const wrapper = mount(SettingsPage, { props: { api, lanApi: fakeLanApi() } });
     await flushPromises();
 
     await wrapper.get(".model-form").trigger("submit");
@@ -220,7 +244,7 @@ describe("SettingsPage", () => {
   it("includes search-learning settings and forwards its action toasts", async () => {
     const learningApi = fakeLearningApi();
     const wrapper = mount(SettingsPage, {
-      props: { api: fakeApi(), learningApi },
+      props: { api: fakeApi(), learningApi, lanApi: fakeLanApi() },
     });
     await flushPromises();
 

@@ -807,6 +807,47 @@ def _handler_type(gateway: GatewayServer) -> type[BaseHTTPRequestHandler]:
             if method == "GET" and segments == ("settings",):
                 self._json(HTTPStatus.OK, gateway._facade.settings())
                 return
+            if method == "GET" and segments == ("lan-access",):
+                _reject_unknown_query(query_values, set())
+                self._json(HTTPStatus.OK, gateway._facade.lan_access_status())
+                return
+            if method == "PUT" and segments == ("lan-access",):
+                self._json(
+                    HTTPStatus.OK,
+                    gateway._facade.update_lan_access(self._read_json()),
+                )
+                return
+            if method == "POST" and segments == ("lan-access", "start"):
+                self._json(HTTPStatus.OK, gateway._facade.start_lan_access())
+                return
+            if method == "POST" and segments == ("lan-access", "stop"):
+                self._json(HTTPStatus.OK, gateway._facade.stop_lan_access())
+                return
+            if (
+                method == "POST"
+                and len(segments) == 4
+                and segments[:2] == ("lan-access", "pairings")
+                and segments[3] == "approve"
+            ):
+                self._json(
+                    HTTPStatus.OK,
+                    gateway._facade.approve_lan_pairing(segments[2]),
+                )
+                return
+            if (
+                method == "POST"
+                and len(segments) == 4
+                and segments[:2] == ("lan-access", "pairings")
+                and segments[3] == "reject"
+            ):
+                self._json(
+                    HTTPStatus.OK,
+                    gateway._facade.reject_lan_pairing(segments[2]),
+                )
+                return
+            if method == "DELETE" and segments == ("lan-access", "device"):
+                self._json(HTTPStatus.OK, gateway._facade.revoke_lan_device())
+                return
             if method == "PUT" and segments == ("models",):
                 body = self._read_json()
                 if "json_text" in body:

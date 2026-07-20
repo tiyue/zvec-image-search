@@ -128,6 +128,7 @@ from zvec_desktop.search_service import (
 )
 
 from .image_registry import ImageRegistry, ImageRegistryError
+from .lan_access import LanAccessController, LanAccessError
 
 _TERMINAL_STATUSES = frozenset(
     {
@@ -254,6 +255,7 @@ class _SearchOperation:
     query: JsonObject
     submitted_at: float
     submission: Any
+    service: SearchService | None = None
     status: str = "queued"
     progress: JsonObject | None = None
     outcome: SearchOutcome | None = None
@@ -324,6 +326,7 @@ class PreviewFacade:
         activity_store: ActivityStore | None = None,
         search_learning_service: SearchLearningService | None = None,
         data_migration_coordinator: DataMigrationCoordinator | None = None,
+        lan_access_controller: LanAccessController | None = None,
         observer_job_history_fallback: bool = False,
     ) -> None:
         if not isinstance(observer_job_history_fallback, bool):
@@ -410,6 +413,7 @@ class PreviewFacade:
         self._backend_runtime: BackendRuntime | None = None
         self._backend_future: Future[Any] | None = None
         self._search_service: SearchService | None = None
+        self._lan_search_service: SearchService | None = None
         self._task_service: LibraryTaskService | None = None
         self._searches: dict[str, _SearchOperation] = {}
         self._tasks: dict[str, _TaskOperation] = {}
@@ -421,6 +425,10 @@ class PreviewFacade:
         self._activity_job_statuses: dict[str, str] = {}
         self._activity_search_statuses: dict[str, str] = {}
         self._closed = False
+        self._lan_access = lan_access_controller or LanAccessController(
+            self,
+            self._configuration.config_home,
+        )
 
     @property
     def image_registry(self) -> ImageRegistry:
@@ -434,6 +442,41 @@ class PreviewFacade:
         """Return process-local secrets for the private diagnostic writer."""
 
         return self._activity.redactions()
+
+    def lan_access_status(self) -> JsonObject:
+        return self._lan_access_call(self._lan_access.status)
+
+    def update_lan_access(self, payload: Mapping[str, Any]) -> JsonObject:
+        return self._lan_access_call(lambda: self._lan_access.update(payload))
+
+    def start_lan_access(self) -> JsonObject:
+        return self._lan_access_call(self._lan_access.start)
+
+    def start_lan_access_if_enabled(self) -> None:
+        self._lan_access.start_if_enabled()
+
+    def stop_lan_access(self) -> JsonObject:
+        return self._lan_access_call(self._lan_access.stop)
+
+    def approve_lan_pairing(self, pairing_id: str) -> JsonObject:
+        return self._lan_access_call(lambda: self._lan_access.approve(pairing_id))
+
+    def reject_lan_pairing(self, pairing_id: str) -> JsonObject:
+        return self._lan_access_call(lambda: self._lan_access.reject(pairing_id))
+
+    def revoke_lan_device(self) -> JsonObject:
+        return self._lan_access_call(self._lan_access.revoke_device)
+
+    @staticmethod
+    def _lan_access_call(call: Callable[[], JsonObject]) -> JsonObject:
+        try:
+            return call()
+        except LanAccessError as exc:
+            raise FacadeError(
+                exc.code,
+                exc.message,
+                status=exc.status,
+            ) from exc
 
     def job_history(
         self,
@@ -1246,6 +1289,25 @@ class PreviewFacade:
     def submit_search(self, payload: Mapping[str, Any]) -> JsonObject:
         self._ensure_migration_not_active()
         service = self._ready_search_service()
+        return self._submit_search_with_service(payload, service)
+
+    def submit_lan_search(self, payload: Mapping[str, Any]) -> JsonObject:
+        """Submit a trusted, already-streamed LAN query image without a size cap.
+
+        The LAN gateway writes request bodies to a private temporary file in
+        bounded chunks.  This second staging copy therefore keeps streaming
+        file I/O while deliberately omitting the desktop upload byte ceiling.
+        """
+
+        self._ensure_migration_not_active()
+        service = self._ready_lan_search_service()
+        return self._submit_search_with_service(payload, service)
+
+    def _submit_search_with_service(
+        self,
+        payload: Mapping[str, Any],
+        service: SearchService,
+    ) -> JsonObject:
         request_payload = dict(payload)
         query_image_id = request_payload.pop("query_image_id", None)
         if query_image_id is not None:
@@ -1276,6 +1338,7 @@ class PreviewFacade:
             query={**query, "page_size": page_size},
             submitted_at=time.time(),
             submission=submission,
+            service=service,
         )
         with self._lock:
             self._searches[operation.operation_id] = operation
@@ -1346,13 +1409,15 @@ class PreviewFacade:
 
     def cancel_search(self, operation_id: str) -> JsonObject:
         normalized = _operation_id(operation_id)
-        service = self._ready_search_service()
         with self._lock:
             operation = self._searches.get(normalized)
             if operation is None:
                 raise FacadeError(
                     "search_not_found", "搜索任务不存在或已过期。", status=404
                 )
+            service = operation.service
+        if service is None:
+            service = self._ready_search_service()
         try:
             job = service.cancel(operation.submission)
         except Exception as exc:
@@ -2419,6 +2484,7 @@ class PreviewFacade:
             self._backend_runtime = None
             self._backend_future = None
             self._search_service = None
+            self._lan_search_service = None
             self._task_service = None
         return was_running
 
@@ -2923,6 +2989,7 @@ class PreviewFacade:
                     self._activity.close(timeout=2.0)
                 if self._owns_search_learning:
                     self._search_learning.close()
+                self._lan_access.close()
                 self._registry.close()
                 self._invalidate_catalog()
                 if self._owns_executor:
@@ -2940,6 +3007,11 @@ class PreviewFacade:
             if secret:
                 self._host.client.configure_credentials(secret)
             search_service = SearchService(self._host.client, runtime.query_root)
+            lan_search_service = SearchService(
+                self._host.client,
+                runtime.query_root,
+                max_query_image_bytes=None,
+            )
             task_service = LibraryTaskService(self._host.client)
         except Exception as exc:
             with self._lock:
@@ -2947,6 +3019,7 @@ class PreviewFacade:
                 self._backend_error = _error_payload(exc, "backend_start_failed")
                 self._backend_runtime = None
                 self._search_service = None
+                self._lan_search_service = None
                 self._task_service = None
             self._activity_log(
                 level="error",
@@ -2962,6 +3035,7 @@ class PreviewFacade:
         with self._lock:
             self._backend_runtime = runtime
             self._search_service = search_service
+            self._lan_search_service = lan_search_service
             self._task_service = task_service
             self._backend_state = "ready"
             self._backend_error = None
@@ -3032,7 +3106,9 @@ class PreviewFacade:
     def _wait_search_worker(self, operation_id: str) -> None:
         with self._lock:
             operation = self._searches.get(operation_id)
-            service = self._search_service
+            service = operation.service if operation is not None else None
+            if service is None:
+                service = self._search_service
             if operation is None or service is None:
                 return
             operation.status = "running"
@@ -3493,6 +3569,15 @@ class PreviewFacade:
     def _ready_search_service(self) -> SearchService:
         with self._lock:
             service = self._search_service
+            if self._backend_state != "ready" or service is None:
+                raise FacadeError(
+                    "backend_not_ready", "后端尚未就绪，请稍后重试。", status=503
+                )
+            return service
+
+    def _ready_lan_search_service(self) -> SearchService:
+        with self._lock:
+            service = self._lan_search_service
             if self._backend_state != "ready" or service is None:
                 raise FacadeError(
                     "backend_not_ready", "后端尚未就绪，请稍后重试。", status=503

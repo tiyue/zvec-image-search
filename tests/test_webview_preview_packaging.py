@@ -91,6 +91,7 @@ class WebviewPreviewSourceContractTest(unittest.TestCase):
             project,
         )
         self.assertIn('"zvec_webview*"', project)
+        self.assertIn('"zvec_lan*"', project)
         self.assertIn('"frontend_dist/.vite/manifest.json"', project)
         self.assertIn('"frontend_dist/assets/*"', project)
         self.assertNotIn('zvec_webview = ["assets/*"]', project)
@@ -128,7 +129,7 @@ class WebviewPreviewSourceContractTest(unittest.TestCase):
         self.assertIsNone(plan.makensis_command)
         self.assertEqual(
             plan.installer_output.name,
-            "Zvec-Webview-Preview-0.4.0-win-x64-unsigned-setup.exe",
+            f"Zvec-Webview-Preview-{plan.version}-win-x64-unsigned-setup.exe",
         )
         self.assertEqual(plan.to_dict()["target_runtime"], "win-x64")
         self.assertEqual(plan.frontend_directory.name, "frontend")
@@ -216,8 +217,8 @@ class WebviewPreviewSourceContractTest(unittest.TestCase):
             plan.makensis_command,
             (
                 str(compiler.resolve()),
-                "/DVERSION=0.4.0",
-                "/DFILE_VERSION=0.4.0.0",
+                f"/DVERSION={plan.version}",
+                f"/DFILE_VERSION={windows_file_version(plan.version)}",
                 f"/DSOURCE_DIR={plan.payload_directory}",
                 f"/DOUTPUT_FILE={plan.installer_output}",
                 "/DRID=win-x64",
@@ -267,6 +268,9 @@ class WebviewPreviewSourceContractTest(unittest.TestCase):
         self.assertIn('"image_vector_service.search_learning_evaluator"', spec)
         self.assertIn('"image_vector_service.search_learning_store"', spec)
         self.assertIn('"image_vector_service.search_learning_runtime"', spec)
+        self.assertIn('"zvec_lan.http_server"', spec)
+        self.assertIn('"zvec_lan.service"', spec)
+        self.assertIn('"zvec_webview.lan_access"', spec)
         self.assertIn('name="Zvec-Webview-Preview"', spec)
         self.assertIn('"tkinter"', spec)
         self.assertIn('"pystray"', spec)
@@ -316,6 +320,12 @@ class WebviewPreviewSourceContractTest(unittest.TestCase):
                 "image_vector_service.search_learning_runtime",
                 "image_vector_service.search_learning_service",
                 "image_vector_service.search_learning_store",
+                "zvec_lan.discovery",
+                "zvec_lan.http_server",
+                "zvec_lan.models",
+                "zvec_lan.pairing",
+                "zvec_lan.service",
+                "zvec_lan.uploads",
                 "webview",
                 "webview.platforms.edgechromium",
                 "webview.platforms.winforms",
@@ -323,6 +333,8 @@ class WebviewPreviewSourceContractTest(unittest.TestCase):
                 "zvec_webview.app",
                 "zvec_webview.facade",
                 "zvec_webview.frontend_assets",
+                "zvec_webview.lan_access",
+                "zvec_webview.lan_settings",
                 "zvec_webview.native_bridge",
                 "zvec_webview.runtime",
                 "zvec_webview.server",

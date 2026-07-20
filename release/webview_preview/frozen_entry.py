@@ -70,9 +70,17 @@ def _run_packaging_self_test(output_path: Path) -> int:
         import image_vector_service.search_learning_runtime as search_learning_runtime
         import image_vector_service.search_learning_service as search_learning_service
         import image_vector_service.search_learning_store as search_learning_store
+        import zvec_lan.discovery as lan_discovery
+        import zvec_lan.http_server as lan_http_server
+        import zvec_lan.models as lan_models
+        import zvec_lan.pairing as lan_pairing
+        import zvec_lan.service as lan_service
+        import zvec_lan.uploads as lan_uploads
         import zvec_webview.app as preview_app
         import zvec_webview.facade as preview_facade
         import zvec_webview.frontend_assets as frontend_assets
+        import zvec_webview.lan_access as lan_access
+        import zvec_webview.lan_settings as lan_settings
         import zvec_webview.native_bridge as native_bridge
         import zvec_webview.runtime as preview_runtime
         import zvec_webview.server as preview_server
@@ -159,8 +167,16 @@ def _run_packaging_self_test(output_path: Path) -> int:
                     search_learning_runtime.__name__,
                     search_learning_service.__name__,
                     search_learning_store.__name__,
+                    lan_discovery.__name__,
+                    lan_http_server.__name__,
+                    lan_models.__name__,
+                    lan_pairing.__name__,
+                    lan_service.__name__,
+                    lan_uploads.__name__,
                     frontend_assets.__name__,
                     Image.__name__,
+                    lan_access.__name__,
+                    lan_settings.__name__,
                     native_bridge.__name__,
                     preview_app.__name__,
                     preview_facade.__name__,

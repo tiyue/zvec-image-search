@@ -8,6 +8,7 @@ payload, and keeps polling/cancellation logic out of Tk event handlers.
 from __future__ import annotations
 
 import math
+import os
 import shutil
 import threading
 import time
@@ -15,7 +16,11 @@ import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, Protocol
+from typing import Any, BinaryIO, Literal, Protocol
+
+from PIL import Image, ImageOps, UnidentifiedImageError
+
+from image_vector_service.image_data_uri import DASHSCOPE_DATA_URI_TARGET_BYTES
 
 from .backend_api import JsonObject
 
@@ -34,6 +39,36 @@ _MAX_TAGS = 100
 _MAX_TAG_CHARACTERS = 256
 _MAX_LIBRARIES = 100
 _MAX_TECHNICAL_COUNT = 2**31 - 1
+_MAX_LAN_DECODE_PIXELS = 40_000_000
+_MAX_LAN_OUTPUT_DIMENSION = 4096
+_MIN_LAN_OUTPUT_DIMENSION = 64
+_LAN_JPEG_QUALITIES = (90, 82, 74, 66, 58, 50)
+_MAX_LAN_RESIZE_ROUNDS = 10
+_SUPPORTED_IMAGE_SUFFIXES = frozenset(
+    {
+        ".jpg",
+        ".jpeg",
+        ".png",
+        ".webp",
+        ".bmp",
+        ".tif",
+        ".tiff",
+        ".ico",
+        ".dib",
+        ".icns",
+        ".sgi",
+    }
+)
+_IMAGE_SUFFIX_BY_FORMAT = {
+    "JPEG": ".jpg",
+    "PNG": ".png",
+    "WEBP": ".webp",
+    "BMP": ".bmp",
+    "TIFF": ".tiff",
+    "ICO": ".ico",
+    "ICNS": ".icns",
+    "SGI": ".sgi",
+}
 
 
 class SearchServiceError(RuntimeError):
@@ -150,13 +185,31 @@ class SearchService:
         client: SearchClient,
         query_root: str | Path,
         *,
-        max_query_image_bytes: int = _MAX_QUERY_IMAGE_BYTES,
+        max_query_image_bytes: int | None = _MAX_QUERY_IMAGE_BYTES,
+        model_source_image_bytes: int = _MAX_QUERY_IMAGE_BYTES,
+        max_image_data_uri_bytes: int = DASHSCOPE_DATA_URI_TARGET_BYTES,
+        max_decode_pixels: int = _MAX_LAN_DECODE_PIXELS,
+        max_output_dimension: int = _MAX_LAN_OUTPUT_DIMENSION,
     ) -> None:
-        if isinstance(max_query_image_bytes, bool) or max_query_image_bytes < 1:
-            raise ValueError("max_query_image_bytes must be a positive integer")
+        if max_query_image_bytes is not None and (
+            isinstance(max_query_image_bytes, bool) or max_query_image_bytes < 1
+        ):
+            raise ValueError("max_query_image_bytes must be a positive integer or None")
+        for name, value in (
+            ("model_source_image_bytes", model_source_image_bytes),
+            ("max_image_data_uri_bytes", max_image_data_uri_bytes),
+            ("max_decode_pixels", max_decode_pixels),
+            ("max_output_dimension", max_output_dimension),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
         self._client = client
         self._query_root = Path(query_root).expanduser().resolve()
         self._max_query_image_bytes = max_query_image_bytes
+        self._model_source_image_bytes = model_source_image_bytes
+        self._max_image_data_uri_bytes = max_image_data_uri_bytes
+        self._max_decode_pixels = max_decode_pixels
+        self._max_output_dimension = max_output_dimension
 
     @property
     def query_root(self) -> Path:
@@ -257,12 +310,16 @@ class SearchService:
         if not resolved_source.is_file():
             raise SearchValidationError("查询图片必须是文件。")
         try:
-            size = resolved_source.stat().st_size
+            source_stat = resolved_source.stat()
         except OSError as exc:
             raise SearchValidationError("无法读取查询图片大小。") from exc
+        size = source_stat.st_size
         if size <= 0:
             raise SearchValidationError("查询图片不能为空文件。")
-        if size > self._max_query_image_bytes:
+        if (
+            self._max_query_image_bytes is not None
+            and size > self._max_query_image_bytes
+        ):
             raise SearchValidationError(
                 f"查询图片不能超过 {self._max_query_image_bytes // (1024 * 1024)} MiB。"
             )
@@ -275,23 +332,379 @@ class SearchService:
         if not root.is_dir():
             raise SearchServiceError("后端查询图片暂存路径不是文件夹。")
 
+        # ``None`` is reserved for the LAN service. Its HTTP upload is already
+        # streamed to disk without a byte cap, but the model client still has a
+        # separate source-read ceiling. Oversized sources are decoded from the
+        # file handle and converted into a bounded JPEG before backend submit;
+        # the original upload is never rewritten or loaded wholesale as bytes.
+        if (
+            self._max_query_image_bytes is None
+            and size > self._model_source_image_bytes
+        ):
+            return self._stage_transcoded_lan_image(
+                resolved_source,
+                source_stat=source_stat,
+                root=root,
+            )
+
         suffix = _safe_suffix(resolved_source.suffix)
+        if (
+            self._max_query_image_bytes is None
+            and suffix not in _SUPPORTED_IMAGE_SUFFIXES
+        ):
+            # LAN uploads intentionally use opaque ``.bin`` storage names.
+            # Detect only enough metadata to give the backend a supported
+            # extension; pixel data remains streaming-copy-only in this branch.
+            suffix = _detect_image_suffix(
+                resolved_source,
+                expected_stat=source_stat,
+            )
         target = root / f"query-{uuid.uuid4().hex}{suffix}"
         try:
             with (
                 resolved_source.open("rb") as source_stream,
                 target.open("xb") as target_stream,
             ):
+                opened_stat = os.fstat(source_stream.fileno())
+                if _stat_signature(opened_stat) != _stat_signature(source_stat):
+                    raise SearchValidationError("查询图片在处理时发生变化，请重试。")
                 shutil.copyfileobj(source_stream, target_stream, length=1024 * 1024)
+                target_stream.flush()
+                os.fsync(target_stream.fileno())
+                closed_stat = os.fstat(source_stream.fileno())
             shutil.copystat(resolved_source, target, follow_symlinks=True)
             copied_size = target.stat().st_size
+            final_stat = resolved_source.stat()
+        except SearchValidationError:
+            _unlink_if_present(target)
+            raise
         except OSError as exc:
             _unlink_if_present(target)
             raise SearchServiceError("复制查询图片到后端暂存目录失败。") from exc
-        if copied_size != size:
+        if (
+            copied_size != size
+            or _stat_signature(closed_stat) != _stat_signature(source_stat)
+            or _stat_signature(final_stat) != _stat_signature(source_stat)
+        ):
             _unlink_if_present(target)
-            raise SearchServiceError("查询图片复制不完整，请重试。")
+            raise SearchValidationError("查询图片在复制时发生变化，请重试。")
         return target.resolve(strict=True)
+
+    def _stage_transcoded_lan_image(
+        self,
+        source: Path,
+        *,
+        source_stat: os.stat_result,
+        root: Path,
+    ) -> Path:
+        """Create a model-safe LAN query copy with bounded decode memory."""
+
+        target = root / f"query-{uuid.uuid4().hex}.jpg"
+        prepared: Image.Image | None = None
+        try:
+            try:
+                source_stream = source.open("rb")
+            except OSError as exc:
+                raise SearchValidationError("无法读取查询图片。") from exc
+            with source_stream:
+                opened_stat = os.fstat(source_stream.fileno())
+                if _stat_signature(opened_stat) != _stat_signature(source_stat):
+                    raise SearchValidationError("查询图片在处理时发生变化，请重试。")
+                prepared = _prepare_lan_image(
+                    source_stream,
+                    max_decode_pixels=self._max_decode_pixels,
+                    max_output_dimension=self._max_output_dimension,
+                )
+                _write_bounded_jpeg(
+                    prepared,
+                    target,
+                    model_source_limit=self._model_source_image_bytes,
+                    data_uri_limit=self._max_image_data_uri_bytes,
+                )
+                closed_stat = os.fstat(source_stream.fileno())
+            try:
+                final_stat = source.stat()
+            except OSError as exc:
+                raise SearchValidationError(
+                    "查询图片在处理时发生变化，请重试。"
+                ) from exc
+            if _stat_signature(closed_stat) != _stat_signature(
+                source_stat
+            ) or _stat_signature(final_stat) != _stat_signature(source_stat):
+                raise SearchValidationError("查询图片在处理时发生变化，请重试。")
+            _verify_staged_jpeg(target)
+            return target.resolve(strict=True)
+        except (SearchServiceError, SearchValidationError):
+            _unlink_if_present(target)
+            raise
+        except MemoryError as exc:
+            _unlink_if_present(target)
+            raise SearchServiceError("处理查询图片时内存不足。") from exc
+        except OSError as exc:
+            _unlink_if_present(target)
+            raise SearchServiceError("保存查询图片暂存副本失败。") from exc
+        except Exception as exc:
+            _unlink_if_present(target)
+            raise SearchServiceError("处理查询图片暂存副本失败。") from exc
+        finally:
+            if prepared is not None:
+                prepared.close()
+
+
+def _detect_image_suffix(
+    source: Path,
+    *,
+    expected_stat: os.stat_result,
+) -> str:
+    """Identify an opaque LAN upload without reading its complete payload."""
+
+    try:
+        with source.open("rb") as stream:
+            opened_stat = os.fstat(stream.fileno())
+            if _stat_signature(opened_stat) != _stat_signature(expected_stat):
+                raise SearchValidationError("查询图片在处理时发生变化，请重试。")
+            with Image.open(stream) as image:
+                image_format = (image.format or "").upper()
+            closed_stat = os.fstat(stream.fileno())
+        final_stat = source.stat()
+    except SearchValidationError:
+        raise
+    except MemoryError as exc:
+        raise SearchServiceError("识别查询图片时内存不足。") from exc
+    except (
+        Image.DecompressionBombError,
+        Image.DecompressionBombWarning,
+        UnidentifiedImageError,
+        OSError,
+        SyntaxError,
+        ValueError,
+    ) as exc:
+        raise SearchValidationError("查询图片损坏或格式不受支持。") from exc
+    if _stat_signature(closed_stat) != _stat_signature(
+        expected_stat
+    ) or _stat_signature(final_stat) != _stat_signature(expected_stat):
+        raise SearchValidationError("查询图片在处理时发生变化，请重试。")
+    suffix = _IMAGE_SUFFIX_BY_FORMAT.get(image_format)
+    if suffix is None:
+        raise SearchValidationError("查询图片格式不受支持。")
+    return suffix
+
+
+def _prepare_lan_image(
+    source_stream: BinaryIO,
+    *,
+    max_decode_pixels: int,
+    max_output_dimension: int,
+) -> Image.Image:
+    """Decode one image with a hard pixel budget and return an owned RGB copy."""
+
+    oriented: Image.Image | None = None
+    try:
+        with Image.open(source_stream) as opened:
+            image_format = (opened.format or "").upper()
+            if image_format not in _IMAGE_SUFFIX_BY_FORMAT:
+                raise SearchValidationError("查询图片格式不受支持。")
+            width, height = opened.size
+            if width < 1 or height < 1:
+                raise SearchValidationError("查询图片尺寸无效。")
+
+            original_pixels = width * height
+            if (
+                original_pixels > max_decode_pixels
+                or max(width, height) > max_output_dimension
+            ):
+                # JPEG and a few other decoders can reduce during decode. If a
+                # format cannot honour ``draft``, the post-draft pixel gate
+                # rejects it before ``load`` expands unsafe pixel memory.
+                opened.draft(
+                    "RGB",
+                    _decoder_draft_size(
+                        opened.size,
+                        max_dimension=max_output_dimension,
+                    ),
+                )
+            decoded_pixels = opened.width * opened.height
+            if decoded_pixels > max_decode_pixels:
+                raise SearchValidationError(
+                    "查询图片像素过大，无法在安全内存范围内处理。"
+                )
+            if max(opened.size) > max_output_dimension:
+                # Resize before EXIF transpose so formats without decoder
+                # subsampling do not create a second full-resolution oriented
+                # copy. Rotation/reflection is applied to the reduced pixels.
+                opened.thumbnail(
+                    (max_output_dimension, max_output_dimension),
+                    Image.Resampling.LANCZOS,
+                )
+
+            oriented = ImageOps.exif_transpose(opened)
+            oriented.load()
+            if oriented.width * oriented.height > max_decode_pixels:
+                raise SearchValidationError("查询图片旋转后的像素数量超过安全限制。")
+            return _flatten_lan_image(oriented)
+    except SearchValidationError:
+        raise
+    except MemoryError as exc:
+        raise SearchServiceError("处理查询图片时内存不足。") from exc
+    except (
+        Image.DecompressionBombError,
+        Image.DecompressionBombWarning,
+        UnidentifiedImageError,
+        OSError,
+        SyntaxError,
+        ValueError,
+    ) as exc:
+        raise SearchValidationError("查询图片损坏或无法解码。") from exc
+    finally:
+        if oriented is not None:
+            oriented.close()
+
+
+def _flatten_lan_image(image: Image.Image) -> Image.Image:
+    """Match the model encoder's transparent-image behaviour using white."""
+
+    if image.mode in {"RGBA", "LA"} or "transparency" in image.info:
+        rgba = image.convert("RGBA")
+        try:
+            background = Image.new("RGB", rgba.size, "white")
+            alpha = rgba.getchannel("A")
+            try:
+                background.paste(rgba, mask=alpha)
+            finally:
+                alpha.close()
+            background.load()
+            return background
+        finally:
+            rgba.close()
+    converted = image.convert("RGB")
+    converted.load()
+    return converted
+
+
+def _write_bounded_jpeg(
+    image: Image.Image,
+    target: Path,
+    *,
+    model_source_limit: int,
+    data_uri_limit: int,
+) -> None:
+    """Write a JPEG that both the backend reader and data URI can accept."""
+
+    payload_limit = min(
+        model_source_limit,
+        _maximum_data_uri_payload(data_uri_limit, mime_type="image/jpeg"),
+    )
+    current = image
+    owns_current = False
+    last_size = 0
+    try:
+        for _resize_round in range(_MAX_LAN_RESIZE_ROUNDS):
+            for quality in _LAN_JPEG_QUALITIES:
+                try:
+                    mode = "wb" if target.exists() else "xb"
+                    with target.open(mode) as stream:
+                        current.save(
+                            stream,
+                            format="JPEG",
+                            quality=quality,
+                            optimize=True,
+                            progressive=True,
+                            subsampling="4:2:0",
+                        )
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    last_size = target.stat().st_size
+                except OSError as exc:
+                    raise SearchServiceError(
+                        "保存查询图片暂存副本失败，可能是磁盘空间不足。"
+                    ) from exc
+                if (
+                    0 < last_size <= payload_limit
+                    and _data_uri_size(last_size, mime_type="image/jpeg")
+                    <= data_uri_limit
+                ):
+                    return
+
+            longest = max(current.size)
+            if longest <= _MIN_LAN_OUTPUT_DIMENSION:
+                break
+            scale = 0.75
+            if last_size > 0:
+                scale = min(
+                    scale,
+                    max(0.35, math.sqrt(payload_limit / last_size) * 0.92),
+                )
+            next_longest = max(
+                _MIN_LAN_OUTPUT_DIMENSION,
+                int(longest * scale),
+            )
+            if next_longest >= longest:
+                break
+            ratio = next_longest / longest
+            next_size = (
+                max(1, int(current.width * ratio)),
+                max(1, int(current.height * ratio)),
+            )
+            resized = current.resize(next_size, Image.Resampling.LANCZOS)
+            if owns_current:
+                current.close()
+            current = resized
+            owns_current = True
+    finally:
+        if owns_current:
+            current.close()
+    raise SearchValidationError("查询图片无法在安全尺寸内压缩到模型允许的大小。")
+
+
+def _maximum_data_uri_payload(limit: int, *, mime_type: str) -> int:
+    prefix_size = len(f"data:{mime_type};base64,".encode("ascii"))
+    if limit <= prefix_size + 4:
+        raise SearchValidationError("模型图片请求预算过小。")
+    payload = ((limit - prefix_size) // 4) * 3
+    while payload > 0 and _data_uri_size(payload, mime_type=mime_type) > limit:
+        payload -= 1
+    if payload < 1:
+        raise SearchValidationError("模型图片请求预算过小。")
+    return payload
+
+
+def _data_uri_size(payload_size: int, *, mime_type: str) -> int:
+    prefix_size = len(f"data:{mime_type};base64,".encode("ascii"))
+    return prefix_size + 4 * ((payload_size + 2) // 3)
+
+
+def _decoder_draft_size(
+    size: tuple[int, int],
+    *,
+    max_dimension: int,
+) -> tuple[int, int]:
+    width, height = size
+    if max(width, height) <= max_dimension:
+        return size
+    if width >= height:
+        return max_dimension, max(1, height * max_dimension // width)
+    return max(1, width * max_dimension // height), max_dimension
+
+
+def _verify_staged_jpeg(path: Path) -> None:
+    try:
+        with Image.open(path) as image:
+            if (image.format or "").upper() != "JPEG":
+                raise SearchServiceError("查询图片暂存副本格式无效。")
+            image.verify()
+    except SearchServiceError:
+        raise
+    except (OSError, SyntaxError, UnidentifiedImageError, ValueError) as exc:
+        raise SearchServiceError("查询图片暂存副本校验失败。") from exc
+
+
+def _stat_signature(value: os.stat_result) -> tuple[int, int, int, int]:
+    return (
+        int(getattr(value, "st_dev", 0)),
+        int(getattr(value, "st_ino", 0)),
+        int(getattr(value, "st_size", -1)),
+        int(getattr(value, "st_mtime_ns", -1)),
+    )
 
 
 def normalize_search_request(request: SearchRequest) -> NormalizedSearchRequest:

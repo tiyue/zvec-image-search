@@ -43,6 +43,9 @@ class PreviewRuntime:
                 return RuntimeStart(address, backend_started_async=False)
             self._started = True
         future = self.facade.start_backend_async()
+        # A LAN bind failure is recorded in the settings surface and must never
+        # prevent the loopback desktop window from starting.
+        self.facade.start_lan_access_if_enabled()
         return RuntimeStart(address, backend_started_async=future is not None)
 
     def close(self, *, force: bool = False) -> None:

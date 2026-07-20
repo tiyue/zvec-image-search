@@ -52,6 +52,7 @@ jobs:
           python -m mypy
           image_vector_service
           zvec_desktop
+          zvec_lan
           zvec_webview
           image_service.py
           zvec_launcher.py
@@ -89,6 +90,47 @@ jobs:
           tests.test_native_cli_smoke
           tests.test_native_package
           -v
+
+  android-lan-viewer:
+    name: Android LAN Viewer (JDK 17)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+          cache-dependency-path: |
+            android/*.gradle.kts
+            android/app/*.gradle.kts
+            android/gradle.properties
+            android/gradle/wrapper/gradle-wrapper.properties
+      - name: Test, lint, and assemble debug preview
+        working-directory: android
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          ./gradlew --no-daemon testDebugUnitTest assembleDebug lintDebug
+      - name: Stage debug-preview APK and checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          output="$RUNNER_TEMP/zvec-android-preview"
+          apk_name="Zvec-LAN-Viewer-${GITHUB_SHA}-android-debug-preview.apk"
+          mkdir -p "$output"
+          cp -- android/app/build/outputs/apk/debug/app-debug.apk "$output/$apk_name"
+          (
+            cd "$output"
+            sha256sum -- "$apk_name" > SHA256SUMS.txt
+          )
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: android-lan-viewer-${{ github.sha }}-debug-preview
+          path: ${{ runner.temp }}/zvec-android-preview/*
+          if-no-files-found: error
+          retention-days: 14
 
   large-library-gates:
     name: Large-library bounded I/O gates (Windows x64)

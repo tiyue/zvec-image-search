@@ -21,6 +21,7 @@ from scripts.prepare_python_release import (
 )
 from scripts.python_preview_packaging import (
     ENTRY_POINTS,
+    read_project_version,
     repository_root,
     write_payload_manifest,
     write_portable_archive,
@@ -55,7 +56,7 @@ def _valid_payload(output: Path) -> Path:
         _write(payload, relative)
     write_payload_manifest(
         payload,
-        version="0.4.0",
+        version=read_project_version(repository_root()),
         pyinstaller_version="6.16.0",
         signing_status="unsigned",
     )
@@ -86,16 +87,17 @@ def _revision(root: Path) -> str:
 class PythonReleaseMaterialsTest(unittest.TestCase):
     def test_generates_offline_spdx_provenance_manifest_and_checksums(self) -> None:
         root = repository_root()
+        version = read_project_version(root)
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary)
             payload = _valid_payload(output)
             write_portable_archive(
                 payload,
-                output / "Zvec-Desktop-0.4.0-win-x64-portable.zip",
+                output / f"Zvec-Desktop-{version}-win-x64-portable.zip",
             )
             _write(
                 output,
-                "Zvec-Desktop-0.4.0-win-x64-unsigned-setup.exe",
+                f"Zvec-Desktop-{version}-win-x64-unsigned-setup.exe",
                 b"synthetic installer",
             )
 
@@ -114,7 +116,9 @@ class PythonReleaseMaterialsTest(unittest.TestCase):
             self.assertFalse(release["runtime"]["dotnet_required"])
             self.assertFalse(release["runtime"]["docker_required"])
             sbom = json.loads(
-                (output / "Zvec-Desktop-0.4.0.spdx.json").read_text(encoding="utf-8")
+                (output / f"Zvec-Desktop-{version}.spdx.json").read_text(
+                    encoding="utf-8"
+                )
             )
             self.assertEqual(sbom["spdxVersion"], "SPDX-2.3")
             package_names = {package["name"] for package in sbom["packages"]}
@@ -128,7 +132,7 @@ class PythonReleaseMaterialsTest(unittest.TestCase):
                 },
             )
             provenance = json.loads(
-                (output / "Zvec-Desktop-0.4.0.provenance.json").read_text(
+                (output / f"Zvec-Desktop-{version}.provenance.json").read_text(
                     encoding="utf-8"
                 )
             )
@@ -137,8 +141,8 @@ class PythonReleaseMaterialsTest(unittest.TestCase):
                 "https://slsa.dev/provenance/v1",
             )
             checksums = (output / "SHA256SUMS.txt").read_text(encoding="utf-8")
-            self.assertIn("Zvec-Desktop-0.4.0-win-x64-portable.zip", checksums)
-            self.assertIn("Zvec-Desktop-0.4.0.spdx.json", checksums)
+            self.assertIn(f"Zvec-Desktop-{version}-win-x64-portable.zip", checksums)
+            self.assertIn(f"Zvec-Desktop-{version}.spdx.json", checksums)
             self.assertEqual(
                 release["supply_chain"]["packaging_lock"]["file"],
                 "requirements-packaging.txt",
@@ -159,10 +163,11 @@ class PythonReleaseMaterialsTest(unittest.TestCase):
 class PythonReleasePolicyTest(unittest.TestCase):
     def test_branch_preview_is_explicit_and_uses_python_desktop_policy(self) -> None:
         root = repository_root()
+        version = read_project_version(root)
         outputs = validate_release_request(
             repository_root=root,
-            version="0.4.0",
-            requested_prerelease=False,
+            version=version,
+            requested_prerelease="-" in version,
             search_quality_gate_path="",
             allow_uncertified_preview=True,
             require_authenticode=False,
@@ -173,16 +178,18 @@ class PythonReleasePolicyTest(unittest.TestCase):
         self.assertEqual(outputs["search_quality_certified"], "false")
 
     def test_uncertified_release_must_be_explicit(self) -> None:
+        root = repository_root()
+        version = read_project_version(root)
         with self.assertRaisesRegex(ReleaseRequestError, "formal search-quality"):
             validate_release_request(
-                repository_root=repository_root(),
-                version="0.4.0",
-                requested_prerelease=False,
+                repository_root=root,
+                version=version,
+                requested_prerelease="-" in version,
                 search_quality_gate_path="",
                 allow_uncertified_preview=False,
                 require_authenticode=False,
                 github_ref="refs/heads/main",
-                github_sha=_revision(repository_root()),
+                github_sha=_revision(root),
             )
 
 
@@ -193,20 +200,25 @@ class PythonReleaseAssemblyTest(unittest.TestCase):
             desktop = root / "desktop"
             webview = root / "webview"
             native = root / "native"
+            android = root / "android"
             desktop.mkdir()
             webview.mkdir()
             native.mkdir()
+            android.mkdir()
             _write(desktop, "desktop.zip")
             _write(webview, "Zvec-Webview-Preview-0.4.0-win-x64-portable.zip")
             _write(native, "package.whl")
+            _write(android, "Zvec-LAN-Viewer-0.4.0-android-debug-preview.apk")
             _write_checksums(desktop)
             _write_checksums(webview)
             _write_checksums(native)
+            _write_checksums(android)
 
             outputs = assemble_release(
                 desktop_directory=desktop,
                 webview_directory=webview,
                 native_directory=native,
+                android_directory=android,
                 output_directory=root / "candidate",
                 version="0.4.0",
                 revision="a" * 40,
@@ -225,6 +237,10 @@ class PythonReleaseAssemblyTest(unittest.TestCase):
             )
             self.assertFalse(policy["desktop_runtime"]["powershell_required"])
             self.assertFalse(policy["webview_preview"]["powershell_required"])
+            self.assertEqual(
+                policy["android_client"]["signing_status"], "android-debug"
+            )
+            self.assertFalse(policy["android_client"]["production_signed"])
             self.assertFalse(policy["stable_channel_eligible"])
             self.assertTrue(
                 (
@@ -242,11 +258,16 @@ class PythonReleaseAssemblyTest(unittest.TestCase):
                 directory.mkdir()
                 _write(directory, "same.bin")
                 _write_checksums(directory)
+            android = root / "android"
+            android.mkdir()
+            _write(android, "Zvec-LAN-Viewer-0.4.0-android-debug-preview.apk")
+            _write_checksums(android)
             with self.assertRaisesRegex(ReleaseAssemblyError, "Duplicate"):
                 assemble_release(
                     desktop_directory=root / "desktop",
                     webview_directory=root / "webview",
                     native_directory=root / "native",
+                    android_directory=android,
                     output_directory=root / "candidate",
                     version="0.4.0",
                     revision="a" * 40,
@@ -265,12 +286,17 @@ class PythonReleaseAssemblyTest(unittest.TestCase):
                 directory.mkdir()
                 _write(directory, f"{name}.bin")
                 _write_checksums(directory)
+            android = root / "android"
+            android.mkdir()
+            _write(android, "Zvec-LAN-Viewer-0.4.0-android-debug-preview.apk")
+            _write_checksums(android)
             (root / "desktop/desktop.bin").write_bytes(b"tampered")
             with self.assertRaisesRegex(ReleaseAssemblyError, "SHA-256 mismatch"):
                 assemble_release(
                     desktop_directory=root / "desktop",
                     webview_directory=root / "webview",
                     native_directory=root / "native",
+                    android_directory=android,
                     output_directory=root / "candidate",
                     version="0.4.0",
                     revision="a" * 40,
@@ -281,6 +307,76 @@ class PythonReleaseAssemblyTest(unittest.TestCase):
                     search_quality_certified=False,
                 )
             self.assertFalse((root / "candidate").exists())
+
+    def test_rejects_android_apk_that_is_not_explicitly_debug_preview(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name in ("desktop", "webview", "native"):
+                directory = root / name
+                directory.mkdir()
+                _write(directory, f"{name}.bin")
+                _write_checksums(directory)
+            android = root / "android"
+            android.mkdir()
+            _write(android, "Zvec-LAN-Viewer-0.4.0.apk")
+            _write_checksums(android)
+
+            with self.assertRaisesRegex(ReleaseAssemblyError, "debug-preview"):
+                assemble_release(
+                    desktop_directory=root / "desktop",
+                    webview_directory=root / "webview",
+                    native_directory=root / "native",
+                    android_directory=android,
+                    output_directory=root / "candidate",
+                    version="0.4.0",
+                    revision="a" * 40,
+                    signing_status="unsigned",
+                    version_prerelease=False,
+                    exact_tag_ref=False,
+                    license_present=False,
+                    search_quality_certified=False,
+                )
+
+    def test_debug_android_apk_forces_an_otherwise_stable_candidate_to_preview(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name in ("desktop", "webview", "native"):
+                directory = root / name
+                directory.mkdir()
+                _write(directory, f"{name}.bin")
+                _write_checksums(directory)
+            android = root / "android"
+            android.mkdir()
+            _write(android, "Zvec-LAN-Viewer-0.4.0-android-debug-preview.apk")
+            _write_checksums(android)
+
+            outputs = assemble_release(
+                desktop_directory=root / "desktop",
+                webview_directory=root / "webview",
+                native_directory=root / "native",
+                android_directory=android,
+                output_directory=root / "candidate",
+                version="0.4.0",
+                revision="a" * 40,
+                signing_status="authenticode",
+                version_prerelease=False,
+                exact_tag_ref=True,
+                license_present=True,
+                search_quality_certified=True,
+            )
+
+            self.assertEqual(outputs["effective_prerelease"], "true")
+            policy = json.loads(
+                (root / "candidate/release-assets/RELEASE-POLICY.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                policy["preview_reasons"],
+                ["the Android client is a debug-signed preview"],
+            )
 
 
 class PurePythonWorkflowContractTest(unittest.TestCase):
@@ -313,6 +409,8 @@ class PurePythonWorkflowContractTest(unittest.TestCase):
         self.assertIn("smoke_python_desktop_installer.py", release)
         self.assertIn("webview-preview-${{ inputs.version }}-unsigned", release)
         self.assertIn("--webview-directory candidate/webview", release)
+        self.assertIn("android-lan-viewer-${{ inputs.version }}-debug-preview", release)
+        self.assertIn("--android-directory candidate/android", release)
 
         ci = (root / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         self.assertIn(
@@ -320,11 +418,14 @@ class PurePythonWorkflowContractTest(unittest.TestCase):
             ci,
         )
         self.assertIn("needs: webview-frontend", ci)
+        self.assertIn("testDebugUnitTest assembleDebug lintDebug", ci)
+        self.assertIn("zvec_lan", ci)
 
         assembly = (root / "scripts/assemble_python_release.py").read_text(
             encoding="utf-8"
         )
         self.assertIn('assets / "WEBVIEW-SHA256SUMS.txt"', assembly)
+        self.assertIn('assets / "ANDROID-SHA256SUMS.txt"', assembly)
         self.assertIn("WebView Preview: frozen payload", assembly)
 
     def test_formal_icon_and_installer_do_not_read_the_wpf_tree(self) -> None:

@@ -6,6 +6,8 @@ import {
   type SearchLearningApi,
 } from "../search-learning";
 import DataMigrationSection from "./DataMigrationSection.vue";
+import LanAccessSection from "./LanAccessSection.vue";
+import type { LanAccessApi } from "./lanTypes";
 import type { DataMigrationApi } from "./migrationTypes";
 import type {
   LibraryDraft,
@@ -18,6 +20,7 @@ import { useSettings } from "./useSettings";
 
 const props = withDefaults(defineProps<{
   api?: SettingsApi;
+  lanApi?: LanAccessApi;
   migrationApi?: DataMigrationApi;
   learningApi?: SearchLearningApi;
   autoLoad?: boolean;
@@ -340,6 +343,11 @@ function chooseResultsDirectory(): void {
       :libraries="settings.libraries.value"
       @toast="(title, message, kind) => emit('toast', title, message, kind)"
       @completed="settings.load"
+    />
+
+    <LanAccessSection
+      :api="props.lanApi"
+      @toast="(title, message, kind) => emit('toast', title, message, kind)"
     />
 
     <SearchLearningSettingsCard

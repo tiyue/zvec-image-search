@@ -44,6 +44,7 @@ class _Facade:
         self.activity_error: FacadeError | None = None
         self.migration_recovery_body: dict[str, Any] | None = None
         self.fixed_evaluation_body: dict[str, Any] | None = None
+        self.lan_calls: list[tuple[str, object | None]] = []
 
     def bootstrap(self) -> dict[str, Any]:
         return {
@@ -55,6 +56,49 @@ class _Facade:
 
     def settings(self) -> dict[str, Any]:
         return {"credentials": {"configured": False}}
+
+    def _lan_status(self, message: str = "ready") -> dict[str, Any]:
+        return {
+            "enabled": True,
+            "running": message != "stopped",
+            "bind_host": "192.168.1.20",
+            "port": 38522,
+            "display_name": "Zvec test",
+            "discovery_port": 38521,
+            "address": "http://192.168.1.20:38522",
+            "available_hosts": [],
+            "pending_pairings": [],
+            "device": None,
+            "message": message,
+        }
+
+    def lan_access_status(self) -> dict[str, Any]:
+        self.lan_calls.append(("status", None))
+        return self._lan_status()
+
+    def update_lan_access(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self.lan_calls.append(("update", payload))
+        return self._lan_status("updated")
+
+    def start_lan_access(self) -> dict[str, Any]:
+        self.lan_calls.append(("start", None))
+        return self._lan_status("started")
+
+    def stop_lan_access(self) -> dict[str, Any]:
+        self.lan_calls.append(("stop", None))
+        return self._lan_status("stopped")
+
+    def approve_lan_pairing(self, pairing_id: str) -> dict[str, Any]:
+        self.lan_calls.append(("approve", pairing_id))
+        return self._lan_status("approved")
+
+    def reject_lan_pairing(self, pairing_id: str) -> dict[str, Any]:
+        self.lan_calls.append(("reject", pairing_id))
+        return self._lan_status("rejected")
+
+    def revoke_lan_device(self) -> dict[str, Any]:
+        self.lan_calls.append(("revoke", None))
+        return self._lan_status("revoked")
 
     def latest_results(self, *, page: int, page_size: int) -> dict[str, Any]:
         return {"id": "latest", "page": page, "page_size": page_size, "items": []}
@@ -430,6 +474,49 @@ class GatewayTests(unittest.TestCase):
             urlopen(wrong, timeout=5)
         self.assertEqual(caught.exception.code, 404)
         caught.exception.close()
+
+    def test_lan_access_control_routes_remain_loopback_only(self) -> None:
+        status, _headers, payload = _json(self.server.url + "api/lan-access")
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["running"])
+
+        body = {
+            "enabled": True,
+            "bind_host": "192.168.1.20",
+            "port": 38522,
+            "display_name": "Zvec test",
+        }
+        self.assertEqual(
+            _json(
+                self.server.url + "api/lan-access",
+                method="PUT",
+                body=body,
+            )[0],
+            200,
+        )
+        for route in (
+            "api/lan-access/start",
+            "api/lan-access/stop",
+            "api/lan-access/pairings/pair-1/approve",
+            "api/lan-access/pairings/pair-2/reject",
+        ):
+            self.assertEqual(_json(self.server.url + route, method="POST")[0], 200)
+        self.assertEqual(
+            _json(self.server.url + "api/lan-access/device", method="DELETE")[0],
+            200,
+        )
+        self.assertEqual(
+            self.facade.lan_calls,
+            [
+                ("status", None),
+                ("update", body),
+                ("start", None),
+                ("stop", None),
+                ("approve", "pair-1"),
+                ("reject", "pair-2"),
+                ("revoke", None),
+            ],
+        )
 
     def test_fixed_evaluation_import_route_forwards_the_selected_source(self) -> None:
         source_path = r"C:\Evaluation\fixed-evaluation.json"
