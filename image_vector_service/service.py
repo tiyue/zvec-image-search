@@ -8,9 +8,10 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path
-from time import perf_counter
+from time import monotonic, perf_counter
 from typing import Any, cast
 
 from PIL import Image, UnidentifiedImageError
@@ -42,6 +43,11 @@ from .cluster_operation_store import (
     ClusterOperationStoreUnavailable,
     ClusterOperationValidationError,
 )
+from .collection_write_coordinator import (
+    CollectionWriteCoordinator,
+    CollectionWriteRecoveryError,
+    PreparedCollectionUpsert,
+)
 from .config import ConfigurationError, ServiceConfig
 from .dashscope_client import (
     DashScopeEmbeddingClient,
@@ -70,12 +76,18 @@ from .image_clustering import (
     write_cluster_snapshot,
 )
 from .image_scanner import (
+    StagedScanResult,
     file_sha256,
     inspect_query_image,
-    scan_folder,
+    scan_folder_to_staging,
+)
+from .large_cluster_adapter import (
+    DEFAULT_CLUSTER_TYPES,
+    LargeClusterAdapter,
+    should_use_large_cluster_engine,
 )
 from .library_browser import LibraryBrowser
-from .logical_paths import normalize_path
+from .logical_paths import normalize_path, normalize_relative_path
 from .metadata_backfill import (
     MetadataBackfillItem,
     MetadataBackfillReport,
@@ -99,6 +111,12 @@ from .models import (
     SearchReport,
     SearchSortMode,
 )
+from .optimize_policy import (
+    OptimizePolicyStatus,
+    OptimizePolicyStore,
+    OptimizeRuntimeAdapter,
+    evaluate_optimize_gate,
+)
 from .process_lock import ProcessLock
 from .rank_fusion import (
     DEFAULT_AGREEMENT_REWARD,
@@ -119,6 +137,7 @@ from .result_exporter import (
     cleanup_search_results,
     export_results,
 )
+from .scan_staging import StagedImageRecord, retire_orphaned_scan_staging
 from .search_learning_config import (
     ACTIVE_CONFIG_FILENAME,
     SEARCH_LEARNING_DIRECTORY,
@@ -134,34 +153,45 @@ from .search_quality import (
 from .source_resolver import SourcePathResolver
 from .state import IndexState
 from .tag_aliases import TagAliasDictionary, TagAliasStore
+from .tag_rank_query import ranked_tag_candidates
 from .tag_search import (
     TagCatalog,
     TagMatchMode,
     TagSearchPlan,
     matched_tags_for_result,
-    normalize_tag_search_text,
-    result_matches_tag_plan,
 )
-from .tags import folder_tags_for_image, normalize_tags
+from .tags import folder_tags_for_relative_path, normalize_tags
 from .zvec_repository import ZvecImageRepository
 
 
 @dataclass(frozen=True)
+class _EmbeddingWorkItem:
+    content_hash: str
+    representative: ImageRecord
+    member_count: int
+
+
+@dataclass
+class _StagedPipelineControl:
+    storage_halted: bool = False
+
+
+@dataclass(frozen=True)
 class _EmbeddingFailure:
-    items: list[tuple[str, list[ImageRecord]]]
+    items: list[_EmbeddingWorkItem]
     error: str
     kind: FailureKind
 
 
 @dataclass
 class _EmbeddingBatchResult:
-    successes: list[tuple[tuple[str, list[ImageRecord]], list[float]]] = field(
+    successes: list[tuple[_EmbeddingWorkItem, list[float]]] = field(
         default_factory=list
     )
     failures: list[_EmbeddingFailure] = field(default_factory=list)
     usage: list[dict[str, object]] = field(default_factory=list)
     systemic_error: str = ""
-    systemic_items: list[tuple[str, list[ImageRecord]]] = field(default_factory=list)
+    systemic_items: list[_EmbeddingWorkItem] = field(default_factory=list)
 
     def extend(self, other: _EmbeddingBatchResult) -> None:
         self.successes.extend(other.successes)
@@ -175,6 +205,8 @@ class _EmbeddingBatchResult:
 class _UpsertResult:
     committed: bool
     inserted_entries: list[dict[str, Any]] = field(default_factory=list)
+    deferred_count: int = 0
+    successful_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -229,6 +261,23 @@ class _PipelineNetworkMetrics:
         )
 
 
+class _DirectOptimizeRuntimeAdapter:
+    """Treat a standalone service as idle while honoring caller cancellation."""
+
+    def __init__(self, cancel_check: Callable[[], None]) -> None:
+        self._cancel_check = cancel_check
+
+    def cancellation_requested(self) -> bool:
+        try:
+            self._cancel_check()
+        except Exception:
+            return True
+        return False
+
+    def queue_is_idle(self) -> bool:
+        return True
+
+
 class ImageVectorService:
     def __init__(
         self,
@@ -254,6 +303,27 @@ class ImageVectorService:
         try:
             initialize_zvec(self.config.log_dir)
             self.logger = get_app_logger(self.config.log_dir)
+            try:
+                retired_scan_files = retire_orphaned_scan_staging(
+                    self.config.workspace / ".scan-staging",
+                    warning_handler=lambda warning: self.logger.warning(
+                        "scan_staging_retirement_warning warning=%s",
+                        warning,
+                    ),
+                )
+                if retired_scan_files:
+                    self.logger.info(
+                        "scan_staging_retired artifacts=%d api_requests=0",
+                        len(retired_scan_files),
+                    )
+            except Exception as exc:
+                # Scan scratch is never authoritative state. A maintenance
+                # failure must not make the Collection unavailable; the same
+                # strict retirement is retried before the next scan.
+                self.logger.warning(
+                    "scan_staging_retirement_failed error=%s",
+                    str(exc) or exc.__class__.__name__,
+                )
             self.repository = repository or ZvecImageRepository(self.config)
             self._embedding_client = embedding_client
             self.state = IndexState(
@@ -281,6 +351,54 @@ class ImageVectorService:
                 self.repository.collection_uuid,
                 reset_if_unbound=self.repository.created,
             )
+            self.optimize_policy = OptimizePolicyStore(
+                self.config.workspace / "optimize-policy.sqlite3"
+            )
+            self._optimize_runtime_adapter: OptimizeRuntimeAdapter = (
+                _DirectOptimizeRuntimeAdapter(self.cancel_check)
+            )
+            self._optimize_external_idle_runner = False
+            self._optimize_retry_not_before = 0.0
+            self._optimize_max_interval_deadline: float | None = None
+            self._set_optimize_pending_status(self.optimize_policy.status())
+            self.collection_writes = CollectionWriteCoordinator(
+                state=self.state,
+                repository=self.repository,
+                model=self.config.model,
+                dimension=self.config.dimension,
+                mutation_observer=self._record_collection_mutation,
+            )
+            try:
+                collection_write_recovery = self.collection_writes.recover_pending()
+            except CollectionWriteRecoveryError as exc:
+                raise ConfigurationError(
+                    "Pending Collection writes could not be recovered safely."
+                ) from exc
+            if collection_write_recovery["pending_before"]:
+                self.logger.warning(
+                    "collection_write_recovered pending=%d applied=%d failed=%d "
+                    "interrupted=%d api_requests=0",
+                    collection_write_recovery["pending_before"],
+                    collection_write_recovery["recovered"],
+                    collection_write_recovery["failed"],
+                    collection_write_recovery["interrupted"],
+                )
+            try:
+                pruned_writes = self.state.write_outbox.prune_applied()
+                if pruned_writes["operations"]:
+                    self.logger.info(
+                        "collection_write_history_pruned operations=%d items=%d",
+                        pruned_writes["operations"],
+                        pruned_writes["items"],
+                    )
+            except Exception as exc:
+                # Historical cleanup is maintenance only. Replayable and failed
+                # rows are outside the prune query, and a cleanup failure must
+                # never make the image service unavailable.
+                self.logger.warning(
+                    "collection_write_history_prune_failed error=%s",
+                    str(exc) or exc.__class__.__name__,
+                )
             self.cluster_operations: ClusterOperationStore | None = None
             try:
                 self.cluster_operations = ClusterOperationStore(
@@ -325,6 +443,7 @@ class ImageVectorService:
                 source_resolver=self.source_resolver,
                 progress=self.progress,
                 cancel_check=self.cancel_check,
+                collection_writes=self.collection_writes,
             )
             self.validate_documents = self.repository.doc_count != self.state.count()
         except Exception:
@@ -332,6 +451,9 @@ class ImageVectorService:
                 self.auto_tag_cache.close()
             if hasattr(self, "state"):
                 self.state.close()
+            close_repository = getattr(getattr(self, "repository", None), "close", None)
+            if callable(close_repository):
+                close_repository()
             if hasattr(self, "logger"):
                 close_app_logger(self.logger)
             self._lock.release()
@@ -342,6 +464,299 @@ class ImageVectorService:
         if self._embedding_client is None:
             self._embedding_client = DashScopeEmbeddingClient(self.config)
         return self._embedding_client
+
+    def configure_optimize_runtime(
+        self,
+        adapter: OptimizeRuntimeAdapter,
+        *,
+        externally_managed: bool = True,
+    ) -> None:
+        """Attach the owner-thread queue/cancellation view used by maintenance."""
+
+        self._optimize_runtime_adapter = adapter
+        self._optimize_external_idle_runner = bool(externally_managed)
+
+    def has_pending_optimize_maintenance(self) -> bool:
+        """Return an in-memory due hint without opening the policy database."""
+
+        if not bool(getattr(self, "_optimize_pending", False)):
+            return False
+        now = monotonic()
+        if now < float(getattr(self, "_optimize_retry_not_before", 0.0)):
+            return False
+        if bool(getattr(self, "_optimize_threshold_due", False)):
+            return True
+        deadline = getattr(self, "_optimize_max_interval_deadline", None)
+        return deadline is not None and now >= float(deadline)
+
+    def optimize_maintenance_wait_seconds(self) -> float | None:
+        """Return the next policy wake-up without consulting SQLite."""
+
+        if not bool(getattr(self, "_optimize_pending", False)):
+            return None
+        now = monotonic()
+        retry_at = float(getattr(self, "_optimize_retry_not_before", 0.0))
+        if retry_at > now:
+            return retry_at - now
+        if bool(getattr(self, "_optimize_threshold_due", False)):
+            return 0.0
+        deadline = getattr(self, "_optimize_max_interval_deadline", None)
+        if deadline is None:
+            return None
+        return max(0.0, float(deadline) - now)
+
+    def run_idle_maintenance(self) -> dict[str, object]:
+        """Run due Zvec compaction without making the preceding user task fail."""
+
+        if not self.has_pending_optimize_maintenance():
+            return {
+                "status": "not_due",
+                "reason": "in_memory_policy_hint",
+                "attempted": False,
+            }
+        policy = getattr(self, "optimize_policy", None)
+        if not isinstance(policy, OptimizePolicyStore):
+            return {
+                "status": "unavailable",
+                "reason": "policy_unavailable",
+                "attempted": False,
+            }
+        try:
+            document_count = max(0, int(self.repository.doc_count))
+        except Exception as exc:
+            self._defer_optimize_retry()
+            self._log_optimize_warning(
+                "optimize_document_count_failed",
+                exc.__class__.__name__,
+            )
+            return {
+                "status": "deferred",
+                "reason": "document_count_unavailable",
+                "attempted": False,
+                "error_type": exc.__class__.__name__,
+            }
+
+        decision = policy.should_optimize(document_count)
+        diagnostic: dict[str, object] = {
+            "status": "not_due",
+            "reason": decision.reason,
+            "attempted": False,
+            "pending_changes": decision.pending_changes,
+            "pending_deletes": decision.pending_deletes,
+            "document_count": decision.document_count,
+        }
+        if not decision.should_optimize:
+            if decision.retry_after_seconds is not None:
+                self._optimize_retry_not_before = monotonic() + max(
+                    0.0,
+                    decision.retry_after_seconds,
+                )
+            elif decision.reason == "policy_unavailable":
+                self._defer_optimize_retry()
+            elif decision.reason == "no_pending_changes":
+                self._set_optimize_pending_status(policy.status())
+            else:
+                self._recompute_optimize_threshold_hint()
+            return diagnostic
+
+        adapter = getattr(self, "_optimize_runtime_adapter", None)
+        if adapter is None:
+            adapter = _DirectOptimizeRuntimeAdapter(self.cancel_check)
+        gate = evaluate_optimize_gate(adapter)
+        if not gate.allowed:
+            diagnostic.update(status="deferred", reason=gate.reason)
+            if gate.error:
+                self._log_optimize_warning("optimize_runtime_gate_failed", gate.error)
+            return diagnostic
+
+        attempt_id = f"optimize:{uuid.uuid4().hex}"
+        attempt = policy.mark_attempt(decision, attempt_id)
+        if not attempt.ok:
+            self._defer_optimize_retry()
+            self._log_optimize_warning("optimize_attempt_record_failed", attempt.error)
+            diagnostic.update(status="deferred", reason="attempt_record_failed")
+            return diagnostic
+
+        diagnostic["attempted"] = True
+        try:
+            self.repository.optimize()
+        except Exception as exc:
+            failure = policy.mark_failure(
+                decision,
+                exc,
+                attempt_id=attempt_id,
+            )
+            status = policy.status()
+            self._schedule_optimize_failure_retry(status)
+            self._log_optimize_warning(
+                "collection_optimize_failed",
+                failure.error if not failure.ok else exc.__class__.__name__,
+            )
+            diagnostic.update(
+                status="failed",
+                reason="repository_optimize_failed",
+                error_type=exc.__class__.__name__,
+            )
+            return diagnostic
+
+        success = policy.mark_success(decision, attempt_id=attempt_id)
+        if not success.ok:
+            # The Collection was compacted, but the optional acknowledgement
+            # could not be persisted. Keep the counters and retry later.
+            self._defer_optimize_retry()
+            self._log_optimize_warning("optimize_success_record_failed", success.error)
+            diagnostic.update(status="deferred", reason="success_record_failed")
+            return diagnostic
+        status = policy.status()
+        if status.available:
+            self._set_optimize_pending_status(status)
+        else:
+            self._defer_optimize_retry()
+        logger = getattr(self, "logger", None)
+        if logger is not None:
+            logger.info(
+                "collection_optimize_completed reason=%s changes=%d deletes=%d "
+                "residual=%d",
+                decision.reason,
+                decision.pending_changes,
+                decision.pending_deletes,
+                status.total_pending if status.available else -1,
+            )
+        diagnostic.update(
+            status="succeeded",
+            reason=decision.reason,
+            residual_changes=(status.pending_changes if status.available else -1),
+            residual_deletes=(status.pending_deletes if status.available else -1),
+        )
+        return diagnostic
+
+    def _record_collection_mutation(
+        self,
+        operation_id: str,
+        *,
+        changes: int,
+        deletes: int,
+    ) -> None:
+        policy = getattr(self, "optimize_policy", None)
+        if not isinstance(policy, OptimizePolicyStore):
+            return
+        try:
+            result = policy.mark_changes(
+                operation_id,
+                changes=changes,
+                deletes=deletes,
+            )
+        except Exception as exc:
+            self._log_optimize_warning(
+                "optimize_change_record_failed",
+                exc.__class__.__name__,
+            )
+            return
+        if not result.ok:
+            self._log_optimize_warning(
+                "optimize_change_record_failed",
+                result.error,
+            )
+            return
+        if not result.applied:
+            return
+        if not bool(getattr(self, "_optimize_pending", False)):
+            self._optimize_max_interval_deadline = (
+                monotonic() + policy.config.max_interval.total_seconds()
+            )
+        self._optimize_pending = True
+        self._optimize_pending_changes = int(
+            getattr(self, "_optimize_pending_changes", 0)
+        ) + int(changes)
+        self._optimize_pending_deletes = int(
+            getattr(self, "_optimize_pending_deletes", 0)
+        ) + int(deletes)
+        self._recompute_optimize_threshold_hint()
+
+    def _set_optimize_pending_status(self, status: OptimizePolicyStatus) -> None:
+        policy = getattr(self, "optimize_policy", None)
+        if not status.available or not isinstance(policy, OptimizePolicyStore):
+            self._optimize_pending = False
+            self._optimize_pending_changes = 0
+            self._optimize_pending_deletes = 0
+            self._optimize_threshold_due = False
+            self._optimize_max_interval_deadline = None
+            return
+        self._optimize_pending_changes = status.pending_changes
+        self._optimize_pending_deletes = status.pending_deletes
+        self._optimize_pending = status.total_pending > 0
+        if status.pending_since is None or not self._optimize_pending:
+            self._optimize_max_interval_deadline = None
+        else:
+            elapsed = max(
+                0.0,
+                (datetime.now(timezone.utc) - status.pending_since).total_seconds(),
+            )
+            self._optimize_max_interval_deadline = monotonic() + max(
+                0.0,
+                policy.config.max_interval.total_seconds() - elapsed,
+            )
+        self._recompute_optimize_threshold_hint()
+        if not self._optimize_pending:
+            self._optimize_retry_not_before = 0.0
+
+    def _recompute_optimize_threshold_hint(self) -> None:
+        policy = getattr(self, "optimize_policy", None)
+        if not isinstance(policy, OptimizePolicyStore):
+            self._optimize_threshold_due = False
+            return
+        changes = int(getattr(self, "_optimize_pending_changes", 0))
+        deletes = int(getattr(self, "_optimize_pending_deletes", 0))
+        config = policy.config
+        due = (
+            changes + deletes >= config.change_threshold
+            or deletes >= config.delete_count_threshold
+        )
+        if not due and deletes >= config.delete_ratio_minimum_count:
+            try:
+                document_count = max(0, int(self.repository.doc_count))
+            except Exception:
+                document_count = -1
+            denominator = document_count + deletes
+            due = bool(
+                document_count >= 0
+                and denominator > 0
+                and deletes / denominator >= config.delete_ratio_threshold
+            )
+        self._optimize_threshold_due = due
+
+    def _defer_optimize_retry(self) -> None:
+        policy = getattr(self, "optimize_policy", None)
+        delay = (
+            policy.config.failure_backoff_initial.total_seconds()
+            if isinstance(policy, OptimizePolicyStore)
+            else 60.0
+        )
+        self._optimize_retry_not_before = monotonic() + delay
+
+    def _schedule_optimize_failure_retry(
+        self,
+        status: OptimizePolicyStatus,
+    ) -> None:
+        policy = getattr(self, "optimize_policy", None)
+        if not isinstance(policy, OptimizePolicyStore):
+            self._defer_optimize_retry()
+            return
+        exponent = max(0, min(status.consecutive_failures - 1, 62))
+        delay = min(
+            policy.config.failure_backoff_initial.total_seconds() * (2**exponent),
+            policy.config.failure_backoff_maximum.total_seconds(),
+        )
+        self._optimize_retry_not_before = monotonic() + delay
+
+    def _log_optimize_warning(self, event: str, error: object) -> None:
+        logger = getattr(self, "logger", None)
+        if logger is None:
+            return
+        # Policy-returned errors are already sanitized. Bound them again so an
+        # optional maintenance failure cannot flood the application log.
+        safe_error = " ".join(str(error).split())[:800] or "unknown"
+        logger.warning("%s error=%s", event, safe_error)
 
     def _clear_legacy_root_tags(self) -> None:
         cleared = 0
@@ -518,6 +933,18 @@ class ImageVectorService:
             library_id=normalized,
             progress=self.progress,
             cancel_check=self.cancel_check,
+            mutation_observer=self._record_folder_deletion_mutation,
+        )
+
+    def _record_folder_deletion_mutation(
+        self,
+        operation_id: str,
+        indexed_deleted: int,
+    ) -> None:
+        self._record_collection_mutation(
+            f"folder-delete:{operation_id}",
+            changes=0,
+            deletes=max(0, int(indexed_deleted)),
         )
 
     def manual_tag_batch(
@@ -666,14 +1093,6 @@ class ImageVectorService:
 
         if updated:
             self._refresh_tag_catalog()
-            try:
-                self.repository.optimize()
-            except Exception as exc:
-                warnings.append(
-                    "Tag updates were saved, but Collection optimization failed: "
-                    f"{str(exc) or exc.__class__.__name__}"
-                )
-                needs_attention = True
 
         status = (
             "partial"
@@ -850,19 +1269,6 @@ class ImageVectorService:
 
         if restored:
             self._refresh_tag_catalog()
-            try:
-                self.repository.optimize()
-            except Exception as exc:
-                needs_attention = True
-                _append_manual_failure(
-                    failures,
-                    doc_id="",
-                    relative_path="",
-                    error=(
-                        "Tags were restored, but Collection optimization failed: "
-                        f"{str(exc) or exc.__class__.__name__}"
-                    ),
-                )
         remaining = self.state.count_manual_tag_batch_entries(
             batch_id,
             statuses=retryable_statuses,
@@ -994,93 +1400,45 @@ class ImageVectorService:
         self,
         plans: Sequence[_ManualTagPlan],
     ) -> tuple[list[str], dict[str, str], bool]:
-        items = [
-            (
-                _record_from_state_entry(plan.entry),
-                normalize_tags(
-                    [
-                        *plan.after_tags,
-                        *plan.entry.get("folder_tags", ()),
-                        *plan.entry.get("accepted_auto_tags", ()),
-                        *plan.entry.get("inherited_tags", ()),
-                    ]
-                ),
-            )
-            for plan in plans
-        ]
-        succeeded, failures = self._repository_update_record_tags(items)
-        if not succeeded:
-            return [], failures, False
-        succeeded_set = set(succeeded)
-        state_entries = [
-            {**plan.entry, "tags": list(plan.after_tags)}
-            for plan in plans
-            if str(plan.entry["doc_id"]) in succeeded_set
-        ]
-        try:
-            self.state.set_many(state_entries)
-        except Exception as exc:
-            state_error = str(exc) or exc.__class__.__name__
-            rollback_items = [
-                (
-                    _record_from_state_entry(plan.entry),
-                    normalize_tags(
+        vectors, failures = self.repository.fetch_vectors(
+            str(plan.entry["doc_id"]) for plan in plans
+        )
+        prepared: list[PreparedCollectionUpsert] = []
+        for plan in plans:
+            doc_id = str(plan.entry["doc_id"])
+            vector = vectors.get(doc_id)
+            if vector is None:
+                failures.setdefault(
+                    doc_id,
+                    "The indexed image vector is missing.",
+                )
+                continue
+            state_entry = {**plan.entry, "tags": list(plan.after_tags)}
+            prepared.append(
+                PreparedCollectionUpsert(
+                    record=_record_from_state_entry(plan.entry),
+                    image_vector=vector,
+                    effective_tags=normalize_tags(
                         [
-                            *plan.before_tags,
+                            *plan.after_tags,
                             *plan.entry.get("folder_tags", ()),
                             *plan.entry.get("accepted_auto_tags", ()),
                             *plan.entry.get("inherited_tags", ()),
                         ]
                     ),
+                    state_entry=state_entry,
                 )
-                for plan in plans
-                if str(plan.entry["doc_id"]) in succeeded_set
-            ]
-            rolled_back, rollback_failures = self._repository_update_record_tags(
-                rollback_items
             )
-            rolled_back_set = set(rolled_back)
-            inconsistent = False
-            for doc_id in succeeded:
-                if doc_id in rolled_back_set:
-                    failures[doc_id] = (
-                        f"SQLite update failed and was rolled back: {state_error}"
-                    )
-                else:
-                    inconsistent = True
-                    rollback_error = rollback_failures.get(
-                        doc_id, "Collection rollback failed."
-                    )
-                    failures[doc_id] = (
-                        f"SQLite update failed ({state_error}); {rollback_error}"
-                    )
-            return [], failures, inconsistent
-        return succeeded, failures, False
-
-    def _repository_update_record_tags(
-        self,
-        items: Sequence[tuple[ImageRecord, Iterable[str]]],
-    ) -> tuple[list[str], dict[str, str]]:
-        updater = getattr(self.repository, "update_record_tags", None)
-        if callable(updater):
-            return updater(items)
-        succeeded: list[str] = []
-        failures: dict[str, str] = {}
-        for record, tags in items:
-            try:
-                vector = self.repository.fetch_vector(record.doc_id)
-                if vector is None:
-                    raise ConfigurationError("The indexed image vector is missing.")
-                stored, errors = self.repository.upsert_records([record], vector, tags)
-                if stored == [record.doc_id] and not errors:
-                    succeeded.append(record.doc_id)
-                else:
-                    failures[record.doc_id] = errors.get(
-                        record.doc_id, "Collection tag update failed."
-                    )
-            except Exception as exc:
-                failures[record.doc_id] = str(exc) or exc.__class__.__name__
-        return succeeded, failures
+        write_result = self.collection_writes.upsert(
+            prepared,
+            operation_kind="manual_tag",
+        )
+        failures.update(write_result.failures)
+        return (
+            write_result.succeeded,
+            failures,
+            write_result.systemic_failure,
+        )
 
     def index_folder(
         self,
@@ -1283,11 +1641,13 @@ class ImageVectorService:
             len(new_document_tags),
             clear_tags,
         )
-        scan = scan_folder(
+        scan = scan_folder_to_staging(
             root,
             root_id,
+            staging_directory=self.config.workspace / ".scan-staging",
             recursive=recursive,
             previous_lookup=self.state.get,
+            previous_lookup_many=self.state.get_many,
             verify_hash=verify_hash,
             cancel_check=self.cancel_check,
             max_workers=self.config.scan_concurrency,
@@ -1297,222 +1657,164 @@ class ImageVectorService:
             excluded_roots=(self.config.results_path,),
             failure_handler=capture_scan_failure,
         )
-        self.cancel_check()
-        report.scanned = scan.scanned
-        report.supported = scan.supported
-        report.skipped = scan.skipped
-        report.scan_peak_in_flight = scan.peak_in_flight
-        report.warnings.extend(scan.warnings)
-        # Test doubles and older scanner implementations may return failures
-        # without invoking the streaming handler.
-        if scan.failure_count == 0:
-            for failure in scan.failures:
-                capture_scan_failure(failure)
-        if self.state_reset:
-            report.warnings.append(
-                "The Collection identity changed; stale incremental state was reset."
-            )
-        self.progress(
-            f"Found {len(scan.records)} valid images; skipped {scan.skipped}; "
-            f"invalid {scan.failure_count or len(scan.failures)}."
-        )
-
-        groups: dict[str, list[ImageRecord]] = defaultdict(list)
-        for record in scan.records:
+        staging_consumed = False
+        staging_error: BaseException | None = None
+        try:
             self.cancel_check()
-            existing = self.state.get(record.doc_id)
-            record_state = record.state_dict()
-            folder_tags = folder_tags_for_image(Path(record.absolute_path), root)
-            file_unchanged = existing is not None and all(
-                existing.get(key) == value for key, value in record_state.items()
+            report.scanned = scan.scanned
+            report.supported = scan.supported
+            report.skipped = scan.skipped
+            report.scan_peak_in_flight = scan.peak_in_flight
+            report.warnings.extend(scan.warnings)
+            if scan.failure_count == 0:
+                for failure in scan.failures:
+                    capture_scan_failure(failure)
+            if self.state_reset:
+                report.warnings.append(
+                    "The Collection identity changed; stale incremental state "
+                    "was reset."
+                )
+            self.progress(
+                f"Found {scan.record_count} valid images; skipped {scan.skipped}; "
+                f"invalid {scan.failure_count or len(scan.failures)}."
             )
-            folder_tags_unchanged = (
-                existing is not None
-                and tuple(existing.get("folder_tags", ())) == folder_tags
+
+            control = _StagedPipelineControl()
+            embeddable = self._iter_staged_embedding_work(
+                scan,
+                root,
+                new_document_tags,
+                clear_tags,
+                report,
+                index_run_id,
+                failure_sink,
+                control,
+                inserted_commit_callback=inserted_commit_callback,
             )
-            tags_need_clearing = (
-                clear_tags and existing is not None and bool(existing.get("tags"))
+            self._run_embedding_pipeline(
+                embeddable,
+                scan,
+                new_document_tags,
+                clear_tags,
+                report,
+                root,
+                index_run_id,
+                failure_sink,
+                control,
+                inserted_commit_callback=inserted_commit_callback,
+                network_metrics=network_metrics,
             )
-            if file_unchanged and folder_tags_unchanged and not tags_need_clearing:
-                if self.validate_documents and not self.repository.contains(
-                    record.doc_id
-                ):
-                    groups[record.sha256].append(record)
+
+            if sync_deleted:
+                report.would_delete = scan.count_stale_doc_ids(
+                    self.config.state_path,
+                    root_id=root_id,
+                )
+                if report.needs_attention:
+                    report.sync_aborted = True
+                    report.warnings.append(
+                        "Deletion was skipped because indexing needs storage or "
+                        "credential attention."
+                    )
+                elif not scan.complete:
+                    report.sync_aborted = True
+                    report.warnings.append(
+                        "Deletion was skipped because one or more directories "
+                        "could not be scanned."
+                    )
+                elif dry_run:
+                    report.warnings.append("Dry run: no stale records were deleted.")
                 else:
-                    report.unchanged += 1
-                continue
-            groups[record.sha256].append(record)
-
-        reusable: list[tuple[list[ImageRecord], list[float]]] = []
-        pending: list[tuple[str, list[ImageRecord]]] = []
-        for content_hash, records in groups.items():
-            self.cancel_check()
-            cached_doc_id = self.state.find_doc_id_by_sha(content_hash)
-            cached_vector = (
-                self.repository.fetch_vector(cached_doc_id) if cached_doc_id else None
-            )
-            if cached_vector is not None:
-                reusable.append((records, cached_vector))
-            else:
-                pending.append((content_hash, records))
-
-        reusable_halted = False
-        for reusable_index, (records, vector) in enumerate(reusable):
-            self.cancel_check()
-            outcome: _UpsertResult | None = None
-            try:
-                outcome = self._upsert_group(
-                    records,
-                    vector,
-                    new_document_tags,
-                    clear_tags,
-                    report,
-                    root,
-                    index_run_id,
-                    failure_sink,
-                )
-            except Exception as exc:
-                self.logger.exception("reused_vector_commit_failed")
-                self._record_index_failure(
-                    report,
-                    failure_sink,
-                    path=records[0].absolute_path,
-                    error=f"Index storage commit failed: {exc}",
-                    kind="systemic",
-                    stage="index_commit",
-                    sha256_hex=records[0].sha256,
-                    quarantine=False,
-                )
-            if (
-                outcome is not None
-                and outcome.inserted_entries
-                and inserted_commit_callback is not None
-            ):
-                inserted_commit_callback(records[0].sha256, outcome.inserted_entries)
-            committed = outcome is not None and outcome.committed
-            if not committed:
-                reusable_halted = True
-                report.deferred += len(records)
-                report.deferred += sum(
-                    len(remaining_records)
-                    for remaining_records, _vector in reusable[reusable_index + 1 :]
-                )
-                report.deferred += sum(
-                    len(pending_records) for _sha, pending_records in pending
-                )
-                break
-
-        embeddable: list[tuple[str, list[ImageRecord]]] = []
-        for content_hash, records in [] if reusable_halted else pending:
-            self.cancel_check()
-            representative = records[0]
-            if representative.size_bytes > self.config.max_source_image_bytes:
-                message = (
-                    f"image exceeds local safety limit of "
-                    f"{self.config.max_source_image_bytes} bytes"
-                )
-                for record in records:
-                    self._record_index_failure(
-                        report,
-                        failure_sink,
-                        path=record.absolute_path,
-                        error=message,
-                        kind="item",
-                        stage="embedding_preflight",
-                        sha256_hex=record.sha256,
-                    )
-            elif not _record_is_stable(representative):
-                for record in records:
-                    self._record_index_failure(
-                        report,
-                        failure_sink,
-                        path=record.absolute_path,
-                        error="file changed after scanning; run index again",
-                        kind="item",
-                        stage="embedding_preflight",
+                    stale_visited = 0
+                    for chunk in scan.staging.iter_stale_doc_ids(
+                        self.config.state_path,
+                        root_id=root_id,
+                        batch_size=256,
+                    ):
+                        self.cancel_check()
+                        try:
+                            delete_result = self.collection_writes.delete(
+                                chunk,
+                                operation_kind="sync_delete",
+                            )
+                        except Exception as exc:
+                            self.logger.exception("sync_delete_failed")
+                            self._record_index_failure(
+                                report,
+                                failure_sink,
+                                path=str(root),
+                                error=f"Index storage delete failed: {exc}",
+                                kind="systemic",
+                                stage="sync_delete",
+                                quarantine=False,
+                            )
+                            report.deferred += max(
+                                0,
+                                report.would_delete - stale_visited,
+                            )
+                            break
+                        stale_visited += len(chunk)
+                        report.deleted += len(delete_result.succeeded)
+                        report.deferred += delete_result.deferred_count
+                        for doc_id, error in delete_result.failures.items():
+                            raw_kind = delete_result.failure_kinds.get(
+                                doc_id, "systemic"
+                            )
+                            failure_kind: FailureKind = (
+                                "item" if raw_kind == "item" else "systemic"
+                            )
+                            self._record_index_failure(
+                                report,
+                                failure_sink,
+                                path=doc_id,
+                                error=error,
+                                kind=failure_kind,
+                                stage="sync_delete",
+                                quarantine=False,
+                            )
+                        if delete_result.systemic_failure:
+                            report.deferred += max(
+                                0,
+                                report.would_delete - stale_visited,
+                            )
+                            break
+            staging_consumed = True
+        except BaseException as exc:
+            staging_error = exc
+            raise
+        finally:
+            if staging_consumed:
+                with suppress(Exception):
+                    scan.staging.mark_consumed()
+                try:
+                    scan.discard()
+                except Exception as exc:
+                    self.logger.warning(
+                        "scan_staging_discard_failed state=consumed error=%s",
+                        str(exc) or exc.__class__.__name__,
                     )
             else:
-                embeddable.append((content_hash, records))
-
-        self._run_embedding_pipeline(
-            embeddable,
-            new_document_tags,
-            clear_tags,
-            report,
-            root,
-            index_run_id,
-            failure_sink,
-            inserted_commit_callback=inserted_commit_callback,
-            network_metrics=network_metrics,
-        )
-
-        if sync_deleted:
-            stale_ids = sorted(
-                self.state.ids_for_root(root_id) - scan.seen_supported_ids
-            )
-            report.would_delete = len(stale_ids)
-            if report.needs_attention:
-                report.sync_aborted = True
-                report.warnings.append(
-                    "Deletion was skipped because indexing needs storage or "
-                    "credential attention."
+                cancelled = (
+                    staging_error is not None
+                    and "cancel"
+                    in (f"{staging_error.__class__.__name__} {staging_error}").lower()
                 )
-            elif not scan.complete:
-                report.sync_aborted = True
-                report.warnings.append(
-                    "Deletion was skipped because one or more directories "
-                    "could not be scanned."
-                )
-            elif dry_run:
-                report.warnings.append("Dry run: no stale records were deleted.")
-            else:
-                for chunk in _chunks(stale_ids, 256):
-                    self.cancel_check()
-                    try:
-                        succeeded, failures = self.repository.delete(chunk)
-                        self.state.remove_many(succeeded)
-                    except Exception as exc:
-                        self.logger.exception("sync_delete_failed")
-                        self._record_index_failure(
-                            report,
-                            failure_sink,
-                            path=str(root),
-                            error=f"Index storage delete failed: {exc}",
-                            kind="systemic",
-                            stage="sync_delete",
-                            quarantine=False,
-                        )
-                        report.deferred += len(chunk)
-                        break
-                    report.deleted += len(succeeded)
-                    for doc_id, error in failures.items():
-                        self._record_index_failure(
-                            report,
-                            failure_sink,
-                            path=doc_id,
-                            error=error,
-                            kind="systemic",
-                            stage="sync_delete",
-                            quarantine=False,
-                        )
+                with suppress(Exception):
+                    scan.staging.mark_failed(cancelled=cancelled)
+                try:
+                    scan.discard()
+                except Exception as exc:
+                    # Preserve the pipeline exception. The terminal artifact is
+                    # safe scratch and will be retired on startup/next scan.
+                    scan.staging.close()
+                    self.logger.warning(
+                        "scan_staging_discard_failed state=%s error=%s",
+                        "cancelled" if cancelled else "failed",
+                        str(exc) or exc.__class__.__name__,
+                    )
 
         if report.inserted or report.updated or report.deleted:
-            try:
-                self._refresh_tag_catalog()
-                self.cancel_check()
-                self.progress("Optimizing Zvec indexes...")
-                self.repository.optimize()
-            except Exception as exc:
-                self.logger.exception("index_optimize_failed")
-                self._record_index_failure(
-                    report,
-                    failure_sink,
-                    path=str(root),
-                    error=f"Index optimization failed: {exc}",
-                    kind="systemic",
-                    stage="index_optimize",
-                    quarantine=False,
-                )
+            self._refresh_tag_catalog()
 
         if previous_scope is None:
             self.state.record_root(root_id, normalized_root, recursive)
@@ -1589,13 +1891,606 @@ class ImageVectorService:
         )
         return report
 
+    def _iter_staged_group_plans(
+        self,
+        scan: StagedScanResult,
+        root: Path,
+        clear_tags: bool,
+        report: IndexReport,
+        failure_sink: IndexFailureSink | None,
+    ) -> Iterator[_EmbeddingWorkItem]:
+        current_hash = ""
+        representative: ImageRecord | None = None
+        needs_write = 0
+        unchanged = 0
+        folder_tag_cache: dict[str, tuple[str, ...]] = {}
+
+        for staged_page in scan.iter_staged_records_by_sha256(batch_size=256):
+            self.cancel_check()
+            candidate_ids = self._staged_page_candidate_ids(
+                staged_page,
+                root,
+                clear_tags=clear_tags,
+                folder_tag_cache=folder_tag_cache,
+            )
+            for staged in staged_page:
+                if current_hash and staged.sha256 != current_hash:
+                    item = self._finish_staged_group_plan(
+                        scan,
+                        current_hash,
+                        representative,
+                        needs_write,
+                        unchanged,
+                        root,
+                        clear_tags,
+                        report,
+                        failure_sink,
+                    )
+                    if item is not None:
+                        yield item
+                    current_hash = ""
+                    representative = None
+                    needs_write = 0
+                    unchanged = 0
+                if not current_hash:
+                    current_hash = staged.sha256
+
+                if staged.doc_id not in candidate_ids:
+                    unchanged += 1
+                    continue
+                needs_write += 1
+                if representative is None:
+                    candidate = staged.to_image_record(root)
+                    if _record_is_stable(candidate):
+                        representative = candidate
+
+        if current_hash:
+            item = self._finish_staged_group_plan(
+                scan,
+                current_hash,
+                representative,
+                needs_write,
+                unchanged,
+                root,
+                clear_tags,
+                report,
+                failure_sink,
+            )
+            if item is not None:
+                yield item
+
+    def _finish_staged_group_plan(
+        self,
+        scan: StagedScanResult,
+        content_hash: str,
+        representative: ImageRecord | None,
+        needs_write: int,
+        unchanged: int,
+        root: Path,
+        clear_tags: bool,
+        report: IndexReport,
+        failure_sink: IndexFailureSink | None,
+    ) -> _EmbeddingWorkItem | None:
+        report.unchanged += unchanged
+        if not needs_write:
+            return None
+        if representative is None:
+            self._record_staged_group_failure(
+                scan,
+                content_hash,
+                root,
+                clear_tags=clear_tags,
+                report=report,
+                failure_sink=failure_sink,
+                error="file changed after scanning; run index again",
+                kind="item",
+                stage="embedding_preflight",
+            )
+            return None
+        if representative.size_bytes > self.config.max_source_image_bytes:
+            self._record_staged_group_failure(
+                scan,
+                content_hash,
+                root,
+                clear_tags=clear_tags,
+                report=report,
+                failure_sink=failure_sink,
+                error=(
+                    "image exceeds local safety limit of "
+                    f"{self.config.max_source_image_bytes} bytes"
+                ),
+                kind="item",
+                stage="embedding_preflight",
+            )
+            return None
+        return _EmbeddingWorkItem(
+            content_hash=content_hash,
+            representative=representative,
+            member_count=needs_write,
+        )
+
+    def _staged_page_candidates(
+        self,
+        records: Sequence[ImageRecord],
+        root: Path,
+        *,
+        clear_tags: bool,
+        known_unchanged_ids: set[str] | None = None,
+        folder_tag_cache: dict[str, tuple[str, ...]] | None = None,
+    ) -> list[ImageRecord]:
+        if not records:
+            return []
+        existing_by_id = self.state.get_many(record.doc_id for record in records)
+        present_ids: set[str] | None = None
+        if self.validate_documents:
+            fetch_vectors = getattr(self.repository, "fetch_vectors", None)
+            if callable(fetch_vectors):
+                vectors, _failures = fetch_vectors(record.doc_id for record in records)
+                present_ids = set(vectors)
+            else:
+                present_ids = {
+                    record.doc_id
+                    for record in records
+                    if self.repository.contains(record.doc_id)
+                }
+
+        candidates: list[ImageRecord] = []
+        for record in records:
+            existing = existing_by_id.get(record.doc_id)
+            fast_unchanged = (
+                known_unchanged_ids is not None and record.doc_id in known_unchanged_ids
+            )
+            file_unchanged = existing is not None and (
+                fast_unchanged or self._record_state_matches(existing, record)
+            )
+            folder_tags = self._folder_tags_for_staged_path(
+                record.relative_path,
+                root,
+                folder_tag_cache,
+            )
+            folder_tags_unchanged = (
+                existing is not None
+                and tuple(existing.get("folder_tags", ())) == folder_tags
+            )
+            tags_need_clearing = (
+                clear_tags and existing is not None and bool(existing.get("tags"))
+            )
+            document_present = present_ids is None or record.doc_id in present_ids
+            if (
+                file_unchanged
+                and folder_tags_unchanged
+                and not tags_need_clearing
+                and document_present
+            ):
+                continue
+            candidates.append(record)
+        return candidates
+
+    def _staged_page_candidate_ids(
+        self,
+        records: Sequence[StagedImageRecord],
+        root: Path,
+        *,
+        clear_tags: bool,
+        folder_tag_cache: dict[str, tuple[str, ...]],
+    ) -> set[str]:
+        """Return write candidates without materializing unchanged ImageRecords."""
+
+        if not records:
+            return set()
+        existing_by_id = self.state.get_many(record.doc_id for record in records)
+        present_ids: set[str] | None = None
+        if self.validate_documents:
+            fetch_vectors = getattr(self.repository, "fetch_vectors", None)
+            if callable(fetch_vectors):
+                vectors, _failures = fetch_vectors(record.doc_id for record in records)
+                present_ids = set(vectors)
+            else:
+                present_ids = {
+                    record.doc_id
+                    for record in records
+                    if self.repository.contains(record.doc_id)
+                }
+
+        candidates: set[str] = set()
+        for record in records:
+            existing = existing_by_id.get(record.doc_id)
+            file_unchanged = existing is not None and (
+                record.fast_unchanged
+                or self._staged_record_state_matches(existing, record)
+            )
+            folder_tags = self._folder_tags_for_staged_path(
+                record.relative_path,
+                root,
+                folder_tag_cache,
+            )
+            folder_tags_unchanged = (
+                existing is not None
+                and tuple(existing.get("folder_tags", ())) == folder_tags
+            )
+            tags_need_clearing = (
+                clear_tags and existing is not None and bool(existing.get("tags"))
+            )
+            document_present = present_ids is None or record.doc_id in present_ids
+            if not (
+                file_unchanged
+                and folder_tags_unchanged
+                and not tags_need_clearing
+                and document_present
+            ):
+                candidates.add(record.doc_id)
+        return candidates
+
+    @staticmethod
+    def _staged_record_state_matches(
+        existing: Mapping[str, Any],
+        record: StagedImageRecord,
+    ) -> bool:
+        for key in ImageRecord.__dataclass_fields__:
+            if key == "absolute_path":
+                continue
+            existing_value = existing.get(key)
+            value = getattr(record, key)
+            if key == "relative_path":
+                try:
+                    if normalize_relative_path(str(existing_value)) != (
+                        normalize_relative_path(str(value))
+                    ):
+                        return False
+                except ConfigurationError:
+                    return False
+            elif existing_value != value:
+                return False
+        return True
+
+    @staticmethod
+    def _folder_tags_for_staged_path(
+        relative_path: str,
+        root: Path,
+        cache: dict[str, tuple[str, ...]] | None,
+    ) -> tuple[str, ...]:
+        portable = normalize_relative_path(relative_path)
+        parent_key = portable.rpartition("/")[0]
+        if cache is not None and parent_key in cache:
+            return cache[parent_key]
+        tags = folder_tags_for_relative_path(portable, root.name)
+        if cache is not None:
+            cache[parent_key] = tags
+        return tags
+
+    @staticmethod
+    def _record_state_matches(
+        existing: Mapping[str, Any],
+        record: ImageRecord,
+    ) -> bool:
+        for key, value in record.state_dict().items():
+            existing_value = existing.get(key)
+            if key == "relative_path":
+                try:
+                    if normalize_relative_path(str(existing_value)) != (
+                        normalize_relative_path(str(value))
+                    ):
+                        return False
+                except ConfigurationError:
+                    return False
+            elif existing_value != value:
+                return False
+        return True
+
+    def _record_staged_group_failure(
+        self,
+        scan: StagedScanResult,
+        content_hash: str,
+        root: Path,
+        *,
+        clear_tags: bool,
+        report: IndexReport,
+        failure_sink: IndexFailureSink | None,
+        error: str,
+        kind: FailureKind,
+        stage: str,
+    ) -> int:
+        recorded = 0
+        for page in scan.iter_image_records_for_sha256(
+            content_hash,
+            root,
+            batch_size=256,
+        ):
+            self.cancel_check()
+            for record in self._staged_page_candidates(
+                page,
+                root,
+                clear_tags=clear_tags,
+            ):
+                self._record_index_failure(
+                    report,
+                    failure_sink,
+                    path=record.absolute_path,
+                    error=error,
+                    kind=kind,
+                    stage=stage,
+                    sha256_hex=content_hash,
+                    quarantine=kind == "item",
+                )
+                recorded += 1
+        return recorded
+
+    def _iter_staged_embedding_work(
+        self,
+        scan: StagedScanResult,
+        root: Path,
+        new_document_tags: tuple[str, ...],
+        clear_tags: bool,
+        report: IndexReport,
+        index_run_id: str,
+        failure_sink: IndexFailureSink | None,
+        control: _StagedPipelineControl,
+        *,
+        inserted_commit_callback: (Callable[[str, list[dict[str, Any]]], None] | None),
+    ) -> Iterator[_EmbeddingWorkItem]:
+        plans = self._iter_staged_group_plans(
+            scan,
+            root,
+            clear_tags,
+            report,
+            failure_sink,
+        )
+        while True:
+            page: list[_EmbeddingWorkItem] = []
+            for _index in range(256):
+                plan = next(plans, None)
+                if plan is None:
+                    break
+                page.append(plan)
+            if not page:
+                return
+            if control.storage_halted:
+                yield from page
+                continue
+
+            doc_id_by_hash = self.state.find_doc_ids_by_sha_many(
+                item.content_hash for item in page
+            )
+            fetch_vectors = getattr(self.repository, "fetch_vectors", None)
+            vectors_by_doc: dict[str, list[float]] = {}
+            vector_failures: dict[str, str] = {}
+            if callable(fetch_vectors) and doc_id_by_hash:
+                try:
+                    vectors_by_doc, vector_failures = fetch_vectors(
+                        doc_id_by_hash.values()
+                    )
+                except Exception as exc:
+                    error = str(exc) or exc.__class__.__name__
+                    vector_failures = {
+                        doc_id: error for doc_id in doc_id_by_hash.values()
+                    }
+            elif doc_id_by_hash:
+                for doc_id in doc_id_by_hash.values():
+                    try:
+                        vector = self.repository.fetch_vector(doc_id)
+                    except Exception as exc:
+                        vector_failures[doc_id] = str(exc) or exc.__class__.__name__
+                    else:
+                        if vector is not None:
+                            vectors_by_doc[doc_id] = vector
+
+            reusable: list[tuple[_EmbeddingWorkItem, list[float]]] = []
+            pending: list[_EmbeddingWorkItem] = []
+            for item in page:
+                reusable_doc_id = doc_id_by_hash.get(item.content_hash) or ""
+                vector = vectors_by_doc.get(reusable_doc_id)
+                vector_error = vector_failures.get(reusable_doc_id)
+                if vector is not None:
+                    reusable.append((item, vector))
+                elif vector_error and not _vector_failure_is_missing(vector_error):
+                    self._record_index_failure(
+                        report,
+                        failure_sink,
+                        path=item.representative.absolute_path,
+                        error=(
+                            "Could not read an existing reusable vector: "
+                            f"{vector_error}"
+                        ),
+                        kind="systemic",
+                        stage="vector_reuse",
+                        sha256_hex=item.content_hash,
+                        quarantine=False,
+                    )
+                    report.deferred += item.member_count
+                else:
+                    pending.append(item)
+
+            if reusable:
+                control.storage_halted = self._commit_staged_vectors(
+                    reusable,
+                    scan,
+                    new_document_tags,
+                    clear_tags,
+                    report,
+                    root,
+                    index_run_id,
+                    failure_sink,
+                    inserted_commit_callback=inserted_commit_callback,
+                )
+            yield from pending
+
+    def _commit_staged_vectors(
+        self,
+        items: Sequence[tuple[_EmbeddingWorkItem, list[float]]],
+        scan: StagedScanResult,
+        new_document_tags: tuple[str, ...],
+        clear_tags: bool,
+        report: IndexReport,
+        root: Path,
+        index_run_id: str,
+        failure_sink: IndexFailureSink | None,
+        *,
+        inserted_commit_callback: (
+            Callable[[str, list[dict[str, Any]]], None] | None
+        ) = None,
+    ) -> bool:
+        if not items:
+            return False
+
+        item_by_hash = {item.content_hash: item for item, _vector in items}
+        vector_by_hash = {item.content_hash: vector for item, vector in items}
+        if len(item_by_hash) != len(items):
+            raise ValueError("Staged vector commits require unique SHA groups.")
+        write_buffer: list[tuple[str, list[ImageRecord], list[float]]] = []
+        buffered_records = 0
+        successful_count = 0
+        terminal_failures = 0
+        halted = False
+        folder_tag_cache: dict[str, tuple[str, ...]] = {}
+        callback_entries: list[dict[str, Any]] = []
+        callback_hash = ""
+        callback_limit = 0
+
+        def flush() -> None:
+            nonlocal buffered_records, successful_count, halted
+            if not write_buffer or halted:
+                return
+            representative_hash, representative_records, _vector = write_buffer[0]
+            try:
+                outcome = self._upsert_groups(
+                    write_buffer,
+                    new_document_tags,
+                    clear_tags,
+                    report,
+                    root,
+                    index_run_id,
+                    failure_sink,
+                    inserted_commit_callback=None,
+                )
+            except Exception as exc:
+                self.logger.exception(
+                    "index_commit_failed sha256=%s", representative_hash
+                )
+                self._record_index_failure(
+                    report,
+                    failure_sink,
+                    path=representative_records[0].absolute_path,
+                    error=f"Index storage commit failed: {exc}",
+                    kind="systemic",
+                    stage="index_commit",
+                    sha256_hex=representative_hash,
+                    quarantine=False,
+                )
+                halted = True
+            else:
+                successful_count += outcome.successful_count
+                if callback_limit > len(callback_entries):
+                    callback_entries.extend(
+                        outcome.inserted_entries[
+                            : callback_limit - len(callback_entries)
+                        ]
+                    )
+                halted = not outcome.committed
+            write_buffer.clear()
+            buffered_records = 0
+
+        def finish_callback() -> None:
+            nonlocal callback_entries, callback_hash, callback_limit
+            if (
+                inserted_commit_callback is not None
+                and callback_hash
+                and callback_entries
+            ):
+                inserted_commit_callback(callback_hash, callback_entries)
+            callback_entries = []
+            callback_hash = ""
+            callback_limit = 0
+
+        for page in scan.iter_image_records_for_sha256s(
+            tuple(item_by_hash),
+            root,
+            batch_size=256,
+        ):
+            self.cancel_check()
+            candidates = self._staged_page_candidates(
+                page,
+                root,
+                clear_tags=clear_tags,
+                folder_tag_cache=folder_tag_cache,
+            )
+            stable_by_hash: dict[str, list[ImageRecord]] = defaultdict(list)
+            for record in candidates:
+                if _record_is_stable(record):
+                    stable_by_hash[record.sha256].append(record)
+                else:
+                    self._record_index_failure(
+                        report,
+                        failure_sink,
+                        path=record.absolute_path,
+                        error="file changed after scanning; run index again",
+                        kind="item",
+                        stage="embedding_commit",
+                        sha256_hex=record.sha256,
+                    )
+                    terminal_failures += 1
+
+            for content_hash, stable_records in stable_by_hash.items():
+                if inserted_commit_callback is not None:
+                    if callback_hash and callback_hash != content_hash:
+                        flush()
+                        finish_callback()
+                    if not callback_hash:
+                        callback_hash = content_hash
+                        callback_limit = self._inserted_callback_limit(
+                            inserted_commit_callback
+                        )
+                if buffered_records and buffered_records + len(stable_records) > 256:
+                    flush()
+                    if halted:
+                        break
+                write_buffer.append(
+                    (
+                        content_hash,
+                        stable_records,
+                        vector_by_hash[content_hash],
+                    )
+                )
+                buffered_records += len(stable_records)
+                if buffered_records >= 256:
+                    flush()
+                    if halted:
+                        break
+            if halted:
+                break
+
+        flush()
+        finish_callback()
+        if halted:
+            total_needs = sum(item.member_count for item, _vector in items)
+            report.deferred += max(
+                0,
+                total_needs - successful_count - terminal_failures,
+            )
+        return halted
+
+    @staticmethod
+    def _inserted_callback_limit(
+        callback: Callable[[str, list[dict[str, Any]]], None] | None,
+    ) -> int:
+        if callback is None:
+            return 0
+        owner = getattr(callback, "__self__", None)
+        raw_limit = getattr(owner, "limit", 10_000)
+        raw_count = getattr(owner, "candidate_count", 0)
+        try:
+            limit = min(10_000, max(0, int(raw_limit)))
+            count = max(0, int(raw_count))
+        except (TypeError, ValueError):
+            return 10_000
+        return max(0, limit - count)
+
     def _embedding_batches(
-        self, pending: list[tuple[str, list[ImageRecord]]]
-    ) -> Iterable[list[tuple[str, list[ImageRecord]]]]:
-        batch: list[tuple[str, list[ImageRecord]]] = []
+        self, pending: Iterable[_EmbeddingWorkItem]
+    ) -> Iterable[list[_EmbeddingWorkItem]]:
+        batch: list[_EmbeddingWorkItem] = []
         estimated_bytes = 0
         for item in pending:
-            raw_size = item[1][0].size_bytes
+            raw_size = item.representative.size_bytes
             encoded_size = min(
                 4 * ((raw_size + 2) // 3) + 256,
                 self.config.max_image_bytes,
@@ -1614,31 +2509,33 @@ class ImageVectorService:
 
     def _run_embedding_pipeline(
         self,
-        pending: list[tuple[str, list[ImageRecord]]],
+        pending: Iterable[_EmbeddingWorkItem],
+        scan: StagedScanResult,
         new_document_tags: tuple[str, ...],
         clear_tags: bool,
         report: IndexReport,
         root: Path,
         index_run_id: str,
         failure_sink: IndexFailureSink | None,
+        control: _StagedPipelineControl,
         *,
         inserted_commit_callback: (
             Callable[[str, list[dict[str, Any]]], None] | None
         ) = None,
         network_metrics: _PipelineNetworkMetrics | None = None,
     ) -> None:
-        if not pending:
-            return
-
         batches = iter(self._embedding_batches(pending))
         next_batch = next(batches, None)
+        if next_batch is None:
+            return
         active: dict[
             Future[_EmbeddingBatchResult],
-            tuple[list[tuple[str, list[ImageRecord]]], int],
+            tuple[list[_EmbeddingWorkItem], int],
         ] = {}
         inflight_bytes = 0
         completed = 0
-        halt_submission = False
+        halt_submission = control.storage_halted
+        commit_buffer = _EmbeddingBatchResult()
         client = self.embedding_client
         request_count_before = getattr(client, "request_count", 0)
 
@@ -1678,6 +2575,8 @@ class ImageVectorService:
                         inflight_bytes,
                     )
                     next_batch = next(batches, None)
+                    if control.storage_halted:
+                        halt_submission = True
 
                 if not active:
                     break
@@ -1691,6 +2590,7 @@ class ImageVectorService:
                 # again before a completed network result reaches the owner
                 # thread's SQLite/Zvec commit path.
                 self.cancel_check()
+                completed_result = _EmbeddingBatchResult()
                 for future in done:
                     submitted_batch, estimated_bytes = active.pop(future)
                     inflight_bytes -= estimated_bytes
@@ -1701,29 +2601,67 @@ class ImageVectorService:
                             systemic_error=str(exc) or exc.__class__.__name__,
                             systemic_items=submitted_batch,
                         )
-                    halt_submission = (
-                        self._apply_embedding_result(
-                            result,
-                            new_document_tags,
-                            clear_tags,
-                            report,
-                            root,
-                            index_run_id,
-                            failure_sink,
-                            inserted_commit_callback=inserted_commit_callback,
-                        )
-                        or halt_submission
-                    )
+                    completed_result.extend(result)
                     completed += len(submitted_batch)
-                    self.progress(f"Embedded {completed}/{len(pending)} unique images.")
+                    self.progress(f"Embedded {completed} unique images.")
+
+                commit_buffer.extend(completed_result)
+                buffered_records = sum(
+                    item.member_count for item, _vector in commit_buffer.successes
+                )
+                should_flush = (
+                    buffered_records >= self.collection_writes.batch_size
+                    or bool(commit_buffer.systemic_error)
+                    or (
+                        inserted_commit_callback is not None
+                        and bool(commit_buffer.successes)
+                    )
+                    or (next_batch is None and not active)
+                    or (halt_submission and not active)
+                )
+                if should_flush and not halt_submission:
+                    halt_submission = self._apply_embedding_result(
+                        commit_buffer,
+                        scan,
+                        new_document_tags,
+                        clear_tags,
+                        report,
+                        root,
+                        index_run_id,
+                        failure_sink,
+                        inserted_commit_callback=inserted_commit_callback,
+                    )
+                    control.storage_halted = halt_submission
+                    commit_buffer = _EmbeddingBatchResult()
+                elif should_flush:
+                    # A storage failure has already stopped persistence. Keep
+                    # usage/error accounting for completed network requests but
+                    # deliberately discard their vectors.
+                    discarded = _EmbeddingBatchResult(
+                        failures=commit_buffer.failures,
+                        usage=commit_buffer.usage,
+                        systemic_error=commit_buffer.systemic_error,
+                        systemic_items=commit_buffer.systemic_items,
+                    )
+                    self._apply_embedding_result(
+                        discarded,
+                        scan,
+                        new_document_tags,
+                        clear_tags,
+                        report,
+                        root,
+                        index_run_id,
+                        failure_sink,
+                        inserted_commit_callback=inserted_commit_callback,
+                    )
+                    report.deferred += buffered_records
+                    commit_buffer = _EmbeddingBatchResult()
 
             if halt_submission:
-                remaining = []
                 if next_batch is not None:
-                    remaining.extend(next_batch)
+                    report.deferred += sum(item.member_count for item in next_batch)
                 for batch in batches:
-                    remaining.extend(batch)
-                report.deferred += sum(len(records) for _sha, records in remaining)
+                    report.deferred += sum(item.member_count for item in batch)
         except BaseException:
             # Worker tasks perform only encoding/network work.  Do not let the
             # executor context manager wait for a stuck HTTP call during UI
@@ -1740,6 +2678,7 @@ class ImageVectorService:
     def _apply_embedding_result(
         self,
         result: _EmbeddingBatchResult,
+        scan: StagedScanResult,
         new_document_tags: tuple[str, ...],
         clear_tags: bool,
         report: IndexReport,
@@ -1753,87 +2692,56 @@ class ImageVectorService:
     ) -> bool:
         report.usage.extend(result.usage)
         for failure in result.failures:
-            for content_hash, records in failure.items:
-                for record in records:
-                    self._record_index_failure(
-                        report,
-                        failure_sink,
-                        path=record.absolute_path,
-                        error=failure.error,
-                        kind=failure.kind,
-                        stage="embedding",
-                        sha256_hex=content_hash,
-                        quarantine=failure.kind == "item",
-                    )
+            for item in failure.items:
+                self._record_staged_group_failure(
+                    scan,
+                    item.content_hash,
+                    root,
+                    clear_tags=clear_tags,
+                    report=report,
+                    failure_sink=failure_sink,
+                    error=failure.error,
+                    kind=failure.kind,
+                    stage="embedding",
+                )
 
         halt_submission = False
-        for index, ((content_hash, records), vector) in enumerate(result.successes):
-            if not _record_is_stable(records[0]):
-                for record in records:
-                    self._record_index_failure(
-                        report,
-                        failure_sink,
-                        path=record.absolute_path,
-                        error="file changed during embedding; run index again",
-                        kind="item",
-                        stage="embedding_commit",
-                    )
-                continue
-            outcome: _UpsertResult | None = None
-            try:
-                outcome = self._upsert_group(
-                    records,
-                    vector,
-                    new_document_tags,
-                    clear_tags,
-                    report,
+        stable_successes: list[tuple[_EmbeddingWorkItem, list[float]]] = []
+        for item, vector in result.successes:
+            if not _record_is_stable(item.representative):
+                self._record_staged_group_failure(
+                    scan,
+                    item.content_hash,
                     root,
-                    index_run_id,
-                    failure_sink,
+                    clear_tags=clear_tags,
+                    report=report,
+                    failure_sink=failure_sink,
+                    error="file changed during embedding; run index again",
+                    kind="item",
+                    stage="embedding_commit",
                 )
-            except Exception as exc:
-                self.logger.exception("index_commit_failed sha256=%s", content_hash)
-                self._record_index_failure(
-                    report,
-                    failure_sink,
-                    path=records[0].absolute_path,
-                    error=f"Index storage commit failed: {exc}",
-                    kind="systemic",
-                    stage="index_commit",
-                    sha256_hex=content_hash,
-                    quarantine=False,
-                )
-                report.deferred += sum(
-                    len(remaining_records)
-                    for (_remaining_hash, remaining_records), _remaining_vector in (
-                        result.successes[index:]
-                    )
-                )
-                halt_submission = True
-                break
-            assert outcome is not None
-            if outcome.inserted_entries and inserted_commit_callback is not None:
-                inserted_commit_callback(content_hash, outcome.inserted_entries)
-            committed = outcome.committed
-            if not committed:
-                halt_submission = True
-                report.deferred += len(records)
-                report.deferred += sum(
-                    len(remaining_records)
-                    for (_remaining_hash, remaining_records), _remaining_vector in (
-                        result.successes[index + 1 :]
-                    )
-                )
-                break
+                continue
+            stable_successes.append((item, vector))
+
+        if stable_successes:
+            halt_submission = self._commit_staged_vectors(
+                stable_successes,
+                scan,
+                new_document_tags,
+                clear_tags,
+                report,
+                root,
+                index_run_id,
+                failure_sink,
+                inserted_commit_callback=inserted_commit_callback,
+            )
 
         if result.systemic_error:
-            representative = next(
-                (
-                    records[0]
-                    for _content_hash, records in result.systemic_items
-                    if records
-                ),
-                None,
+            representative_item = next(iter(result.systemic_items), None)
+            representative = (
+                representative_item.representative
+                if representative_item is not None
+                else None
             )
             self._record_index_failure(
                 report,
@@ -1845,9 +2753,7 @@ class ImageVectorService:
                 sha256_hex=representative.sha256 if representative else "",
                 quarantine=False,
             )
-            report.deferred += sum(
-                len(records) for _sha, records in result.systemic_items
-            )
+            report.deferred += sum(item.member_count for item in result.systemic_items)
             halt_submission = True
         return halt_submission
 
@@ -1862,7 +2768,35 @@ class ImageVectorService:
         index_run_id: str,
         failure_sink: IndexFailureSink | None,
     ) -> _UpsertResult:
-        if len(vector) != self.config.dimension:
+        return self._upsert_groups(
+            [(records[0].sha256, records, vector)],
+            new_document_tags,
+            clear_tags,
+            report,
+            root,
+            index_run_id,
+            failure_sink,
+        )
+
+    def _upsert_groups(
+        self,
+        groups: Sequence[tuple[str, list[ImageRecord], list[float]]],
+        new_document_tags: tuple[str, ...],
+        clear_tags: bool,
+        report: IndexReport,
+        root: Path,
+        index_run_id: str,
+        failure_sink: IndexFailureSink | None,
+        *,
+        inserted_commit_callback: (
+            Callable[[str, list[dict[str, Any]]], None] | None
+        ) = None,
+    ) -> _UpsertResult:
+        if not groups:
+            return _UpsertResult(True)
+        for content_hash, records, vector in groups:
+            if len(vector) == self.config.dimension:
+                continue
             self._record_index_failure(
                 report,
                 failure_sink,
@@ -1870,96 +2804,127 @@ class ImageVectorService:
                 error=f"invalid vector dimension: {len(vector)}",
                 kind="systemic",
                 stage="embedding_response",
-                sha256_hex=records[0].sha256,
+                sha256_hex=content_hash,
                 quarantine=False,
             )
             return _UpsertResult(False)
 
-        previous = {record.doc_id: self.state.get(record.doc_id) for record in records}
-        records_by_tags: dict[tuple[str, ...], list[ImageRecord]] = defaultdict(list)
+        records = [record for _hash, values, _vector in groups for record in values]
+        previous = self.state.get_many(record.doc_id for record in records)
         state_values: dict[str, dict[str, list[str]]] = {}
-        for record in records:
-            existing = previous[record.doc_id]
-            manual_tags = (
-                ()
-                if clear_tags
-                else new_document_tags
-                if existing is None
-                else tuple(existing.get("tags", ()))
-            )
-            folder_tags = folder_tags_for_image(Path(record.absolute_path), root)
-            accepted_auto_tags = (
-                tuple(existing.get("accepted_auto_tags", ()))
-                if existing is not None and existing.get("sha256") == record.sha256
-                else ()
-            )
-            inherited_tags = (
-                tuple(existing.get("inherited_tags", ()))
-                if existing is not None and existing.get("sha256") == record.sha256
-                else ()
-            )
-            effective_tags = normalize_tags(
-                [
-                    *manual_tags,
-                    *folder_tags,
-                    *accepted_auto_tags,
-                    *inherited_tags,
-                ]
-            )
-            records_by_tags[effective_tags].append(record)
-            state_values[record.doc_id] = {
-                "tags": list(manual_tags),
-                "folder_tags": list(folder_tags),
-                "accepted_auto_tags": list(accepted_auto_tags),
-                "inherited_tags": list(inherited_tags),
-            }
+        prepared: list[PreparedCollectionUpsert] = []
+        content_hash_by_id: dict[str, str] = {}
+        folder_tag_cache: dict[str, tuple[str, ...]] = {}
+        for content_hash, grouped_records, vector in groups:
+            for record in grouped_records:
+                existing = previous.get(record.doc_id)
+                manual_tags = (
+                    ()
+                    if clear_tags
+                    else new_document_tags
+                    if existing is None
+                    else tuple(existing.get("tags", ()))
+                )
+                folder_tags = self._folder_tags_for_staged_path(
+                    record.relative_path,
+                    root,
+                    folder_tag_cache,
+                )
+                accepted_auto_tags = (
+                    tuple(existing.get("accepted_auto_tags", ()))
+                    if existing is not None and existing.get("sha256") == record.sha256
+                    else ()
+                )
+                inherited_tags = (
+                    tuple(existing.get("inherited_tags", ()))
+                    if existing is not None and existing.get("sha256") == record.sha256
+                    else ()
+                )
+                effective_tags = normalize_tags(
+                    [
+                        *manual_tags,
+                        *folder_tags,
+                        *accepted_auto_tags,
+                        *inherited_tags,
+                    ]
+                )
+                state_values[record.doc_id] = {
+                    "tags": list(manual_tags),
+                    "folder_tags": list(folder_tags),
+                    "accepted_auto_tags": list(accepted_auto_tags),
+                    "inherited_tags": list(inherited_tags),
+                }
+                content_hash_by_id[record.doc_id] = content_hash
+                prepared.append(
+                    PreparedCollectionUpsert(
+                        record=record,
+                        image_vector=vector,
+                        effective_tags=effective_tags,
+                        state_entry={
+                            **record.state_dict(),
+                            **state_values[record.doc_id],
+                        },
+                    )
+                )
 
         by_id = {record.doc_id: record for record in records}
         successful_entries: list[dict] = []
         inserted_ids: list[str] = []
         updated_ids: list[str] = []
-        systemic_failure = False
-        for effective_tags, tagged_records in records_by_tags.items():
-            succeeded, failures = self.repository.upsert_records(
-                tagged_records, vector, effective_tags
+        write_result = self.collection_writes.upsert(
+            prepared,
+            operation_kind="index_upsert",
+        )
+        for doc_id in write_result.succeeded:
+            record = by_id[doc_id]
+            if previous.get(doc_id) is None:
+                report.inserted += 1
+                inserted_ids.append(doc_id)
+            else:
+                report.updated += 1
+                updated_ids.append(doc_id)
+            successful_entries.append({**record.state_dict(), **state_values[doc_id]})
+        systemic_failure_recorded = False
+        for doc_id, error in write_result.failures.items():
+            raw_kind = write_result.failure_kinds.get(doc_id, "systemic")
+            failure_kind: FailureKind = "item" if raw_kind == "item" else "systemic"
+            if failure_kind == "systemic" and systemic_failure_recorded:
+                continue
+            systemic_failure_recorded = systemic_failure_recorded or (
+                failure_kind == "systemic"
             )
-            for doc_id in succeeded:
-                record = by_id[doc_id]
-                if previous[doc_id] is None:
-                    report.inserted += 1
-                    inserted_ids.append(doc_id)
-                else:
-                    report.updated += 1
-                    updated_ids.append(doc_id)
-                successful_entries.append(
-                    {**record.state_dict(), **state_values[doc_id]}
-                )
-            for doc_id, error in failures.items():
-                failure_kind = _classify_storage_error(error)
-                systemic_failure = systemic_failure or failure_kind == "systemic"
-                failed_record = by_id.get(doc_id)
-                self._record_index_failure(
-                    report,
-                    failure_sink,
-                    path=failed_record.absolute_path if failed_record else doc_id,
-                    error=error,
-                    kind=failure_kind,
-                    stage="zvec_upsert",
-                    sha256_hex=failed_record.sha256 if failed_record else "",
-                    quarantine=failure_kind != "systemic",
-                )
-        self.state.set_many(successful_entries)
+            failed_record = by_id.get(doc_id)
+            self._record_index_failure(
+                report,
+                failure_sink,
+                path=failed_record.absolute_path if failed_record else doc_id,
+                error=error,
+                kind=failure_kind,
+                stage="zvec_upsert",
+                sha256_hex=failed_record.sha256 if failed_record else "",
+                quarantine=failure_kind != "systemic",
+            )
         if index_run_id:
             self.state.record_index_run_entries(index_run_id, inserted_ids, "inserted")
             self.state.record_index_run_entries(index_run_id, updated_ids, "updated")
         inserted_set = set(inserted_ids)
+        inserted_entries = [
+            entry
+            for entry in successful_entries
+            if str(entry.get("doc_id") or "") in inserted_set
+        ]
+        if inserted_commit_callback is not None:
+            entries_by_hash: dict[str, list[dict[str, Any]]] = defaultdict(list)
+            for entry in inserted_entries:
+                doc_id = str(entry.get("doc_id") or "")
+                entries_by_hash[content_hash_by_id[doc_id]].append(entry)
+            for content_hash, entries in entries_by_hash.items():
+                inserted_commit_callback(content_hash, entries)
         return _UpsertResult(
-            committed=not systemic_failure,
-            inserted_entries=[
-                entry
-                for entry in successful_entries
-                if str(entry.get("doc_id") or "") in inserted_set
-            ],
+            committed=not write_result.systemic_failure,
+            inserted_entries=inserted_entries,
+            deferred_count=write_result.deferred_count,
+            successful_count=len(write_result.succeeded),
         )
 
     def _record_index_failure(
@@ -2014,6 +2979,8 @@ class ImageVectorService:
         show_low_confidence: bool = False,
         diversify_results: bool = True,
         sort_mode: SearchSortMode = "confidence",
+        copy_files: bool = True,
+        report_result_limit: int | None = None,
     ) -> SearchReport:
         started_at = perf_counter()
         self.cancel_check()
@@ -2115,6 +3082,8 @@ class ImageVectorService:
             low_confidence_override=(
                 ranking is not None and ranking.status == "low_confidence_override"
             ),
+            copy_files=copy_files,
+            report_result_limit=report_result_limit,
         )
         self._log_search(report)
         return report
@@ -2128,6 +3097,8 @@ class ImageVectorService:
         show_low_confidence: bool = False,
         diversify_results: bool = True,
         sort_mode: SearchSortMode = "confidence",
+        copy_files: bool = True,
+        report_result_limit: int | None = None,
     ) -> SearchReport:
         """Search locally by fuzzy tag fragments without creating an embedding."""
 
@@ -2140,10 +3111,14 @@ class ImageVectorService:
         if not text:
             raise ValueError("Tag search text cannot be empty.")
 
-        candidates = self._tag_search_hits(
+        candidates, eligible_count = self._tag_search_hits(
             text,
             tags=normalized_tags,
             tag_mode=tag_mode,
+            candidate_limit=hybrid_candidate_count(
+                top_k,
+                self.repository.doc_count,
+            ),
         )
         ranking = self._sort_request_hits(
             candidates,
@@ -2151,6 +3126,16 @@ class ImageVectorService:
             top_k=top_k,
             show_low_confidence=show_low_confidence,
             sort_mode=resolved_sort_mode,
+        )
+        ranking = replace(
+            ranking,
+            candidate_count=eligible_count,
+            filtered_count=max(0, eligible_count - len(ranking.hits)),
+            diagnostics={
+                **ranking.diagnostics,
+                "eligible_candidate_count": eligible_count,
+                "evaluated_candidate_count": len(candidates),
+            },
         )
         diversity_enabled = sort_mode_uses_diversity(
             resolved_sort_mode,
@@ -2197,6 +3182,8 @@ class ImageVectorService:
             sort_mode=resolved_sort_mode,
             ranking_diagnostics=ranking.diagnostics,
             show_low_confidence=show_low_confidence,
+            copy_files=copy_files,
+            report_result_limit=report_result_limit,
         )
         self._log_search(report)
         return report
@@ -2293,6 +3280,8 @@ class ImageVectorService:
         show_low_confidence: bool = False,
         diversify_results: bool = True,
         sort_mode: SearchSortMode = "confidence",
+        copy_files: bool = True,
+        report_result_limit: int | None = None,
     ) -> SearchReport:
         started_at = perf_counter()
         self.cancel_check()
@@ -2390,6 +3379,9 @@ class ImageVectorService:
             low_confidence_override=(
                 ranking is not None and ranking.status == "low_confidence_override"
             ),
+            copy_files=copy_files,
+            report_result_limit=report_result_limit,
+            exclude_sha256=None if include_self else image_hash,
         )
         self._log_search(report)
         return report
@@ -2407,6 +3399,8 @@ class ImageVectorService:
         show_low_confidence: bool = False,
         diversify_results: bool = True,
         sort_mode: SearchSortMode = "confidence",
+        copy_files: bool = True,
+        report_result_limit: int | None = None,
     ) -> SearchReport:
         started_at = perf_counter()
         self.cancel_check()
@@ -2559,6 +3553,9 @@ class ImageVectorService:
             low_confidence_override=(
                 ranking is not None and ranking.status == "low_confidence_override"
             ),
+            copy_files=copy_files,
+            report_result_limit=report_result_limit,
+            exclude_sha256=None if include_self else image_hash,
         )
         self._log_search(report)
         return report
@@ -2660,17 +3657,17 @@ class ImageVectorService:
         if prepared.query_type == "tag":
             if prepared.search_mode != "tags" or prepared.text is None:
                 raise ValueError("Prepared tag query is invalid.")
-            resolved_hits = self._resolve_search_hits(
-                self._tag_search_hits(
-                    prepared.text,
-                    tags=normalized_tags,
-                    tag_mode=tag_mode,
-                )
+            prepared_tag_hits, tag_match_count = self._tag_search_hits(
+                prepared.text,
+                tags=normalized_tags,
+                tag_mode=tag_mode,
+                candidate_limit=candidate_k,
             )
-            collection_size = len(resolved_hits)
+            resolved_hits = self._resolve_search_hits(prepared_tag_hits)
+            collection_size = tag_match_count
             return PreparedSearchCandidates(
                 query_type="tag",
-                hits=resolved_hits[:candidate_k],
+                hits=resolved_hits,
                 candidate_k=candidate_k,
                 collection_size=collection_size,
                 next_candidate_k=self._next_candidate_k(
@@ -2726,12 +3723,13 @@ class ImageVectorService:
                 catalog = self._current_tag_catalog()
                 hybrid_intent = detect_hybrid_tag_intent(prepared.text, catalog)
                 if hybrid_intent.enabled:
-                    tag_hits = self._tag_search_hits(
+                    tag_hits, _tag_match_count = self._tag_search_hits(
                         prepared.text,
                         tags=normalized_tags,
                         tag_mode=tag_mode,
                         query_plan=hybrid_intent.plan,
-                    )[:candidate_k]
+                        candidate_limit=candidate_k,
+                    )
             return PreparedSearchCandidates(
                 query_type="text",
                 hits=self._resolve_search_hits(hits),
@@ -2914,7 +3912,8 @@ class ImageVectorService:
                 tags=tags,
                 tag_mode=tag_mode,
                 query_plan=intent.plan,
-            )[:candidate_k]
+                candidate_limit=candidate_k,
+            )[0]
             if intent.enabled
             else []
         )
@@ -2957,8 +3956,9 @@ class ImageVectorService:
         tags: tuple[str, ...] = (),
         tag_mode: str = "all",
         query_plan: TagSearchPlan | None = None,
-    ) -> list[SearchHit]:
-        """Resolve fuzzy tags and rank matching state rows deterministically."""
+        candidate_limit: int,
+    ) -> tuple[list[SearchHit], int]:
+        """Resolve fuzzy tags and ask SQLite for only the ranked candidate pool."""
 
         catalog = self._current_tag_catalog()
         query_plan = query_plan or catalog.resolve(text, mode="all")
@@ -2966,54 +3966,48 @@ class ImageVectorService:
             tags,
             mode=cast(TagMatchMode, tag_mode),
         )
-        if query_plan.matches_nothing or filter_plan.matches_nothing:
-            return []
+        if (
+            candidate_limit <= 0
+            or query_plan.matches_nothing
+            or filter_plan.matches_nothing
+        ):
+            return [], 0
 
-        scored: list[tuple[float, tuple[str, ...], dict[str, Any]]] = []
-        for entry in self.state.entries_for_any_effective_tags(query_plan.matched_tags):
+        page = ranked_tag_candidates(
+            self.state.connection,
+            query_plan,
+            filter_plan,
+            limit=candidate_limit,
+        )
+        entries = self.state.get_many(item.doc_id for item in page.items)
+        hits: list[SearchHit] = []
+        for candidate in page.items:
             self.cancel_check()
+            entry = entries.get(candidate.doc_id)
+            if entry is None:
+                continue
             effective_tags = tuple(
                 str(value) for value in entry.get("effective_tags", ())
             )
-            if not result_matches_tag_plan(effective_tags, query_plan):
-                continue
-            if not result_matches_tag_plan(effective_tags, filter_plan):
-                continue
             query_matches = matched_tags_for_result(effective_tags, query_plan)
             filter_matches = matched_tags_for_result(effective_tags, filter_plan)
             matched_tags = tuple(dict.fromkeys((*query_matches, *filter_matches)))
-            confidence = _tag_match_confidence(query_plan, query_matches)
             fields = dict(entry)
             fields["tags"] = list(effective_tags)
-            scored.append((confidence, matched_tags, fields))
-
-        scored.sort(
-            key=lambda item: (
-                -item[0],
-                -len(item[1]),
-                str(item[2].get("root_id") or ""),
-                str(item[2].get("relative_path") or ""),
-                str(item[2].get("doc_id") or ""),
+            hits.append(
+                SearchHit(
+                    doc_id=candidate.doc_id,
+                    distance=1.0 - candidate.confidence,
+                    raw_score=1.0 - candidate.confidence,
+                    normalized_score=candidate.confidence,
+                    confidence=candidate.confidence,
+                    fields=fields,
+                    rank=len(hits) + 1,
+                    rank_source="tag",
+                    matched_tags=matched_tags,
+                )
             )
-        )
-        hits = [
-            SearchHit(
-                doc_id=str(fields["doc_id"]),
-                distance=1.0 - confidence,
-                raw_score=1.0 - confidence,
-                normalized_score=confidence,
-                confidence=confidence,
-                fields=fields,
-                rank=rank,
-                rank_source="tag",
-                matched_tags=matched_tags,
-            )
-            for rank, (confidence, matched_tags, fields) in enumerate(
-                scored,
-                start=1,
-            )
-        ]
-        return self._attach_search_learning_evidence(hits)
+        return self._attach_search_learning_evidence(hits), page.total
 
     def _cache_key(self, modality: str, value: str) -> str:
         identity = "\0".join(
@@ -3539,6 +4533,7 @@ class ImageVectorService:
         if not hits or search_learning is None or not search_learning.configured:
             return hits
         entries = self.state.get_many(hit.doc_id for hit in hits)
+        annotations = self.state.get_document_annotations(hit.doc_id for hit in hits)
         enriched: list[SearchHit] = []
         for hit in hits:
             entry = entries.get(hit.doc_id, {})
@@ -3552,7 +4547,7 @@ class ImageVectorService:
                 "vector": [],
             }
             signals: dict[str, float] = {}
-            annotation = self.state.get_document_annotation(hit.doc_id)
+            annotation = annotations.get(hit.doc_id)
             if annotation is not None:
                 high_confidence, annotation_signals = _annotation_learning_evidence(
                     annotation, matched
@@ -3712,7 +4707,7 @@ class ImageVectorService:
         self,
         *,
         scope: str = "new_or_changed",
-        cluster_types: Iterable[str] = ("exact", "perceptual", "semantic"),
+        cluster_types: Iterable[str] = DEFAULT_CLUSTER_TYPES,
     ) -> dict[str, object]:
         """Build local clusters from persisted hashes and existing vectors only."""
 
@@ -3737,28 +4732,112 @@ class ImageVectorService:
                 expanded
                 for requested in requested_types
                 for expanded in (
-                    ("exact", "perceptual")
+                    DEFAULT_CLUSTER_TYPES
                     if requested == "near_duplicate"
                     else (requested,)
                 )
             )
         )
         self.cancel_check()
-        count_entries = getattr(self.state, "count", None)
-        fallback_entries: list[dict[str, Any]] | None = None
-        if callable(count_entries):
-            total = int(count_entries())
-        else:
-            fallback_entries = self.state.list_entries()
-            total = len(fallback_entries)
+        # IndexState is the production contract. Requiring its bounded count
+        # and iterator APIs keeps compatibility fakes from silently turning a
+        # large-library operation back into a full-table materialization.
+        total = int(self.state.count())
+        manual_rules = self._active_cluster_rules()
+        store = self._cluster_operation_store()
+        joined_entry_reader = getattr(
+            self.state,
+            "iter_entries_with_annotations",
+            None,
+        )
+        if (
+            store is not None
+            and callable(joined_entry_reader)
+            and should_use_large_cluster_engine(
+                total,
+                has_active_manual_rules=bool(manual_rules),
+            )
+        ):
+            semantic_enabled = "semantic" in normalized_types
+            previous_record = (
+                store.active_snapshot_version(self._cluster_library_key())
+                if normalized_scope == "new_or_changed"
+                else None
+            )
+            adapter = LargeClusterAdapter(
+                self.state,
+                self.source_resolver,
+                self.repository,
+                ImageClusteringConfig(
+                    embedding_version=self.config.model,
+                    embedding_dimension=self.config.dimension,
+                    enable_exact_hash="exact" in normalized_types,
+                    enable_perceptual_hash="perceptual" in normalized_types,
+                    enable_semantic=semantic_enabled,
+                    external_embedding_lookup=semantic_enabled,
+                ),
+                identity_evidence_builder=_cluster_identity_evidence,
+            )
+            large_result = adapter.run(
+                store,
+                self._cluster_library_key(),
+                previous_snapshot_version=(
+                    previous_record.snapshot_version
+                    if previous_record is not None
+                    else None
+                ),
+                metadata={
+                    "scope": normalized_scope,
+                    "cluster_types": list(normalized_types),
+                },
+                cancel_check=self.cancel_check,
+                progress=self.progress,
+            )
+            payload = large_result.to_dict()
+
+            # Keep the task response bounded.  Complete engine failures remain
+            # queryable in the normalized snapshot; the UI only needs a small
+            # safe preview and an exact total count.
+            preparation = payload.get("preparation")
+            large_preparation_failures: list[dict[str, object]] = []
+            if isinstance(preparation, dict):
+                raw_preparation_failures = preparation.pop("failures", [])
+                if isinstance(raw_preparation_failures, list):
+                    large_preparation_failures = [
+                        cast(dict[str, object], item)
+                        for item in raw_preparation_failures[:200]
+                        if isinstance(item, dict)
+                    ]
+            remaining_failure_slots = max(
+                0,
+                200 - len(large_preparation_failures),
+            )
+            engine_failures: list[dict[str, object]] = []
+            if remaining_failure_slots:
+                failure_page = store.page_snapshot_failures(
+                    large_result.cluster.snapshot_version,
+                    limit=remaining_failure_slots,
+                )
+                raw_engine_failures = failure_page.get("items", [])
+                if isinstance(raw_engine_failures, list):
+                    engine_failures = [
+                        cast(dict[str, object], item)
+                        for item in raw_engine_failures
+                        if isinstance(item, dict)
+                    ]
+            failure_details = [*large_preparation_failures, *engine_failures]
+            payload["failures"] = failure_details
+            raw_failure_count = payload.get("failure_count", 0)
+            failure_count = (
+                raw_failure_count if isinstance(raw_failure_count, int) else 0
+            )
+            payload["failure_details_truncated"] = failure_count > len(failure_details)
+            payload["cluster_engine"] = "streaming_sqlite"
+            payload["snapshot_storage"] = "sqlite"
+            return payload
         items: list[ImageClusterInput] = []
         preparation_failures: list[dict[str, str]] = []
-        iter_entries = getattr(self.state, "iter_entries", None)
-        entry_chunks = (
-            iter_entries(chunk_size=256)
-            if callable(iter_entries)
-            else (fallback_entries or self.state.list_entries(),)
-        )
+        entry_chunks = self.state.iter_entries(chunk_size=256)
         processed_entries = 0
         for entry_chunk in entry_chunks:
             annotation_reader = getattr(
@@ -3900,13 +4979,11 @@ class ImageVectorService:
             previous_snapshot=previous,
             cancel_check=self.cancel_check,
         )
-        manual_rules = self._active_cluster_rules()
         if manual_rules:
             result = replace(
                 result,
                 snapshot=apply_manual_cluster_rules(result.snapshot, manual_rules),
             )
-        store = self._cluster_operation_store()
         snapshot_version = ""
         if store is not None:
             snapshot_record = store.save_snapshot(
@@ -5217,71 +6294,126 @@ class ImageVectorService:
         ):
             raise ValueError("max_images must be between 1 and 10000.")
 
-        fetch_metadata = getattr(self.repository, "fetch_metadata", None)
+        fetch_metadata_many = getattr(
+            self.repository,
+            "fetch_metadata_many",
+            None,
+        )
         upsert_metadata = getattr(
             self.repository,
             "upsert_metadata_embedding",
             None,
         )
-        if not callable(fetch_metadata) or not callable(upsert_metadata):
+        if not callable(fetch_metadata_many) or not callable(upsert_metadata):
             raise ConfigurationError(
                 "Metadata embeddings require Collection schema v4. "
                 "Run 'image_service.py migrate-schema' before starting backfill."
             )
+        maintenance_operation_id = f"metadata-backfill:{uuid.uuid4().hex}"
 
-        entries = self.state.list_entries()
-        candidates: list[MetadataBackfillItem] = []
+        selected: list[MetadataBackfillItem] = []
+        candidate_count = 0
         discovery_failures: list[dict[str, str]] = []
         discovery_failed = 0
         skipped_empty = 0
         already_current = 0
+        scanned = 0
+        total_entries = self.state.count()
         failure_detail_limit = 100
 
-        for index, entry in enumerate(entries, start=1):
-            self.cancel_check()
-            if index == 1 or index % 100 == 0 or index == len(entries):
-                self.progress(f"Metadata backfill scan {index}/{len(entries)}.")
-            doc_id = str(entry.get("doc_id") or "").strip()
+        def record_discovery_failure(
+            doc_id: str,
+            error: str,
+            error_type: str,
+        ) -> None:
+            nonlocal discovery_failed
+            discovery_failed += 1
+            if len(discovery_failures) < failure_detail_limit:
+                discovery_failures.append(
+                    {
+                        "doc_id": doc_id,
+                        "stage": "discovery",
+                        "error": error,
+                        "error_type": error_type,
+                    }
+                )
+
+        for page in self.state.iter_entries_with_annotations(chunk_size=256):
+            page_items: list[MetadataBackfillItem] = []
+            for entry, annotation in page:
+                self.cancel_check()
+                scanned += 1
+                if scanned == 1 or scanned % 100 == 0 or scanned == total_entries:
+                    self.progress(f"Metadata backfill scan {scanned}/{total_entries}.")
+                doc_id = str(entry.get("doc_id") or "").strip()
+                try:
+                    if not doc_id:
+                        raise ValueError("State entry has no doc_id.")
+                    metadata_text = build_metadata_text(entry, annotation)
+                    if not metadata_text.text:
+                        skipped_empty += 1
+                        continue
+                    page_items.append(
+                        MetadataBackfillItem(
+                            doc_id=doc_id,
+                            text=metadata_text.text,
+                            text_hash=metadata_text.sha256,
+                            truncated=metadata_text.truncated,
+                        )
+                    )
+                except Exception as exc:
+                    record_discovery_failure(
+                        doc_id,
+                        str(exc) or exc.__class__.__name__,
+                        exc.__class__.__name__,
+                    )
+
+            if not page_items:
+                continue
             try:
-                if not doc_id:
-                    raise ValueError("State entry has no doc_id.")
-                annotation = self.state.get_document_annotation(doc_id)
-                metadata_text = build_metadata_text(entry, annotation)
-                if not metadata_text.text:
-                    skipped_empty += 1
+                stored_by_doc_id, fetch_failures = fetch_metadata_many(
+                    (item.doc_id for item in page_items),
+                    batch_size=256,
+                )
+            except Exception as exc:
+                error = str(exc) or exc.__class__.__name__
+                for item in page_items:
+                    record_discovery_failure(
+                        item.doc_id,
+                        error,
+                        exc.__class__.__name__,
+                    )
+                continue
+
+            for item in page_items:
+                fetch_error = fetch_failures.get(item.doc_id)
+                if fetch_error is not None:
+                    record_discovery_failure(
+                        item.doc_id,
+                        str(fetch_error) or "Collection metadata fetch failed.",
+                        "CollectionFetchError",
+                    )
                     continue
-                stored = fetch_metadata(doc_id)
+                stored = stored_by_doc_id.get(item.doc_id)
                 if stored is None:
-                    raise ConfigurationError(
+                    missing_error = ConfigurationError(
                         "Document exists in SQLite state but not in the Collection."
                     )
+                    record_discovery_failure(
+                        item.doc_id,
+                        str(missing_error),
+                        missing_error.__class__.__name__,
+                    )
+                    continue
                 if (
                     str(stored.get("metadata_text_hash") or "").lower()
-                    == metadata_text.sha256
+                    == item.text_hash
                 ):
                     already_current += 1
                     continue
-                candidates.append(
-                    MetadataBackfillItem(
-                        doc_id=doc_id,
-                        text=metadata_text.text,
-                        text_hash=metadata_text.sha256,
-                        truncated=metadata_text.truncated,
-                    )
-                )
-            except Exception as exc:
-                discovery_failed += 1
-                if len(discovery_failures) < failure_detail_limit:
-                    discovery_failures.append(
-                        {
-                            "doc_id": doc_id,
-                            "stage": "discovery",
-                            "error": str(exc) or exc.__class__.__name__,
-                            "error_type": exc.__class__.__name__,
-                        }
-                    )
-
-        selected = candidates[:max_images]
+                candidate_count += 1
+                if len(selected) < max_images:
+                    selected.append(item)
 
         def still_current(item: MetadataBackfillItem) -> bool:
             current_entry = self.state.get(item.doc_id)
@@ -5321,7 +6453,7 @@ class ImageVectorService:
                 client_cancel_event=client_cancel_event,
                 concurrency=self.config.embedding_concurrency,
             )
-            runner_report = runner.run(selected, eligible=len(candidates))
+            runner_report = runner.run(selected, eligible=candidate_count)
             limiter = getattr(client, "limiter", None)
             snapshot = (
                 limiter.snapshot().as_dict()
@@ -5331,24 +6463,36 @@ class ImageVectorService:
         else:
             runner_report = MetadataBackfillReport(
                 selected=0,
-                eligible=len(candidates),
+                eligible=candidate_count,
             )
             self.cancel_check()
             self.progress("Metadata backfill 0/0: no pending descriptions.")
             snapshot = None
 
         report = runner_report.to_dict()
+        succeeded_count = int(report["succeeded"])
+        if succeeded_count:
+            # Metadata vectors bypass the image-write outbox. Account once per
+            # explicit run; a crash can only defer optional compaction and does
+            # not affect the already durable metadata document.
+            with suppress(Exception):
+                self._record_collection_mutation(
+                    maintenance_operation_id,
+                    changes=succeeded_count,
+                    deletes=0,
+                )
+        report["operation_id"] = maintenance_operation_id
         runner_failures = list(report["failures"])
         report.update(
             {
-                "scanned": len(entries),
+                "scanned": scanned,
                 "skipped_empty": skipped_empty,
                 "already_current": already_current,
-                "eligible": len(candidates) + discovery_failed,
-                "deferred": max(0, len(candidates) - len(selected)),
+                "eligible": candidate_count + discovery_failed,
+                "deferred": max(0, candidate_count - len(selected)),
                 "failed": int(report["failed"]) + discovery_failed,
                 "remaining": (
-                    max(0, len(candidates) - int(report["succeeded"]))
+                    max(0, candidate_count - int(report["succeeded"]))
                     + discovery_failed
                 ),
                 "failures": (discovery_failures + runner_failures)[
@@ -5395,10 +6539,11 @@ class ImageVectorService:
     def rebind_root(self, root_id: str, new_path: str) -> dict[str, object]:
         report = self.state.rebind_root(root_id, new_path)
         missing = 0
-        for entry in self.state.entries_for_root(root_id):
-            source = self.source_resolver.resolve_fields(entry)
-            if not source.is_file():
-                missing += 1
+        for page in self.state.iter_entries_for_root(root_id, chunk_size=256):
+            for entry in page:
+                source = self.source_resolver.resolve_fields(entry)
+                if not source.is_file():
+                    missing += 1
         report["missing_files"] = missing
         self.logger.info("root_rebind missing_files=%d", missing)
         return report
@@ -5473,10 +6618,18 @@ class ImageVectorService:
     def close(self) -> None:
         if getattr(self, "_closed", True):
             return
+        if not bool(getattr(self, "_optimize_external_idle_runner", False)):
+            # Standalone/CLI callers have no persistent library worker. Run
+            # only maintenance that the in-memory policy says is already due.
+            with suppress(Exception):
+                self.run_idle_maintenance()
         if hasattr(self, "state"):
             self.state.close()
         if hasattr(self, "auto_tag_cache"):
             self.auto_tag_cache.close()
+        close_repository = getattr(getattr(self, "repository", None), "close", None)
+        if callable(close_repository):
+            close_repository()
         if hasattr(self, "logger"):
             close_app_logger(self.logger)
         if hasattr(self, "_lock"):
@@ -5670,46 +6823,9 @@ def _annotation_learning_evidence(
     return list(normalize_tags(high_confidence)), signals
 
 
-def _tag_match_confidence(
-    plan: TagSearchPlan,
-    matched_tags: tuple[str, ...],
-) -> float:
-    """Score exact, alias and substring tag matches without implying probability."""
-
-    if not matched_tags or not plan.expansions:
-        return 0.0
-    normalized_matches = {tag: normalize_tag_search_text(tag) for tag in matched_tags}
-    expansion_scores: list[float] = []
-    for expansion in plan.expansions:
-        allowed = {normalize_tag_search_text(tag) for tag in expansion.matches}
-        equivalents = {
-            normalize_tag_search_text(term) for term in expansion.expanded_terms
-        }
-        best = 0.0
-        for normalized_tag in normalized_matches.values():
-            if normalized_tag not in allowed:
-                continue
-            fragment = expansion.normalized_fragment
-            if normalized_tag == fragment:
-                score = 1.0
-            elif normalized_tag in equivalents:
-                score = 0.96
-            else:
-                ratio = min(1.0, len(fragment) / max(1, len(normalized_tag)))
-                if normalized_tag.startswith(fragment):
-                    score = 0.85 + 0.10 * ratio
-                elif fragment in normalized_tag:
-                    score = 0.70 + 0.15 * ratio
-                else:
-                    score = 0.65
-            best = max(best, score)
-        expansion_scores.append(best)
-    return min(1.0, max(0.0, sum(expansion_scores) / len(expansion_scores)))
-
-
 def _embed_batch_with_activity(
     client: object,
-    batch: list[tuple[str, list[ImageRecord]]],
+    batch: list[_EmbeddingWorkItem],
     metrics: _PipelineNetworkMetrics | None,
 ) -> _EmbeddingBatchResult:
     if metrics is not None:
@@ -5723,14 +6839,14 @@ def _embed_batch_with_activity(
 
 def _embed_batch_resilient(
     client: object,
-    batch: list[tuple[str, list[ImageRecord]]],
+    batch: list[_EmbeddingWorkItem],
 ) -> _EmbeddingBatchResult:
     result = _EmbeddingBatchResult()
     if not batch:
         return result
     try:
         response: EmbeddingResponse = client.embed_images(  # type: ignore[attr-defined]
-            [Path(records[0].absolute_path) for _sha, records in batch]
+            [Path(item.representative.absolute_path) for item in batch]
         )
     except (DashScopeError, ImageInputError) as exc:
         if getattr(exc, "splittable", False) and len(batch) > 1:
@@ -5794,10 +6910,17 @@ def _classify_storage_error(_error: str) -> FailureKind:
     return "systemic"
 
 
+def _vector_failure_is_missing(error: str) -> bool:
+    return (
+        str(error).strip().casefold()
+        == ("the indexed image vector is missing.").casefold()
+    )
+
+
 def _embedding_batch_bytes(
-    batch: list[tuple[str, list[ImageRecord]]],
+    batch: list[_EmbeddingWorkItem],
 ) -> int:
-    return sum(4 * ((records[0].size_bytes + 2) // 3) + 4096 for _sha, records in batch)
+    return sum(4 * ((item.representative.size_bytes + 2) // 3) + 4096 for item in batch)
 
 
 def _chunks(values: list[str], size: int) -> Iterable[list[str]]:

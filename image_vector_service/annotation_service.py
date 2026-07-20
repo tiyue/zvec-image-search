@@ -8,9 +8,9 @@ import threading
 import unicodedata
 import uuid
 from collections import defaultdict
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path, PurePosixPath
 from time import monotonic
 from typing import Any
@@ -27,6 +27,10 @@ from .auto_tagging_assets import (
     FIELD_SPECS,
     FIELD_TAG_LABELS,
     PROMPT_VERSION,
+)
+from .collection_write_coordinator import (
+    CollectionWriteCoordinator,
+    PreparedCollectionUpsert,
 )
 from .config import ConfigurationError, ServiceConfig
 from .failure_sink import FailureSink
@@ -71,7 +75,14 @@ HIGH_CONFIDENCE_ENTITY_THRESHOLD = 0.80
 POLICY_VERSION = 3
 LOW_RISK_FIELD_CONFIDENCE = 0.80
 REVIEW_STATES = {"all", "low_risk", "identity", "conflict", "failed"}
-FOLDER_INHERITANCE_POLICY_VERSION = 1
+FOLDER_INHERITANCE_POLICY_VERSION = 2
+FOLDER_INHERITANCE_AUDIT_LIMIT = 100
+FOLDER_INHERITANCE_ROW_BATCH_SIZE = 500
+FOLDER_INHERITANCE_TAG_LIMIT_PER_SOURCE = 512
+FOLDER_INHERITANCE_GLOBAL_TAG_LIMIT = 50_000
+FOLDER_INHERITANCE_GLOBAL_SOURCE_SAMPLE_LIMIT = 50_000
+FOLDER_INHERITANCE_GLOBAL_FILTER_SAMPLE_LIMIT = 50_000
+_FOLDER_INHERITANCE_FILTER_BUFFER = FOLDER_INHERITANCE_AUDIT_LIMIT * 2
 CLUSTER_IDENTITY_CATEGORIES = frozenset(
     {"real_person", "cosplayer", "character", "work"}
 )
@@ -248,6 +259,310 @@ class _RunAccounting:
         self.actual_cost_cny += max(0.0, float(cost))
 
 
+@dataclass
+class _FolderTagOccurrences:
+    """Track one normalized tag without retaining every donor document."""
+
+    count: int = 0
+    first_occurrences: list[tuple[str, str]] = field(default_factory=list)
+
+    def add(self, *, doc_id: str, tag: str) -> None:
+        self.count += 1
+        if len(self.first_occurrences) < 2:
+            self.first_occurrences.append((doc_id, tag))
+
+    def value_excluding(self, doc_id: str | None) -> str | None:
+        for contributor_id, tag in self.first_occurrences:
+            if contributor_id != doc_id:
+                return tag
+        # A donor contributes a normalized tag at most once per source. Thus,
+        # if both retained slots fail to produce a different document, the
+        # excluded target was the sole contributor. If the target appeared
+        # third or later, the first slot necessarily belongs to another donor.
+        return None
+
+
+@dataclass
+class _FolderInheritanceMemoryBudget:
+    """One run-wide cap shared by every requested folder aggregate."""
+
+    tag_limit: int = FOLDER_INHERITANCE_GLOBAL_TAG_LIMIT
+    source_sample_limit: int = FOLDER_INHERITANCE_GLOBAL_SOURCE_SAMPLE_LIMIT
+    filtered_sample_limit: int = FOLDER_INHERITANCE_GLOBAL_FILTER_SAMPLE_LIMIT
+    retained_tags: int = 0
+    retained_source_samples: int = 0
+    retained_filtered_samples: int = 0
+
+    def reserve_tag(self) -> bool:
+        if self.retained_tags >= self.tag_limit:
+            return False
+        self.retained_tags += 1
+        return True
+
+    def reserve_source_sample(self) -> bool:
+        if self.retained_source_samples >= self.source_sample_limit:
+            return False
+        self.retained_source_samples += 1
+        return True
+
+    def reserve_filtered_sample(self) -> bool:
+        if self.retained_filtered_samples >= self.filtered_sample_limit:
+            return False
+        self.retained_filtered_samples += 1
+        return True
+
+
+@dataclass
+class _FolderInheritanceAggregate:
+    """Bounded donor summary for one direct folder.
+
+    Only unique tag keys and small audit samples survive a consumed database
+    page.  Candidate documents are still allowed to donate manual labels to
+    their peers; two deterministic provenance slots let a target subtract only
+    its own contribution so it can never recover from its own labels.
+    """
+
+    target_doc_ids: frozenset[str]
+    memory_budget: _FolderInheritanceMemoryBudget = field(
+        default_factory=_FolderInheritanceMemoryBudget
+    )
+    tags_by_source: dict[str, dict[str, _FolderTagOccurrences]] = field(
+        default_factory=lambda: {
+            "manual": {},
+            "folder": {},
+            "accepted_auto": {},
+        }
+    )
+    source_count: int = 0
+    source_samples: list[tuple[str, str]] = field(default_factory=list)
+    eligible_target_doc_ids: set[str] = field(default_factory=set)
+    filtered_count: int = 0
+    filtered_samples: list[dict[str, str]] = field(default_factory=list)
+    filtered_counts_by_target: dict[str, int] = field(default_factory=dict)
+    tag_totals_by_source: dict[str, int] = field(
+        default_factory=lambda: {
+            "manual": 0,
+            "folder": 0,
+            "accepted_auto": 0,
+        }
+    )
+    omitted_tags_by_source: dict[str, int] = field(
+        default_factory=lambda: {
+            "manual": 0,
+            "folder": 0,
+            "accepted_auto": 0,
+        }
+    )
+    tag_totals_by_target: dict[str, dict[str, int]] = field(default_factory=dict)
+    omitted_tags_by_target: dict[str, dict[str, int]] = field(default_factory=dict)
+
+    def consume(
+        self,
+        donor: Mapping[str, Any],
+        annotation: Mapping[str, Any] | None,
+    ) -> bool:
+        donor_id = str(donor.get("doc_id") or "")
+        current_annotation = (
+            annotation
+            if annotation is not None
+            and str(annotation.get("source_sha256") or "")
+            == str(donor.get("sha256") or "")
+            else None
+        )
+        manual_tags = normalize_tags(donor.get("tags", ()))
+        annotation_accepted = bool(
+            current_annotation is not None
+            and current_annotation.get("status") == "accepted"
+        )
+        if not manual_tags and not annotation_accepted:
+            return False
+
+        is_target = donor_id in self.target_doc_ids
+        self.source_count += 1
+        if is_target:
+            self.eligible_target_doc_ids.add(donor_id)
+        if (
+            len(self.source_samples) < FOLDER_INHERITANCE_AUDIT_LIMIT + 1
+            and self.memory_budget.reserve_source_sample()
+        ):
+            self.source_samples.append(
+                (donor_id, str(donor.get("relative_path") or ""))
+            )
+
+        values_by_source: tuple[tuple[str, Iterable[str]], ...] = (
+            ("manual", manual_tags),
+            ("folder", normalize_tags(donor.get("folder_tags", ()))),
+            (
+                "accepted_auto",
+                normalize_tags(donor.get("accepted_auto_tags", ()))
+                if annotation_accepted
+                else (),
+            ),
+        )
+        for source, values in values_by_source:
+            bucket = self.tags_by_source[source]
+            # One document may contain spelling/case variants that collapse to
+            # the same comparison key. Count it once so the two provenance
+            # slots always represent two different donor documents.
+            for tag in _stable_strings(values):
+                blocked_category = _blocked_folder_inheritance_category(
+                    tag,
+                    current_annotation,
+                )
+                if blocked_category is not None:
+                    self.filtered_count += 1
+                    if is_target:
+                        self.filtered_counts_by_target[donor_id] = (
+                            self.filtered_counts_by_target.get(donor_id, 0) + 1
+                        )
+                    if (
+                        len(self.filtered_samples) < _FOLDER_INHERITANCE_FILTER_BUFFER
+                        and self.memory_budget.reserve_filtered_sample()
+                    ):
+                        self.filtered_samples.append(
+                            {
+                                "tag": tag,
+                                "category": blocked_category,
+                                "source": source,
+                                "source_doc_id": donor_id,
+                                "reason": "transient_category",
+                            }
+                        )
+                    continue
+                key = _comparison_key(tag)
+                self.tag_totals_by_source[source] += 1
+                if is_target:
+                    target_totals = self.tag_totals_by_target.setdefault(donor_id, {})
+                    target_totals[source] = target_totals.get(source, 0) + 1
+                occurrence = bucket.get(key)
+                if occurrence is None:
+                    if (
+                        len(bucket) >= FOLDER_INHERITANCE_TAG_LIMIT_PER_SOURCE
+                        or not self.memory_budget.reserve_tag()
+                    ):
+                        # Count every omitted contribution without retaining its
+                        # key. This keeps pathological folders with a unique tag
+                        # per image strictly bounded while making truncation
+                        # visible in the persisted audit.
+                        self.omitted_tags_by_source[source] += 1
+                        if is_target:
+                            target_omitted = self.omitted_tags_by_target.setdefault(
+                                donor_id, {}
+                            )
+                            target_omitted[source] = target_omitted.get(source, 0) + 1
+                        continue
+                    occurrence = _FolderTagOccurrences()
+                    bucket[key] = occurrence
+                occurrence.add(doc_id=donor_id, tag=tag)
+        return True
+
+    def payload(self, *, exclude_doc_id: str | None = None) -> dict[str, Any]:
+        source_tags: dict[str, list[str]] = {}
+        accepted: list[str] = []
+        for source in ("manual", "folder", "accepted_auto"):
+            values = [
+                value
+                for occurrence in self.tags_by_source[source].values()
+                if (value := occurrence.value_excluding(exclude_doc_id)) is not None
+            ]
+            normalized = list(normalize_tags(values))
+            source_tags[source] = normalized
+            accepted.extend(normalized)
+
+        source_total = self.source_count - int(
+            bool(exclude_doc_id and exclude_doc_id in self.eligible_target_doc_ids)
+        )
+        source_samples = [
+            (doc_id, relative_path)
+            for doc_id, relative_path in self.source_samples
+            if doc_id != exclude_doc_id
+        ][:FOLDER_INHERITANCE_AUDIT_LIMIT]
+        filtered_total = self.filtered_count - (
+            self.filtered_counts_by_target.get(exclude_doc_id, 0)
+            if exclude_doc_id
+            else 0
+        )
+        filtered_samples = [
+            dict(item)
+            for item in self.filtered_samples
+            if item.get("source_doc_id") != exclude_doc_id
+        ][:FOLDER_INHERITANCE_AUDIT_LIMIT]
+        source_ids = _stable_strings(item[0] for item in source_samples)
+        source_paths = _stable_strings(item[1] for item in source_samples)
+        excluded_tag_totals = (
+            self.tag_totals_by_target.get(exclude_doc_id, {}) if exclude_doc_id else {}
+        )
+        excluded_omitted = (
+            self.omitted_tags_by_target.get(exclude_doc_id, {})
+            if exclude_doc_id
+            else {}
+        )
+        source_tags_total = {
+            source: total - excluded_tag_totals.get(source, 0)
+            for source, total in self.tag_totals_by_source.items()
+        }
+        source_tags_omitted = {
+            source: omitted - excluded_omitted.get(source, 0)
+            for source, omitted in self.omitted_tags_by_source.items()
+        }
+        source_tags_truncated = {
+            source: omitted > 0 for source, omitted in source_tags_omitted.items()
+        }
+        return {
+            # Comparison-key de-duplication across sources is what makes the
+            # manual spelling win over folder/model variants of the same tag.
+            "accepted_tags": _stable_strings(accepted),
+            "filtered_tags": filtered_samples,
+            "filtered_tags_total": filtered_total,
+            "filtered_tags_truncated": filtered_total > len(filtered_samples),
+            "source_doc_ids": source_ids,
+            "source_doc_ids_total": source_total,
+            "source_doc_ids_truncated": source_total > len(source_ids),
+            "source_relative_paths": source_paths,
+            "source_relative_paths_total": source_total,
+            "source_relative_paths_truncated": source_total > len(source_paths),
+            "source_tags": source_tags,
+            "source_tags_total": source_tags_total,
+            "source_tags_omitted": source_tags_omitted,
+            "source_tags_truncated": source_tags_truncated,
+        }
+
+
+def _empty_folder_inheritance_payload() -> dict[str, Any]:
+    return {
+        "accepted_tags": [],
+        "filtered_tags": [],
+        "filtered_tags_total": 0,
+        "filtered_tags_truncated": False,
+        "source_doc_ids": [],
+        "source_doc_ids_total": 0,
+        "source_doc_ids_truncated": False,
+        "source_relative_paths": [],
+        "source_relative_paths_total": 0,
+        "source_relative_paths_truncated": False,
+        "source_tags": {
+            "manual": [],
+            "folder": [],
+            "accepted_auto": [],
+        },
+        "source_tags_total": {
+            "manual": 0,
+            "folder": 0,
+            "accepted_auto": 0,
+        },
+        "source_tags_omitted": {
+            "manual": 0,
+            "folder": 0,
+            "accepted_auto": 0,
+        },
+        "source_tags_truncated": {
+            "manual": False,
+            "folder": False,
+            "accepted_auto": False,
+        },
+    }
+
+
 class AutoTaggingCoordinator:
     def __init__(
         self,
@@ -259,6 +574,7 @@ class AutoTaggingCoordinator:
         source_resolver: SourcePathResolver,
         progress: Callable[[str], None],
         cancel_check: Callable[[], None],
+        collection_writes: CollectionWriteCoordinator,
     ) -> None:
         self.config = config
         self.state = state
@@ -267,6 +583,7 @@ class AutoTaggingCoordinator:
         self.source_resolver = source_resolver
         self.progress = progress
         self.cancel_check = cancel_check
+        self.collection_writes = collection_writes
 
     def estimate(
         self,
@@ -340,9 +657,12 @@ class AutoTaggingCoordinator:
             estimated_plus_requests * ESTIMATED_INPUT_TOKENS_PER_IMAGE,
             estimated_plus_requests * ESTIMATED_OUTPUT_TOKENS_PER_IMAGE,
         )
-        pending_all = self._annotations_in_library("pending_review")
-        pending_count = len(pending_all)
-        pending = pending_all[:50]
+        pending_count = self._annotation_count_in_library("pending_review")
+        pending: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        for annotation, entry in self._annotations_in_library("pending_review"):
+            pending.append((annotation, entry))
+            if len(pending) >= 50:
+                break
         return {
             "scope": scope,
             "model": selected_model,
@@ -373,7 +693,10 @@ class AutoTaggingCoordinator:
                 for entry in candidates[:12]
             ],
             "pending_count": pending_count,
-            "proposals": [self._stored_proposal(item) for item in pending[:50]],
+            "proposals": [
+                self._stored_proposal(annotation, entry)
+                for annotation, entry in pending
+            ],
         }
 
     def pending(
@@ -392,8 +715,7 @@ class AutoTaggingCoordinator:
             if normalized_filters["review_state"] == "failed"
             else "pending_review"
         )
-        annotations = self._annotations_in_library(annotation_status)
-        latest_ids: set[str] | None = None
+        latest_run_id: str | None = None
         if normalized_filters["latest_index_only"]:
             scoped, root_id = self._configured_root()
             latest_run_id = (
@@ -401,27 +723,54 @@ class AutoTaggingCoordinator:
                 if scoped and root_id is None
                 else self.state.latest_index_run_id(root_id if scoped else None)
             )
-            latest_ids = (
-                {
-                    str(entry["doc_id"])
-                    for entry in self.state.entries_for_index_run(latest_run_id)
+            if latest_run_id is None:
+                latest_batch = self.state.latest_auto_tag_review_batch()
+                return {
+                    "pending_count": 0,
+                    "total_count": 0,
+                    "offset": page_offset,
+                    "limit": page_limit,
+                    "proposals": [],
+                    "has_more": False,
+                    "filters": normalized_filters,
+                    "undo_available": self._review_batch_is_undoable(latest_batch),
                 }
-                if latest_run_id
-                else set()
+        requires_python_filtering = any(
+            str(normalized_filters.get(name) or "")
+            for name in ("character", "work", "action", "expression")
+        ) or normalized_filters["review_state"] in {"low_risk", "identity", "conflict"}
+        pending_count = (
+            0
+            if requires_python_filtering
+            else self._annotation_count_in_library(
+                annotation_status,
+                run_id=latest_run_id,
             )
-        filtered = [
-            proposal
-            for annotation in annotations
-            if (proposal := self._stored_proposal(annotation))
-            and _proposal_matches_pending_filters(
-                proposal,
-                normalized_filters,
-                latest_ids=latest_ids,
-                aliases=aliases,
-            )
-        ]
-        pending_count = len(filtered)
-        proposals = filtered[page_offset : page_offset + page_limit]
+        )
+        proposals: list[dict[str, Any]] = []
+        matched_index = 0
+        for annotation, entry in self._annotations_in_library(
+            annotation_status,
+            run_id=latest_run_id,
+        ):
+            proposal = self._stored_proposal(annotation, entry)
+            if requires_python_filtering:
+                if not _proposal_matches_pending_filters(
+                    proposal,
+                    normalized_filters,
+                    latest_ids=None,
+                    aliases=aliases,
+                ):
+                    continue
+                if page_offset <= pending_count < page_offset + page_limit:
+                    proposals.append(proposal)
+                pending_count += 1
+                continue
+            if page_offset <= matched_index < page_offset + page_limit:
+                proposals.append(proposal)
+            matched_index += 1
+            if matched_index >= page_offset + page_limit:
+                break
         latest_batch = self.state.latest_auto_tag_review_batch()
         return {
             "pending_count": pending_count,
@@ -491,7 +840,6 @@ class AutoTaggingCoordinator:
         rejected remain suppressed.
         """
 
-        annotations = self._annotations_in_library("pending_review")
         scanned = 0
         eligible = 0
         updated = 0
@@ -504,7 +852,7 @@ class AutoTaggingCoordinator:
         skipped_stale = 0
         failures: list[dict[str, str]] = []
 
-        for annotation in annotations:
+        for annotation, entry in self._annotations_in_library("pending_review"):
             self.cancel_check()
             scanned += 1
             policy = dict(annotation.get("policy") or {})
@@ -517,8 +865,7 @@ class AutoTaggingCoordinator:
                 continue
 
             doc_id = str(annotation["doc_id"])
-            entry = self.state.get(doc_id)
-            if entry is None or str(annotation.get("source_sha256") or "") != str(
+            if str(annotation.get("source_sha256") or "") != str(
                 entry.get("sha256") or ""
             ):
                 skipped_stale += 1
@@ -875,6 +1222,10 @@ class AutoTaggingCoordinator:
             "folder_inheritance_recovered": recovered,
             "folder_inheritance_unresolved": int(inheritance["unresolved"]),
             "folder_inheritance_failures": list(inheritance["failures"]),
+            "folder_inheritance_failures_total": int(inheritance["failures_total"]),
+            "folder_inheritance_failures_truncated": bool(
+                inheritance["failures_truncated"]
+            ),
             "pending_count": pending_count,
             "proposals": proposals,
         }
@@ -1414,26 +1765,82 @@ class AutoTaggingCoordinator:
                 "recovered": 0,
                 "unresolved": 0,
                 "failures": [],
+                "failures_total": 0,
+                "failures_truncated": False,
                 "proposals": [],
             }
 
-        members_by_folder: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(
-            list
+        requested_folders = sorted(
+            {
+                (
+                    str(entry.get("root_id") or ""),
+                    _folder_display_path(entry),
+                )
+                for entry in candidates.values()
+            },
+            key=lambda value: (value[0], _comparison_key(value[1])),
         )
-        for member in self.state.list_entries():
-            members_by_folder[_folder_identity(member)].append(member)
+        target_doc_ids = frozenset(candidates)
+        memory_budget = _FolderInheritanceMemoryBudget()
+        donors_by_folder: dict[tuple[str, str], _FolderInheritanceAggregate] = {}
+
+        def consume_donor(
+            member: Mapping[str, Any],
+            member_annotation: Mapping[str, Any] | None,
+        ) -> None:
+            identity = _folder_identity(member)
+            aggregate = donors_by_folder.get(identity)
+            if aggregate is None:
+                # Persist summaries only after an eligible donor is observed;
+                # folders containing only failed/unlabelled targets allocate no
+                # retained audit lists.
+                candidate = _FolderInheritanceAggregate(
+                    target_doc_ids,
+                    memory_budget,
+                )
+                if candidate.consume(member, member_annotation):
+                    donors_by_folder[identity] = candidate
+                return
+            aggregate.consume(member, member_annotation)
+
+        folder_reader = getattr(
+            self.state,
+            "iter_entries_for_folders_with_annotations",
+            None,
+        )
+        if not callable(folder_reader):
+            raise ConfigurationError(
+                "Folder inheritance requires the bounded folder annotation reader."
+            )
+        for batch in folder_reader(
+            requested_folders,
+            row_batch_size=FOLDER_INHERITANCE_ROW_BATCH_SIZE,
+        ):
+            self.cancel_check()
+            for member, member_annotation in batch:
+                consume_donor(member, member_annotation)
 
         recovered = 0
         unresolved = 0
+        failure_count = 0
         failures: list[dict[str, str]] = []
         proposals: list[dict[str, Any]] = []
+
+        def record_failure(item: dict[str, str]) -> None:
+            nonlocal failure_count
+            failure_count += 1
+            if len(failures) < FOLDER_INHERITANCE_AUDIT_LIMIT:
+                failures.append(item)
+
+        current_entries = self.state.get_many(candidates)
+        current_annotations = self.state.get_document_annotations(candidates)
         for doc_id in sorted(candidates):
             self.cancel_check()
-            entry = self.state.get(doc_id)
-            annotation = self.state.get_document_annotation(doc_id)
+            entry = current_entries.get(doc_id)
+            annotation = current_annotations.get(doc_id)
             if entry is None or annotation is None:
                 unresolved += 1
-                failures.append(
+                record_failure(
                     {
                         "doc_id": doc_id,
                         "code": "folder_inheritance_target_missing",
@@ -1458,29 +1865,32 @@ class AutoTaggingCoordinator:
                 # model pass.  Never overwrite that newer state.
                 continue
 
-            donors = [
-                donor
-                for donor in members_by_folder.get(_folder_identity(entry), ())
-                if str(donor.get("doc_id") or "") != doc_id
-            ]
-            inheritance = self._folder_inheritance_payload(donors)
+            aggregate = donors_by_folder.get(_folder_identity(entry))
+            inheritance = (
+                aggregate.payload(exclude_doc_id=doc_id)
+                if aggregate is not None
+                else _empty_folder_inheritance_payload()
+            )
             rejected_keys = {
                 _comparison_key(tag)
                 for tag in _iter_strings(annotation.get("rejected_tags"))
             }
             inherited_tags: list[str] = []
             filtered_tags = list(inheritance["filtered_tags"])
+            filtered_total = int(inheritance["filtered_tags_total"])
             for tag in inheritance["accepted_tags"]:
                 if _comparison_key(tag) in rejected_keys:
-                    filtered_tags.append(
-                        {
-                            "tag": tag,
-                            "category": "user_suppressed",
-                            "source": "target_annotation",
-                            "source_doc_id": doc_id,
-                            "reason": "target_rejected_tag",
-                        }
-                    )
+                    filtered_total += 1
+                    if len(filtered_tags) < FOLDER_INHERITANCE_AUDIT_LIMIT:
+                        filtered_tags.append(
+                            {
+                                "tag": tag,
+                                "category": "user_suppressed",
+                                "source": "target_annotation",
+                                "source_doc_id": doc_id,
+                                "reason": "target_rejected_tag",
+                            }
+                        )
                     continue
                 inherited_tags.append(tag)
 
@@ -1489,10 +1899,25 @@ class AutoTaggingCoordinator:
                 "blocked_categories": sorted(FOLDER_INHERITANCE_BLOCKED_CATEGORIES),
                 "folder": _folder_display_path(entry),
                 "source_doc_ids": list(inheritance["source_doc_ids"]),
+                "source_doc_ids_total": int(inheritance["source_doc_ids_total"]),
+                "source_doc_ids_truncated": bool(
+                    inheritance["source_doc_ids_truncated"]
+                ),
                 "source_relative_paths": list(inheritance["source_relative_paths"]),
+                "source_relative_paths_total": int(
+                    inheritance["source_relative_paths_total"]
+                ),
+                "source_relative_paths_truncated": bool(
+                    inheritance["source_relative_paths_truncated"]
+                ),
                 "source_tags": dict(inheritance["source_tags"]),
+                "source_tags_total": dict(inheritance["source_tags_total"]),
+                "source_tags_omitted": dict(inheritance["source_tags_omitted"]),
+                "source_tags_truncated": dict(inheritance["source_tags_truncated"]),
                 "accepted_tags": list(normalize_tags(inherited_tags)),
                 "filtered_tags": filtered_tags,
+                "filtered_tags_total": filtered_total,
+                "filtered_tags_truncated": filtered_total > len(filtered_tags),
                 "original_failure_category": failure_category,
                 "original_error": str(annotation.get("error") or ""),
                 "original_review_reasons": list(policy.get("review_reasons", ())),
@@ -1517,7 +1942,7 @@ class AutoTaggingCoordinator:
                     error=message,
                 )
                 unresolved += 1
-                failures.append(
+                record_failure(
                     {
                         "doc_id": doc_id,
                         "code": "no_inheritable_folder_tags",
@@ -1571,7 +1996,7 @@ class AutoTaggingCoordinator:
                     error=f"Folder inheritance failed to persist tags: {error_text}",
                 )
                 unresolved += 1
-                failures.append(
+                record_failure(
                     {
                         "doc_id": doc_id,
                         "code": "folder_inheritance_write_failed",
@@ -1582,7 +2007,7 @@ class AutoTaggingCoordinator:
 
             recovered += 1
             stored = self.state.get_document_annotation(doc_id)
-            if stored is not None:
+            if stored is not None and len(proposals) < AUTO_TAG_RESULT_PROPOSAL_LIMIT:
                 proposals.append(self._stored_proposal(stored))
             self.progress(
                 f"Recovered refused image {recovered}/{len(candidates)} from "
@@ -1592,7 +2017,9 @@ class AutoTaggingCoordinator:
         return {
             "recovered": recovered,
             "unresolved": unresolved,
-            "failures": failures[:100],
+            "failures": failures,
+            "failures_total": failure_count,
+            "failures_truncated": failure_count > len(failures),
             "proposals": proposals,
         }
 
@@ -1600,91 +2027,27 @@ class AutoTaggingCoordinator:
         self,
         donors: Iterable[dict[str, Any]],
     ) -> dict[str, Any]:
-        """Collect deterministic, provenance-aware tags without voting."""
+        """Compatibility helper for tests and older state adapters.
 
-        source_tags: dict[str, list[str]] = {
-            "manual": [],
-            "folder": [],
-            "accepted_auto": [],
-        }
-        accepted: list[str] = []
-        filtered: list[dict[str, str]] = []
-        source_doc_ids: list[str] = []
-        source_relative_paths: list[str] = []
-        ordered_donors = sorted(
-            donors,
-            key=lambda donor: (
-                str(donor.get("relative_path") or "").casefold(),
-                str(donor.get("doc_id") or ""),
-            ),
-        )
-        eligible_donors: list[tuple[dict[str, Any], dict[str, Any] | None]] = []
-        for donor in ordered_donors:
+        The production path consumes SQLite's already ordered pages directly.
+        This helper deliberately avoids sorting or retaining the input iterable.
+        """
+
+        aggregate = _FolderInheritanceAggregate(frozenset())
+        for donor in donors:
             donor_id = str(donor.get("doc_id") or "")
-            annotation = self.state.get_document_annotation(donor_id)
-            annotation_current = bool(
-                annotation is not None
-                and str(annotation.get("source_sha256") or "")
-                == str(donor.get("sha256") or "")
+            joined_annotation = (
+                donor.get("_joined_annotation")
+                if "_joined_annotation" in donor
+                else self.state.get_document_annotation(donor_id)
             )
-            manually_labelled = bool(normalize_tags(donor.get("tags", ())))
-            annotation_accepted = bool(
-                annotation_current
-                and annotation is not None
-                and annotation.get("status") == "accepted"
+            annotation = (
+                dict(joined_annotation)
+                if isinstance(joined_annotation, Mapping)
+                else None
             )
-            if not manually_labelled and not annotation_accepted:
-                continue
-
-            current_annotation = annotation if annotation_current else None
-            eligible_donors.append((donor, current_annotation))
-            source_doc_ids.append(donor_id)
-            source_relative_paths.append(str(donor.get("relative_path") or ""))
-        # Traverse sources first so a manual spelling/canonical form always wins
-        # over the same tag supplied by a folder name or model output.
-        for source in ("manual", "folder", "accepted_auto"):
-            for donor, annotation in eligible_donors:
-                donor_id = str(donor.get("doc_id") or "")
-                if source == "manual":
-                    values = donor.get("tags", ())
-                elif source == "folder":
-                    values = donor.get("folder_tags", ())
-                else:
-                    values = (
-                        donor.get("accepted_auto_tags", ())
-                        if annotation is not None
-                        and annotation.get("status") != "failed"
-                        else ()
-                    )
-                for tag in normalize_tags(values):
-                    blocked_category = _blocked_folder_inheritance_category(
-                        tag,
-                        annotation,
-                    )
-                    if blocked_category is not None:
-                        filtered.append(
-                            {
-                                "tag": tag,
-                                "category": blocked_category,
-                                "source": source,
-                                "source_doc_id": donor_id,
-                                "reason": "transient_category",
-                            }
-                        )
-                        continue
-                    source_tags[source].append(tag)
-                    accepted.append(tag)
-
-        return {
-            "accepted_tags": list(normalize_tags(accepted)),
-            "filtered_tags": filtered,
-            "source_doc_ids": _stable_strings(source_doc_ids),
-            "source_relative_paths": _stable_strings(source_relative_paths),
-            "source_tags": {
-                source: list(normalize_tags(values))
-                for source, values in source_tags.items()
-            },
-        }
+            aggregate.consume(donor, annotation)
+        return aggregate.payload()
 
     def _update_failed_folder_inheritance(
         self,
@@ -1742,7 +2105,6 @@ class AutoTaggingCoordinator:
 
         if changed:
             self.repository.set_tag_catalog(self.state.list_effective_tags())
-            self.repository.optimize()
         pending_count, pending = self.state.page_document_annotations(
             "pending_review", offset=0, limit=50
         )
@@ -2391,14 +2753,23 @@ class AutoTaggingCoordinator:
                 *restored_entry.get("inherited_tags", ()),
             ]
         )
-        succeeded, failures = self.repository.upsert_records(
-            [record], vector, effective_tags
+        write_result = self.collection_writes.upsert(
+            [
+                PreparedCollectionUpsert(
+                    record=record,
+                    image_vector=vector,
+                    effective_tags=effective_tags,
+                    state_entry=restored_entry,
+                )
+            ],
+            operation_kind="auto_tag_restore",
         )
-        if failures or succeeded != [doc_id]:
+        if write_result.failures or write_result.succeeded != [doc_id]:
             raise AutoTaggingRequestError(
-                failures.get(doc_id, "Failed to restore the Collection tags.")
+                write_result.failures.get(
+                    doc_id, "Failed to restore the Collection tags."
+                )
             )
-        self.state.set_many([restored_entry])
         self.state.delete_document_annotation(doc_id)
 
     def _matches_current_snapshot(self, snapshot: Mapping[str, Any]) -> bool:
@@ -2474,24 +2845,30 @@ class AutoTaggingCoordinator:
                 *normalized_inherited,
             ]
         )
-        succeeded, failures = self.repository.upsert_records(
-            [record], vector, effective_tags
-        )
-        if failures or succeeded != [doc_id]:
-            raise AutoTaggingRequestError(
-                failures.get(doc_id, "Failed to update the Collection tags.")
-            )
-        self.state.set_many(
+        state_entry = {
+            **record.state_dict(),
+            "tags": list(normalized_manual),
+            "folder_tags": list(entry.get("folder_tags", ())),
+            "accepted_auto_tags": list(normalized_accepted),
+            "inherited_tags": list(normalized_inherited),
+        }
+        write_result = self.collection_writes.upsert(
             [
-                {
-                    **record.state_dict(),
-                    "tags": list(normalized_manual),
-                    "folder_tags": list(entry.get("folder_tags", ())),
-                    "accepted_auto_tags": list(normalized_accepted),
-                    "inherited_tags": list(normalized_inherited),
-                }
-            ]
+                PreparedCollectionUpsert(
+                    record=record,
+                    image_vector=vector,
+                    effective_tags=effective_tags,
+                    state_entry=state_entry,
+                )
+            ],
+            operation_kind="auto_tag_update",
         )
+        if write_result.failures or write_result.succeeded != [doc_id]:
+            raise AutoTaggingRequestError(
+                write_result.failures.get(
+                    doc_id, "Failed to update the Collection tags."
+                )
+            )
         self.state.set_document_annotation(
             doc_id=doc_id,
             source_sha256=str(entry["sha256"]),
@@ -2510,7 +2887,6 @@ class AutoTaggingCoordinator:
 
     def _finalize_review_repository(self) -> None:
         self.repository.set_tag_catalog(self.state.list_effective_tags())
-        self.repository.optimize()
 
     def _candidates(self, scope: str, limit: int) -> list[dict[str, Any]]:
         if scope not in SUPPORTED_SCOPES:
@@ -2519,40 +2895,23 @@ class AutoTaggingCoordinator:
             )
         scoped, root_id = self._configured_root()
         if scoped and root_id is None:
-            entries: list[dict[str, Any]] = []
-        elif scope == "latest_index_run":
-            run_id = self.state.latest_index_run_id(root_id if scoped else None)
-            entries = self.state.entries_for_index_run(run_id) if run_id else []
-        elif scoped:
-            assert root_id is not None
-            entries = self.state.entries_for_root(root_id)
-        else:
-            entries = self.state.list_entries()
-
-        selected: list[dict[str, Any]] = []
-        for entry in entries:
-            annotation = self.state.get_document_annotation(str(entry["doc_id"]))
-            current = (
-                annotation is not None
-                and annotation["source_sha256"] == entry["sha256"]
+            return []
+        run_id = (
+            self.state.latest_index_run_id(root_id if scoped else None)
+            if scope == "latest_index_run"
+            else None
+        )
+        selector = getattr(self.state, "list_auto_tag_candidates", None)
+        if not callable(selector):
+            raise ConfigurationError(
+                "Auto-tagging requires the bounded candidate selector."
             )
-            if scope == "untagged" and current:
-                continue
-            if scope in {"failed", "failed_all"}:
-                if (
-                    not current
-                    or annotation is None
-                    or annotation["status"] != "failed"
-                ):
-                    continue
-                if scope == "failed" and not _failed_annotation_is_retryable(
-                    annotation
-                ):
-                    continue
-            selected.append(entry)
-            if len(selected) >= limit:
-                break
-        return selected
+        return selector(
+            scope,
+            limit=limit,
+            root_id=root_id if scoped else None,
+            run_id=run_id,
+        )
 
     def _configured_root(self) -> tuple[bool, str | None]:
         root = self.config.library_image_root
@@ -2560,19 +2919,59 @@ class AutoTaggingCoordinator:
             return False, None
         return True, self.state.find_root_id(str(root))
 
-    def _annotations_in_library(self, status: str) -> list[dict[str, Any]]:
-        annotations = self.state.list_document_annotations(status)
+    def _annotations_in_library(
+        self,
+        status: str,
+        *,
+        run_id: str | None = None,
+    ) -> Iterator[tuple[dict[str, Any], dict[str, Any]]]:
         scoped, root_id = self._configured_root()
-        if not scoped:
-            return annotations
-        if root_id is None:
-            return []
-        return [
-            annotation
-            for annotation in annotations
-            if (entry := self.state.get(str(annotation["doc_id"]))) is not None
-            and str(entry["root_id"]) == root_id
-        ]
+        if scoped and root_id is None:
+            return
+        pager = getattr(self.state, "page_document_annotations_with_entries", None)
+        if not callable(pager):
+            raise ConfigurationError(
+                "Auto-tagging requires the bounded annotation pager."
+            )
+        after: tuple[str, str] | None = None
+        while True:
+            page = pager(
+                status,
+                root_id=root_id if scoped else None,
+                run_id=run_id,
+                after=after,
+                limit=500,
+            )
+            if not page:
+                return
+            yield from page
+            last_annotation = page[-1][0]
+            after = (
+                str(last_annotation.get("updated_at") or ""),
+                str(last_annotation.get("doc_id") or ""),
+            )
+
+    def _annotation_count_in_library(
+        self,
+        status: str,
+        *,
+        run_id: str | None = None,
+    ) -> int:
+        scoped, root_id = self._configured_root()
+        if scoped and root_id is None:
+            return 0
+        counter = getattr(self.state, "count_document_annotations", None)
+        if not callable(counter):
+            raise ConfigurationError(
+                "Auto-tagging requires the bounded annotation counter."
+            )
+        return int(
+            counter(
+                status,
+                root_id=root_id if scoped else None,
+                run_id=run_id,
+            )
+        )
 
     def _attach_proposal(
         self,
@@ -2728,9 +3127,14 @@ class AutoTaggingCoordinator:
             "status": status,
         }
 
-    def _stored_proposal(self, annotation: dict[str, Any]) -> dict[str, Any]:
+    def _stored_proposal(
+        self,
+        annotation: dict[str, Any],
+        entry: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
         doc_id = str(annotation["doc_id"])
-        entry = self.state.get(doc_id)
+        if entry is None:
+            entry = self.state.get(doc_id)
         policy = dict(annotation.get("policy") or {})
         status = str(annotation.get("status") or "pending_review")
         structured = dict(annotation.get("structured") or {})

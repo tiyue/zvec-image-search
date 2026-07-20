@@ -10,6 +10,7 @@ import stat
 import time
 import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -220,6 +221,24 @@ class FolderDeletionJournal:
         )
         return [dict(row) for row in rows]
 
+    def count_items(
+        self,
+        operation_id: str,
+        *,
+        statuses: Sequence[str] | None = None,
+    ) -> int:
+        values: list[Any] = [operation_id]
+        where = "operation_id = ?"
+        if statuses:
+            placeholders = ", ".join("?" for _ in statuses)
+            where += f" AND status IN ({placeholders})"
+            values.extend(statuses)
+        row = self.connection.execute(
+            f"SELECT COUNT(*) FROM operation_items WHERE {where}",
+            values,
+        ).fetchone()
+        return int(row[0]) if row is not None else 0
+
     def update_operation(
         self,
         operation_id: str,
@@ -319,6 +338,7 @@ class FolderDeletionManager:
         library_id: str,
         progress: Callable[[str], None] | None = None,
         cancel_check: Callable[[], None] | None = None,
+        mutation_observer: Callable[[str, int], None] | None = None,
     ) -> None:
         self.config = config
         self.state = state
@@ -328,6 +348,7 @@ class FolderDeletionManager:
             raise ValueError("library_id must not be empty.")
         self.progress = progress or (lambda _message: None)
         self.cancel_check = cancel_check or (lambda: None)
+        self.mutation_observer = mutation_observer
         self.journal = FolderDeletionJournal(
             config.workspace / "folder_deletions.sqlite3"
         )
@@ -521,6 +542,7 @@ class FolderDeletionManager:
         if operation["status"] in {"committed", "partial", "needs_attention"}:
             result = dict(operation.get("result") or {})
             result["already_finished"] = True
+            self._notify_mutation(result)
             return result
         if operation["status"] != "prepared":
             raise FolderDeletionError(
@@ -704,7 +726,7 @@ class FolderDeletionManager:
                             }
                         )
                 deleted += 1
-            selected_count = len(self.journal.items(operation_id))
+            selected_count = self.journal.count_items(operation_id)
             self.progress(f"Removed {deleted}/{selected_count} indexed images.")
 
         failed_items = self.journal.items(operation_id, statuses=("failed", "staged"))
@@ -725,6 +747,11 @@ class FolderDeletionManager:
                 )
 
         failed_count = len(failed_items)
+        selected_count = self.journal.count_items(operation_id)
+        indexed_deleted = self.journal.count_items(
+            operation_id,
+            statuses=("deleted",),
+        )
         result = {
             "operation_id": operation_id,
             "status": (
@@ -734,9 +761,9 @@ class FolderDeletionManager:
                 if failed_count
                 else "committed"
             ),
-            "selected": len(self.journal.items(operation_id)),
-            "indexed_deleted": deleted,
-            "physical_deleted": deleted,
+            "selected": selected_count,
+            "indexed_deleted": indexed_deleted,
+            "physical_deleted": indexed_deleted,
             "missing": missing,
             "failed": failed_count + int(needs_attention and failed_count == 0),
             "failures": failures[:_MAX_FAILURE_DETAILS],
@@ -747,6 +774,10 @@ class FolderDeletionManager:
             "api_requests": 0,
         }
         final_status = str(result["status"])
+        # Account before the final journal commit. If the process stops between
+        # these two durable writes, recovery repeats the same stable operation
+        # id and the optimize policy treats it as an idempotent duplicate.
+        self._notify_mutation(result)
         self.journal.update_operation(
             operation_id,
             status=final_status,
@@ -754,6 +785,15 @@ class FolderDeletionManager:
             error="; ".join(item["error"] for item in failures[:3]),
         )
         return result
+
+    def _notify_mutation(self, result: Mapping[str, Any]) -> None:
+        observer = self.mutation_observer
+        deleted = int(result.get("indexed_deleted") or 0)
+        operation_id = str(result.get("operation_id") or "")
+        if observer is None or deleted <= 0 or not operation_id:
+            return
+        with suppress(Exception):
+            observer(operation_id, deleted)
 
     def _validate_snapshot(self, operation: Mapping[str, Any]) -> None:
         target = Path(str(operation["target_path"]))

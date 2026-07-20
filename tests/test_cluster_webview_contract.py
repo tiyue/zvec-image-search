@@ -60,6 +60,21 @@ class ClusterWebViewContractTests(unittest.TestCase):
                 "task_type": "cluster_images",
                 "library_id": self.library_id,
                 "scope": "new_or_changed",
+            }
+        )
+        self.assertEqual(task_type, "cluster_images")
+        self.assertEqual(library_id, self.library_id)
+        self.assertIsInstance(request, ClusterImagesRequest)
+        self.assertEqual(
+            request.to_params()["cluster_types"],
+            ["exact", "perceptual"],
+        )
+
+        task_type, request, library_id = _library_request(
+            {
+                "task_type": "cluster_images",
+                "library_id": self.library_id,
+                "scope": "new_or_changed",
                 "cluster_types": ["exact", "perceptual", "semantic"],
             }
         )

@@ -245,6 +245,58 @@ def result_matches_tag_plan(
     return all(expansion_matches) if plan.mode == "all" else any(expansion_matches)
 
 
+def tag_match_score(expansion: TagFragmentExpansion, tag: str) -> float:
+    """Return the deterministic relevance score for one resolved tag match.
+
+    This score is deliberately a ranking signal, not a probability.  Keeping
+    the calculation in the tag-search module lets both the Python fallback and
+    the SQLite Top-N query use exactly the same semantics.
+    """
+
+    if not isinstance(expansion, TagFragmentExpansion):
+        raise TagSearchError("expansion must be a TagFragmentExpansion.")
+    normalized_tag = normalize_tag_search_text(_validate_catalog_tag(tag))
+    allowed = {normalize_tag_search_text(value) for value in expansion.matches}
+    if normalized_tag not in allowed:
+        return 0.0
+    equivalents = {
+        normalize_tag_search_text(value) for value in expansion.expanded_terms
+    }
+    fragment = expansion.normalized_fragment
+    if normalized_tag == fragment:
+        return 1.0
+    if normalized_tag in equivalents:
+        return 0.96
+    ratio = min(1.0, len(fragment) / max(1, len(normalized_tag)))
+    if normalized_tag.startswith(fragment):
+        return 0.85 + 0.10 * ratio
+    if fragment in normalized_tag:
+        return 0.70 + 0.15 * ratio
+    return 0.65
+
+
+def tag_match_confidence(
+    plan: TagSearchPlan,
+    matched_tags: Iterable[str] | str | None,
+) -> float:
+    """Score one result using the best match for each requested fragment."""
+
+    if not isinstance(plan, TagSearchPlan):
+        raise TagSearchError("plan must be a TagSearchPlan.")
+    values: list[str] = []
+    for value in _coerce_values(matched_tags):
+        if not isinstance(value, str):
+            raise TagSearchError("Tag search values must be strings.")
+        values.append(value)
+    if not values or not plan.expansions:
+        return 0.0
+    scores = [
+        max((tag_match_score(expansion, tag) for tag in values), default=0.0)
+        for expansion in plan.expansions
+    ]
+    return min(1.0, max(0.0, sum(scores) / len(scores)))
+
+
 def normalize_tag_search_text(value: str) -> str:
     """Return the comparison form used by partial tag search."""
 

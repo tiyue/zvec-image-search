@@ -574,7 +574,6 @@ export function useSimilarityGroups(
   const clusterTypes = ref<ClusterRunType[]>([
     "exact",
     "perceptual",
-    "semantic",
   ]);
   const clusterTypeFilter = ref<ClusterType>("all");
   const offset = ref(0);

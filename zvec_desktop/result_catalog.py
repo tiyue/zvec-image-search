@@ -3,23 +3,37 @@ from __future__ import annotations
 import json
 import math
 import os
+import sqlite3
 import stat
 import threading
 from collections import OrderedDict
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import CancelledError
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 from image_vector_service.search_features import SearchFeatureError, SearchFeatures
+from image_vector_service.search_result_store import (
+    ResultStoreReference,
+    SearchResultStoreError,
+    parse_result_store_reference,
+    read_result_range,
+)
+from image_vector_service.search_result_store import (
+    result_count as stored_result_count,
+)
 
 CONFIG_SCHEMA_VERSION = 3
 DEFAULT_PAGE_SIZE = 15
 MAX_PAGE_SIZE = 500
 MAX_CONFIG_BYTES = 2 * 1024 * 1024
 MAX_MANIFEST_BYTES = 32 * 1024 * 1024
+SOURCE_ONLY_MANIFEST_SCHEMA_VERSION = 3
+RESULT_STORAGE_COPIED = "copied"
+RESULT_STORAGE_SOURCE_ONLY = "source_only"
 DEFAULT_MANIFEST_CACHE_ENTRIES = 8
 DEFAULT_MANIFEST_CACHE_RESULTS = 100_000
 IMAGE_SUFFIXES = frozenset(
@@ -51,6 +65,7 @@ class LibraryRecord:
     name: str
     image_root: Path
     enabled: bool = True
+    workspace_directory: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,6 +157,24 @@ class _FileVersion:
 
 
 @dataclass(frozen=True, slots=True)
+class _StateFileVersion:
+    """A filesystem identity strong enough to notice SQLite replacement/writes."""
+
+    mtime_ns: int
+    ctime_ns: int
+    size: int
+    inode: int
+
+
+@dataclass(frozen=True, slots=True)
+class _StateDatabaseVersion:
+    """Version the database together with its WAL, where recent writes live."""
+
+    database: _StateFileVersion
+    wal: _StateFileVersion | None
+
+
+@dataclass(frozen=True, slots=True)
 class _ManifestSnapshot:
     path: Path
     version: _FileVersion
@@ -153,6 +186,15 @@ class _ManifestSnapshot:
     sort_mode: str
     ranking_diagnostics: dict[str, Any]
     created_timestamp: float
+    manifest_metadata: Mapping[str, Any]
+    result_store: _PagedResultStore | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _PagedResultStore:
+    path: Path
+    version: _FileVersion
+    reference: ResultStoreReference
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,6 +221,8 @@ class ResultCatalog:
             raise ValueError("manifest_cache_results must be positive")
         self.config = config
         self._libraries_by_id = config.libraries_by_id
+        self._source_root_cache: dict[tuple[str, str], Path | None] = {}
+        self._source_state_versions: dict[str, _StateDatabaseVersion | None] = {}
         # Folder browsing may contain hundreds of thousands of images. Keep one
         # sorted path snapshot so changing gallery pages does not rescan the tree.
         self._folder_cache: dict[Path, tuple[Path, ...]] = {}
@@ -252,6 +296,10 @@ class ResultCatalog:
                         f"libraries[{index}].image_root",
                     ),
                     enabled=enabled,
+                    workspace_directory=_absolute_path(
+                        raw_library.get("workspace_directory"),
+                        f"libraries[{index}].workspace_directory",
+                    ),
                 )
             )
             seen_ids.add(library_id)
@@ -275,18 +323,31 @@ class ResultCatalog:
         """Load the newest valid immediate-child ``results.json`` manifest."""
 
         page, page_size = _validate_pagination(page, page_size)
-        snapshot = self._latest_snapshot()
-        snapshot = self._refresh_snapshot_for_page(snapshot, page, page_size)
-        if (
-            snapshot.raw_result_count
-            and len(snapshot.results) != snapshot.raw_result_count
-        ):
-            # The selected search became incomplete without changing its
-            # manifest (for example, an exported image was deleted). Rediscover
-            # so an older complete search can be shown instead.
-            self.clear_manifest_cache(snapshot.path)
+        self._refresh_source_root_state()
+        for attempt in range(2):
             snapshot = self._latest_snapshot()
-        return self._page_from_snapshot(snapshot, page=page, page_size=page_size)
+            try:
+                snapshot = self._refresh_snapshot_for_page(snapshot, page, page_size)
+                if (
+                    snapshot.result_store is None
+                    and snapshot.raw_result_count
+                    and len(snapshot.results) != snapshot.raw_result_count
+                ):
+                    # The selected legacy search became incomplete without
+                    # changing its manifest. Rediscover so an older complete
+                    # search can be shown instead.
+                    raise ResultCatalogError(
+                        f"Manifest references unavailable result images: "
+                        f"{snapshot.path}"
+                    )
+                return self._page_from_snapshot(
+                    snapshot, page=page, page_size=page_size
+                )
+            except ResultCatalogError:
+                self.clear_manifest_cache(snapshot.path)
+                if attempt:
+                    raise
+        raise AssertionError("unreachable")
 
     def load_manifest(
         self,
@@ -297,6 +358,7 @@ class ResultCatalog:
         """Load one explicit result manifest below the configured results root."""
 
         page, page_size = _validate_pagination(page, page_size)
+        self._refresh_source_root_state()
         resolved = self._resolve_manifest_path(manifest_path)
         snapshot = self._manifest_snapshot(resolved)
         snapshot = self._refresh_snapshot_for_page(snapshot, page, page_size)
@@ -334,12 +396,61 @@ class ResultCatalog:
         version: _FileVersion,
         payload: Mapping[str, Any],
     ) -> _ManifestSnapshot:
+        _result_storage_mode(payload)
         raw_results = payload.get("results")
         if not isinstance(raw_results, list):
             raise ResultCatalogError(
                 f"Manifest results must be an array: {manifest_path}"
             )
 
+        raw_store = payload.get("result_store")
+        if raw_store is not None:
+            try:
+                reference = parse_result_store_reference(raw_store)
+                store_path = _resolve_result_store_path(manifest_path.parent, reference)
+                store_version = _file_version(store_path, require_file=True)
+                count = stored_result_count(store_path, reference.session_id)
+            except SearchResultStoreError as exc:
+                raise ResultCatalogError(
+                    f"Invalid paged result store for {manifest_path}: {exc}"
+                ) from exc
+            if count != reference.result_count:
+                raise ResultCatalogError(
+                    f"Paged result count does not match the manifest reference: "
+                    f"{manifest_path}"
+                )
+            manifest_count = payload.get("result_count")
+            if manifest_count != count:
+                raise ResultCatalogError(
+                    f"Manifest result_count does not match the paged store: "
+                    f"{manifest_path}"
+                )
+            metadata = dict(payload)
+            metadata.pop("results", None)
+            return _ManifestSnapshot(
+                path=manifest_path,
+                version=version,
+                results=(),
+                raw_result_count=count,
+                source_label=manifest_path.parent.name,
+                query_type=_optional_text(payload.get("query_type"), "unknown"),
+                status=_optional_text(payload.get("status"), "ok"),
+                sort_mode=_optional_text(payload.get("sort_mode"), "legacy"),
+                ranking_diagnostics=(
+                    dict(payload["ranking_diagnostics"])
+                    if isinstance(payload.get("ranking_diagnostics"), Mapping)
+                    else {}
+                ),
+                created_timestamp=_created_timestamp(payload.get("created_at")),
+                manifest_metadata=metadata,
+                result_store=_PagedResultStore(
+                    path=store_path,
+                    version=store_version,
+                    reference=reference,
+                ),
+            )
+
+        self._prime_source_roots(raw_results, payload)
         results: list[SearchResult] = []
         for index, raw_result in enumerate(raw_results):
             if not isinstance(raw_result, Mapping):
@@ -370,6 +481,9 @@ class ResultCatalog:
                 else {}
             ),
             created_timestamp=_created_timestamp(payload.get("created_at")),
+            manifest_metadata={
+                key: value for key, value in payload.items() if key != "results"
+            },
         )
 
     def _page_from_snapshot(
@@ -380,6 +494,54 @@ class ResultCatalog:
         page_size: int,
     ) -> SearchResultPage:
         start = (page - 1) * page_size
+        if snapshot.result_store is not None:
+            expected_count = min(page_size, max(0, snapshot.raw_result_count - start))
+            stored_results = []
+            if expected_count:
+                try:
+                    stored_results = read_result_range(
+                        snapshot.result_store.path,
+                        session_id=snapshot.result_store.reference.session_id,
+                        start_rank=start + 1,
+                        limit=page_size,
+                    )
+                except SearchResultStoreError as exc:
+                    raise ResultCatalogError(
+                        f"Could not read paged results for {snapshot.path}: {exc}"
+                    ) from exc
+            if len(stored_results) != expected_count or any(
+                stored.rank != start + offset
+                for offset, stored in enumerate(stored_results, start=1)
+            ):
+                raise ResultCatalogError(
+                    f"Paged result ranks are incomplete for {snapshot.path}"
+                )
+            self._prime_source_roots(
+                (stored.payload for stored in stored_results),
+                snapshot.manifest_metadata,
+            )
+            results: list[SearchResult] = []
+            for stored in stored_results:
+                result = self._manifest_result(
+                    stored.payload,
+                    index=stored.rank - 1,
+                    manifest_path=snapshot.path,
+                    manifest=snapshot.manifest_metadata,
+                )
+                if result is not None:
+                    results.append(result)
+            return _page_of_slice(
+                results,
+                total_items=snapshot.raw_result_count,
+                page=page,
+                page_size=page_size,
+                manifest_path=snapshot.path,
+                source_label=snapshot.source_label,
+                query_type=snapshot.query_type,
+                status=snapshot.status,
+                sort_mode=snapshot.sort_mode,
+                ranking_diagnostics=snapshot.ranking_diagnostics,
+            )
         return _page_of_slice(
             list(snapshot.results[start : start + page_size]),
             total_items=len(snapshot.results),
@@ -548,6 +710,14 @@ class ResultCatalog:
         page: int,
         page_size: int,
     ) -> _ManifestSnapshot:
+        if snapshot.result_store is not None:
+            current = _file_version(snapshot.result_store.path, require_file=True)
+            if current != snapshot.result_store.version:
+                raise ResultCatalogError(
+                    f"Paged result store changed while being read: "
+                    f"{snapshot.result_store.path}"
+                )
+            return snapshot
         start = (page - 1) * page_size
         page_items = snapshot.results[start : start + page_size]
         if all(_result_path_is_current(item) for item in page_items):
@@ -629,7 +799,8 @@ class ResultCatalog:
                 manifest_versions.append((manifest_path, manifest_version))
                 snapshot = self._manifest_snapshot(manifest_path)
                 if (
-                    snapshot.raw_result_count
+                    snapshot.result_store is None
+                    and snapshot.raw_result_count
                     and len(snapshot.results) != snapshot.raw_result_count
                 ):
                     with self._cache_condition:
@@ -692,30 +863,50 @@ class ResultCatalog:
         manifest: Mapping[str, Any],
     ) -> SearchResult | None:
         label = f"results[{index}]"
+        result_storage = _result_storage_mode(manifest)
+        source_only = result_storage == RESULT_STORAGE_SOURCE_ONLY
         copied_relative = _safe_relative_path(
-            raw.get("copied_file"), f"{label}.copied_file", required=True
-        )
-        assert copied_relative is not None
-        copied_candidate = _resolve_below(
-            manifest_path.parent,
-            copied_relative,
+            raw.get("copied_file"),
             f"{label}.copied_file",
+            required=not source_only,
         )
-        copied_path = copied_candidate if copied_candidate.is_file() else None
+        copied_path: Path | None = None
+        if copied_relative is not None:
+            copied_candidate = _resolve_below(
+                manifest_path.parent,
+                copied_relative,
+                f"{label}.copied_file",
+            )
+            copied_path = copied_candidate if copied_candidate.is_file() else None
 
         relative_path = _safe_relative_path(
-            raw.get("relative_path"), f"{label}.relative_path", required=False
+            raw.get("relative_path"),
+            f"{label}.relative_path",
+            required=source_only,
         )
+        if source_only:
+            _non_empty_text(raw.get("library_id"), f"{label}.library_id")
+            _non_empty_text(raw.get("root_id"), f"{label}.root_id")
         library = self._result_library(raw, manifest)
+        if source_only and library is None:
+            raise ResultCatalogError(
+                f"{label}.library_id does not identify a configured library."
+            )
         original_path: Path | None = None
         if relative_path is not None and library is not None:
-            original_candidate = _resolve_below(
-                library.image_root,
-                relative_path,
-                f"{label}.relative_path",
-            )
-            if original_candidate.is_file():
-                original_path = original_candidate
+            source_root = self._source_root(library, raw.get("root_id"))
+            if source_only and source_root is None:
+                raise ResultCatalogError(
+                    f"{label}.root_id does not identify a current library root."
+                )
+            if source_root is not None:
+                original_candidate = _resolve_below(
+                    source_root,
+                    relative_path,
+                    f"{label}.relative_path",
+                )
+                if original_candidate.is_file():
+                    original_path = original_candidate
 
         display_path = original_path or copied_path
         if display_path is None:
@@ -815,6 +1006,124 @@ class ResultCatalog:
             ),
         )
 
+    def _source_root(self, library: LibraryRecord, raw_root_id: Any) -> Path | None:
+        """Resolve a logical root through the library state database when present."""
+
+        if not isinstance(raw_root_id, str) or not raw_root_id.strip():
+            # Only copied/legacy manifests may omit root_id. Source-only
+            # manifests validate it before reaching this compatibility path.
+            return library.image_root
+        root_id = raw_root_id.strip()
+        cache_key = (library.library_id, root_id)
+        with self._cache_condition:
+            if cache_key in self._source_root_cache:
+                return self._source_root_cache[cache_key]
+            state_version = self._source_state_versions.get(library.library_id)
+        workspace = library.workspace_directory
+        if workspace is None or state_version is None:
+            # A configured image_root does not prove that an arbitrary logical
+            # root_id belongs to it. Fail closed when the authoritative mapping
+            # is absent instead of opening a same-named file from the main root.
+            resolved: Path | None = None
+        else:
+            state_path = workspace / "image_collection.state.sqlite3"
+            resolved = _root_path_from_state(state_path, root_id)
+            if resolved is not None and _same_path(resolved, library.image_root):
+                # The state row is explicit proof that this root_id is the
+                # configured main root; retain the configured canonical path.
+                resolved = library.image_root
+        with self._cache_condition:
+            # A concurrent gallery load may have observed a rebind while this
+            # SQLite lookup was in flight. Never reinsert a mapping resolved
+            # against the superseded state version.
+            if self._source_state_versions.get(library.library_id) == state_version:
+                self._source_root_cache[cache_key] = resolved
+        return resolved
+
+    def _prime_source_roots(
+        self,
+        raw_results: Iterable[Any],
+        manifest: Mapping[str, Any],
+    ) -> None:
+        """Resolve all uncached logical roots for a page in one query per library."""
+
+        pending: dict[str, tuple[LibraryRecord, set[str]]] = {}
+        with self._cache_condition:
+            for raw in raw_results:
+                if not isinstance(raw, Mapping):
+                    continue
+                raw_root_id = raw.get("root_id")
+                if not isinstance(raw_root_id, str) or not raw_root_id.strip():
+                    continue
+                library = self._result_library(raw, manifest)
+                if library is None:
+                    continue
+                root_id = raw_root_id.strip()
+                if (library.library_id, root_id) in self._source_root_cache:
+                    continue
+                item = pending.get(library.library_id)
+                if item is None:
+                    pending[library.library_id] = (library, {root_id})
+                else:
+                    item[1].add(root_id)
+
+        for library, root_ids in pending.values():
+            with self._cache_condition:
+                state_version = self._source_state_versions.get(library.library_id)
+            workspace = library.workspace_directory
+            resolved_by_id: dict[str, Path] = {}
+            if workspace is not None and state_version is not None:
+                resolved_by_id = _root_paths_from_state(
+                    workspace / "image_collection.state.sqlite3",
+                    root_ids,
+                )
+            with self._cache_condition:
+                if self._source_state_versions.get(library.library_id) != state_version:
+                    continue
+                for root_id in root_ids:
+                    resolved = resolved_by_id.get(root_id)
+                    if resolved is not None and _same_path(
+                        resolved, library.image_root
+                    ):
+                        resolved = library.image_root
+                    self._source_root_cache[(library.library_id, root_id)] = resolved
+
+    def _refresh_source_root_state(self) -> None:
+        """Invalidate root/manifest caches after a state DB or WAL change.
+
+        This runs once per gallery load and stats each configured library once.
+        Individual result rows therefore reuse a root lookup instead of opening
+        SQLite or scanning the roots table for every image.
+        """
+
+        current_versions = {
+            library.library_id: _library_state_version(library)
+            for library in self.libraries
+        }
+        with self._cache_condition:
+            changed_libraries = {
+                library_id
+                for library_id, current in current_versions.items()
+                if library_id in self._source_state_versions
+                and self._source_state_versions[library_id] != current
+            }
+            self._source_state_versions.update(current_versions)
+            if not changed_libraries:
+                return
+            self._source_root_cache = {
+                key: value
+                for key, value in self._source_root_cache.items()
+                if key[0] not in changed_libraries
+            }
+            # Legacy inline manifests cache materialized SearchResult paths.
+            # Discard them together with latest-result discovery so a rebind is
+            # observable on the next load in this same desktop process.
+            self._cache_generation += 1
+            self._latest_discovery = None
+            self._manifest_cache.clear()
+            self._manifest_cache_results = 0
+            self._cache_condition.notify_all()
+
     def _result_library(
         self, raw: Mapping[str, Any], manifest: Mapping[str, Any]
     ) -> LibraryRecord | None:
@@ -894,6 +1203,37 @@ def _file_version_or_none(path: Path, *, require_file: bool) -> _FileVersion | N
         return None
 
 
+def _library_state_version(library: LibraryRecord) -> _StateDatabaseVersion | None:
+    workspace = library.workspace_directory
+    if workspace is None:
+        return None
+    state_path = workspace / "image_collection.state.sqlite3"
+    database = _state_file_version(state_path)
+    if database is None:
+        return None
+    wal = _state_file_version(Path(f"{state_path}-wal"))
+    return _StateDatabaseVersion(database=database, wal=wal)
+
+
+def _state_file_version(path: Path) -> _StateFileVersion | None:
+    """Return a non-following regular-file fingerprint, or None if unavailable."""
+
+    try:
+        if _is_link_like(path):
+            return None
+        metadata = path.stat()
+    except OSError:
+        return None
+    if not stat.S_ISREG(metadata.st_mode):
+        return None
+    return _StateFileVersion(
+        mtime_ns=metadata.st_mtime_ns,
+        ctime_ns=metadata.st_ctime_ns,
+        size=metadata.st_size,
+        inode=metadata.st_ino,
+    )
+
+
 def _result_path_is_current(result: SearchResult) -> bool:
     path = result.display_path
     try:
@@ -913,6 +1253,12 @@ def _absolute_path(value: Any, label: str) -> Path:
     if not path.is_absolute():
         raise ResultCatalogError(f"{label} must be an absolute path: {value}")
     return path.resolve()
+
+
+def _same_path(left: Path, right: Path) -> bool:
+    return os.path.normcase(os.path.abspath(left)) == os.path.normcase(
+        os.path.abspath(right)
+    )
 
 
 def _non_empty_text(value: Any, label: str) -> str:
@@ -981,6 +1327,29 @@ def _optional_search_features(value: Any, label: str) -> dict[str, object] | Non
         raise ResultCatalogError(f"{label} is invalid: {exc}") from exc
 
 
+def _result_storage_mode(manifest: Mapping[str, Any]) -> str:
+    """Return the result ownership mode while preserving legacy manifests."""
+
+    raw_version = manifest.get("manifest_schema_version")
+    if raw_version is None or (
+        isinstance(raw_version, int)
+        and not isinstance(raw_version, bool)
+        and raw_version in {1, 2}
+    ):
+        return RESULT_STORAGE_COPIED
+    if raw_version != SOURCE_ONLY_MANIFEST_SCHEMA_VERSION:
+        raise ResultCatalogError(
+            f"Unsupported result manifest schema_version: {raw_version!r}."
+        )
+    mode = manifest.get("result_storage")
+    if mode not in {RESULT_STORAGE_COPIED, RESULT_STORAGE_SOURCE_ONLY}:
+        raise ResultCatalogError(
+            "Result manifest schema 3 requires result_storage to be "
+            "'copied' or 'source_only'."
+        )
+    return str(mode)
+
+
 def _safe_relative_path(
     value: Any, label: str, *, required: bool
 ) -> PurePosixPath | None:
@@ -1012,6 +1381,78 @@ def _resolve_below(root: Path, relative: PurePosixPath, label: str) -> Path:
             f"{label} escaped its allowed image directory."
         ) from exc
     return candidate
+
+
+def _resolve_result_store_path(
+    result_directory: Path, reference: ResultStoreReference
+) -> Path:
+    candidate = result_directory / reference.path
+    if _is_link_like(candidate):
+        raise ResultCatalogError(f"Paged result store must not be a link: {candidate}")
+    try:
+        resolved_root = result_directory.resolve(strict=True)
+        resolved = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise ResultCatalogError(
+            f"Paged result store does not exist: {candidate}"
+        ) from exc
+    if resolved.parent != resolved_root or not resolved.is_file():
+        raise ResultCatalogError(
+            f"Paged result store must be a direct file below {resolved_root}"
+        )
+    return resolved
+
+
+def _root_path_from_state(state_path: Path, root_id: str) -> Path | None:
+    """Read one current root mapping without loading the library state."""
+
+    return _root_paths_from_state(state_path, (root_id,)).get(root_id)
+
+
+def _root_paths_from_state(
+    state_path: Path, root_ids: Iterable[str]
+) -> dict[str, Path]:
+    """Read indexed root mappings in bounded batches without scanning roots."""
+
+    requested = tuple(dict.fromkeys(root_ids))
+    if not requested:
+        return {}
+    resolved: dict[str, Path] = {}
+    try:
+        with closing(
+            sqlite3.connect(
+                f"{state_path.resolve(strict=True).as_uri()}?mode=ro",
+                uri=True,
+                timeout=1.0,
+            )
+        ) as connection:
+            connection.execute("PRAGMA query_only = ON")
+            for offset in range(0, len(requested), 500):
+                chunk = requested[offset : offset + 500]
+                placeholders = ",".join("?" for _value in chunk)
+                rows = connection.execute(
+                    "SELECT root_id, current_path FROM roots "
+                    f"WHERE root_id IN ({placeholders})",
+                    chunk,
+                )
+                for row in rows:
+                    root_id = row[0]
+                    current_path = row[1]
+                    if not isinstance(root_id, str) or not isinstance(
+                        current_path, str
+                    ):
+                        continue
+                    value = Path(current_path).expanduser()
+                    if not value.is_absolute():
+                        raise ResultCatalogError(
+                            f"Library state root {root_id!r} is not an absolute path."
+                        )
+                    resolved[root_id] = value.resolve(strict=False)
+    except (OSError, sqlite3.Error) as exc:
+        raise ResultCatalogError(
+            f"Could not resolve source roots from {state_path}."
+        ) from exc
+    return resolved
 
 
 def _validate_pagination(page: int, page_size: int) -> tuple[int, int]:

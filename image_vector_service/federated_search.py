@@ -32,7 +32,7 @@ from .rank_fusion import (
     sort_mode_uses_diversity,
 )
 from .result_diversity import diversify_search_hits
-from .result_exporter import export_results
+from .result_exporter import export_results, search_report_payload
 from .search_learning_config import SearchLearningBundle, load_search_learning
 
 
@@ -458,6 +458,9 @@ def export_federated_search(
     show_low_confidence: bool = False,
     diversify_results: bool = True,
     sort_mode: SearchSortMode = "confidence",
+    result_limit: int | None = None,
+    copy_files: bool = True,
+    report_result_limit: int | None = None,
 ) -> dict:
     search_learning = load_search_learning(config.config_home_path)
     ranking = rank_federated_hits(
@@ -514,8 +517,11 @@ def export_federated_search(
         ranking_diagnostics=ranking.ranking_diagnostics,
         show_low_confidence=show_low_confidence,
         low_confidence_override=ranking.status == "low_confidence_override",
+        copy_files=copy_files,
+        report_result_limit=report_result_limit,
+        exclude_sha256=prepared.image_sha256,
     )
-    result = report.to_dict()
+    result = search_report_payload(report, result_limit=result_limit)
     result["search_quality"] = quality_diagnostics
     return result
 

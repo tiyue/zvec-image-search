@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import uuid
 from collections.abc import Iterable
+from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, cast
@@ -16,6 +17,8 @@ from .tag_search import TagCatalog, TagMatchMode, TagSearchPlan, matched_tags_fo
 from .tags import build_tags_filter, normalize_tags
 
 COLLECTION_SCHEMA_VERSION = 4
+DEFAULT_METADATA_READ_BATCH_SIZE = 256
+MAX_METADATA_READ_BATCH_SIZE = 1_000
 
 METADATA_FIELDS = [
     "metadata_text",
@@ -43,9 +46,31 @@ class ZvecImageRepository:
         self.config = config
         self.config.validate()
         self.created = False
+        self._closed = False
         self.collection, metadata = self._open_or_create()
         self.collection_uuid = str(metadata["collection_uuid"])
         self._tag_catalog: TagCatalog | None = None
+
+    def close(self) -> None:
+        """Release the native Collection handle deterministically.
+
+        Zvec does not currently expose a public ``close`` method.  Its Python
+        wrapper releases RocksDB locks when the Collection object is destroyed,
+        so dropping the final owned reference is important on Windows where an
+        open ``LOCK`` file prevents library migration, cleanup, and test teardown.
+        """
+
+        if self._closed:
+            return
+        collection = getattr(self, "collection", None)
+        if collection is not None:
+            # Flush is best effort during shutdown.  The Collection may already
+            # be unusable because the caller is unwinding an initialization or
+            # storage error, but its native handle must still be released.
+            with suppress(Exception):
+                collection.flush()
+            del self.collection
+        self._closed = True
 
     def set_tag_catalog(
         self,
@@ -161,6 +186,49 @@ class ZvecImageRepository:
         vector = document.vectors.get("embedding")
         return list(vector) if vector is not None else None
 
+    def fetch_vectors(
+        self, doc_ids: Iterable[str]
+    ) -> tuple[dict[str, list[float]], dict[str, str]]:
+        """Fetch image vectors in one bounded call with item isolation fallback."""
+
+        ids = list(dict.fromkeys(str(doc_id) for doc_id in doc_ids))
+        if not ids:
+            return {}, {}
+        try:
+            fetched = self.collection.fetch(
+                ids,
+                output_fields=[],
+                include_vector=True,
+            )
+        except Exception:
+            fetched = {}
+            failures: dict[str, str] = {}
+            for doc_id in ids:
+                try:
+                    fetched.update(
+                        self.collection.fetch(
+                            doc_id,
+                            output_fields=[],
+                            include_vector=True,
+                        )
+                    )
+                except Exception as exc:
+                    failures[doc_id] = str(exc) or exc.__class__.__name__
+        else:
+            failures = {}
+
+        vectors: dict[str, list[float]] = {}
+        for doc_id in ids:
+            if doc_id in failures:
+                continue
+            document = fetched.get(doc_id)
+            vector = document.vectors.get("embedding") if document else None
+            if vector is None or len(vector) != self.config.dimension:
+                failures[doc_id] = "The indexed image vector is missing."
+                continue
+            vectors[doc_id] = list(vector)
+        return vectors, failures
+
     def fetch_metadata(self, doc_id: str) -> dict[str, object] | None:
         """Return the persisted metadata text, hash, and vector for one document."""
 
@@ -178,6 +246,77 @@ class ZvecImageRepository:
             "metadata_text_hash": str(document.fields.get("metadata_text_hash", "")),
             "metadata_embedding": list(vector) if vector is not None else [],
         }
+
+    def fetch_metadata_many(
+        self,
+        doc_ids: Iterable[str],
+        *,
+        batch_size: int = DEFAULT_METADATA_READ_BATCH_SIZE,
+        include_embedding: bool = False,
+    ) -> tuple[dict[str, dict[str, object]], dict[str, str]]:
+        """Fetch metadata in bounded Collection calls with item isolation.
+
+        A corrupt document may make a Zvec batch fetch fail.  Retrying only
+        that bounded page one item at a time preserves useful results without
+        turning metadata discovery into one request per image in the healthy
+        case.  Backfill discovery needs only the two string fields, so vectors
+        are excluded by default to avoid materializing both high-dimensional
+        Collection vectors for hundreds of documents at once.
+        """
+
+        if isinstance(batch_size, bool) or not isinstance(batch_size, int):
+            raise ValueError("Metadata batch_size must be an integer.")
+        if not 1 <= batch_size <= MAX_METADATA_READ_BATCH_SIZE:
+            raise ValueError("Metadata batch_size must be between 1 and 1000.")
+        ids = list(dict.fromkeys(str(doc_id) for doc_id in doc_ids))
+        metadata: dict[str, dict[str, object]] = {}
+        failures: dict[str, str] = {}
+        for offset in range(0, len(ids), batch_size):
+            chunk = ids[offset : offset + batch_size]
+            try:
+                fetched = self.collection.fetch(
+                    chunk,
+                    output_fields=METADATA_FIELDS,
+                    include_vector=include_embedding,
+                )
+            except Exception:
+                fetched = {}
+                for doc_id in chunk:
+                    try:
+                        fetched.update(
+                            self.collection.fetch(
+                                doc_id,
+                                output_fields=METADATA_FIELDS,
+                                include_vector=include_embedding,
+                            )
+                        )
+                    except Exception as exc:
+                        failures[doc_id] = str(exc) or exc.__class__.__name__
+
+            for doc_id in chunk:
+                if doc_id in failures:
+                    continue
+                document = fetched.get(doc_id)
+                if document is None:
+                    continue
+                try:
+                    vector = (
+                        document.vectors.get("metadata_embedding")
+                        if include_embedding
+                        else None
+                    )
+                    metadata[doc_id] = {
+                        "metadata_text": str(document.fields.get("metadata_text", "")),
+                        "metadata_text_hash": str(
+                            document.fields.get("metadata_text_hash", "")
+                        ),
+                        "metadata_embedding": (
+                            list(vector) if vector is not None else []
+                        ),
+                    }
+                except Exception as exc:
+                    failures[doc_id] = str(exc) or exc.__class__.__name__
+        return metadata, failures
 
     def upsert_metadata_embedding(
         self,
@@ -247,22 +386,68 @@ class ZvecImageRepository:
         vector: list[float],
         tags: Iterable[str] = (),
     ) -> tuple[list[str], dict[str, str]]:
-        normalized_tags = list(normalize_tags(tags))
-        documents = [
-            self._to_doc(record, vector, normalized_tags) for record in records
-        ]
-        statuses = self.collection.upsert(documents)
-        if not isinstance(statuses, list):
-            statuses = [statuses]
+        normalized_tags = normalize_tags(tags)
+        return self.upsert_record_vectors(
+            (record, vector, normalized_tags) for record in records
+        )
 
-        succeeded: list[str] = []
-        failed: dict[str, str] = {}
-        for record, status in zip(records, statuses, strict=True):
-            if status.ok():
-                succeeded.append(record.doc_id)
-            else:
-                failed[record.doc_id] = str(status)
-        return succeeded, failed
+    def upsert_record_vectors(
+        self,
+        items: Iterable[tuple[ImageRecord, list[float], Iterable[str]]],
+    ) -> tuple[list[str], dict[str, str]]:
+        """Persist records with independent vectors/tags in one Zvec call.
+
+        DashScope request batches are intentionally small, while local storage
+        batches can be much larger.  This API lets the owner thread combine
+        multiple completed model requests without issuing one Zvec transaction
+        per unique image.  A failed bulk call is retried item-by-item so one bad
+        document still cannot terminate an otherwise valid import batch.
+        """
+
+        documents: list[zvec.Doc] = []
+        document_ids: list[str] = []
+        failures: dict[str, str] = {}
+        seen: set[str] = set()
+        for record, vector, tags in items:
+            if record.doc_id in seen:
+                raise ValueError(f"Duplicate document id: {record.doc_id}")
+            seen.add(record.doc_id)
+            if len(vector) != self.config.dimension:
+                failures[record.doc_id] = (
+                    "Embedding dimension mismatch: "
+                    f"{len(vector)} != {self.config.dimension}."
+                )
+                continue
+            documents.append(
+                self._to_doc(record, list(vector), list(normalize_tags(tags)))
+            )
+            document_ids.append(record.doc_id)
+        if not documents:
+            return [], failures
+
+        try:
+            statuses = self.collection.upsert(documents)
+            if not isinstance(statuses, list):
+                statuses = [statuses]
+            succeeded: list[str] = []
+            for doc_id, status in zip(document_ids, statuses, strict=True):
+                if status.ok():
+                    succeeded.append(doc_id)
+                else:
+                    failures[doc_id] = str(status)
+            return succeeded, failures
+        except Exception:
+            succeeded = []
+            for doc_id, document in zip(document_ids, documents, strict=True):
+                try:
+                    status = self.collection.upsert(document)
+                    if status.ok():
+                        succeeded.append(doc_id)
+                    else:
+                        failures[doc_id] = str(status)
+                except Exception as exc:
+                    failures[doc_id] = str(exc) or exc.__class__.__name__
+            return succeeded, failures
 
     def update_record_tags(
         self,

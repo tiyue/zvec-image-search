@@ -153,7 +153,7 @@ class DesktopAsyncWidgetTests(unittest.TestCase):
             return image
 
         completion = mock.Mock()
-        dispatcher = ImageTaskDispatcher(root, loader, workers=1)  # type: ignore[arg-type]
+        dispatcher = ImageTaskDispatcher(root, loader, workers=1)
         dispatcher.request(Path("late.jpg"), (40, 40), "contain", completion)
         self.assertTrue(started.wait(timeout=5))
 
@@ -244,7 +244,20 @@ class DesktopWindowSmokeTests(unittest.TestCase):
                 for _ in range(12):
                     window.root.update()
                     time.sleep(0.02)
-                self.assertFalse(window._gallery._scrollbar_visible)
+                # Windows clamps an 850-pixel test window to the available
+                # work area.  On a 720p runner that leaves only ~246 pixels
+                # for the gallery, where scrolling is required to avoid
+                # clipping rows.  Assert against the final, real viewport
+                # instead of assuming the requested outer geometry survived.
+                gallery_layout = calculate_gallery_layout(
+                    window._gallery._canvas.winfo_width(),
+                    window._gallery._canvas.winfo_height(),
+                    len(window._items),
+                )
+                self.assertEqual(
+                    window._gallery._scrollbar_visible,
+                    gallery_layout.scroll_required,
+                )
                 self.assertEqual(len(window._nav_buttons), 4)
                 self.assertTrue(str(window._nav_buttons[0]["text"]).startswith("⌕"))
                 self.assertEqual(

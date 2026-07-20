@@ -9,6 +9,7 @@ from typing import Any
 
 from PIL import Image
 
+from image_vector_service.collection_write_coordinator import CollectionWriteResult
 from image_vector_service.config import ServiceConfig
 from image_vector_service.library_browser import LibraryBrowser
 from image_vector_service.service import ImageVectorService
@@ -55,8 +56,68 @@ class _Repository:
             succeeded.append(record.doc_id)
         return succeeded, failures
 
+    def fetch_vectors(self, doc_ids) -> tuple[dict[str, list[float]], dict[str, str]]:
+        vectors: dict[str, list[float]] = {}
+        failures: dict[str, str] = {}
+        for doc_id in dict.fromkeys(str(value) for value in doc_ids):
+            if doc_id not in self.tags:
+                failures[doc_id] = "The indexed image vector is missing."
+                continue
+            vectors[doc_id] = [0.0]
+        return vectors, failures
+
     def optimize(self) -> None:
         self.optimize_count += 1
+
+
+class _CollectionWrites:
+    """Small transactional writer used to exercise the service contract."""
+
+    def __init__(self, state: IndexState, repository: _Repository) -> None:
+        self.state = state
+        self.repository = repository
+
+    def upsert(self, writes, *, operation_kind: str) -> CollectionWriteResult:
+        prepared = list(writes)
+        if not prepared:
+            return CollectionWriteResult()
+        if operation_kind != "manual_tag":
+            raise AssertionError(f"Unexpected operation kind: {operation_kind}")
+
+        previous_tags = {
+            item.record.doc_id: list(self.repository.tags[item.record.doc_id])
+            for item in prepared
+        }
+        succeeded, failures = self.repository.update_record_tags(
+            (item.record, item.effective_tags) for item in prepared
+        )
+        result = CollectionWriteResult(failures=dict(failures))
+        succeeded_set = set(succeeded)
+        committed = [item for item in prepared if item.record.doc_id in succeeded_set]
+        if not committed:
+            return result
+
+        try:
+            self.state.set_many(dict(item.state_entry) for item in committed)
+        except Exception as exc:
+            message = str(exc) or exc.__class__.__name__
+            _restored, rollback_failures = self.repository.update_record_tags(
+                (item.record, previous_tags[item.record.doc_id]) for item in committed
+            )
+            for item in committed:
+                doc_id = item.record.doc_id
+                rollback_error = rollback_failures.get(doc_id)
+                result.failures[doc_id] = (
+                    f"{message}; Collection rollback failed: {rollback_error}"
+                    if rollback_error
+                    else message
+                )
+                result.failure_kinds[doc_id] = "systemic"
+            result.systemic_failure = True
+            return result
+
+        result.succeeded.extend(succeeded)
+        return result
 
 
 class ManualTagBatchTest(unittest.TestCase):
@@ -85,6 +146,7 @@ class ManualTagBatchTest(unittest.TestCase):
         self.service.config = SimpleNamespace(state_path=self.state_path)
         self.service.state = self.state
         self.service.repository = self.repository
+        self.service.collection_writes = _CollectionWrites(self.state, self.repository)
         self.service.cancel_check = lambda: None
         self.service.progress = self.progress.append
         self.service._refresh_tag_catalog = lambda: None

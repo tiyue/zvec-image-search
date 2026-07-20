@@ -1215,7 +1215,6 @@ class ClusterImagesRequest:
     cluster_types: tuple[ClusterRunType, ...] = (
         "exact",
         "perceptual",
-        "semantic",
     )
 
     command: ClassVar[str] = "cluster_images"
@@ -1231,7 +1230,8 @@ class ClusterImagesRequest:
         values = self.cluster_types
         if not isinstance(values, tuple) or not values:
             raise _validation(
-                "cluster_types must contain near_duplicate and/or semantic.",
+                "cluster_types must contain exact, perceptual, semantic, "
+                "and/or near_duplicate.",
                 "cluster_types",
             )
         normalized = tuple(

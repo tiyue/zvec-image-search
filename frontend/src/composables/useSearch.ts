@@ -13,6 +13,9 @@ const PAGE_SIZE = 15 as const;
 const CACHE_LIMIT = 5;
 const LATEST_CACHE_TTL_MS = 30_000;
 const DEFAULT_SEARCH_TIMEOUT_MS = 120_000;
+const HIGH_RESOLUTION_PREVIEW_DELAY_MS = 200;
+const MAX_QUEUE_RETRIES = 3;
+const DEFAULT_QUEUE_RETRY_MS = 1_000;
 const TERMINAL = new Set([
   "succeeded",
   "partial",
@@ -44,6 +47,18 @@ function isAbortError(error: unknown): boolean {
 
 function abortError(): DOMException {
   return new DOMException("操作已取消。", "AbortError");
+}
+
+function queueRetryDelayMs(error: ApiError, attempt: number): number {
+  const payload = error.details as {
+    error?: { details?: { retry_after_seconds?: unknown } };
+  } | null;
+  const configured = payload?.error?.details?.retry_after_seconds;
+  const seconds = typeof configured === "number" && Number.isFinite(configured)
+    ? configured
+    : 0;
+  if (seconds > 0) return Math.min(5_000, Math.max(250, Math.trunc(seconds * 1_000)));
+  return Math.min(5_000, DEFAULT_QUEUE_RETRY_MS * 2 ** attempt);
 }
 
 /**
@@ -226,6 +241,8 @@ export function useSearch(api: SearchApi = searchApi, events: SearchEvents = {})
   let searchWatchdogHandle: number | null = null;
   let foregroundController: AbortController | null = null;
   let idleHandle: number | null = null;
+  let highResolutionPreviewHandle: number | null = null;
+  let previewEnabled = true;
   const prefetchControllers = new Set<AbortController>();
   const cache = new Map<number, CacheEntry>();
 
@@ -250,6 +267,25 @@ export function useSearch(api: SearchApi = searchApi, events: SearchEvents = {})
     if (searchWatchdogHandle === null) return;
     window.clearTimeout(searchWatchdogHandle);
     searchWatchdogHandle = null;
+  }
+
+  function clearHighResolutionPreview(): void {
+    if (highResolutionPreviewHandle !== null) {
+      window.clearTimeout(highResolutionPreviewHandle);
+      highResolutionPreviewHandle = null;
+    }
+    highResolutionPreview.value = false;
+  }
+
+  function scheduleHighResolutionPreview(id: string): void {
+    clearHighResolutionPreview();
+    if (!previewEnabled || !id) return;
+    highResolutionPreviewHandle = window.setTimeout(() => {
+      highResolutionPreviewHandle = null;
+      if (previewEnabled && selectedId.value === id) {
+        highResolutionPreview.value = true;
+      }
+    }, HIGH_RESOLUTION_PREVIEW_DELAY_MS);
   }
 
   function armSearchWatchdog(localGeneration: number, controller: AbortController): void {
@@ -382,7 +418,7 @@ export function useSearch(api: SearchApi = searchApi, events: SearchEvents = {})
     if (nextStatus !== "failed") store(payload);
     items.value = nextItems;
     selectedId.value = nextItems[0]?.id ?? "";
-    highResolutionPreview.value = false;
+    clearHighResolutionPreview();
     page.value = nextPage;
     totalItems.value = nextTotal;
     totalPages.value = nextPages;
@@ -559,7 +595,33 @@ export function useSearch(api: SearchApi = searchApi, events: SearchEvents = {})
         page_size: PAGE_SIZE,
         ...(mode.value === "combined" ? { query_image_id: queryImageId.value } : {}),
       };
-      const payload = await awaitWithAbort(api.submit(body, controller.signal), controller.signal);
+      let payload: SearchPageResponse | null = null;
+      for (let attempt = 0; attempt <= MAX_QUEUE_RETRIES; attempt += 1) {
+        try {
+          payload = await awaitWithAbort(
+            api.submit(body, controller.signal),
+            controller.signal,
+          );
+          break;
+        } catch (error) {
+          if (
+            !(error instanceof ApiError) ||
+            error.status !== 429 ||
+            attempt >= MAX_QUEUE_RETRIES
+          ) throw error;
+          const delayMs = queueRetryDelayMs(error, attempt);
+          status.value = "queued";
+          message.value = `图库任务较多，${Math.ceil(delayMs / 1000)} 秒后自动重试搜索`;
+          emitDiagnostic("search_queue_backpressure", {
+            attempt: attempt + 1,
+            delay_ms: delayMs,
+          });
+          await waitWithAbort(delayMs, controller.signal);
+        }
+      }
+      if (payload === null) {
+        throw new ApiError("搜索请求未能进入任务队列。", 503);
+      }
       if (localGeneration !== generation) return false;
       activeOperationId = operationId(payload);
       emitDiagnostic("search_submit_accepted", {
@@ -660,7 +722,17 @@ export function useSearch(api: SearchApi = searchApi, events: SearchEvents = {})
   function select(id: string, loadHighResolution = true): void {
     if (!items.value.some((item) => item.id === id)) return;
     selectedId.value = id;
-    highResolutionPreview.value = loadHighResolution;
+    if (loadHighResolution) scheduleHighResolutionPreview(id);
+    else clearHighResolutionPreview();
+  }
+
+  function setPreviewEnabled(enabled: boolean): void {
+    previewEnabled = enabled;
+    if (!enabled) {
+      clearHighResolutionPreview();
+      return;
+    }
+    if (selectedId.value) scheduleHighResolutionPreview(selectedId.value);
   }
 
   function setQueryImage(id = "", name = ""): void {
@@ -671,6 +743,7 @@ export function useSearch(api: SearchApi = searchApi, events: SearchEvents = {})
   function dispose(): void {
     generation += 1;
     abortActivity(true);
+    clearHighResolutionPreview();
   }
 
   return {
@@ -686,6 +759,7 @@ export function useSearch(api: SearchApi = searchApi, events: SearchEvents = {})
     selectedId,
     selectedItem,
     highResolutionPreview,
+    setPreviewEnabled,
     page,
     totalItems,
     totalPages,

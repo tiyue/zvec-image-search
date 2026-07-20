@@ -305,6 +305,8 @@ def validate_static_inputs(plan: BuildPlan) -> None:
         plan.repository_root / "image_vector_service" / "cluster_operation_store.py",
         plan.repository_root / "image_vector_service" / "folder_deletion.py",
         plan.repository_root / "image_vector_service" / "image_clustering.py",
+        plan.repository_root / "image_vector_service" / "large_cluster_adapter.py",
+        plan.repository_root / "image_vector_service" / "large_image_clustering.py",
         plan.repository_root / "image_vector_service" / "library_browser.py",
         plan.repository_root / "image_vector_service" / "learning_ranker.py",
         plan.repository_root / "image_vector_service" / "search_features.py",

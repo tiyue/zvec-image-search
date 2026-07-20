@@ -68,6 +68,27 @@ describe("useSearch", () => {
     expect(search.connectionMessage.value).toBe("本地服务已就绪");
   });
 
+  it("delays full previews and discards superseded selections", async () => {
+    const search = useSearch(fakeApi());
+    await search.initialize();
+
+    search.select("image-2");
+    expect(search.highResolutionPreview.value).toBe(false);
+    await vi.advanceTimersByTimeAsync(199);
+    expect(search.highResolutionPreview.value).toBe(false);
+
+    search.select("image-3");
+    await vi.advanceTimersByTimeAsync(200);
+    expect(search.selectedId.value).toBe("image-3");
+    expect(search.highResolutionPreview.value).toBe(true);
+
+    search.setPreviewEnabled(false);
+    expect(search.highResolutionPreview.value).toBe(false);
+    search.select("image-4");
+    await vi.advanceTimersByTimeAsync(500);
+    expect(search.highResolutionPreview.value).toBe(false);
+  });
+
   it("submits any positive top_k while keeping page_size fixed at 15", async () => {
     const api = fakeApi();
     const search = useSearch(api);

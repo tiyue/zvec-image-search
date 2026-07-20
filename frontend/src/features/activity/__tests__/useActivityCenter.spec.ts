@@ -60,7 +60,10 @@ function logItem(sequence: number, message = "完成"): ActivityLogItem {
 
 describe("useActivityCenter", () => {
   beforeEach(() => vi.useFakeTimers());
-  afterEach(() => vi.useRealTimers());
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
 
   it("limits every history page to 50 and keeps active jobs first", () => {
     const payload = {
@@ -183,6 +186,32 @@ describe("useActivityCenter", () => {
 
     expect(listJobHistory).toHaveBeenCalledTimes(1);
     expect(listActivityLogs).not.toHaveBeenCalled();
+    wrapper.unmount();
+  });
+
+  it("stops all periodic requests while the application is hidden", async () => {
+    let visibility: DocumentVisibilityState = "visible";
+    vi.spyOn(document, "visibilityState", "get").mockImplementation(() => visibility);
+    const listJobHistory = vi.fn(async () => ({ items: [] }));
+    const listActivityLogs = vi.fn(async () => ({ items: [] }));
+    const { state, wrapper } = mountComposable(
+      fakeApi({ listJobHistory, listActivityLogs }),
+      { autoStart: false, pollIntervalMs: 1_000 },
+    );
+    state.startPolling();
+
+    visibility = "hidden";
+    document.dispatchEvent(new Event("visibilitychange"));
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(listJobHistory).not.toHaveBeenCalled();
+    expect(listActivityLogs).not.toHaveBeenCalled();
+
+    visibility = "visible";
+    document.dispatchEvent(new Event("visibilitychange"));
+    await vi.advanceTimersByTimeAsync(1_000);
+    await flushPromises();
+    expect(listJobHistory).toHaveBeenCalledTimes(1);
+    expect(listActivityLogs).toHaveBeenCalledTimes(1);
     wrapper.unmount();
   });
 

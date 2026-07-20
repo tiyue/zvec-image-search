@@ -18,14 +18,15 @@ import hashlib
 import json
 import sqlite3
 import uuid
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Final, Literal, cast
+from typing import Any, Final, Literal, TypeVar, cast
 
 from .image_clustering import (
+    CLUSTER_SNAPSHOT_SCHEMA_VERSION,
     IDENTITY_CATEGORIES,
     ClusterEdge,
     ClusterItemState,
@@ -37,6 +38,7 @@ from .image_clustering import (
 )
 
 JsonObject = dict[str, Any]
+_StreamRow = TypeVar("_StreamRow")
 ManualRuleKind = Literal["must_link", "must_not_link"]
 ClusterOperationType = Literal["merge", "split", "apply_identity", "undo"]
 
@@ -139,6 +141,9 @@ CREATE INDEX IF NOT EXISTS idx_cluster_snapshot_items_cluster
         snapshot_version, cluster_id, cluster_member_order, doc_id
     );
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_cluster_snapshot_items_order
+    ON cluster_snapshot_items(snapshot_version, snapshot_order);
+
 CREATE INDEX IF NOT EXISTS idx_cluster_snapshot_cluster_page
     ON cluster_snapshot_clusters(
         snapshot_version, member_count DESC, cluster_id
@@ -153,6 +158,124 @@ CREATE TABLE IF NOT EXISTS cluster_snapshot_edges (
     PRIMARY KEY (snapshot_version, left_doc_id, right_doc_id, kind),
     FOREIGN KEY (snapshot_version)
         REFERENCES cluster_snapshot_versions(snapshot_version)
+        ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS cluster_snapshot_failures (
+    snapshot_version TEXT NOT NULL,
+    failure_index INTEGER NOT NULL CHECK (failure_index >= 0),
+    doc_id TEXT NOT NULL,
+    code TEXT NOT NULL,
+    message TEXT NOT NULL,
+    PRIMARY KEY (snapshot_version, failure_index),
+    FOREIGN KEY (snapshot_version)
+        REFERENCES cluster_snapshot_versions(snapshot_version)
+        ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_cluster_snapshot_failures_doc
+    ON cluster_snapshot_failures(snapshot_version, doc_id, failure_index);
+
+-- Large clustering runs are materialized here in bounded batches.  These
+-- tables are deliberately separate from canonical snapshots: an interrupted
+-- run can be removed without exposing a partial snapshot to readers.
+CREATE TABLE IF NOT EXISTS cluster_stream_runs (
+    run_id TEXT PRIMARY KEY,
+    library_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('building', 'finalizing')),
+    target_snapshot_version TEXT
+);
+
+CREATE TABLE IF NOT EXISTS cluster_stream_items (
+    run_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    doc_id TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    perceptual_hash TEXT,
+    valid INTEGER NOT NULL DEFAULT 1 CHECK (valid IN (0, 1)),
+    changed INTEGER NOT NULL DEFAULT 1 CHECK (changed IN (0, 1)),
+    component INTEGER,
+    snapshot_order INTEGER,
+    cluster_member_order INTEGER,
+    PRIMARY KEY (run_id, ordinal),
+    UNIQUE (run_id, doc_id),
+    FOREIGN KEY (run_id) REFERENCES cluster_stream_runs(run_id)
+        ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_cluster_stream_items_sha
+    ON cluster_stream_items(run_id, valid, sha256, doc_id);
+CREATE INDEX IF NOT EXISTS idx_cluster_stream_items_component
+    ON cluster_stream_items(run_id, valid, component, doc_id);
+CREATE INDEX IF NOT EXISTS idx_cluster_stream_items_order
+    ON cluster_stream_items(run_id, valid, snapshot_order);
+
+CREATE TABLE IF NOT EXISTS cluster_stream_evidence (
+    run_id TEXT NOT NULL,
+    item_ordinal INTEGER NOT NULL,
+    evidence_index INTEGER NOT NULL CHECK (evidence_index >= 0),
+    category TEXT NOT NULL,
+    value TEXT NOT NULL,
+    normalized_value TEXT NOT NULL,
+    source TEXT NOT NULL,
+    source_priority INTEGER NOT NULL,
+    confidence REAL NOT NULL,
+    PRIMARY KEY (run_id, item_ordinal, evidence_index),
+    FOREIGN KEY (run_id, item_ordinal)
+        REFERENCES cluster_stream_items(run_id, ordinal)
+        ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_cluster_stream_evidence_component
+    ON cluster_stream_evidence(run_id, item_ordinal, category, normalized_value);
+
+CREATE TABLE IF NOT EXISTS cluster_stream_edges (
+    run_id TEXT NOT NULL,
+    left_ordinal INTEGER NOT NULL,
+    right_ordinal INTEGER NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('exact', 'perceptual', 'semantic', 'legacy')),
+    score REAL,
+    PRIMARY KEY (run_id, left_ordinal, right_ordinal, kind),
+    CHECK (left_ordinal < right_ordinal),
+    FOREIGN KEY (run_id, left_ordinal)
+        REFERENCES cluster_stream_items(run_id, ordinal)
+        ON DELETE CASCADE,
+    FOREIGN KEY (run_id, right_ordinal)
+        REFERENCES cluster_stream_items(run_id, ordinal)
+        ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_cluster_stream_edges_left
+    ON cluster_stream_edges(run_id, left_ordinal);
+CREATE INDEX IF NOT EXISTS idx_cluster_stream_edges_right
+    ON cluster_stream_edges(run_id, right_ordinal);
+
+CREATE TABLE IF NOT EXISTS cluster_stream_components (
+    run_id TEXT NOT NULL,
+    component INTEGER NOT NULL,
+    cluster_id TEXT NOT NULL,
+    member_count INTEGER NOT NULL CHECK (member_count > 0),
+    representative_doc_id TEXT NOT NULL,
+    has_exact INTEGER NOT NULL DEFAULT 0 CHECK (has_exact IN (0, 1)),
+    has_perceptual INTEGER NOT NULL DEFAULT 0 CHECK (has_perceptual IN (0, 1)),
+    has_semantic INTEGER NOT NULL DEFAULT 0 CHECK (has_semantic IN (0, 1)),
+    identity_anchors_json TEXT NOT NULL DEFAULT '[]',
+    PRIMARY KEY (run_id, component),
+    UNIQUE (run_id, cluster_id),
+    FOREIGN KEY (run_id) REFERENCES cluster_stream_runs(run_id)
+        ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS cluster_stream_failures (
+    run_id TEXT NOT NULL,
+    failure_index INTEGER NOT NULL CHECK (failure_index >= 0),
+    doc_id TEXT NOT NULL,
+    code TEXT NOT NULL,
+    message TEXT NOT NULL,
+    PRIMARY KEY (run_id, failure_index),
+    FOREIGN KEY (run_id) REFERENCES cluster_stream_runs(run_id)
         ON DELETE CASCADE
 );
 
@@ -330,6 +453,47 @@ class ClusterSnapshotVersionRecord:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class ClusterSnapshotStreamCluster:
+    """One normalized cluster row produced without a full snapshot object."""
+
+    cluster_id: str
+    member_count: int
+    representative_doc_id: str
+    edge_kinds: tuple[EdgeKind, ...] = ()
+    identity_anchors: tuple[IdentityAnchor, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ClusterSnapshotStreamItem:
+    """One normalized member row in deterministic snapshot order."""
+
+    doc_id: str
+    fingerprint: str
+    cluster_id: str
+    snapshot_order: int
+    cluster_member_order: int
+
+
+@dataclass(frozen=True, slots=True)
+class ClusterSnapshotStreamEdge:
+    """One normalized edge row; endpoints are canonicalized by the store."""
+
+    left_doc_id: str
+    right_doc_id: str
+    kind: EdgeKind
+    score: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ClusterSnapshotStreamFailure:
+    """A bounded per-item failure persisted with the resulting snapshot."""
+
+    doc_id: str
+    code: str
+    message: str
+
+
 class ClusterOperationStore:
     """SQLite-backed snapshots, manual constraints, and reversible batches."""
 
@@ -362,6 +526,7 @@ class ClusterOperationStore:
                     raise ClusterOperationStoreUnavailable(
                         "Unsupported cluster operation database schema."
                     )
+                self._recover_streaming_runs(connection)
                 if recover_interrupted:
                     self._recover_interrupted(connection)
         except (OSError, sqlite3.Error) as exc:
@@ -547,6 +712,352 @@ class ClusterOperationStore:
             ) from exc
         return self.snapshot_version(version)
 
+    def save_snapshot_stream(
+        self,
+        library_id: str,
+        *,
+        algorithm_version: str,
+        embedding_version: str,
+        clusters: Iterable[ClusterSnapshotStreamCluster],
+        items: Iterable[ClusterSnapshotStreamItem],
+        edges: Iterable[ClusterSnapshotStreamEdge],
+        failures: Iterable[ClusterSnapshotStreamFailure] = (),
+        snapshot_version: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
+        activate: bool = True,
+        batch_size: int = 512,
+        schema_version: int = CLUSTER_SNAPSHOT_SCHEMA_VERSION,
+    ) -> ClusterSnapshotVersionRecord:
+        """Persist normalized snapshot streams with bounded materialization.
+
+        The caller must provide deterministic streams.  Only ``batch_size``
+        rows are retained at once and the new version remains invisible until
+        every cluster, item, edge, and failure has passed validation.  A
+        failed iterator or SQLite write rolls the transaction back atomically.
+        """
+
+        library = _identifier(library_id, "library_id")
+        algorithm = _bounded_text(algorithm_version, "algorithm_version", maximum=256)
+        embedding = _bounded_text(embedding_version, "embedding_version", maximum=256)
+        version = _identifier(
+            snapshot_version or _generated_id("cluster-snapshot"),
+            "snapshot_version",
+        )
+        if not isinstance(activate, bool):
+            raise ClusterOperationValidationError("activate must be a boolean")
+        if (
+            isinstance(schema_version, bool)
+            or not isinstance(schema_version, int)
+            or schema_version <= 0
+        ):
+            raise ClusterOperationValidationError(
+                "schema_version must be a positive integer"
+            )
+        stream_batch_size = _limit(batch_size, maximum=4_096)
+        metadata_payload = dict(metadata or {})
+        metadata_payload.setdefault("streamed", True)
+        metadata_json = _safe_json(metadata_payload, maximum=MAX_METADATA_JSON_BYTES)
+        created_at = self._now()
+        digest = hashlib.sha256()
+        digest.update(
+            _canonical_json(
+                {
+                    "schema_version": schema_version,
+                    "algorithm_version": algorithm,
+                    "embedding_version": embedding,
+                },
+                maximum=4 * 1024,
+            ).encode("utf-8")
+        )
+        cluster_count = 0
+        item_count = 0
+        edge_count = 0
+        failure_count = 0
+        declared_members = 0
+        try:
+            with self._write_connection() as connection:
+                if (
+                    connection.execute(
+                        "SELECT 1 FROM cluster_snapshot_versions "
+                        "WHERE snapshot_version = ?",
+                        (version,),
+                    ).fetchone()
+                    is not None
+                ):
+                    raise ClusterOperationValidationError(
+                        f"Cluster snapshot version already exists: {version}"
+                    )
+                connection.execute(
+                    """
+                    INSERT INTO cluster_snapshot_versions (
+                        snapshot_version, library_id, schema_version,
+                        algorithm_version, embedding_version, snapshot_sha256,
+                        created_at, active, item_count, edge_count, cluster_count,
+                        metadata_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, ?)
+                    """,
+                    (
+                        version,
+                        library,
+                        schema_version,
+                        algorithm,
+                        embedding,
+                        "0" * 64,
+                        created_at,
+                        metadata_json,
+                    ),
+                )
+                for cluster_batch in _iter_batches(clusters, stream_batch_size):
+                    values: list[tuple[Any, ...]] = []
+                    for cluster in cluster_batch:
+                        if not isinstance(cluster, ClusterSnapshotStreamCluster):
+                            raise ClusterOperationValidationError(
+                                "clusters must contain ClusterSnapshotStreamCluster"
+                            )
+                        cluster_id = _identifier(cluster.cluster_id, "cluster_id")
+                        member_count = _positive_int(
+                            cluster.member_count, "member_count"
+                        )
+                        representative = _bounded_text(
+                            cluster.representative_doc_id,
+                            "representative_doc_id",
+                            maximum=512,
+                        )
+                        edge_kinds = tuple(dict.fromkeys(cluster.edge_kinds))
+                        if any(
+                            kind not in {"exact", "perceptual", "semantic", "legacy"}
+                            for kind in edge_kinds
+                        ):
+                            raise ClusterOperationValidationError(
+                                "Cluster edge kinds are invalid"
+                            )
+                        anchors_json = _safe_json(
+                            [anchor.to_dict() for anchor in cluster.identity_anchors],
+                            maximum=256 * 1024,
+                        )
+                        cluster_type = (
+                            "single"
+                            if member_count == 1
+                            else "exact"
+                            if "exact" in edge_kinds
+                            else "perceptual"
+                            if "perceptual" in edge_kinds
+                            else "semantic"
+                        )
+                        cluster_row = (
+                            version,
+                            cluster_id,
+                            member_count,
+                            representative,
+                            cluster_type,
+                            int("exact" in edge_kinds),
+                            int("perceptual" in edge_kinds),
+                            int("semantic" in edge_kinds),
+                            _safe_json(list(edge_kinds), maximum=16 * 1024),
+                            anchors_json,
+                        )
+                        values.append(cluster_row)
+                        declared_members += member_count
+                        _stream_hash_update(digest, "cluster", cluster_row[1:])
+                    connection.executemany(
+                        """
+                        INSERT INTO cluster_snapshot_clusters (
+                            snapshot_version, cluster_id, member_count,
+                            representative_doc_id, cluster_type, has_exact,
+                            has_perceptual, has_semantic, edge_kinds_json,
+                            identity_anchors_json
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        values,
+                    )
+                    cluster_count += len(values)
+
+                for item_batch in _iter_batches(items, stream_batch_size):
+                    item_values: list[tuple[Any, ...]] = []
+                    for item in item_batch:
+                        if not isinstance(item, ClusterSnapshotStreamItem):
+                            raise ClusterOperationValidationError(
+                                "items must contain ClusterSnapshotStreamItem"
+                            )
+                        item_row = (
+                            version,
+                            _bounded_text(item.doc_id, "doc_id", maximum=512),
+                            _bounded_text(item.fingerprint, "fingerprint", maximum=256),
+                            _identifier(item.cluster_id, "cluster_id"),
+                            _non_negative_int(item.snapshot_order, "snapshot_order"),
+                            _non_negative_int(
+                                item.cluster_member_order,
+                                "cluster_member_order",
+                            ),
+                        )
+                        item_values.append(item_row)
+                        _stream_hash_update(digest, "item", item_row[1:])
+                    connection.executemany(
+                        """
+                        INSERT INTO cluster_snapshot_items (
+                            snapshot_version, doc_id, fingerprint, cluster_id,
+                            snapshot_order, cluster_member_order
+                        ) VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        item_values,
+                    )
+                    item_count += len(item_values)
+
+                if declared_members != item_count:
+                    raise ClusterOperationValidationError(
+                        "Cluster member counts do not match the item stream"
+                    )
+
+                for edge_batch in _iter_batches(edges, stream_batch_size):
+                    edge_values: list[tuple[Any, ...]] = []
+                    for raw_edge in edge_batch:
+                        if not isinstance(raw_edge, ClusterSnapshotStreamEdge):
+                            raise ClusterOperationValidationError(
+                                "edges must contain ClusterSnapshotStreamEdge"
+                            )
+                        edge = ClusterEdge(
+                            raw_edge.left_doc_id,
+                            raw_edge.right_doc_id,
+                            raw_edge.kind,
+                            raw_edge.score,
+                        )
+                        edge_row = (
+                            version,
+                            _bounded_text(edge.left_doc_id, "left_doc_id", maximum=512),
+                            _bounded_text(
+                                edge.right_doc_id, "right_doc_id", maximum=512
+                            ),
+                            edge.kind,
+                            edge.score,
+                        )
+                        edge_values.append(edge_row)
+                        _stream_hash_update(digest, "edge", edge_row[1:])
+                    connection.executemany(
+                        """
+                        INSERT INTO cluster_snapshot_edges (
+                            snapshot_version, left_doc_id, right_doc_id, kind, score
+                        ) VALUES (?, ?, ?, ?, ?)
+                        """,
+                        edge_values,
+                    )
+                    edge_count += len(edge_values)
+
+                missing_endpoint = connection.execute(
+                    """
+                    SELECT 1 FROM cluster_snapshot_edges AS edge
+                    LEFT JOIN cluster_snapshot_items AS left_item
+                      ON left_item.snapshot_version = edge.snapshot_version
+                     AND left_item.doc_id = edge.left_doc_id
+                    LEFT JOIN cluster_snapshot_items AS right_item
+                      ON right_item.snapshot_version = edge.snapshot_version
+                     AND right_item.doc_id = edge.right_doc_id
+                    WHERE edge.snapshot_version = ?
+                      AND (left_item.doc_id IS NULL OR right_item.doc_id IS NULL)
+                    LIMIT 1
+                    """,
+                    (version,),
+                ).fetchone()
+                if missing_endpoint is not None:
+                    raise ClusterOperationValidationError(
+                        "Snapshot edges must reference streamed items"
+                    )
+
+                for failure_batch in _iter_batches(failures, stream_batch_size):
+                    failure_values: list[tuple[Any, ...]] = []
+                    for failure in failure_batch:
+                        if not isinstance(failure, ClusterSnapshotStreamFailure):
+                            raise ClusterOperationValidationError(
+                                "failures must contain ClusterSnapshotStreamFailure"
+                            )
+                        failure_values.append(
+                            (
+                                version,
+                                failure_count + len(failure_values),
+                                _bounded_text(
+                                    failure.doc_id, "failure.doc_id", maximum=512
+                                ),
+                                _bounded_text(
+                                    failure.code, "failure.code", maximum=128
+                                ),
+                                self._safe_error(failure.message)
+                                or "Clustering item failed.",
+                            )
+                        )
+                    connection.executemany(
+                        """
+                        INSERT INTO cluster_snapshot_failures (
+                            snapshot_version, failure_index, doc_id, code, message
+                        ) VALUES (?, ?, ?, ?, ?)
+                        """,
+                        failure_values,
+                    )
+                    failure_count += len(failure_values)
+
+                snapshot_sha256 = digest.hexdigest()
+                if activate:
+                    connection.execute(
+                        "UPDATE cluster_snapshot_versions SET active = 0 "
+                        "WHERE library_id = ? AND active = 1",
+                        (library,),
+                    )
+                metadata_payload["failure_count"] = failure_count
+                connection.execute(
+                    """
+                    UPDATE cluster_snapshot_versions
+                    SET snapshot_sha256 = ?, active = ?, item_count = ?,
+                        edge_count = ?, cluster_count = ?, metadata_json = ?
+                    WHERE snapshot_version = ?
+                    """,
+                    (
+                        snapshot_sha256,
+                        int(activate),
+                        item_count,
+                        edge_count,
+                        cluster_count,
+                        _safe_json(metadata_payload, maximum=MAX_METADATA_JSON_BYTES),
+                        version,
+                    ),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise ClusterOperationValidationError(
+                "Streamed snapshot violates the normalized storage contract."
+            ) from exc
+        return self.snapshot_version(version)
+
+    def page_snapshot_failures(
+        self, snapshot_version: str, *, offset: int = 0, limit: int = 100
+    ) -> JsonObject:
+        """Return bounded per-item failures for a streamed clustering run."""
+
+        record = self.snapshot_version(snapshot_version)
+        page_offset = _non_negative_int(offset, "offset")
+        page_limit = _limit(limit, maximum=1_000)
+        with self._read_connection() as connection:
+            total = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM cluster_snapshot_failures "
+                    "WHERE snapshot_version = ?",
+                    (record.snapshot_version,),
+                ).fetchone()[0]
+            )
+            rows = connection.execute(
+                """
+                SELECT doc_id, code, message FROM cluster_snapshot_failures
+                WHERE snapshot_version = ? ORDER BY failure_index
+                LIMIT ? OFFSET ?
+                """,
+                (record.snapshot_version, page_limit, page_offset),
+            ).fetchall()
+        return {
+            "snapshot_version": record.snapshot_version,
+            "total_count": total,
+            "offset": page_offset,
+            "limit": page_limit,
+            "has_more": page_offset + len(rows) < total,
+            "items": [dict(row) for row in rows],
+            "api_requests": 0,
+        }
+
     def activate_snapshot(self, snapshot_version: str) -> ClusterSnapshotVersionRecord:
         version = _identifier(snapshot_version, "snapshot_version")
         record = self.snapshot_version(version)
@@ -679,10 +1190,10 @@ class ClusterOperationStore:
                 """
                 SELECT doc_id, fingerprint, cluster_id
                 FROM cluster_snapshot_items
-                WHERE snapshot_version = ?
-                ORDER BY snapshot_order LIMIT ? OFFSET ?
+                WHERE snapshot_version = ? AND snapshot_order >= ?
+                ORDER BY snapshot_order LIMIT ?
                 """,
-                (record.snapshot_version, page_limit, page_offset),
+                (record.snapshot_version, page_offset, page_limit),
             ).fetchall()
         return {
             "snapshot_version": record.snapshot_version,
@@ -1881,6 +2392,24 @@ class ClusterOperationStore:
                     (operation_id, row["undo_of_operation_id"]),
                 )
 
+    @staticmethod
+    def _recover_streaming_runs(connection: sqlite3.Connection) -> None:
+        """Remove crash leftovers before any canonical snapshot is exposed."""
+
+        targets = connection.execute(
+            """
+            SELECT target_snapshot_version FROM cluster_stream_runs
+            WHERE target_snapshot_version IS NOT NULL
+            """
+        ).fetchall()
+        for row in targets:
+            connection.execute(
+                "DELETE FROM cluster_snapshot_versions WHERE snapshot_version = ?",
+                (str(row["target_snapshot_version"]),),
+            )
+        # Child staging rows are removed through foreign-key cascades.
+        connection.execute("DELETE FROM cluster_stream_runs")
+
     def _safe_error(self, value: str | None) -> str | None:
         if value is None:
             return None
@@ -1913,12 +2442,17 @@ class ClusterOperationStore:
     def _write_connection(self) -> Iterator[sqlite3.Connection]:
         try:
             connection = self._connect()
-            connection.execute("BEGIN IMMEDIATE")
         except sqlite3.Error as exc:
             raise ClusterOperationStoreUnavailable(
                 "Unable to open the cluster operation database for writing."
             ) from exc
         try:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+            except sqlite3.Error as exc:
+                raise ClusterOperationStoreUnavailable(
+                    "Unable to open the cluster operation database for writing."
+                ) from exc
             yield connection
             connection.commit()
         except Exception:
@@ -1929,12 +2463,19 @@ class ClusterOperationStore:
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=10.0)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA busy_timeout = 10000")
-        connection.execute("PRAGMA journal_mode = WAL")
-        connection.execute("PRAGMA synchronous = NORMAL")
-        return connection
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("PRAGMA busy_timeout = 10000")
+            connection.execute("PRAGMA journal_mode = WAL")
+            connection.execute("PRAGMA synchronous = NORMAL")
+            return connection
+        except BaseException:
+            # sqlite3.Connection.__exit__ only commits or rolls back; it does
+            # not close the handle.  Explicitly close partially configured
+            # connections so a failed PRAGMA cannot leak a Windows file lock.
+            connection.close()
+            raise
 
 
 def _snapshot_record(row: sqlite3.Row) -> ClusterSnapshotVersionRecord:
@@ -2163,6 +2704,12 @@ def _non_negative_int(value: object, name: str) -> int:
     return value
 
 
+def _positive_int(value: object, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ClusterOperationValidationError(f"{name} must be a positive integer")
+    return value
+
+
 def _limit(value: object, *, maximum: int) -> int:
     if (
         isinstance(value, bool)
@@ -2199,6 +2746,26 @@ def _canonical_json(value: object, *, maximum: int) -> str:
             f"Stored state exceeds the {maximum}-byte limit"
         )
     return encoded.decode("utf-8")
+
+
+def _iter_batches(
+    values: Iterable[_StreamRow], batch_size: int
+) -> Iterator[list[_StreamRow]]:
+    batch: list[_StreamRow] = []
+    for value in values:
+        batch.append(value)
+        if len(batch) >= batch_size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+
+
+def _stream_hash_update(digest: Any, row_kind: str, values: Sequence[object]) -> None:
+    digest.update(row_kind.encode("ascii"))
+    digest.update(b"\x00")
+    digest.update(_canonical_json(list(values), maximum=1024 * 1024).encode("utf-8"))
+    digest.update(b"\n")
 
 
 def _timestamp(value: datetime | str) -> str:
@@ -2256,6 +2823,10 @@ __all__ = [
     "ClusterOperationStoreError",
     "ClusterOperationStoreUnavailable",
     "ClusterOperationValidationError",
+    "ClusterSnapshotStreamCluster",
+    "ClusterSnapshotStreamEdge",
+    "ClusterSnapshotStreamFailure",
+    "ClusterSnapshotStreamItem",
     "ClusterSnapshotVersionRecord",
     "InvalidClusterRuleCursor",
 ]

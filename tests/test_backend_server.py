@@ -25,12 +25,16 @@ from image_vector_service.backend_server import create_backend_server
 from image_vector_service.config import ServiceConfig
 from image_vector_service.library_config import LibraryCatalog, LibraryDefinition
 from image_vector_service.models import (
+    ExportedHit,
     PreparedSearch,
     PreparedSearchCandidates,
     RankSource,
     ResolvedSearchHit,
     SearchHit,
+    SearchReport,
 )
+from image_vector_service.result_exporter import RESULT_OWNERSHIP_MARKER
+from image_vector_service.search_result_store import RESULT_STORE_FILENAME
 
 
 class FakeReport:
@@ -500,6 +504,22 @@ class BackendServerTest(unittest.TestCase):
         self.assertTrue(health["capabilities"]["multi_library"])
         self.assertTrue(health["capabilities"]["persistent_backend_session"])
         self.assertTrue(health["capabilities"]["graceful_shutdown"])
+        self.assertTrue(health["capabilities"]["source_only_search_results"])
+        self.assertTrue(health["capabilities"]["large_library_policy_diagnostics"])
+        policy = health["large_library_policy"]
+        self.assertEqual(policy["schema_version"], 1)
+        self.assertEqual(policy["queue"]["capacity_per_library"], 64)
+        self.assertEqual(policy["queue"]["cooperative_checkpoint_items"], 200)
+        self.assertEqual(policy["collection_writes"]["batch_size"], 256)
+        self.assertEqual(policy["results"]["preview_page_size"], 15)
+        self.assertEqual(
+            policy["large_clustering"]["default_types"],
+            ["exact", "perceptual"],
+        )
+        self.assertRegex(
+            health["large_library_policy_sha256"],
+            r"^[0-9a-f]{64}$",
+        )
 
         status, version = self.request("GET", "/version")
         self.assertEqual(status, 200)
@@ -511,6 +531,7 @@ class BackendServerTest(unittest.TestCase):
         self.assertTrue(version["capabilities"]["low_confidence_override"])
         self.assertTrue(version["capabilities"]["hybrid_tag_vector_search"])
         self.assertTrue(version["capabilities"]["result_diversity"])
+        self.assertTrue(version["capabilities"]["source_only_search_results"])
         self.assertEqual(
             version["capabilities"]["search_sort_modes"],
             ["confidence", "relevance", "diverse", "legacy"],
@@ -519,6 +540,11 @@ class BackendServerTest(unittest.TestCase):
         self.assertTrue(version["capabilities"]["auto_tag_review_batch"])
         self.assertTrue(version["capabilities"]["auto_tag_review_undo"])
         self.assertTrue(version["capabilities"]["metadata_embedding_backfill"])
+        self.assertEqual(version["large_library_policy"], policy)
+        self.assertEqual(
+            version["large_library_policy_sha256"],
+            health["large_library_policy_sha256"],
+        )
 
     def test_session_credentials_are_authenticated_and_never_echoed(self):
         secret = "dashscope-secret-not-for-output"
@@ -798,6 +824,27 @@ class BackendServerTest(unittest.TestCase):
 
         assert self.fake is not None
         self.assertEqual(set(self.fake.call_threads), {self.fake.owner_thread})
+
+    def test_single_library_search_uses_source_only_bounded_publication(self):
+        assert self.fake is not None
+        cases = (
+            ({"text": "red"}, "search_text"),
+            ({"text": "原", "search_mode": "tags"}, "search_tags"),
+            ({"image": str(self.query_image)}, "search_image"),
+            (
+                {"text": "red", "image": str(self.query_image)},
+                "search_combined",
+            ),
+        )
+
+        for params, expected_operation in cases:
+            with self.subTest(operation=expected_operation):
+                completed = self.wait_for_job(self.submit("search", params)["id"])
+                self.assertEqual(completed["status"], "succeeded", completed)
+                operation, values = self.fake.calls[-1]
+                self.assertEqual(operation, expected_operation)
+                self.assertIs(values["copy_files"], False)
+                self.assertEqual(values["report_result_limit"], 15)
 
     def test_index_and_auto_tag_normalizes_and_preserves_combined_result(self):
         assert self.fake is not None
@@ -1434,8 +1481,9 @@ class MultiLibraryBackendTest(unittest.TestCase):
                 assert library.image_root is not None
                 library.image_root.mkdir()
         sources = {
-            "library-a": self.temp_dir / "source-a.jpg",
-            "library-b": self.temp_dir / "source-b.jpg",
+            library.library_id: library.image_root / f"source-{library.library_id}.jpg"
+            for library in libraries
+            if library.enabled and library.image_root is not None
         }
         for source in sources.values():
             source.write_bytes(source.name.encode())
@@ -1625,6 +1673,14 @@ class MultiLibraryBackendTest(unittest.TestCase):
         self.assertEqual(manifest["filtered_count"], 0)
         self.assertEqual(manifest["ranking_mode"], "confidence")
         self.assertEqual(manifest["search_quality"]["ranking_mode"], "confidence")
+        self.assertEqual(result["result_storage"], "source_only")
+        self.assertLessEqual(len(result["results"]), 15)
+        self.assertTrue(all(hit["copied_file"] is None for hit in result["results"]))
+        output_dir = Path(result["output_dir"])
+        self.assertEqual(
+            {path.name for path in output_dir.iterdir()},
+            {RESULT_OWNERSHIP_MARKER, "results.json", RESULT_STORE_FILENAME},
+        )
 
     def test_federated_query_starts_all_collections_before_waiting_for_results(self):
         service_a = self.services["library-a"]
@@ -1755,6 +1811,80 @@ class MultiLibraryBackendTest(unittest.TestCase):
         self.assertEqual(completed["result"]["library_id"], "library-b")
         self.assertEqual(completed["result"]["results"][0]["library_name"], "Library B")
         self.assertEqual(self.services["library-b"].prepare_count, 0)
+
+    def test_single_search_job_json_keeps_only_a_first_page_preview(self):
+        service = self.services["library-b"]
+        preview = [
+            ExportedHit(
+                rank=index + 1,
+                distance=0.1,
+                root_id="root",
+                relative_path=f"preview-{index}.jpg",
+                copied_file=f"preview-{index}.jpg",
+                doc_id=f"preview-{index}",
+            )
+            for index in range(15)
+        ]
+        omitted = ExportedHit(
+            rank=16,
+            distance=0.2,
+            root_id="root",
+            relative_path="must-not-enter-job-json.jpg",
+            copied_file="must-not-enter-job-json.jpg",
+            doc_id="must-not-enter-job-json",
+        )
+
+        def huge_search(text, **_kwargs):
+            service._record()
+            del text
+            return SearchReport(
+                query_type="text",
+                output_dir="single",
+                result_count=100_000,
+                results=preview + [omitted] * (100_000 - len(preview)),
+            )
+
+        service.search_by_text = huge_search
+        completed = self.wait_for_job(
+            self.submit("search", {"text": "red", "library_ids": ["library-b"]})["id"]
+        )
+
+        result = completed["result"]
+        encoded = json.dumps(completed, ensure_ascii=False)
+        self.assertEqual(result["result_count"], 100_000)
+        self.assertEqual(len(result["results"]), 15)
+        self.assertEqual(result["results_inline_count"], 15)
+        self.assertTrue(result["results_truncated"])
+        self.assertNotIn("must-not-enter-job-json", encoded)
+        self.assertLess(len(encoded), 16 * 1024)
+
+    def test_federated_search_job_json_keeps_only_a_first_page_preview(self):
+        preview = [{"doc_id": f"preview-{index}"} for index in range(15)]
+        omitted = {"doc_id": "must-not-enter-federated-job-json"}
+        huge_result = {
+            "query_type": "text",
+            "output_dir": "federated",
+            "result_count": 100_000,
+            "results": preview + [omitted] * (100_000 - len(preview)),
+            "candidate_count": 100_000,
+        }
+
+        with patch(
+            "image_vector_service.backend_server.export_federated_search",
+            return_value=huge_result,
+        ) as export_search:
+            completed = self.wait_for_job(self.submit("search", {"text": "red"})["id"])
+
+        result = completed["result"]
+        encoded = json.dumps(completed, ensure_ascii=False)
+        self.assertEqual(result["result_count"], 100_000)
+        self.assertEqual(len(result["results"]), 15)
+        self.assertEqual(result["results_inline_count"], 15)
+        self.assertTrue(result["results_truncated"])
+        self.assertNotIn("must-not-enter-federated-job-json", encoded)
+        self.assertLess(len(encoded), 16 * 1024)
+        self.assertFalse(export_search.call_args.kwargs["copy_files"])
+        self.assertEqual(export_search.call_args.kwargs["report_result_limit"], 15)
 
     def test_unknown_and_disabled_library_selection_is_rejected(self):
         for library_id, code in (

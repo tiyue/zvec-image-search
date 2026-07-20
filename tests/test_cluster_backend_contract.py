@@ -281,6 +281,18 @@ class ClusterBackendContractTests(unittest.TestCase):
             time.sleep(0.01)
         self.fail(f"job did not finish: {latest}")
 
+    def test_cluster_images_defaults_to_hash_based_sources(self) -> None:
+        command, params = _normalize_job(
+            {
+                "command": "cluster_images",
+                "params": {"library_id": "library-a"},
+            },
+            self.root / "query",
+        )
+
+        self.assertEqual(command, "cluster_images")
+        self.assertEqual(params["cluster_types"], ["exact", "perceptual"])
+
     def test_all_intelligence_tasks_submit_poll_and_persist_history(self) -> None:
         requests = (
             {

@@ -213,6 +213,8 @@ def _run_frozen_self_test(plan: BuildPlan) -> dict[str, object]:
             "image_vector_service.migration_recovery",
             "image_vector_service.folder_deletion",
             "image_vector_service.image_clustering",
+            "image_vector_service.large_cluster_adapter",
+            "image_vector_service.large_image_clustering",
             "image_vector_service.library_browser",
             "image_vector_service.learning_ranker",
             "image_vector_service.search_features",

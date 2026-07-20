@@ -5,6 +5,7 @@ import tempfile
 import threading
 import unittest
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -239,6 +240,31 @@ class FacadeContractTests(unittest.TestCase):
             self.assertFalse(payload["service"]["credentials_configured"])
         finally:
             facade.close()
+
+    def test_long_background_waiters_cannot_starve_control_requests(self) -> None:
+        control = ThreadPoolExecutor(max_workers=1)
+        background = ThreadPoolExecutor(max_workers=1)
+        facade = PreviewFacade(
+            self.root / "config.json",
+            backend_host=_IdleHost(),  # type: ignore[arg-type]
+            credential_store=SessionCredentialStore(),
+            executor=control,
+            background_executor=background,
+        )
+        release = threading.Event()
+        blocked = background.submit(release.wait, 5.0)
+        try:
+            self.assertFalse(blocked.done())
+            self.assertEqual(
+                control.submit(lambda: "responsive").result(timeout=0.5),
+                "responsive",
+            )
+        finally:
+            release.set()
+            blocked.result(timeout=1.0)
+            facade.close()
+            control.shutdown(wait=True, cancel_futures=True)
+            background.shutdown(wait=True, cancel_futures=True)
 
     def test_invalid_config_keeps_preview_available_in_degraded_state(self) -> None:
         config_path = self.root / "config.json"

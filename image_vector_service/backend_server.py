@@ -4,15 +4,16 @@ import hashlib
 import hmac
 import json
 import os
-import queue
 import re
 import threading
 import uuid
+from collections import deque
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from datetime import datetime, timezone
+from enum import IntEnum
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.metadata import PackageNotFoundError, version
@@ -25,13 +26,20 @@ from .activity_store import ActivityStore
 from .backend_instance_lock import BackendInstanceLock
 from .config import RuntimeCredentials, ServiceConfig, default_config_home
 from .federated_search import LibraryCandidateSet, export_federated_search
+from .large_cluster_adapter import DEFAULT_CLUSTER_TYPES
+from .large_library_policy import (
+    build_large_library_policy_snapshot,
+    canonical_large_library_policy_sha256,
+)
 from .library_browser import LibraryBrowser
 from .library_config import (
     LibraryCatalog,
     LibraryDefinition,
     load_library_catalog,
 )
+from .models import SearchReport
 from .rank_fusion import confidence_candidate_limit
+from .result_exporter import search_report_payload
 from .service import ImageVectorService
 
 ServiceFactory = Callable[[Callable[[str], None], Callable[[], None]], Any]
@@ -61,6 +69,15 @@ _ACTIVITY_JOB_HISTORY_EXCLUDED_COMMANDS = frozenset(
     }
 )
 _ACTIVITY_PROGRESS_INTERVAL_SECONDS = 0.75
+_DEFAULT_LIBRARY_QUEUE_CAPACITY = 64
+_MAX_LIBRARY_QUEUE_CAPACITY = 10_000
+_QUEUE_RETRY_AFTER_SECONDS = 1
+_DEFAULT_COOPERATIVE_BATCH_SIZE = 200
+_MAX_COOPERATIVE_BATCH_SIZE = 10_000
+_DEFAULT_COOPERATIVE_MAX_INTERVAL_SECONDS = 0.25
+_DEFAULT_COOPERATIVE_MAX_CALLS = 4
+_DEFAULT_IDLE_MAINTENANCE_DELAY_SECONDS = 2.0
+_DEFAULT_RESULT_PREVIEW_PAGE_SIZE = 15
 _CAPABILITIES = {
     "multi_library": True,
     "federated_search": True,
@@ -103,6 +120,10 @@ _CAPABILITIES = {
     "partial_jobs": True,
     "persistent_backend_session": True,
     "graceful_shutdown": True,
+    "bounded_priority_queue": True,
+    "cooperative_batch_scheduling": True,
+    "source_only_search_results": True,
+    "large_library_policy_diagnostics": True,
     # Reserved protocol flags.  The first concurrent-jobs release exposes the
     # state names to clients, while pause/resume and failure paging remain off.
     "job_pause_resume": False,
@@ -148,6 +169,59 @@ class JobCancelled(RuntimeError):
     pass
 
 
+class _JobPriority(IntEnum):
+    HIGH = 0
+    INTERACTIVE = 1
+    BATCH = 2
+
+
+_PRIORITY_LABELS = {
+    _JobPriority.HIGH: "high",
+    _JobPriority.INTERACTIVE: "interactive",
+    _JobPriority.BATCH: "batch",
+}
+
+# Weighted scheduling keeps interactive search responsive without starving a
+# previously queued batch forever. FIFO order is preserved inside each lane.
+_PRIORITY_SCHEDULE = (
+    _JobPriority.HIGH,
+    _JobPriority.HIGH,
+    _JobPriority.HIGH,
+    _JobPriority.HIGH,
+    _JobPriority.INTERACTIVE,
+    _JobPriority.INTERACTIVE,
+    _JobPriority.BATCH,
+)
+_HIGH_PRIORITY_COMMANDS = frozenset({"search", "folder_list", "folder_images"})
+_BATCH_PRIORITY_COMMANDS = frozenset(
+    {
+        "index",
+        "sync",
+        "index_and_auto_tag",
+        "auto_tag",
+        "auto_tag_policy_migrate",
+        "folder_tag_backfill",
+        "metadata_backfill",
+        "cluster_images",
+        "active_learning_queue",
+    }
+)
+
+
+class _LibraryQueueFull(RuntimeError):
+    def __init__(self, *, library_id: str, capacity: int, depth: int) -> None:
+        super().__init__(f"Library queue is full: {library_id}")
+        self.library_id = library_id
+        self.capacity = capacity
+        self.depth = depth
+
+
+@dataclass(frozen=True)
+class _LibrarySubmission:
+    future: Future[Any]
+    queue_position: int | None
+
+
 @dataclass
 class BackendJob:
     id: str
@@ -185,6 +259,208 @@ class _LibraryCall:
     job_id: str
     callback: Callable[[Any], Any]
     future: Future[Any]
+    priority: _JobPriority
+
+
+class _BoundedPriorityCallQueue:
+    """A bounded weighted-priority queue for one Collection owner thread."""
+
+    def __init__(self, capacity: int) -> None:
+        self._capacity = capacity
+        self._lanes: dict[_JobPriority, deque[_LibraryCall]] = {
+            priority: deque() for priority in _JobPriority
+        }
+        self._size = 0
+        self._schedule_index = 0
+        self._closed = False
+        self._condition = threading.Condition()
+
+    @property
+    def capacity(self) -> int:
+        return self._capacity
+
+    @property
+    def depth(self) -> int:
+        with self._condition:
+            return self._size
+
+    @property
+    def closed(self) -> bool:
+        with self._condition:
+            return self._closed
+
+    def put(self, call: _LibraryCall, *, library_id: str) -> int:
+        with self._condition:
+            if self._closed:
+                raise RuntimeError("Library worker is shutting down.")
+            if self._size >= self._capacity:
+                raise _LibraryQueueFull(
+                    library_id=library_id,
+                    capacity=self._capacity,
+                    depth=self._size,
+                )
+            self._lanes[call.priority].append(call)
+            self._size += 1
+            position = self._position_locked(call.job_id)
+            if position is None:  # pragma: no cover - guarded by the insertion above
+                raise RuntimeError("Queued library call has no scheduling position.")
+            self._condition.notify()
+            return position
+
+    def get(self, timeout: float | None = None) -> _LibraryCall | None:
+        with self._condition:
+            deadline = None if timeout is None else monotonic() + max(0.0, timeout)
+            while self._size == 0 and not self._closed:
+                if deadline is None:
+                    self._condition.wait()
+                    continue
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    return None
+                self._condition.wait(remaining)
+            if self._size == 0:
+                return None
+            call, self._schedule_index = self._pop_next(
+                self._lanes,
+                self._schedule_index,
+            )
+            self._size -= 1
+            return call
+
+    def take_high_priority(self) -> _LibraryCall | None:
+        """Take one queued read-only/high-priority call without blocking.
+
+        Long batch work calls this only from the Collection owner thread.  It
+        deliberately ignores interactive and batch lanes because many commands
+        in those lanes mutate Collection state and therefore are not safe to
+        interleave with a partially completed index transaction.
+        """
+
+        with self._condition:
+            lane = self._lanes[_JobPriority.HIGH]
+            if not lane:
+                return None
+            call = lane.popleft()
+            self._size -= 1
+            return call
+
+    def position(self, job_id: str) -> int | None:
+        with self._condition:
+            return self._position_locked(job_id)
+
+    def remove(self, job_id: str) -> Future[Any] | None:
+        with self._condition:
+            for lane in self._lanes.values():
+                for call in tuple(lane):
+                    if call.job_id != job_id:
+                        continue
+                    lane.remove(call)
+                    self._size -= 1
+                    return call.future
+            return None
+
+    def close(self) -> tuple[Future[Any], ...]:
+        with self._condition:
+            if self._closed:
+                return ()
+            self._closed = True
+            pending = tuple(
+                call.future for lane in self._lanes.values() for call in lane
+            )
+            for lane in self._lanes.values():
+                lane.clear()
+            self._size = 0
+            self._condition.notify_all()
+            return pending
+
+    def _position_locked(self, job_id: str) -> int | None:
+        lanes = {priority: deque(values) for priority, values in self._lanes.items()}
+        schedule_index = self._schedule_index
+        for position in range(1, self._size + 1):
+            call, schedule_index = self._pop_next(lanes, schedule_index)
+            if call.job_id == job_id:
+                return position
+        return None
+
+    @staticmethod
+    def _pop_next(
+        lanes: dict[_JobPriority, deque[_LibraryCall]],
+        schedule_index: int,
+    ) -> tuple[_LibraryCall, int]:
+        for offset in range(len(_PRIORITY_SCHEDULE)):
+            index = (schedule_index + offset) % len(_PRIORITY_SCHEDULE)
+            priority = _PRIORITY_SCHEDULE[index]
+            lane = lanes[priority]
+            if lane:
+                return lane.popleft(), (index + 1) % len(_PRIORITY_SCHEDULE)
+        raise RuntimeError("Priority queue size is inconsistent with its lanes.")
+
+
+def _job_priority(command: str) -> _JobPriority:
+    if command in _HIGH_PRIORITY_COMMANDS:
+        return _JobPriority.HIGH
+    if command in _BATCH_PRIORITY_COMMANDS:
+        return _JobPriority.BATCH
+    return _JobPriority.INTERACTIVE
+
+
+def _resolve_library_queue_capacity(value: int | None) -> int:
+    candidate: int | str
+    if value is None:
+        configured = os.getenv("ZVEC_LIBRARY_QUEUE_CAPACITY", "").strip()
+        candidate = configured or _DEFAULT_LIBRARY_QUEUE_CAPACITY
+    else:
+        candidate = value
+    if isinstance(candidate, bool):
+        raise ValueError("library_queue_capacity must be an integer")
+    try:
+        capacity = int(candidate)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("library_queue_capacity must be an integer") from exc
+    if not 1 <= capacity <= _MAX_LIBRARY_QUEUE_CAPACITY:
+        raise ValueError(
+            "library_queue_capacity must be between 1 and "
+            f"{_MAX_LIBRARY_QUEUE_CAPACITY}"
+        )
+    return capacity
+
+
+def _resolve_cooperative_batch_size(value: int | None) -> int:
+    candidate: int | str
+    if value is None:
+        configured = os.getenv("ZVEC_COOPERATIVE_BATCH_SIZE", "").strip()
+        candidate = configured or _DEFAULT_COOPERATIVE_BATCH_SIZE
+    else:
+        candidate = value
+    if isinstance(candidate, bool):
+        raise ValueError("cooperative_batch_size must be an integer")
+    try:
+        batch_size = int(candidate)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("cooperative_batch_size must be an integer") from exc
+    if not 1 <= batch_size <= _MAX_COOPERATIVE_BATCH_SIZE:
+        raise ValueError(
+            "cooperative_batch_size must be between 1 and "
+            f"{_MAX_COOPERATIVE_BATCH_SIZE}"
+        )
+    return batch_size
+
+
+def _queue_full_error(
+    error: _LibraryQueueFull,
+    message: str,
+) -> BackendRequestError:
+    return BackendRequestError(
+        "queue_full",
+        message,
+        status=HTTPStatus.TOO_MANY_REQUESTS,
+        details={
+            "library_id": error.library_id,
+            "queue_depth": error.depth,
+            "queue_capacity": error.capacity,
+            "retry_after_seconds": _QUEUE_RETRY_AFTER_SECONDS,
+        },
+    )
 
 
 class _LibraryWorker:
@@ -194,17 +470,26 @@ class _LibraryWorker:
         service_factory: LibraryServiceFactory,
         report_progress: Callable[[str, LibraryDefinition, str], None],
         check_cancel: Callable[[str], None],
+        *,
+        queue_capacity: int,
+        cooperative_batch_size: int,
     ) -> None:
         self.library = library
         self._service_factory = service_factory
         self._report_job_progress = report_progress
         self._check_job_cancel = check_cancel
-        self._queue: queue.Queue[_LibraryCall | None] = queue.Queue()
+        self._queue = _BoundedPriorityCallQueue(queue_capacity)
         self._ready = threading.Event()
         self._stop = threading.Event()
         self._startup_error: dict[str, Any] | None = None
         self._recovery_report: dict[str, Any] | None = None
+        self._service: Any = None
         self._current_job_id: str | None = None
+        self._current_priority: _JobPriority | None = None
+        self._cooperative_batch_size = cooperative_batch_size
+        self._cooperative_checkpoints = 0
+        self._cooperative_last_yield = monotonic()
+        self._cooperative_depth = 0
         self._thread = threading.Thread(
             target=self._main,
             name=f"zvec-library-{library.library_id}",
@@ -229,31 +514,68 @@ class _LibraryWorker:
 
     @property
     def queue_depth(self) -> int:
-        return self._queue.qsize()
+        return self._queue.depth
+
+    @property
+    def queue_capacity(self) -> int:
+        return self._queue.capacity
+
+    def cancellation_requested(self) -> bool:
+        """Expose shutdown state to optional idle Collection maintenance."""
+
+        return self._stop.is_set()
+
+    def queue_is_idle(self) -> bool:
+        """Return true only when no user call is waiting for this Collection."""
+
+        return self._queue.depth == 0
 
     def start(self) -> None:
         self._thread.start()
 
-    def submit(self, job_id: str, callback: Callable[[Any], Any]) -> Future[Any]:
-        future: Future[Any] = Future()
+    def submit(
+        self,
+        job_id: str,
+        callback: Callable[[Any], Any],
+        *,
+        priority: _JobPriority,
+        future: Future[Any] | None = None,
+    ) -> _LibrarySubmission:
+        submitted_future = future or Future()
         if self._stop.is_set():
-            future.set_exception(RuntimeError("Library worker is shutting down."))
-            return future
+            submitted_future.set_exception(
+                RuntimeError("Library worker is shutting down.")
+            )
+            return _LibrarySubmission(submitted_future, None)
         if self._startup_error is not None:
-            future.set_exception(
+            submitted_future.set_exception(
                 RuntimeError(
                     str(self._startup_error.get("message") or "startup failed")
                 )
             )
-            return future
-        self._queue.put(_LibraryCall(job_id, callback, future))
-        return future
+            return _LibrarySubmission(submitted_future, None)
+        position = self._queue.put(
+            _LibraryCall(job_id, callback, submitted_future, priority),
+            library_id=self.library.library_id,
+        )
+        return _LibrarySubmission(submitted_future, position)
+
+    def queue_position(self, job_id: str) -> int | None:
+        return self._queue.position(job_id)
+
+    def cancel_queued(self, job_id: str) -> bool:
+        future = self._queue.remove(job_id)
+        if future is None:
+            return False
+        future.cancel()
+        return True
 
     def close(self) -> None:
         self._stop.set()
+        for future in self._queue.close():
+            future.cancel()
         if self._thread.ident is None:
             return
-        self._queue.put(None)
         self._thread.join()
 
     def _main(self) -> None:
@@ -264,6 +586,14 @@ class _LibraryWorker:
                 self._report_progress,
                 self._check_cancel,
             )
+            self._service = service
+            configure_maintenance = getattr(
+                service,
+                "configure_optimize_runtime",
+                None,
+            )
+            if callable(configure_maintenance):
+                configure_maintenance(self, externally_managed=True)
             recover = getattr(service, "recover_folder_deletions", None)
             if callable(recover):
                 recovery = recover(library_id=self.library.library_id)
@@ -271,22 +601,14 @@ class _LibraryWorker:
                     self._recovery_report = _json_safe(recovery)
             self._ready.set()
             while True:
-                call = self._queue.get()
+                timeout = self._idle_maintenance_wait_timeout(service)
+                call = self._queue.get(timeout=timeout)
                 if call is None:
-                    self._queue.task_done()
-                    return
-                self._current_job_id = call.job_id
-                try:
-                    self._check_cancel()
-                    if not call.future.set_running_or_notify_cancel():
-                        continue
-                    call.future.set_result(call.callback(service))
-                except BaseException as exc:
-                    if not call.future.done():
-                        call.future.set_exception(exc)
-                finally:
-                    self._current_job_id = None
-                    self._queue.task_done()
+                    if self._stop.is_set() or self._queue.closed:
+                        return
+                    self._run_idle_maintenance(service)
+                    continue
+                self._execute_call(call, service)
         except Exception as exc:
             self._startup_error = {
                 "code": "service_initialization_failed",
@@ -302,16 +624,55 @@ class _LibraryWorker:
             if service is not None:
                 with suppress(Exception):
                     service.close()
+            self._service = None
 
     def _fail_pending(self, error: BaseException) -> None:
-        while True:
+        for future in self._queue.close():
+            if not future.done():
+                future.set_exception(error)
+
+    def _run_idle_maintenance(self, service: Any) -> None:
+        if not self.queue_is_idle():
+            return
+        pending = getattr(service, "has_pending_optimize_maintenance", None)
+        if callable(pending):
             try:
-                call = self._queue.get_nowait()
-            except queue.Empty:
+                if not pending():
+                    return
+            except Exception:
                 return
-            if call is not None and not call.future.done():
-                call.future.set_exception(error)
-            self._queue.task_done()
+        maintenance = getattr(service, "run_idle_maintenance", None)
+        if callable(maintenance):
+            # The user Future was completed by _execute_call before this point.
+            # Maintenance is best effort and must never terminate the worker.
+            with suppress(Exception):
+                maintenance()
+
+    @staticmethod
+    def _idle_maintenance_wait_timeout(service: Any) -> float | None:
+        wait_hint = getattr(service, "optimize_maintenance_wait_seconds", None)
+        if callable(wait_hint):
+            try:
+                seconds = wait_hint()
+                if seconds is None:
+                    return None
+                normalized = max(0.0, float(seconds))
+                return (
+                    _DEFAULT_IDLE_MAINTENANCE_DELAY_SECONDS
+                    if normalized == 0
+                    else normalized
+                )
+            except Exception:
+                return None
+        pending = getattr(service, "has_pending_optimize_maintenance", None)
+        if not callable(pending):
+            return None
+        try:
+            if pending():
+                return _DEFAULT_IDLE_MAINTENANCE_DELAY_SECONDS
+        except Exception:
+            return None
+        return None
 
     def _report_progress(self, message: str) -> None:
         self._check_cancel()
@@ -323,6 +684,62 @@ class _LibraryWorker:
             raise JobCancelled("Library worker shutdown requested.")
         if self._current_job_id is not None:
             self._check_job_cancel(self._current_job_id)
+        self._cooperate_if_due()
+        if self._current_job_id is not None:
+            # A queued search can take long enough for cancellation to arrive
+            # while the outer batch is suspended.  Recheck before resuming it.
+            self._check_job_cancel(self._current_job_id)
+
+    def _execute_call(self, call: _LibraryCall, service: Any) -> None:
+        previous_job_id = self._current_job_id
+        previous_priority = self._current_priority
+        self._current_job_id = call.job_id
+        self._current_priority = call.priority
+        try:
+            if not call.future.set_running_or_notify_cancel():
+                return
+            self._check_cancel()
+            call.future.set_result(call.callback(service))
+        except BaseException as exc:
+            if not call.future.done():
+                call.future.set_exception(exc)
+        finally:
+            self._current_job_id = previous_job_id
+            self._current_priority = previous_priority
+
+    def _cooperate_if_due(self) -> None:
+        """Run bounded urgent reads between safe checkpoints of a batch job.
+
+        Every callback still executes on this worker's single owner thread.  A
+        time threshold keeps model/network waits responsive, while the work-unit
+        threshold avoids taking the queue lock for every file in a fast scan.
+        """
+
+        if (
+            self._cooperative_depth
+            or self._current_priority is not _JobPriority.BATCH
+            or threading.get_ident() != self._thread.ident
+        ):
+            return
+        self._cooperative_checkpoints += 1
+        now = monotonic()
+        if (
+            self._cooperative_checkpoints < self._cooperative_batch_size
+            and now - self._cooperative_last_yield
+            < _DEFAULT_COOPERATIVE_MAX_INTERVAL_SECONDS
+        ):
+            return
+        self._cooperative_checkpoints = 0
+        self._cooperative_last_yield = now
+        self._cooperative_depth += 1
+        try:
+            for _index in range(_DEFAULT_COOPERATIVE_MAX_CALLS):
+                call = self._queue.take_high_priority()
+                if call is None:
+                    break
+                self._execute_call(call, self._service)
+        finally:
+            self._cooperative_depth -= 1
 
 
 class BackendJobManager:
@@ -340,6 +757,8 @@ class BackendJobManager:
         library_catalog: LibraryCatalog | None = None,
         activity_store: ActivityStore | None = None,
         owns_activity_store: bool = False,
+        library_queue_capacity: int | None = None,
+        cooperative_batch_size: int | None = None,
     ) -> None:
         if owns_activity_store and activity_store is None:
             raise ValueError("owns_activity_store requires an activity_store")
@@ -366,6 +785,12 @@ class BackendJobManager:
         self._stop_requested = threading.Event()
         self._started = False
         self._closed = False
+        self._library_queue_capacity = _resolve_library_queue_capacity(
+            library_queue_capacity
+        )
+        self._cooperative_batch_size = _resolve_cooperative_batch_size(
+            cooperative_batch_size
+        )
         factory = library_service_factory or self._adapt_service_factory(
             service_factory
         )
@@ -375,6 +800,8 @@ class BackendJobManager:
                 factory,
                 self._report_progress,
                 self._check_cancel,
+                queue_capacity=self._library_queue_capacity,
+                cooperative_batch_size=self._cooperative_batch_size,
             )
             for library in self._catalog.enabled
         }
@@ -386,6 +813,7 @@ class BackendJobManager:
             thread_name_prefix="zvec-backend-control",
         )
         self._job_futures: dict[str, Future[Any]] = {}
+        self._job_worker_ids: dict[str, str] = {}
 
     def _adapt_service_factory(
         self, service_factory: ServiceFactory | None
@@ -619,6 +1047,16 @@ class BackendJobManager:
             for job in self._jobs.values():
                 if job.status not in _TERMINAL_STATUSES:
                     job.cancel_requested = True
+                    if job.status == "queued":
+                        job.status = "cancelled"
+                        job.finished_at = job.finished_at or _utc_now()
+                        job.progress = {
+                            **(job.progress or {}),
+                            "message": "Cancelled during backend shutdown.",
+                            "updated_at": job.finished_at,
+                        }
+                    elif job.status == "running":
+                        job.status = "cancelling"
         try:
             if self._started:
                 for worker in self._library_workers.values():
@@ -678,6 +1116,16 @@ class BackendJobManager:
                     "ready": self._library_workers[library.library_id].ready
                     if library.enabled
                     else False,
+                    "queue_depth": (
+                        self._library_workers[library.library_id].queue_depth
+                        if library.enabled
+                        else 0
+                    ),
+                    "queue_capacity": (
+                        self._library_workers[library.library_id].queue_capacity
+                        if library.enabled
+                        else self._library_queue_capacity
+                    ),
                     "folder_delete_recovery": (
                         self._library_workers[library.library_id].recovery_report
                         if library.enabled
@@ -701,6 +1149,19 @@ class BackendJobManager:
         return status, payload
 
     def version_info(self) -> dict[str, Any]:
+        large_library_policy = build_large_library_policy_snapshot(
+            queue_capacity_per_library=self._library_queue_capacity,
+            queue_max_capacity_per_library=_MAX_LIBRARY_QUEUE_CAPACITY,
+            queue_retry_after_seconds=_QUEUE_RETRY_AFTER_SECONDS,
+            cooperative_checkpoint_items=self._cooperative_batch_size,
+            cooperative_max_checkpoint_items=_MAX_COOPERATIVE_BATCH_SIZE,
+            cooperative_max_interval_seconds=(
+                _DEFAULT_COOPERATIVE_MAX_INTERVAL_SECONDS
+            ),
+            cooperative_max_high_priority_calls=_DEFAULT_COOPERATIVE_MAX_CALLS,
+            result_preview_page_size=_DEFAULT_RESULT_PREVIEW_PAGE_SIZE,
+            optimize_idle_grace_seconds=(_DEFAULT_IDLE_MAINTENANCE_DELAY_SECONDS),
+        )
         return {
             "protocol_version": _PROTOCOL_VERSION,
             "app": "zvec-image-search",
@@ -709,6 +1170,12 @@ class BackendJobManager:
             "config_fingerprint": self._config_fingerprint,
             "capabilities": dict(_CAPABILITIES),
             "credentials_configured": bool(self._config.api_key),
+            "library_queue_capacity": self._library_queue_capacity,
+            "cooperative_batch_size": self._cooperative_batch_size,
+            "large_library_policy": large_library_policy,
+            "large_library_policy_sha256": (
+                canonical_large_library_policy_sha256(large_library_policy)
+            ),
         }
 
     def configure_credentials(self, payload: dict[str, Any]) -> dict[str, bool]:
@@ -774,10 +1241,18 @@ class BackendJobManager:
                     status=HTTPStatus.SERVICE_UNAVAILABLE,
                 )
             self._jobs[job.id] = job
-            snapshot = job.to_dict()
+        try:
+            self._schedule(job)
+        except BaseException:
+            with self._jobs_lock:
+                self._jobs.pop(job.id, None)
+                self._job_futures.pop(job.id, None)
+                self._job_worker_ids.pop(job.id, None)
+            raise
+        with self._jobs_lock:
+            snapshot = self._job_view_locked(job)
         self._record_job_history(snapshot, force=True)
-        self._schedule(job)
-        return job.to_dict()
+        return snapshot
 
     def request_shutdown_if_idle(self, payload: dict[str, Any]) -> dict[str, Any]:
         unknown = set(payload) - {"if_idle"}
@@ -831,7 +1306,7 @@ class BackendJobManager:
                 ]
             selected = jobs[:limit]
             return {
-                "jobs": [job.to_dict() for job in selected],
+                "jobs": [self._job_view_locked(job) for job in selected],
                 "count": len(selected),
                 "total_count": len(jobs),
             }
@@ -845,7 +1320,7 @@ class BackendJobManager:
                     "The requested job does not exist.",
                     status=HTTPStatus.NOT_FOUND,
                 )
-            return job.to_dict()
+            return self._job_view_locked(job)
 
     def cancel(self, job_id: str) -> dict[str, Any]:
         with self._jobs_lock:
@@ -881,11 +1356,29 @@ class BackendJobManager:
                     "updated_at": _utc_now(),
                 }
             future = self._job_futures.get(job_id)
-            result = job.to_dict()
+            worker_id = self._job_worker_ids.get(job_id)
+            result = self._job_view_locked(job)
+        worker = self._library_workers.get(worker_id or "")
+        removed = worker.cancel_queued(job_id) if worker is not None else False
         self._record_job_history(result, force=True)
-        if future is not None and result["status"] == "cancelled":
+        if future is not None and result["status"] == "cancelled" and not removed:
             future.cancel()
         return result
+
+    def _job_view_locked(self, job: BackendJob) -> dict[str, Any]:
+        """Return one UI snapshot with a live pending position when available."""
+
+        payload = job.to_dict()
+        priority = _job_priority(job.command)
+        payload["queue_priority"] = _PRIORITY_LABELS[priority]
+        queue_position: int | None = None
+        if job.status == "queued":
+            worker_id = self._job_worker_ids.get(job.id)
+            worker = self._library_workers.get(worker_id or "")
+            if worker is not None:
+                queue_position = worker.queue_position(job.id)
+        payload["queue_position"] = queue_position
+        return payload
 
     def _schedule(self, job: BackendJob) -> None:
         if job.command == "libraries":
@@ -907,21 +1400,58 @@ class BackendJobManager:
                 )
             else:
                 library = libraries[0]
-                future = self._library_workers[library.library_id].submit(
+                self._schedule_library_job(
+                    job,
+                    library,
                     job.id,
                     lambda service: self._run_library_job(job.id, service, library),
                 )
+                return
         else:
             library = self._single_library(job.params)
-            future = self._library_workers[library.library_id].submit(
+            self._schedule_library_job(
+                job,
+                library,
                 job.id,
                 lambda service: self._run_library_job(job.id, service, library),
             )
+            return
         with self._jobs_lock:
             self._job_futures[job.id] = future
         future.add_done_callback(
             lambda completed: self._complete_job(job.id, completed)
         )
+
+    def _schedule_library_job(
+        self,
+        job: BackendJob,
+        library: LibraryDefinition,
+        job_id: str,
+        callback: Callable[[Any], Any],
+    ) -> None:
+        worker = self._library_workers[library.library_id]
+        future: Future[Any] = Future()
+        future.add_done_callback(
+            lambda completed: self._complete_job(job.id, completed)
+        )
+        with self._jobs_lock:
+            self._job_futures[job.id] = future
+            self._job_worker_ids[job.id] = library.library_id
+        try:
+            worker.submit(
+                job_id,
+                callback,
+                priority=_job_priority(job.command),
+                future=future,
+            )
+        except _LibraryQueueFull as exc:
+            with self._jobs_lock:
+                self._job_futures.pop(job.id, None)
+                self._job_worker_ids.pop(job.id, None)
+            raise _queue_full_error(
+                exc,
+                "The selected library has reached its pending-job capacity.",
+            ) from exc
 
     def _begin_job(self, job_id: str) -> BackendJob:
         with self._jobs_lock:
@@ -949,7 +1479,11 @@ class BackendJobManager:
         job = self._begin_job(job_id)
         result = self._execute_single(service, library, job.command, job.params)
         self._check_cancel(job_id)
-        return _attribute_result(result, library)
+        return _attribute_result(
+            result,
+            library,
+            result_preview_limit=15 if job.command == "search" else None,
+        )
 
     def _run_browse_job(
         self,
@@ -985,7 +1519,9 @@ class BackendJobManager:
         self, job_id: str, libraries: list[LibraryDefinition]
     ) -> Any:
         job = self._begin_job(job_id)
-        return self._execute_federated_search(job, libraries)
+        return _bounded_search_result(
+            self._execute_federated_search(job, libraries), 15
+        )
 
     def _complete_job(self, job_id: str, future: Future[Any]) -> None:
         failure_type: str | None = None
@@ -1000,6 +1536,20 @@ class BackendJobManager:
                 job.progress = {
                     **(job.progress or {}),
                     "message": "Cancelled.",
+                    "updated_at": _utc_now(),
+                }
+        except BackendRequestError as exc:
+            with self._jobs_lock:
+                job = self._jobs[job_id]
+                if job.status == "cancelled":
+                    return
+                job.status = "failed"
+                job.result = None
+                job.error = exc.to_dict()
+                failure_type = exc.__class__.__name__
+                job.progress = {
+                    **(job.progress or {}),
+                    "message": "Failed.",
                     "updated_at": _utc_now(),
                 }
         except BaseException as exc:
@@ -1064,6 +1614,7 @@ class BackendJobManager:
                 if job.status in _TERMINAL_STATUSES:
                     job.finished_at = job.finished_at or _utc_now()
                 self._job_futures.pop(job_id, None)
+                self._job_worker_ids.pop(job_id, None)
                 snapshot = job.to_dict()
             self._record_job_history(snapshot, force=True)
             if snapshot.get("status") in {
@@ -1112,10 +1663,10 @@ class BackendJobManager:
         candidate_k = params["candidate_k"]
         if self._config.max_top_k is not None:
             candidate_k = min(self._config.max_top_k, candidate_k)
-        futures = [
-            (
-                library,
-                self._library_workers[library.library_id].submit(
+        futures: list[tuple[LibraryDefinition, Future[Any]]] = []
+        try:
+            for library in libraries:
+                submission = self._library_workers[library.library_id].submit(
                     job.id,
                     lambda service: service.query_prepared_search(
                         prepared,
@@ -1124,10 +1675,16 @@ class BackendJobManager:
                         tags=params["tags"],
                         tag_mode=params["tag_mode"],
                     ),
-                ),
-            )
-            for library in libraries
-        ]
+                    priority=_JobPriority.HIGH,
+                )
+                futures.append((library, submission.future))
+        except _LibraryQueueFull as exc:
+            for _library, future in futures:
+                future.cancel()
+            raise _queue_full_error(
+                exc,
+                "A library required by federated search has reached capacity.",
+            ) from exc
         collections = [
             LibraryCandidateSet(library=library, candidates=future.result())
             for library, future in futures
@@ -1150,6 +1707,9 @@ class BackendJobManager:
             show_low_confidence=params["show_low_confidence"],
             diversify_results=params["diversify_results"],
             sort_mode=params["sort_mode"],
+            result_limit=_DEFAULT_RESULT_PREVIEW_PAGE_SIZE,
+            copy_files=False,
+            report_result_limit=_DEFAULT_RESULT_PREVIEW_PAGE_SIZE,
         )
 
     def _execute_single(
@@ -1328,6 +1888,8 @@ class BackendJobManager:
                 "show_low_confidence": params["show_low_confidence"],
                 "diversify_results": params["diversify_results"],
                 "sort_mode": params["sort_mode"],
+                "copy_files": False,
+                "report_result_limit": _DEFAULT_RESULT_PREVIEW_PAGE_SIZE,
             }
             if params["search_mode"] == "tags":
                 return service.search_by_tags(text, **common)
@@ -1366,9 +1928,18 @@ class BackendJobManager:
         library: LibraryDefinition,
         callback: Callable[[Any], Any],
     ) -> Any:
-        return (
-            self._library_workers[library.library_id].submit(job_id, callback).result()
-        )
+        try:
+            submission = self._library_workers[library.library_id].submit(
+                job_id,
+                callback,
+                priority=_JobPriority.HIGH,
+            )
+        except _LibraryQueueFull as exc:
+            raise _queue_full_error(
+                exc,
+                "A library required by federated search has reached capacity.",
+            ) from exc
+        return submission.future.result()
 
     def _report_progress(
         self, job_id: str, library: LibraryDefinition, message: str
@@ -1739,7 +2310,16 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
         return payload
 
     def _send_error(self, error: BackendRequestError) -> None:
-        self._send_json(error.status, {"error": error.to_dict()})
+        headers: dict[str, str] | None = None
+        if error.code == "queue_full" and error.details is not None:
+            retry_after = error.details.get("retry_after_seconds")
+            if isinstance(retry_after, int) and retry_after > 0:
+                headers = {"Retry-After": str(retry_after)}
+        self._send_json(
+            error.status,
+            {"error": error.to_dict()},
+            extra_headers=headers,
+        )
 
     def _send_json(
         self,
@@ -1843,6 +2423,8 @@ def create_backend_server(
     library_catalog: LibraryCatalog | None = None,
     activity_store: ActivityStore | None = None,
     activity_config_home: str | Path | None = None,
+    library_queue_capacity: int | None = None,
+    cooperative_batch_size: int | None = None,
 ) -> tuple[BackendHTTPServer, BackendJobManager]:
     if not token:
         raise ValueError("A non-empty backend Bearer token is required.")
@@ -1916,6 +2498,8 @@ def create_backend_server(
             library_catalog=resolved_catalog,
             activity_store=resolved_activity,
             owns_activity_store=owns_activity,
+            library_queue_capacity=library_queue_capacity,
+            cooperative_batch_size=cooperative_batch_size,
         )
         server = BackendHTTPServer((host, port), manager, token, instance_lock)
         manager.start()
@@ -1959,14 +2543,19 @@ def serve_backend(
         libraries_config=libraries_config,
         activity_config_home=_default_config_home(),
     )
+    version_info = manager.version_info()
     print(
         json.dumps(
             {
                 "event": "backend_listening",
                 "host": server.server_address[0],
                 "port": server.server_address[1],
-                "instance_id": manager.version_info()["instance_id"],
-                "config_fingerprint": manager.version_info()["config_fingerprint"],
+                "instance_id": version_info["instance_id"],
+                "config_fingerprint": version_info["config_fingerprint"],
+                "large_library_policy": version_info["large_library_policy"],
+                "large_library_policy_sha256": version_info[
+                    "large_library_policy_sha256"
+                ],
             },
             ensure_ascii=False,
         ),
@@ -2615,7 +3204,7 @@ def _normalize_job(
             raise BackendRequestError(
                 "invalid_params", "scope must be new_or_changed or all."
             )
-        raw_types = params.get("cluster_types", ["exact", "perceptual", "semantic"])
+        raw_types = params.get("cluster_types", list(DEFAULT_CLUSTER_TYPES))
         if not isinstance(raw_types, list) or not raw_types:
             raise BackendRequestError(
                 "invalid_params", "cluster_types must be a non-empty array."
@@ -3294,8 +3883,17 @@ def _manual_tag_selection(value: Any) -> dict[str, Any]:
     )
 
 
-def _attribute_result(value: Any, library: LibraryDefinition) -> Any:
-    result = _json_safe(value)
+def _attribute_result(
+    value: Any,
+    library: LibraryDefinition,
+    *,
+    result_preview_limit: int | None = None,
+) -> Any:
+    result = (
+        _bounded_search_result(value, result_preview_limit)
+        if result_preview_limit is not None
+        else _json_safe(value)
+    )
     if not isinstance(result, dict):
         return result
     attributed = dict(result)
@@ -3322,6 +3920,42 @@ def _attribute_result(value: Any, library: LibraryDefinition) -> Any:
     if not attributed.get("library_names"):
         attributed["library_names"] = [library.name]
     return attributed
+
+
+def _bounded_search_result(value: Any, result_limit: int) -> Any:
+    """Build a search-job summary without serializing every exported hit."""
+
+    if isinstance(value, SearchReport):
+        return _json_safe(search_report_payload(value, result_limit=result_limit))
+
+    if isinstance(value, dict):
+        raw = value
+    else:
+        to_dict = getattr(value, "to_dict", None)
+        if not callable(to_dict):
+            return _json_safe(value)
+        converted = to_dict()
+        if not isinstance(converted, dict):
+            return _json_safe(converted)
+        raw = converted
+
+    bounded = {
+        str(key): _json_safe(item) for key, item in raw.items() if key != "results"
+    }
+    raw_results = raw.get("results")
+    if isinstance(raw_results, list):
+        preview = raw_results[:result_limit]
+        bounded["results"] = _json_safe(preview)
+        declared_count = bounded.get("result_count")
+        total_count = (
+            declared_count
+            if isinstance(declared_count, int) and not isinstance(declared_count, bool)
+            else len(raw_results)
+        )
+        bounded["result_count"] = total_count
+        bounded["results_inline_count"] = len(preview)
+        bounded["results_truncated"] = total_count > len(preview)
+    return bounded
 
 
 def _json_safe(value: Any) -> Any:

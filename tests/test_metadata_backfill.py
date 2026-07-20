@@ -4,6 +4,7 @@ import hashlib
 import threading
 import time
 import unittest
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -308,6 +309,21 @@ class _State:
     def list_entries(self) -> list[dict]:
         return list(self.entries.values())
 
+    def count(self) -> int:
+        return len(self.entries)
+
+    def iter_entries_with_annotations(
+        self,
+        *,
+        chunk_size: int = 256,
+    ) -> Iterator[list[tuple[dict, dict | None]]]:
+        entries = list(self.entries.values())
+        for offset in range(0, len(entries), chunk_size):
+            yield [
+                (entry, self.annotations.get(str(entry["doc_id"])))
+                for entry in entries[offset : offset + chunk_size]
+            ]
+
     def get(self, doc_id: str) -> dict | None:
         return self.entries.get(doc_id)
 
@@ -322,6 +338,22 @@ class _Repository:
 
     def fetch_metadata(self, doc_id: str) -> dict | None:
         return self.stored.get(doc_id)
+
+    def fetch_metadata_many(
+        self,
+        doc_ids: Iterable[str],
+        *,
+        batch_size: int = 256,
+    ) -> tuple[dict[str, dict], dict[str, str]]:
+        del batch_size
+        return (
+            {
+                doc_id: self.stored[doc_id]
+                for doc_id in doc_ids
+                if doc_id in self.stored
+            },
+            {},
+        )
 
     def upsert_metadata_embedding(
         self,
@@ -402,6 +434,12 @@ class ImageVectorServiceMetadataBackfillTest(unittest.TestCase):
         self,
     ) -> None:
         service, repository, client = self._service()
+        observed: list[tuple[str, int, int]] = []
+        service._record_collection_mutation = (  # type: ignore[method-assign]
+            lambda operation_id, *, changes, deletes: observed.append(
+                (operation_id, changes, deletes)
+            )
+        )
 
         first = service.backfill_metadata_embeddings(max_images=1)
         self.assertEqual(first["scanned"], 3)
@@ -415,6 +453,11 @@ class ImageVectorServiceMetadataBackfillTest(unittest.TestCase):
         self.assertEqual(first["rate_limit"]["configured_backfill_concurrency"], 2)
         self.assertEqual(first["rate_limit"]["hard_requests_per_minute"], 60)
         self.assertEqual(first["rate_limit"]["hard_tokens_per_minute"], 100_000)
+        self.assertEqual(
+            observed,
+            [(str(first["operation_id"]), 1, 0)],
+        )
+        self.assertTrue(str(first["operation_id"]).startswith("metadata-backfill:"))
 
         second = service.backfill_metadata_embeddings(max_images=1)
         self.assertEqual(second["selected"], 0)
@@ -422,6 +465,7 @@ class ImageVectorServiceMetadataBackfillTest(unittest.TestCase):
         self.assertEqual(second["already_current"], 2)
         self.assertEqual(second["remaining"], 0)
         self.assertEqual(len(client.calls), 1)
+        self.assertEqual(len(observed), 1)
 
 
 if __name__ == "__main__":

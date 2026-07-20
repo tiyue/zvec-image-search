@@ -5,6 +5,7 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from image_vector_service import federated_search as federated_search_module
 from image_vector_service.config import ServiceConfig
@@ -22,6 +23,8 @@ from image_vector_service.models import (
     ResolvedSearchHit,
     SearchHit,
 )
+from image_vector_service.result_exporter import RESULT_OWNERSHIP_MARKER
+from image_vector_service.search_result_store import RESULT_STORE_FILENAME
 
 
 def candidate(
@@ -1269,6 +1272,105 @@ class FederatedSearchTest(unittest.TestCase):
         )
         self.assertEqual(manifest["results"][0]["library_name"], "Library A")
         self.assertEqual(manifest["results"][0]["sha256"], "a" * 64)
+        self.assertEqual(manifest["result_storage"], "copied")
+        self.assertTrue(
+            all(
+                (Path(report["output_dir"]) / hit["copied_file"]).is_file()
+                for hit in report["results"]
+            )
+        )
+
+    def test_source_only_export_keeps_a_bounded_preview_without_image_copies(self):
+        collections = [
+            LibraryCandidateSet(
+                self.library_a,
+                PreparedSearchCandidates(
+                    query_type="text",
+                    hits=[
+                        candidate(
+                            f"doc-{index}",
+                            index / 100.0,
+                            f"{index:064x}",
+                            self.source_a,
+                        )
+                        for index in range(1, 21)
+                    ],
+                ),
+            )
+        ]
+
+        with mock.patch(
+            "image_vector_service.result_exporter.shutil.copy2"
+        ) as copy_file:
+            report = export_federated_search(
+                ServiceConfig(
+                    workspace=self.root / "workspace",
+                    results_directory=self.results,
+                ),
+                PreparedSearch(
+                    query_type="text",
+                    text="query",
+                    text_vector=[1.0],
+                ),
+                collections,
+                top_k=20,
+                image_weight=0.5,
+                text_weight=0.5,
+                tags=None,
+                tag_mode="all",
+                copy_files=False,
+            )
+
+        copy_file.assert_not_called()
+        self.assertEqual(report["result_count"], 20)
+        self.assertEqual(report["result_storage"], "source_only")
+        self.assertEqual(len(report["results"]), 15)
+        self.assertTrue(report["results_truncated"])
+        self.assertTrue(all(hit["copied_file"] is None for hit in report["results"]))
+        output_dir = Path(report["output_dir"])
+        self.assertEqual(
+            {path.name for path in output_dir.iterdir()},
+            {RESULT_OWNERSHIP_MARKER, "results.json", RESULT_STORE_FILENAME},
+        )
+
+    def test_source_only_image_export_excludes_query_content_hash(self):
+        excluded_hash = "a" * 64
+        collections = [
+            LibraryCandidateSet(
+                self.library_a,
+                PreparedSearchCandidates(
+                    query_type="image",
+                    hits=[
+                        candidate("query-copy", 0.01, excluded_hash, self.source_a),
+                        candidate("other", 0.20, "b" * 64, self.source_duplicate),
+                    ],
+                ),
+            )
+        ]
+
+        report = export_federated_search(
+            ServiceConfig(
+                workspace=self.root / "workspace",
+                results_directory=self.results,
+            ),
+            PreparedSearch(
+                query_type="image",
+                image_path=str(self.source_a),
+                image_sha256=excluded_hash,
+                image_vector=[1.0],
+            ),
+            collections,
+            top_k=2,
+            image_weight=0.5,
+            text_weight=0.5,
+            tags=None,
+            tag_mode="all",
+            copy_files=False,
+        )
+
+        self.assertEqual(report["result_count"], 1)
+        self.assertEqual([item["doc_id"] for item in report["results"]], ["other"])
+        self.assertEqual(report["result_storage"], "source_only")
 
 
 if __name__ == "__main__":

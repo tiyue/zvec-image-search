@@ -459,6 +459,10 @@ class TagAliasRequestTest(unittest.TestCase):
             TagAliasDeleteRequest("library-a", "x" * 257)
 
     def test_clustering_and_active_learning_validate_safe_bounds(self) -> None:
+        self.assertEqual(
+            ClusterImagesRequest("library-a").to_params()["cluster_types"],
+            ["exact", "perceptual"],
+        )
         with self.assertRaises(LibraryTaskValidationError):
             ClusterImagesRequest("library-a", cluster_types=())
         with self.assertRaises(LibraryTaskValidationError):

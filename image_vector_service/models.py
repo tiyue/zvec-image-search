@@ -300,7 +300,11 @@ class ExportedHit:
     distance: float
     root_id: str
     relative_path: str
-    copied_file: str
+    # Search sessions may either own a copied result file or point back to the
+    # immutable logical source (library/root/relative path).  Keeping this
+    # optional lets the desktop gallery avoid duplicating every hit while the
+    # explicit export workflow can still create real copies on demand.
+    copied_file: str | None
     doc_id: str
     tags: list[str] = field(default_factory=list)
     sha256: str | None = None
@@ -339,12 +343,17 @@ class SearchReport:
     output_dir: str
     result_count: int
     results: list[ExportedHit] = field(default_factory=list)
+    # ``results`` can be a bounded first-page preview while ``result_count``
+    # remains authoritative and arbitrary pages live in results.sqlite3.
+    results_truncated: bool = False
     copy_failures: list[FileFailure] = field(default_factory=list)
+    copy_failure_count: int = 0
     request_ids: list[str] = field(default_factory=list)
     usage: list[dict[str, Any]] = field(default_factory=list)
     embedding_sources: dict[str, str] = field(default_factory=dict)
     library_ids: list[str] = field(default_factory=list)
     library_names: list[str] = field(default_factory=list)
+    result_storage: str = "copied"
     status: str = "ok"
     candidate_count: int = 0
     filtered_count: int = 0

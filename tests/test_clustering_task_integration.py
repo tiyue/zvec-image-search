@@ -19,8 +19,19 @@ class _State:
     def __init__(self, entries: list[dict[str, Any]]) -> None:
         self.entries = entries
 
-    def list_entries(self) -> list[dict[str, Any]]:
-        return [dict(entry) for entry in self.entries]
+    def count(self) -> int:
+        return len(self.entries)
+
+    def iter_entries(self, *, chunk_size: int = 256):
+        for offset in range(0, len(self.entries), chunk_size):
+            yield [dict(entry) for entry in self.entries[offset : offset + chunk_size]]
+
+    def get_document_annotations(self, doc_ids: Any) -> dict[str, dict[str, Any]]:
+        return {
+            doc_id: annotation
+            for doc_id in (str(value) for value in doc_ids)
+            if (annotation := self.get_document_annotation(doc_id)) is not None
+        }
 
     def get_document_annotation(self, doc_id: str) -> dict[str, Any] | None:
         if doc_id not in {"doc-a", "doc-b"}:
@@ -218,6 +229,14 @@ class ClusteringTaskIntegrationTests(unittest.TestCase):
             recover_interrupted=False,
         )
         self.service = service
+
+    def test_default_clustering_skips_semantic_vector_queries(self) -> None:
+        result = self.service.cluster_images(scope="all")
+
+        self.assertEqual(result["semantic_query_count"], 0)
+        self.assertEqual(self.repository.fetch_count, 0)
+        self.assertEqual(self.repository.query_count, 0)
+        self.assertEqual(result["api_requests"], 0)
 
     def test_cluster_task_reuses_vectors_without_embedding_api_requests(self) -> None:
         first = self.service.cluster_images(

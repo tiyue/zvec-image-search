@@ -4,11 +4,15 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Sized
+from contextlib import suppress
+from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
+from uuid import uuid4
 
 from .config import ConfigurationError, ServiceConfig
 from .models import (
@@ -17,6 +21,16 @@ from .models import (
     SearchHit,
     SearchReport,
     SearchSortMode,
+)
+from .search_result_store import (
+    RESULT_STORE_FILENAME,
+    SearchResultStoreError,
+    iter_result_file_references,
+    parse_result_store_reference,
+    write_result_store,
+)
+from .search_result_store import (
+    result_count as stored_result_count,
 )
 
 WINDOWS_RESERVED_NAMES = {
@@ -31,10 +45,70 @@ BEIJING_TIMEZONE = timezone(timedelta(hours=8))
 RESULT_OWNERSHIP_MARKER = ".zvec-search-result.json"
 RESULT_OWNERSHIP_KIND = "zvec-search-result"
 RESULT_OWNERSHIP_SCHEMA_VERSION = 1
+RESULT_MANIFEST_SCHEMA_VERSION = 3
+RESULT_MANIFEST_INLINE_LIMIT = 15
+RESULT_FAILURE_PREVIEW_LIMIT = 200
+RESULT_HASH_MEMORY_LIMIT = 4_096
 RESULT_DIRECTORY_NAME_PATTERN = re.compile(
     r"^.+_(?P<timestamp>\d{8}_\d{6}_\d{3})(?:_(?P<suffix>\d{2}))?$",
     re.UNICODE,
 )
+
+
+def search_report_payload(
+    report: SearchReport,
+    *,
+    result_limit: int | None = None,
+) -> dict[str, Any]:
+    """Serialize a report while optionally bounding its inline result preview."""
+
+    if result_limit is not None and (
+        isinstance(result_limit, bool)
+        or not isinstance(result_limit, int)
+        or result_limit < 0
+    ):
+        raise ValueError("result_limit must be a non-negative integer or None")
+    selected = report.results if result_limit is None else report.results[:result_limit]
+    selected_failures = (
+        report.copy_failures
+        if result_limit is None
+        else report.copy_failures[:RESULT_FAILURE_PREVIEW_LIMIT]
+    )
+    failure_total = max(report.copy_failure_count, len(report.copy_failures))
+    payload: dict[str, Any] = {
+        "query_type": report.query_type,
+        "output_dir": report.output_dir,
+        "result_count": report.result_count,
+        "results": [asdict(item) for item in selected],
+        "copy_failures": [asdict(item) for item in selected_failures],
+        "copy_failure_count": failure_total,
+        "request_ids": list(report.request_ids),
+        "usage": list(report.usage),
+        "embedding_sources": dict(report.embedding_sources),
+        "library_ids": list(report.library_ids),
+        "library_names": list(report.library_names),
+        "result_storage": report.result_storage,
+        "status": report.status,
+        "candidate_count": report.candidate_count,
+        "filtered_count": report.filtered_count,
+        "latency_ms": report.latency_ms,
+        "ranking_mode": report.ranking_mode,
+        "sort_mode": report.sort_mode,
+        "show_low_confidence": report.show_low_confidence,
+        "low_confidence_override": report.low_confidence_override,
+    }
+    if result_limit is not None or report.results_truncated:
+        payload["results_truncated"] = (
+            report.results_truncated or report.result_count > len(selected)
+        )
+        payload["results_inline_count"] = len(selected)
+    if result_limit is not None or failure_total > len(selected_failures):
+        payload["copy_failures_truncated"] = failure_total > len(selected_failures)
+    if report.ranking_diagnostics is not None:
+        payload["ranking_diagnostics"] = report.ranking_diagnostics
+    if report.search_quality is not None:
+        payload["search_quality"] = report.search_quality
+    return payload
 
 
 def _safe_name(value: str, limit: int = 60) -> str:
@@ -64,10 +138,109 @@ def _unique_result_directory(results_path: Path, base_name: str) -> Path:
     return candidate
 
 
+def _safe_logical_relative_path(value: str) -> bool:
+    if not value:
+        return False
+    windows_path = PureWindowsPath(value)
+    posix_path = PurePosixPath(value.replace("\\", "/"))
+    return not (
+        windows_path.is_absolute()
+        or windows_path.drive
+        or posix_path.is_absolute()
+        or any(part in {"", ".", ".."} for part in posix_path.parts)
+    )
+
+
+class _BoundedHashDeduplicator:
+    """Keep small searches in memory and spill large SHA sets to SQLite."""
+
+    def __init__(self, output_dir: Path) -> None:
+        self._path = output_dir / ".result-hashes.sqlite3.tmp"
+        self._memory: set[str] = set()
+        self._connection: sqlite3.Connection | None = None
+
+    def remember(self, sha256: str) -> bool:
+        if not sha256:
+            return True
+        if self._connection is None and len(self._memory) < RESULT_HASH_MEMORY_LIMIT:
+            if sha256 in self._memory:
+                return False
+            self._memory.add(sha256)
+            return True
+        connection = self._ensure_connection()
+        try:
+            cursor = connection.execute(
+                "INSERT OR IGNORE INTO seen_hashes(sha256) VALUES (?)",
+                (sha256,),
+            )
+        except sqlite3.Error as exc:
+            raise SearchResultStoreError(
+                f"Could not deduplicate search results: {exc}"
+            ) from exc
+        return cursor.rowcount == 1
+
+    def close(self) -> None:
+        if self._connection is not None:
+            try:
+                self._connection.close()
+            finally:
+                self._connection = None
+        for candidate in (
+            self._path,
+            self._path.with_name(f"{self._path.name}-journal"),
+            self._path.with_name(f"{self._path.name}-wal"),
+            self._path.with_name(f"{self._path.name}-shm"),
+        ):
+            # An undeclared temporary file makes later cleanup fail closed;
+            # it is safer to leave it than to broaden ownership rules.
+            with suppress(OSError):
+                candidate.unlink(missing_ok=True)
+
+    def forget(self, sha256: str) -> None:
+        if not sha256:
+            return
+        if self._connection is None:
+            self._memory.discard(sha256)
+            return
+        try:
+            self._connection.execute(
+                "DELETE FROM seen_hashes WHERE sha256 = ?", (sha256,)
+            )
+        except sqlite3.Error as exc:
+            raise SearchResultStoreError(
+                f"Could not update search-result deduplication: {exc}"
+            ) from exc
+
+    def _ensure_connection(self) -> sqlite3.Connection:
+        if self._connection is not None:
+            return self._connection
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = sqlite3.connect(str(self._path), timeout=30.0)
+            connection.execute("PRAGMA journal_mode = OFF")
+            connection.execute("PRAGMA synchronous = OFF")
+            connection.execute(
+                "CREATE TABLE seen_hashes (sha256 TEXT PRIMARY KEY) WITHOUT ROWID"
+            )
+            connection.executemany(
+                "INSERT INTO seen_hashes(sha256) VALUES (?)",
+                ((value,) for value in self._memory),
+            )
+            self._memory.clear()
+            self._connection = connection
+            return connection
+        except sqlite3.Error as exc:
+            if connection is not None:
+                connection.close()
+            raise SearchResultStoreError(
+                f"Could not initialize search-result deduplication: {exc}"
+            ) from exc
+
+
 def export_results(
     config: ServiceConfig,
     query_type: str,
-    hits: list[SearchHit],
+    hits: Iterable[SearchHit],
     top_k: int,
     query: dict[str, Any],
     request_ids: list[str],
@@ -88,7 +261,31 @@ def export_results(
     ranking_diagnostics: dict[str, object] | None = None,
     show_low_confidence: bool = False,
     low_confidence_override: bool = False,
+    copy_files: bool = True,
+    report_result_limit: int | None = None,
+    exclude_sha256: str | None = None,
 ) -> SearchReport:
+    """Publish a search session and optionally copy its source images.
+
+    ``copy_files=True`` preserves the historical CLI/export behavior. Desktop
+    search can set it to ``False`` and retain only a bounded report preview.
+    Source-only publication trusts the indexed logical identity and performs
+    filesystem checks only when a page is displayed, avoiding one stat per hit.
+    """
+
+    if not isinstance(copy_files, bool):
+        raise ValueError("copy_files must be a boolean")
+    if report_result_limit is not None and (
+        isinstance(report_result_limit, bool)
+        or not isinstance(report_result_limit, int)
+        or report_result_limit < 0
+    ):
+        raise ValueError("report_result_limit must be a non-negative integer or None")
+    effective_report_limit = (
+        RESULT_MANIFEST_INLINE_LIMIT
+        if not copy_files and report_result_limit is None
+        else report_result_limit
+    )
     config.results_path.mkdir(parents=True, exist_ok=True)
     directory_name = _result_directory_name(query_type, query)
     output_dir = _unique_result_directory(config.results_path, directory_name)
@@ -97,68 +294,111 @@ def export_results(
     normalized_exclude = (
         os.path.normcase(str(Path(exclude_path).resolve())) if exclude_path else None
     )
-    seen_hashes: set[str] = set()
-    exported: list[ExportedHit] = []
+    deduplicator = _BoundedHashDeduplicator(output_dir)
+    report_results: list[ExportedHit] = []
     failures: list[FileFailure] = []
+    failure_count = 0
+    exported_count = 0
+    inspected_count = 0
+    input_count_hint = len(hits) if isinstance(hits, Sized) else None
+    configured_library_ids = library_ids or []
+    configured_library_names = library_names or []
 
-    for hit in hits:
-        if len(exported) >= top_k:
-            break
-        root_id = str(hit.fields.get("root_id") or "")
-        relative_path = str(hit.fields.get("relative_path") or "")
-        try:
-            source = resolve_source(hit)
-        except (OSError, ValueError, ConfigurationError) as exc:
-            failures.append(FileFailure(relative_path, str(exc)))
-            continue
-        normalized_source = os.path.normcase(str(source.resolve())) if source else ""
-        if normalized_exclude and normalized_source == normalized_exclude:
-            continue
-        sha256 = str(hit.fields.get("sha256") or "")
-        if sha256 and sha256 in seen_hashes:
-            continue
-        if not source.is_file():
-            failures.append(FileFailure(relative_path, "source image no longer exists"))
-            continue
+    def record_failure(path: str, error: str) -> None:
+        nonlocal failure_count
+        failure_count += 1
+        if len(failures) < RESULT_FAILURE_PREVIEW_LIMIT:
+            failures.append(FileFailure(path, error))
 
-        display_score = (
-            hit.fused_score
-            if hit.fused_score is not None
-            else float(hit.confidence or 0.0)
-            if hit.rank_source == "tag"
-            else float(hit.raw_score or 0.0)
-            if hit.rank_source == "fused"
-            else hit.distance
-        )
-        rank = len(exported) + 1
-        value_label = (
-            "rrf"
-            if hit.fused_score is not None
-            else "tag"
-            if hit.rank_source == "tag"
-            else "confidence"
-            if hit.rank_source == "fused"
-            else "distance"
-        )
-        destination_name = (
-            f"{rank:03d}_{value_label}_{display_score:.6f}_"
-            f"{_safe_name(source.stem, 80)}{source.suffix.lower()}"
-        )
-        destination = output_dir / destination_name
-        if destination.exists():
-            destination = output_dir / (
-                f"{destination.stem}_{hit.doc_id[:8]}{destination.suffix}"
-            )
-        try:
-            shutil.copy2(source, destination)
-        except OSError as exc:
-            failures.append(FileFailure(str(source), str(exc)))
-            continue
+    def iter_exported_payloads() -> Iterable[dict[str, Any]]:
+        nonlocal exported_count, inspected_count
+        for hit in hits:
+            if exported_count >= top_k:
+                break
+            inspected_count += 1
+            root_id = str(hit.fields.get("root_id") or "").strip()
+            relative_path = str(hit.fields.get("relative_path") or "").strip()
+            library_id = str(hit.fields.get("library_id") or "").strip()
+            if not library_id:
+                if len(configured_library_ids) == 1:
+                    library_id = configured_library_ids[0]
+                elif config.library_id:
+                    library_id = config.library_id
+            library_name = str(hit.fields.get("library_name") or "").strip()
+            if not library_name and len(configured_library_names) == 1:
+                library_name = configured_library_names[0]
+            if not copy_files and (
+                not library_id
+                or not root_id
+                or not _safe_logical_relative_path(relative_path)
+            ):
+                record_failure(
+                    relative_path,
+                    "source-only result has incomplete library/root/path identity",
+                )
+                continue
+            sha256 = str(hit.fields.get("sha256") or "")
+            if exclude_sha256 and sha256 == exclude_sha256:
+                continue
+            if not deduplicator.remember(sha256):
+                continue
 
-        seen_hashes.add(sha256)
-        exported.append(
-            ExportedHit(
-                rank=rank,
+            copied_file: str | None = None
+            if copy_files:
+                try:
+                    source = resolve_source(hit)
+                except (OSError, ValueError, ConfigurationError) as exc:
+                    deduplicator.forget(sha256)
+                    record_failure(relative_path, str(exc))
+                    continue
+                normalized_source = (
+                    os.path.normcase(str(source.resolve())) if source else ""
+                )
+                if normalized_exclude and normalized_source == normalized_exclude:
+                    deduplicator.forget(sha256)
+                    continue
+                if not source.is_file():
+                    deduplicator.forget(sha256)
+                    record_failure(relative_path, "source image no longer exists")
+                    continue
+                display_score = (
+                    hit.fused_score
+                    if hit.fused_score is not None
+                    else float(hit.confidence or 0.0)
+                    if hit.rank_source == "tag"
+                    else float(hit.raw_score or 0.0)
+                    if hit.rank_source == "fused"
+                    else hit.distance
+                )
+                value_label = (
+                    "rrf"
+                    if hit.fused_score is not None
+                    else "tag"
+                    if hit.rank_source == "tag"
+                    else "confidence"
+                    if hit.rank_source == "fused"
+                    else "distance"
+                )
+                destination_name = (
+                    f"{exported_count + 1:03d}_{value_label}_{display_score:.6f}_"
+                    f"{_safe_name(source.stem, 80)}{source.suffix.lower()}"
+                )
+                destination = output_dir / destination_name
+                if destination.exists():
+                    destination = output_dir / (
+                        f"{destination.stem}_{hit.doc_id[:8]}{destination.suffix}"
+                    )
+                try:
+                    shutil.copy2(source, destination)
+                except OSError as exc:
+                    deduplicator.forget(sha256)
+                    record_failure(str(source), str(exc))
+                    continue
+                copied_file = destination.name
+
+            exported_count += 1
+            exported_hit = ExportedHit(
+                rank=exported_count,
                 distance=hit.distance,
                 fused_score=hit.fused_score,
                 raw_score=float(
@@ -178,19 +418,19 @@ def export_results(
                 rank_agreement=hit.rank_agreement,
                 root_id=root_id,
                 relative_path=relative_path,
-                copied_file=destination.name,
+                copied_file=copied_file,
                 doc_id=hit.doc_id,
                 tags=[str(tag) for tag in (hit.fields.get("tags") or [])],
                 matched_tags=list(hit.matched_tags),
                 sha256=sha256 or None,
-                library_id=str(hit.fields.get("library_id") or ""),
-                library_name=str(hit.fields.get("library_name") or ""),
+                library_id=library_id,
+                library_name=library_name,
                 ranking_model_version=hit.ranking_model_version,
                 ranking_score=hit.ranking_score,
                 feature_schema_version=hit.feature_schema_version,
                 ranking_fallback=hit.ranking_fallback,
                 ranking_fallback_reason=hit.ranking_fallback_reason,
-                calibrated_minimum_confidence=(hit.calibrated_minimum_confidence),
+                calibrated_minimum_confidence=hit.calibrated_minimum_confidence,
                 calibration_version=hit.calibration_version,
                 calibration_scope=hit.calibration_scope,
                 calibration_fallback=hit.calibration_fallback,
@@ -200,23 +440,55 @@ def export_results(
                     else None
                 ),
             )
-        )
+            if (
+                effective_report_limit is None
+                or len(report_results) < effective_report_limit
+            ):
+                report_results.append(exported_hit)
+            yield asdict(exported_hit)
 
+    created_at = datetime.now().astimezone().isoformat()
+    session_id = uuid4().hex
+    try:
+        try:
+            result_store = write_result_store(
+                output_dir / RESULT_STORE_FILENAME,
+                session_id=session_id,
+                created_at=created_at,
+                results=iter_exported_payloads(),
+            )
+        except SearchResultStoreError as exc:
+            raise ConfigurationError(
+                f"Could not write paged search results: {exc}"
+            ) from exc
+    finally:
+        deduplicator.close()
+
+    authoritative_candidate_count = (
+        candidate_count
+        if candidate_count is not None
+        else input_count_hint
+        if input_count_hint is not None
+        else inspected_count
+    )
     report = SearchReport(
         query_type=query_type,
         output_dir=str(output_dir),
-        result_count=len(exported),
-        results=exported,
+        result_count=result_store.result_count,
+        results=report_results,
+        results_truncated=result_store.result_count > len(report_results),
         copy_failures=failures,
+        copy_failure_count=failure_count,
         request_ids=[item for item in request_ids if item],
         usage=usage,
         embedding_sources=embedding_sources or {},
-        library_ids=library_ids or [],
-        library_names=library_names or [],
+        library_ids=configured_library_ids,
+        library_names=configured_library_names,
+        result_storage="copied" if copy_files else "source_only",
         status=status,
-        candidate_count=len(hits) if candidate_count is None else candidate_count,
+        candidate_count=authoritative_candidate_count,
         filtered_count=(
-            max(0, len(hits) - len(exported))
+            max(0, authoritative_candidate_count - result_store.result_count)
             if filtered_count is None
             else filtered_count
         ),
@@ -228,7 +500,17 @@ def export_results(
         low_confidence_override=low_confidence_override,
         search_quality=search_quality,
     )
+
+    # Keep a small inline first-page preview for older tools while making the
+    # immutable SQLite sidecar authoritative for counts and arbitrary pages.
+    # Building the manifest summary explicitly avoids ``SearchReport.to_dict``
+    # recursively duplicating every result in memory.
+    report_summary = search_report_payload(
+        report, result_limit=RESULT_MANIFEST_INLINE_LIMIT
+    )
     manifest = {
+        "manifest_schema_version": RESULT_MANIFEST_SCHEMA_VERSION,
+        "result_storage": report.result_storage,
         "query_type": query_type,
         "query": query,
         "model": config.model,
@@ -279,8 +561,9 @@ def export_results(
             ),
         },
         **({"search_quality": search_quality} if search_quality is not None else {}),
-        "created_at": datetime.now().astimezone().isoformat(),
-        **report.to_dict(),
+        "created_at": created_at,
+        **report_summary,
+        "result_store": result_store.to_dict(),
     }
     manifest_path = output_dir / "results.json"
     temporary_manifest = manifest_path.with_suffix(".json.tmp")
@@ -535,11 +818,9 @@ def _validate_cleanup_candidate(path: Path, root: Path) -> str | None:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:  # pragma: no cover - base check
         return f"missing or invalid results manifest: {exc}"
-    raw_results = manifest.get("results") if isinstance(manifest, dict) else None
-    if not isinstance(raw_results, list):  # pragma: no cover - base check
-        return "results manifest has no results array"
-
-    declared, declaration_error = _cleanup_declared_names(raw_results)
+    if not isinstance(manifest, dict):  # pragma: no cover - base check
+        return "results manifest must be an object"
+    declared, declaration_error = _cleanup_declared_names_from_manifest(path, manifest)
     if declaration_error is not None:
         return declaration_error
 
@@ -567,12 +848,16 @@ def _validate_cleanup_candidate(path: Path, root: Path) -> str | None:
 
 def _cleanup_declared_names(
     raw_results: list[Any],
+    *,
+    source_only: bool = False,
 ) -> tuple[set[str], str | None]:
     declared = {RESULT_OWNERSHIP_MARKER, "results.json"}
     for index, result in enumerate(raw_results):
         if not isinstance(result, dict):
             return declared, f"results[{index}] must be an object"
         copied_file = result.get("copied_file")
+        if source_only and copied_file is None:
+            continue
         if (
             not isinstance(copied_file, str)
             or not copied_file.strip()
@@ -590,6 +875,88 @@ def _cleanup_declared_names(
     return declared, None
 
 
+def _cleanup_declared_names_from_manifest(
+    result_directory: Path,
+    manifest: dict[str, Any],
+) -> tuple[set[str], str | None]:
+    storage_mode, storage_error = _cleanup_result_storage_mode(manifest)
+    if storage_error is not None:
+        return {RESULT_OWNERSHIP_MARKER, "results.json"}, storage_error
+    source_only = storage_mode == "source_only"
+    raw_store = manifest.get("result_store")
+    if raw_store is None:
+        raw_results = manifest.get("results")
+        if not isinstance(raw_results, list):
+            return (
+                {RESULT_OWNERSHIP_MARKER, "results.json"},
+                "results manifest has no results array",
+            )
+        return _cleanup_declared_names(raw_results, source_only=source_only)
+
+    declared = {
+        RESULT_OWNERSHIP_MARKER,
+        "results.json",
+        RESULT_STORE_FILENAME,
+    }
+    try:
+        reference = parse_result_store_reference(raw_store)
+        store_path = result_directory / reference.path
+        actual_count = stored_result_count(store_path, reference.session_id)
+        if actual_count != reference.result_count:
+            return declared, "result store count does not match its manifest reference"
+        manifest_count = manifest.get("result_count")
+        if manifest_count != actual_count:
+            return declared, "result_count does not match the result store"
+        seen_count = 0
+        for index, copied_file in enumerate(
+            iter_result_file_references(store_path, session_id=reference.session_id)
+        ):
+            seen_count = index + 1
+            if copied_file is None:
+                if not source_only:
+                    return (
+                        declared,
+                        f"stored result {index + 1} has no copied filename",
+                    )
+                continue
+            if (
+                not copied_file.strip()
+                or copied_file != Path(copied_file).name
+                or "/" in copied_file
+                or "\\" in copied_file
+            ):
+                return declared, f"stored result {index + 1} has an unsafe filename"
+            if copied_file in declared:
+                return (
+                    declared,
+                    f"stored result {index + 1} filename is duplicated or reserved",
+                )
+            declared.add(copied_file)
+        if seen_count != actual_count:
+            return declared, "result store row count does not match its session count"
+    except SearchResultStoreError as exc:
+        return declared, f"invalid result store: {exc}"
+    return declared, None
+
+
+def _cleanup_result_storage_mode(
+    manifest: dict[str, Any],
+) -> tuple[str, str | None]:
+    raw_version = manifest.get("manifest_schema_version")
+    if raw_version is None or (
+        isinstance(raw_version, int)
+        and not isinstance(raw_version, bool)
+        and raw_version in {1, 2}
+    ):
+        return "copied", None
+    if raw_version != RESULT_MANIFEST_SCHEMA_VERSION:
+        return "", f"unsupported result manifest schema_version: {raw_version!r}"
+    mode = manifest.get("result_storage")
+    if mode not in {"copied", "source_only"}:
+        return "", "result manifest schema 3 has invalid result_storage"
+    return str(mode), None
+
+
 def _delete_cleanup_candidate(path: Path, root: Path) -> None:
     """Delete only manifest-declared files, then remove the empty directory."""
 
@@ -598,8 +965,11 @@ def _delete_cleanup_candidate(path: Path, root: Path) -> None:
         raise OSError(reason)
     try:
         manifest = json.loads((path / "results.json").read_text(encoding="utf-8"))
-        raw_results = manifest["results"]
-        declared, declaration_error = _cleanup_declared_names(raw_results)
+        if not isinstance(manifest, dict):
+            raise OSError("results manifest must be an object")
+        declared, declaration_error = _cleanup_declared_names_from_manifest(
+            path, manifest
+        )
         if declaration_error is not None:
             raise OSError(declaration_error)
         # Result copies go first. Ownership evidence is removed last, so a partial

@@ -62,6 +62,7 @@ const requiresAllScopeConfirmation = computed(
 
 const jobsState = useJobs(undefined, {
   autoStart: false,
+  pollSubmittedJobs: false,
   onError: (title, message) => {
     noticeKind.value = "error";
     notice.value = `${title}：${message}`;

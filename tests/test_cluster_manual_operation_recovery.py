@@ -13,6 +13,7 @@ from PIL import Image
 from image_vector_service.annotation_service import AutoTaggingCoordinator
 from image_vector_service.auto_tag_cache import SharedAutoTagCache
 from image_vector_service.cluster_operation_store import ClusterOperationStore
+from image_vector_service.collection_write_coordinator import CollectionWriteResult
 from image_vector_service.config import ServiceConfig
 from image_vector_service.image_clustering import (
     ClusterEdge,
@@ -167,6 +168,34 @@ class _Repository:
         self.optimize_count += 1
 
 
+class _CollectionWrites:
+    """Test-only durable-writer seam with the same success boundary as production."""
+
+    def __init__(self, repository: _Repository, state: _State) -> None:
+        self.repository = repository
+        self.state = state
+
+    def upsert(
+        self,
+        writes: Any,
+        *,
+        operation_kind: str = "test_upsert",
+    ) -> CollectionWriteResult:
+        del operation_kind
+        result = CollectionWriteResult()
+        for prepared in writes:
+            succeeded, failures = self.repository.upsert_records(
+                [prepared.record],
+                list(prepared.image_vector),
+                list(prepared.effective_tags),
+            )
+            result.succeeded.extend(succeeded)
+            result.failures.update(failures)
+            if succeeded:
+                self.state.set_many([dict(prepared.state_entry)])
+        return result
+
+
 def _entry(root: Path, doc_id: str, index: int) -> dict[str, Any]:
     path = root / f"{doc_id}.png"
     Image.new("RGB", (12, 10), (index % 255, 90, 150)).save(path)
@@ -267,11 +296,14 @@ class ClusterManualOperationRecoveryTests(unittest.TestCase):
         service.cancel_check = lambda: None
         service.progress = lambda _message: None
         service.logger = logging.getLogger("cluster-p1-tests")
+        collection_writes = _CollectionWrites(repository, state)
+        service.collection_writes = collection_writes
         service.auto_tagging = AutoTaggingCoordinator(
             config=config,
             state=state,
             repository=repository,
             cache=cache,
+            collection_writes=collection_writes,
             source_resolver=resolver,
             progress=lambda _message: None,
             cancel_check=lambda: None,
@@ -343,7 +375,9 @@ class ClusterManualOperationRecoveryTests(unittest.TestCase):
         self.assertEqual(result["failures"][0]["doc_id"], "doc-b")
         self.assertEqual(service.state.get("doc-b")["inherited_tags"], [])
         self.assertEqual(service.state.get("doc-c")["inherited_tags"], ["原神"])
-        self.assertEqual(service.repository.optimize_count, 1)
+        # Tag writes are immediately durable; expensive Collection compaction
+        # is now deferred to the library worker's idle maintenance policy.
+        self.assertEqual(service.repository.optimize_count, 0)
 
     def test_merge_and_split_rules_survive_full_reclustering(self) -> None:
         vectors = {

@@ -509,6 +509,7 @@ function handleGlobalKeydown(event: KeyboardEvent): void {
 
 function updatePreviewVisibility(event?: MediaQueryListEvent): void {
   previewVisible.value = event ? event.matches : Boolean(previewMedia?.matches);
+  search.setPreviewEnabled(previewVisible.value);
 }
 
 onMounted(() => {

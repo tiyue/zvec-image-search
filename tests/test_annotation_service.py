@@ -16,7 +16,17 @@ from unittest.mock import patch
 
 from PIL import Image
 
-from image_vector_service.annotation_service import AutoTaggingRequestError, _cache_key
+from image_vector_service.annotation_service import (
+    FOLDER_INHERITANCE_AUDIT_LIMIT,
+    FOLDER_INHERITANCE_GLOBAL_FILTER_SAMPLE_LIMIT,
+    FOLDER_INHERITANCE_GLOBAL_SOURCE_SAMPLE_LIMIT,
+    FOLDER_INHERITANCE_GLOBAL_TAG_LIMIT,
+    FOLDER_INHERITANCE_TAG_LIMIT_PER_SOURCE,
+    AutoTaggingRequestError,
+    _cache_key,
+    _FolderInheritanceAggregate,
+    _FolderInheritanceMemoryBudget,
+)
 from image_vector_service.auto_tag_cache import SharedAutoTagCache
 from image_vector_service.auto_tagging_assets import FIELD_SPECS, FIELD_TAG_LABELS
 from image_vector_service.config import ServiceConfig
@@ -283,6 +293,214 @@ class FolderFallbackVisionClient(FakeVisionClient):
         payload = type(self).success_payload
         type(self).responses = {self.model: [payload]}
         return super().tag_image(path, context=context)
+
+
+class FolderInheritanceAggregateTest(unittest.TestCase):
+    @staticmethod
+    def _donor(
+        doc_id: str,
+        *,
+        manual_tags: tuple[str, ...] = (),
+        folder_tags: tuple[str, ...] = (),
+        accepted_auto_tags: tuple[str, ...] = (),
+    ) -> dict[str, Any]:
+        return {
+            "doc_id": doc_id,
+            "root_id": "root-a",
+            "relative_path": f"shared/{doc_id}.jpg",
+            "parent_directory": "shared",
+            "sha256": f"sha-{doc_id}",
+            "tags": list(manual_tags),
+            "folder_tags": list(folder_tags),
+            "accepted_auto_tags": list(accepted_auto_tags),
+        }
+
+    @staticmethod
+    def _accepted_annotation(donor: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "doc_id": donor["doc_id"],
+            "source_sha256": donor["sha256"],
+            "status": "accepted",
+            "structured": {},
+        }
+
+    def test_target_subtracts_only_itself_and_other_failed_manual_peer_can_donate(
+        self,
+    ) -> None:
+        aggregate = _FolderInheritanceAggregate(frozenset({"target", "peer"}))
+        target = self._donor(
+            "target",
+            manual_tags=("OnlySelf", "onlyself", "SharedTag", "sharedtag"),
+        )
+        peer = self._donor(
+            "peer",
+            manual_tags=("PeerCharacter", "SHAREDTAG"),
+        )
+
+        # A current failed annotation does not disqualify explicit manual tags.
+        aggregate.consume(
+            target,
+            {
+                "source_sha256": target["sha256"],
+                "status": "failed",
+                "structured": {},
+            },
+        )
+        aggregate.consume(
+            peer,
+            {
+                "source_sha256": peer["sha256"],
+                "status": "failed",
+                "structured": {},
+            },
+        )
+
+        target_payload = aggregate.payload(exclude_doc_id="target")
+        peer_payload = aggregate.payload(exclude_doc_id="peer")
+        self.assertNotIn("OnlySelf", target_payload["accepted_tags"])
+        self.assertIn("PeerCharacter", target_payload["accepted_tags"])
+        self.assertIn("SHAREDTAG", target_payload["accepted_tags"])
+        self.assertIn("OnlySelf", peer_payload["accepted_tags"])
+        self.assertNotIn("PeerCharacter", peer_payload["accepted_tags"])
+        self.assertEqual(target_payload["source_doc_ids_total"], 1)
+        self.assertEqual(target_payload["source_tags_total"]["manual"], 2)
+        self.assertTrue(
+            all(
+                not hasattr(occurrence, "target_contributors")
+                for bucket in aggregate.tags_by_source.values()
+                for occurrence in bucket.values()
+            )
+        )
+
+    def test_one_hundred_thousand_donors_keep_only_bounded_audit_samples(self) -> None:
+        walking = FIELD_TAG_LABELS[FIELD_SPECS["action"].values[1]]
+        aggregate = _FolderInheritanceAggregate(frozenset({"doc-0", "doc-1"}))
+
+        for index in range(100_000):
+            donor = self._donor(
+                f"doc-{index}",
+                manual_tags=("ManualCharacter", walking),
+                folder_tags=("manualcharacter", "FolderWork"),
+                accepted_auto_tags=("MANUALCHARACTER", "ModelIdentity"),
+            )
+            aggregate.consume(donor, self._accepted_annotation(donor))
+
+        payload = aggregate.payload(exclude_doc_id="doc-0")
+        self.assertEqual(payload["source_doc_ids_total"], 99_999)
+        self.assertEqual(len(payload["source_doc_ids"]), FOLDER_INHERITANCE_AUDIT_LIMIT)
+        self.assertTrue(payload["source_doc_ids_truncated"])
+        self.assertEqual(
+            len(payload["source_relative_paths"]), FOLDER_INHERITANCE_AUDIT_LIMIT
+        )
+        self.assertTrue(payload["source_relative_paths_truncated"])
+        self.assertEqual(payload["filtered_tags_total"], 99_999)
+        self.assertEqual(len(payload["filtered_tags"]), FOLDER_INHERITANCE_AUDIT_LIMIT)
+        self.assertTrue(payload["filtered_tags_truncated"])
+        self.assertNotIn(walking, payload["accepted_tags"])
+        self.assertEqual(
+            payload["accepted_tags"],
+            ["ManualCharacter", "FolderWork", "ModelIdentity"],
+        )
+        self.assertLessEqual(
+            len(aggregate.source_samples), FOLDER_INHERITANCE_AUDIT_LIMIT + 1
+        )
+        self.assertLessEqual(
+            len(aggregate.filtered_samples), FOLDER_INHERITANCE_AUDIT_LIMIT * 2
+        )
+        self.assertEqual(
+            sum(len(tags) for tags in aggregate.tags_by_source.values()),
+            5,
+        )
+
+    def test_one_hundred_thousand_unique_tags_stop_at_per_source_limit(self) -> None:
+        aggregate = _FolderInheritanceAggregate(frozenset())
+
+        for index in range(100_000):
+            donor = self._donor(
+                f"unique-{index}",
+                manual_tags=(f"UniqueTag-{index}",),
+            )
+            aggregate.consume(donor, None)
+
+        payload = aggregate.payload()
+        self.assertEqual(
+            len(aggregate.tags_by_source["manual"]),
+            FOLDER_INHERITANCE_TAG_LIMIT_PER_SOURCE,
+        )
+        self.assertEqual(
+            len(payload["accepted_tags"]),
+            FOLDER_INHERITANCE_TAG_LIMIT_PER_SOURCE,
+        )
+        self.assertEqual(payload["source_tags_total"]["manual"], 100_000)
+        self.assertEqual(
+            payload["source_tags_omitted"]["manual"],
+            100_000 - FOLDER_INHERITANCE_TAG_LIMIT_PER_SOURCE,
+        )
+        self.assertTrue(payload["source_tags_truncated"]["manual"])
+
+    def test_many_folders_share_one_global_retained_tag_budget(self) -> None:
+        memory_budget = _FolderInheritanceMemoryBudget()
+        aggregates: list[_FolderInheritanceAggregate] = []
+        folder_count = (
+            FOLDER_INHERITANCE_GLOBAL_TAG_LIMIT
+            // FOLDER_INHERITANCE_TAG_LIMIT_PER_SOURCE
+            + 10
+        )
+
+        for folder_index in range(folder_count):
+            aggregate = _FolderInheritanceAggregate(frozenset(), memory_budget)
+            donor = self._donor(
+                f"folder-{folder_index}",
+                manual_tags=tuple(
+                    f"Folder-{folder_index}-Tag-{tag_index}"
+                    for tag_index in range(FOLDER_INHERITANCE_TAG_LIMIT_PER_SOURCE)
+                ),
+            )
+            aggregate.consume(donor, None)
+            aggregates.append(aggregate)
+
+        retained = sum(
+            len(bucket)
+            for aggregate in aggregates
+            for bucket in aggregate.tags_by_source.values()
+        )
+        omitted = sum(
+            aggregate.omitted_tags_by_source["manual"] for aggregate in aggregates
+        )
+        self.assertEqual(retained, FOLDER_INHERITANCE_GLOBAL_TAG_LIMIT)
+        self.assertEqual(memory_budget.retained_tags, retained)
+        self.assertGreater(omitted, 0)
+
+    def test_many_folders_share_global_audit_sample_budgets(self) -> None:
+        walking = FIELD_TAG_LABELS[FIELD_SPECS["action"].values[1]]
+        memory_budget = _FolderInheritanceMemoryBudget()
+        aggregates: list[_FolderInheritanceAggregate] = []
+
+        # 600 folders x 100 eligible donors exceeds both 50k run-wide audit
+        # budgets while remaining cheap enough for a deterministic unit test.
+        for folder_index in range(600):
+            aggregate = _FolderInheritanceAggregate(frozenset(), memory_budget)
+            for donor_index in range(100):
+                donor = self._donor(
+                    f"audit-{folder_index}-{donor_index}",
+                    manual_tags=(walking,),
+                )
+                aggregate.consume(donor, None)
+            aggregates.append(aggregate)
+
+        self.assertEqual(
+            sum(len(aggregate.source_samples) for aggregate in aggregates),
+            FOLDER_INHERITANCE_GLOBAL_SOURCE_SAMPLE_LIMIT,
+        )
+        self.assertEqual(
+            sum(len(aggregate.filtered_samples) for aggregate in aggregates),
+            FOLDER_INHERITANCE_GLOBAL_FILTER_SAMPLE_LIMIT,
+        )
+        last_payload = aggregates[-1].payload()
+        self.assertEqual(last_payload["source_doc_ids_total"], 100)
+        self.assertTrue(last_payload["source_doc_ids_truncated"])
+        self.assertEqual(last_payload["filtered_tags_total"], 100)
+        self.assertTrue(last_payload["filtered_tags_truncated"])
 
 
 class AutoTaggingIntegrationTest(unittest.TestCase):
@@ -848,9 +1066,18 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
             work="Work-A",
         )
 
-        with patch(
-            "image_vector_service.annotation_service.DashScopeVisionTaggingClient",
-            FolderFallbackVisionClient,
+        with (
+            patch(
+                "image_vector_service.annotation_service.DashScopeVisionTaggingClient",
+                FolderFallbackVisionClient,
+            ),
+            patch.object(
+                self.service.state,
+                "list_entries",
+                side_effect=AssertionError(
+                    "folder inheritance must not read the complete library"
+                ),
+            ),
         ):
             report = self.service.auto_tag_images(
                 scope="latest_index_run",
@@ -1433,9 +1660,22 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
             )
 
         calls_after_tagging = FakeVisionClient.calls
-        first = self.service.pending_auto_tags(offset=0, limit=1)
-        second = self.service.pending_auto_tags(offset=1, limit=1)
-        beyond = self.service.pending_auto_tags(offset=2, limit=1)
+        with (
+            patch.object(
+                self.service.state,
+                "list_document_annotations",
+                side_effect=AssertionError("full annotation reads are forbidden"),
+            ),
+            patch.object(
+                self.service.state,
+                "get",
+                side_effect=AssertionError("per-proposal entry reads are forbidden"),
+            ),
+        ):
+            first = self.service.pending_auto_tags(offset=0, limit=1)
+            second = self.service.pending_auto_tags(offset=1, limit=1)
+            beyond = self.service.pending_auto_tags(offset=2, limit=1)
+            estimate = self.service.estimate_auto_tags(scope="untagged", max_images=10)
 
         self.assertEqual(FakeVisionClient.calls, calls_after_tagging)
         self.assertEqual(first["pending_count"], 2)
@@ -1451,6 +1691,9 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
         )
         self.assertEqual(beyond["proposals"], [])
         self.assertFalse(beyond["has_more"])
+        self.assertEqual(estimate["candidate_count"], 0)
+        self.assertEqual(estimate["pending_count"], 2)
+        self.assertEqual(len(estimate["proposals"]), 2)
 
         for offset, limit in ((-1, 1), (0, 0), (0, 501)):
             with self.assertRaises(AutoTaggingRequestError):

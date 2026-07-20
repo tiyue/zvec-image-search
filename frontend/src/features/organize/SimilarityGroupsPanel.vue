@@ -27,7 +27,11 @@ const groups = useSimilarityGroups(toRef(props, "libraryId"), props.api, {
 const runTypeOptions: Array<{ value: ClusterRunType; label: string; description: string }> = [
   { value: "exact", label: "完全重复", description: "SHA-256 完全一致" },
   { value: "perceptual", label: "视觉近似", description: "可选感知哈希" },
-  { value: "semantic", label: "内容相似", description: "复用现有图片向量" },
+  {
+    value: "semantic",
+    label: "内容相似",
+    description: "大图库耗时较长，按需启用",
+  },
 ];
 
 const filterOptions: Array<{ value: ClusterType; label: string }> = [
@@ -85,7 +89,7 @@ onMounted(() => {
       <div>
         <p class="intelligence-eyebrow">本地智能整理</p>
         <h2 id="similarity-groups-title">相似分组</h2>
-        <p>从现有哈希和向量中找出重复图、近似图与内容相似图片。</p>
+        <p>默认查找重复图和近似图；内容相似可按需启用。</p>
       </div>
       <div class="no-cost-badge" title="聚类不会请求阿里云模型">
         <span aria-hidden="true">◇</span>
@@ -141,6 +145,13 @@ onMounted(() => {
     </div>
 
     <div class="cluster-feedback">
+      <p
+        v-if="groups.clusterTypes.value.includes('semantic')"
+        class="semantic-performance-note"
+        role="status"
+      >
+        内容相似会逐张读取已有向量，大图库可能需要较长时间；任务可取消，不调用模型，也不会产生 API 费用。
+      </p>
       <div v-if="groups.busy.value || groups.statusMessage.value" class="operation-status" aria-live="polite">
         <div>
           <strong>{{ groups.statusMessage.value || "正在处理" }}</strong>
@@ -425,7 +436,7 @@ onMounted(() => {
 @media(max-width:1450px){.cluster-grid{grid-template-columns:repeat(3,minmax(0,1fr))}.cluster-controls{grid-template-columns:minmax(190px,.7fr) minmax(360px,1.5fr)}.cluster-run-actions{grid-column:1/-1;justify-content:flex-end}}
 @media(max-width:980px){.intelligence-panel{height:auto;overflow:visible}.intelligence-heading{align-items:flex-start;flex-direction:column}.cluster-controls{grid-template-columns:1fr}.cluster-controls fieldset{flex-wrap:wrap}.cluster-type-option{min-width:150px}.cluster-grid{grid-template-columns:repeat(2,minmax(0,1fr));max-height:none;overflow:visible}.cluster-member-grid{grid-template-columns:repeat(3,minmax(0,1fr))}}
 @media(max-width:620px){.cluster-grid{grid-template-columns:1fr}.cluster-controls fieldset{display:grid;grid-template-columns:1fr}.cluster-list-heading{align-items:stretch;flex-direction:column}.cluster-list-heading label{grid-template-columns:1fr}.cluster-member-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.propagation-policy{align-items:flex-start;flex-direction:column}}
-.cluster-feedback{display:grid;gap:7px;min-height:0}.cluster-operation-summary{display:grid;grid-template-columns:auto minmax(240px,1fr) auto;align-items:center;gap:10px;padding:8px 11px;border:1px solid #dedaf8;border-radius:11px;color:#5044aa;background:#f8f7ff}.cluster-operation-summary dl{display:grid;grid-template-columns:repeat(3,minmax(60px,1fr));gap:5px;margin:0}.cluster-operation-summary dl div{display:flex;align-items:baseline;justify-content:space-between;gap:5px;padding:4px 7px;border-radius:7px;background:#fff}.cluster-operation-summary dt{font-size:8px}.cluster-operation-summary dd{margin:0;font-size:11px;font-weight:850}.cluster-operation-summary small{overflow:hidden;color:#8b84ba;font-size:8px;text-overflow:ellipsis;white-space:nowrap}.cluster-list-heading>div:first-child{display:flex;align-items:baseline;gap:8px}.cluster-list-tools{display:flex;align-items:center;justify-content:flex-end;gap:7px}.cluster-list-tools>output{color:#6256b7;font-size:10px;font-weight:800}.cluster-card{position:relative}.cluster-card.selected{border-color:#6b5ce0;box-shadow:0 0 0 2px rgba(107,92,224,.14)}.cluster-select{position:absolute;z-index:3;top:8px;left:8px;display:flex;align-items:center;gap:4px;padding:4px 6px;border-radius:8px;color:#fff;background:rgba(21,27,43,.68);font-size:8px;backdrop-filter:blur(5px)}.cluster-select input{margin:0;accent-color:#7464e7}.cluster-preview:disabled{cursor:wait}.cluster-modal{width:min(1040px,100%);grid-template-rows:auto auto auto auto minmax(0,1fr) auto}.cluster-identity-editor{display:grid;grid-template-columns:160px minmax(260px,1fr) auto;align-items:end;gap:9px;padding:10px;border:1px solid #e4e1f5;border-radius:12px;background:#faf9ff}.cluster-identity-editor label{display:grid;gap:5px;color:#59637b;font-size:11px;font-weight:780}.cluster-identity-editor select,.cluster-identity-editor input{height:39px;border:1px solid #d9deea;border-radius:10px;padding:0 10px;color:#17203a;background:#fff;font:inherit}.identity-value-input{min-width:0}.cluster-member-toolbar,.cluster-detail-pagination{display:flex;align-items:center;justify-content:space-between;gap:12px}.cluster-member-toolbar{padding:8px 10px;border:1px solid #e5e8ef;border-radius:11px;color:#5e687f;background:#fafbfe;font-size:10px}.cluster-member-toolbar>div,.cluster-detail-pagination>div{display:flex;gap:7px}.cluster-member{cursor:pointer}.cluster-member.selected{border-color:#6b5ce0;background:#f3f1ff;box-shadow:0 0 0 2px rgba(107,92,224,.13)}.cluster-member:disabled{cursor:wait;opacity:.7}.cluster-detail-pagination{min-height:38px;border-top:1px solid #edf0f5;color:#788196;font-size:10px}
+.cluster-feedback{display:grid;gap:7px;min-height:0}.semantic-performance-note{margin:0;padding:9px 11px;border:1px solid #e4d9a7;border-radius:11px;color:#69551e;background:#fffbea;font-size:10px;line-height:1.5}.cluster-operation-summary{display:grid;grid-template-columns:auto minmax(240px,1fr) auto;align-items:center;gap:10px;padding:8px 11px;border:1px solid #dedaf8;border-radius:11px;color:#5044aa;background:#f8f7ff}.cluster-operation-summary dl{display:grid;grid-template-columns:repeat(3,minmax(60px,1fr));gap:5px;margin:0}.cluster-operation-summary dl div{display:flex;align-items:baseline;justify-content:space-between;gap:5px;padding:4px 7px;border-radius:7px;background:#fff}.cluster-operation-summary dt{font-size:8px}.cluster-operation-summary dd{margin:0;font-size:11px;font-weight:850}.cluster-operation-summary small{overflow:hidden;color:#8b84ba;font-size:8px;text-overflow:ellipsis;white-space:nowrap}.cluster-list-heading>div:first-child{display:flex;align-items:baseline;gap:8px}.cluster-list-tools{display:flex;align-items:center;justify-content:flex-end;gap:7px}.cluster-list-tools>output{color:#6256b7;font-size:10px;font-weight:800}.cluster-card{position:relative}.cluster-card.selected{border-color:#6b5ce0;box-shadow:0 0 0 2px rgba(107,92,224,.14)}.cluster-select{position:absolute;z-index:3;top:8px;left:8px;display:flex;align-items:center;gap:4px;padding:4px 6px;border-radius:8px;color:#fff;background:rgba(21,27,43,.68);font-size:8px;backdrop-filter:blur(5px)}.cluster-select input{margin:0;accent-color:#7464e7}.cluster-preview:disabled{cursor:wait}.cluster-modal{width:min(1040px,100%);grid-template-rows:auto auto auto auto minmax(0,1fr) auto}.cluster-identity-editor{display:grid;grid-template-columns:160px minmax(260px,1fr) auto;align-items:end;gap:9px;padding:10px;border:1px solid #e4e1f5;border-radius:12px;background:#faf9ff}.cluster-identity-editor label{display:grid;gap:5px;color:#59637b;font-size:11px;font-weight:780}.cluster-identity-editor select,.cluster-identity-editor input{height:39px;border:1px solid #d9deea;border-radius:10px;padding:0 10px;color:#17203a;background:#fff;font:inherit}.identity-value-input{min-width:0}.cluster-member-toolbar,.cluster-detail-pagination{display:flex;align-items:center;justify-content:space-between;gap:12px}.cluster-member-toolbar{padding:8px 10px;border:1px solid #e5e8ef;border-radius:11px;color:#5e687f;background:#fafbfe;font-size:10px}.cluster-member-toolbar>div,.cluster-detail-pagination>div{display:flex;gap:7px}.cluster-member{cursor:pointer}.cluster-member.selected{border-color:#6b5ce0;background:#f3f1ff;box-shadow:0 0 0 2px rgba(107,92,224,.13)}.cluster-member:disabled{cursor:wait;opacity:.7}.cluster-detail-pagination{min-height:38px;border-top:1px solid #edf0f5;color:#788196;font-size:10px}
 @media(max-width:1180px){.cluster-list-heading{align-items:flex-start;flex-direction:column}.cluster-list-tools{width:100%;flex-wrap:wrap;justify-content:flex-start}.cluster-operation-summary{grid-template-columns:1fr auto}.cluster-operation-summary dl{grid-column:1/-1;grid-row:2}}
 @media(max-width:980px){.cluster-identity-editor{grid-template-columns:1fr 2fr}.cluster-identity-editor button{grid-column:1/-1}}
 @media(max-width:620px){.cluster-list-tools{display:grid;grid-template-columns:1fr 1fr}.cluster-list-tools label,.cluster-list-tools output{grid-column:1/-1}.cluster-operation-summary{grid-template-columns:1fr}.cluster-operation-summary dl{grid-template-columns:1fr}.cluster-identity-editor{grid-template-columns:1fr}.cluster-member-toolbar,.cluster-detail-pagination{align-items:flex-start;flex-direction:column}}

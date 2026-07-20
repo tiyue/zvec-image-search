@@ -221,6 +221,23 @@ describe("useJobs", () => {
     wrapper.unmount();
   });
 
+  it("does not duplicate ActivityCenter polling after a task-page submission", async () => {
+    const api = fakeApi();
+    const { state, wrapper } = mountComposable(api, {
+      autoStart: false,
+      pollSubmittedJobs: false,
+      pollIntervalMs: 250,
+    });
+
+    expect(await state.submitJob({ task_type: "index", library_id: "people" })).toBe(true);
+    await vi.advanceTimersByTimeAsync(2_000);
+    await flushPromises();
+
+    expect(api.submit).toHaveBeenCalledTimes(1);
+    expect(api.list).not.toHaveBeenCalled();
+    wrapper.unmount();
+  });
+
   it("keeps successful work visible when one image fails", async () => {
     const api = fakeApi({
       list: vi.fn(async () => ({

@@ -56,6 +56,11 @@ interface JobsEvents {
   onInfo?: (title: string, message: string) => void;
   pollIntervalMs?: number;
   autoStart?: boolean;
+  /**
+   * Task pages backed by ActivityCenter already have one durable progress
+   * stream. Disable this legacy list poller there to avoid duplicate traffic.
+   */
+  pollSubmittedJobs?: boolean;
 }
 
 function firstText(...values: unknown[]): string {
@@ -377,8 +382,10 @@ export function useJobs(api: JobsApi = jobsApi, events: JobsEvents = {}) {
         "任务会按照后端运行配置的并发、限流与错误隔离策略安全执行。",
       );
       lastError.value = "";
-      pollingEnabled = true;
-      schedulePoll();
+      if (events.pollSubmittedJobs !== false) {
+        pollingEnabled = true;
+        schedulePoll();
+      }
       return true;
     } catch (error) {
       reportError("无法创建任务", error);

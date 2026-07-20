@@ -301,11 +301,34 @@ describe("organize similarity groups", () => {
     });
     await flushPromises();
 
+    const sourceOptions = wrapper.findAll(".cluster-type-option");
+    const exact = sourceOptions.find((value) => value.text().includes("完全重复"));
+    const perceptual = sourceOptions.find((value) =>
+      value.text().includes("视觉近似"),
+    );
+    const semantic = sourceOptions.find((value) =>
+      value.text().includes("内容相似"),
+    );
+    if (!exact || !perceptual || !semantic) {
+      throw new Error("clustering source option missing");
+    }
+    expect(
+      (exact.get('input[type="checkbox"]').element as HTMLInputElement).checked,
+    ).toBe(true);
+    expect(
+      (perceptual.get('input[type="checkbox"]').element as HTMLInputElement)
+        .checked,
+    ).toBe(true);
+    expect(
+      (semantic.get('input[type="checkbox"]').element as HTMLInputElement).checked,
+    ).toBe(false);
+    expect(wrapper.text()).toContain("大图库耗时较长，按需启用");
+    expect(wrapper.find(".semantic-performance-note").exists()).toBe(false);
+
+    await semantic.get('input[type="checkbox"]').setValue(true);
+    expect(wrapper.text()).toContain("不调用模型，也不会产生 API 费用");
+
     await wrapper.get('.cluster-controls select').setValue("all");
-    const perceptual = wrapper
-      .findAll(".cluster-type-option")
-      .find((value) => value.text().includes("视觉近似"));
-    if (!perceptual) throw new Error("perceptual option missing");
     await perceptual.get('input[type="checkbox"]').setValue(false);
     await buttonWithText(wrapper, "运行增量聚类").trigger("click");
     await flushPromises();

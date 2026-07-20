@@ -5,10 +5,11 @@ import os
 import sqlite3
 import uuid
 from array import array
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from .collection_write_outbox import CollectionWriteOutbox, CollectionWriteOutboxError
 from .config import ConfigurationError
 from .logical_paths import logical_document_id, normalize_path, resolve_under_root
 from .tags import normalize_tags
@@ -32,7 +33,27 @@ ENTRY_COLUMNS = (
     "inherited_tags_json",
 )
 
+DOCUMENT_ANNOTATION_COLUMNS = (
+    "doc_id",
+    "source_sha256",
+    "cache_key",
+    "status",
+    "retry_eligible",
+    "proposed_tags_json",
+    "accepted_tags_json",
+    "rejected_tags_json",
+    "description",
+    "entities_json",
+    "warnings_json",
+    "structured_json",
+    "policy_json",
+    "error",
+    "updated_at",
+)
+
 _SQLITE_PARAMETER_CHUNK = 900
+DEFAULT_STATE_READ_PAGE_SIZE = 256
+MAX_STATE_READ_PAGE_SIZE = 1_000
 
 
 class IndexState:
@@ -42,6 +63,12 @@ class IndexState:
         try:
             self.connection = sqlite3.connect(path, timeout=5)
             self.connection.row_factory = sqlite3.Row
+            self.connection.create_function(
+                "zvec_annotation_retryable",
+                2,
+                _annotation_retry_eligible,
+                deterministic=True,
+            )
             self.connection.execute("PRAGMA journal_mode=WAL")
             self.connection.execute("PRAGMA synchronous=FULL")
             version = self._existing_schema_version()
@@ -52,12 +79,22 @@ class IndexState:
                 )
             self._create_schema()
             self._validate_schema_version()
+            # Persist exact, already-generated vector writes before applying
+            # them to Zvec. Interrupted items are made replayable here without
+            # scanning entries or calling an embedding model again.
+            self.write_outbox = CollectionWriteOutbox(self.connection)
             if legacy_path is not None:
                 self._migrate_legacy_json(legacy_path)
         except ConfigurationError:
             if hasattr(self, "connection"):
                 self.connection.close()
             raise
+        except CollectionWriteOutboxError as exc:
+            if hasattr(self, "connection"):
+                self.connection.close()
+            raise ConfigurationError(
+                f"Invalid collection write recovery state: {path}"
+            ) from exc
         except sqlite3.DatabaseError as exc:
             if hasattr(self, "connection"):
                 self.connection.close()
@@ -88,7 +125,8 @@ class IndexState:
                 accepted_auto_tags_json TEXT NOT NULL DEFAULT '[]',
                 inherited_tags_json TEXT NOT NULL DEFAULT '[]'
             );
-            CREATE INDEX IF NOT EXISTS idx_entries_sha256 ON entries(sha256);
+            CREATE INDEX IF NOT EXISTS idx_entries_sha256
+                ON entries(sha256, doc_id);
             CREATE INDEX IF NOT EXISTS idx_entries_root_id ON entries(root_id);
             CREATE TABLE IF NOT EXISTS roots (
                 root_id TEXT PRIMARY KEY,
@@ -113,7 +151,7 @@ class IndexState:
                 PRIMARY KEY(doc_id, tag)
             );
             CREATE INDEX IF NOT EXISTS idx_entry_tag_index_tag
-                ON entry_tag_index(tag);
+                ON entry_tag_index(tag, doc_id);
             CREATE TABLE IF NOT EXISTS entry_folder_index (
                 doc_id TEXT NOT NULL,
                 root_id TEXT NOT NULL,
@@ -180,6 +218,9 @@ class IndexState:
                 source_sha256 TEXT NOT NULL,
                 cache_key TEXT,
                 status TEXT NOT NULL,
+                retry_eligible INTEGER NOT NULL DEFAULT 1 CHECK (
+                    retry_eligible IN (0, 1)
+                ),
                 proposed_tags_json TEXT NOT NULL DEFAULT '[]',
                 accepted_tags_json TEXT NOT NULL DEFAULT '[]',
                 rejected_tags_json TEXT NOT NULL DEFAULT '[]',
@@ -298,6 +339,15 @@ class IndexState:
                 "ALTER TABLE document_annotations ADD COLUMN policy_json "
                 "TEXT NOT NULL DEFAULT '{}'"
             )
+        if "retry_eligible" not in annotation_columns:
+            self.connection.execute(
+                "ALTER TABLE document_annotations ADD COLUMN retry_eligible "
+                "INTEGER NOT NULL DEFAULT 1 CHECK (retry_eligible IN (0, 1))"
+            )
+            self.connection.execute(
+                "UPDATE document_annotations SET retry_eligible = "
+                "zvec_annotation_retryable(policy_json, error)"
+            )
         if "deferred_count" not in index_run_columns:
             self.connection.execute(
                 "ALTER TABLE index_runs ADD COLUMN deferred_count "
@@ -326,6 +376,43 @@ class IndexState:
             "CREATE INDEX IF NOT EXISTS idx_entries_folder_page "
             "ON entries(root_id, parent_directory, relative_path, doc_id)"
         )
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_entries_auto_tag_page "
+            "ON entries(root_id, relative_path, doc_id)"
+        )
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_document_annotations_status_page "
+            "ON document_annotations("
+            "status, updated_at DESC, doc_id, retry_eligible)"
+        )
+        sha_index_columns = tuple(
+            str(row["name"])
+            for row in self.connection.execute(
+                "PRAGMA index_info('idx_entries_sha256')"
+            )
+        )
+        if sha_index_columns != ("sha256", "doc_id"):
+            # Older state databases indexed only the hash.  Including doc_id
+            # makes bulk content-dedup lookups covering and gives MIN(doc_id)
+            # deterministic results without visiting every matching row.
+            self.connection.execute("DROP INDEX IF EXISTS idx_entries_sha256")
+            self.connection.execute(
+                "CREATE INDEX idx_entries_sha256 ON entries(sha256, doc_id)"
+            )
+        tag_index_columns = tuple(
+            str(row["name"])
+            for row in self.connection.execute(
+                "PRAGMA index_info('idx_entry_tag_index_tag')"
+            )
+        )
+        if tag_index_columns != ("tag", "doc_id"):
+            # The original tag-only index forced a table lookup for every
+            # matching document id. Rebuild it once as a covering index so a
+            # broad fuzzy tag search can aggregate directly from the B-tree.
+            self.connection.execute("DROP INDEX IF EXISTS idx_entry_tag_index_tag")
+            self.connection.execute(
+                "CREATE INDEX idx_entry_tag_index_tag ON entry_tag_index(tag, doc_id)"
+            )
         tag_index_count = int(
             self.connection.execute("SELECT COUNT(*) FROM entry_tag_index").fetchone()[
                 0
@@ -548,6 +635,7 @@ class IndexState:
                 )
             return False
         with self.connection:
+            self.write_outbox.discard_all_for_collection_rebind()
             self.connection.execute("DELETE FROM entries")
             self.connection.execute("DELETE FROM roots")
             self.connection.execute("DELETE FROM embedding_cache")
@@ -758,12 +846,16 @@ class IndexState:
         )
         return [self._entry_from_row(row) for row in rows]
 
-    def iter_entries(self, *, chunk_size: int = 256) -> Iterator[list[dict[str, Any]]]:
+    def iter_entries(
+        self,
+        *,
+        chunk_size: int = DEFAULT_STATE_READ_PAGE_SIZE,
+    ) -> Iterator[list[dict[str, Any]]]:
         """Yield the library in stable keyset pages instead of one full list."""
 
         if isinstance(chunk_size, bool) or not isinstance(chunk_size, int):
             raise ValueError("Entry chunk_size must be an integer.")
-        if not 1 <= chunk_size <= 1_000:
+        if not 1 <= chunk_size <= MAX_STATE_READ_PAGE_SIZE:
             raise ValueError("Entry chunk_size must be between 1 and 1000.")
         after_root = ""
         after_path = ""
@@ -801,6 +893,64 @@ class IndexState:
             after_path = str(last["relative_path"])
             after_doc_id = str(last["doc_id"])
 
+    def iter_entries_with_annotations(
+        self,
+        *,
+        chunk_size: int = DEFAULT_STATE_READ_PAGE_SIZE,
+    ) -> Iterator[list[tuple[dict[str, Any], dict[str, Any] | None]]]:
+        """Yield entries and their optional annotations in bounded JOIN pages.
+
+        Metadata discovery needs both records for every image.  Keeping the
+        join and keyset cursor in SQLite avoids a full ``list_entries`` copy and
+        one annotation query per document while retaining deterministic order.
+        """
+
+        if isinstance(chunk_size, bool) or not isinstance(chunk_size, int):
+            raise ValueError("Joined entry chunk_size must be an integer.")
+        if not 1 <= chunk_size <= MAX_STATE_READ_PAGE_SIZE:
+            raise ValueError("Joined entry chunk_size must be between 1 and 1000.")
+        after_root = ""
+        after_path = ""
+        after_doc_id = ""
+        first = True
+        while True:
+            if first:
+                rows = self.connection.execute(
+                    _joined_annotation_select()
+                    + " FROM entries LEFT JOIN document_annotations AS annotations "
+                    "ON annotations.doc_id = entries.doc_id "
+                    "ORDER BY entries.root_id, entries.relative_path, entries.doc_id "
+                    "LIMIT ?",
+                    (chunk_size,),
+                ).fetchall()
+                first = False
+            else:
+                rows = self.connection.execute(
+                    _joined_annotation_select()
+                    + " FROM entries LEFT JOIN document_annotations AS annotations "
+                    "ON annotations.doc_id = entries.doc_id "
+                    "WHERE (entries.root_id, entries.relative_path, entries.doc_id) "
+                    "> (?, ?, ?) "
+                    "ORDER BY entries.root_id, entries.relative_path, entries.doc_id "
+                    "LIMIT ?",
+                    (
+                        after_root,
+                        after_path,
+                        after_doc_id,
+                        chunk_size,
+                    ),
+                ).fetchall()
+            if not rows:
+                return
+            yield [
+                _decode_joined_annotation_row(row, annotation_optional=True)
+                for row in rows
+            ]
+            last = rows[-1]
+            after_root = str(last["entry_root_id"])
+            after_path = str(last["entry_relative_path"])
+            after_doc_id = str(last["entry_doc_id"])
+
     def get_document_annotations(
         self,
         doc_ids: Iterable[str],
@@ -822,6 +972,223 @@ class IndexState:
                 annotation = self._document_annotation_from_row(row)
                 result[str(annotation["doc_id"])] = annotation
         return result
+
+    def list_auto_tag_candidates(
+        self,
+        scope: str,
+        *,
+        limit: int,
+        root_id: str | None = None,
+        run_id: str | None = None,
+        after: tuple[str, str, str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return one stable, bounded auto-tag candidate page in a single query.
+
+        Annotation freshness is evaluated inside SQLite by comparing the stored
+        source hash with the current entry hash.  This avoids loading the whole
+        library and issuing one annotation lookup per image merely to select a
+        small model batch.
+        """
+
+        normalized_scope = str(scope).strip().lower()
+        supported = {"untagged", "failed", "failed_all", "all", "latest_index_run"}
+        if normalized_scope not in supported:
+            raise ValueError(f"Unsupported auto-tag scope: {scope}")
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= 10_000
+        ):
+            raise ValueError("Auto-tag candidate limit must be between 1 and 10000.")
+        normalized_root = str(root_id).strip() if root_id is not None else None
+        if normalized_root == "":
+            raise ValueError("root_id must not be empty when supplied.")
+        if after is not None and (
+            not isinstance(after, tuple)
+            or len(after) != 3
+            or not all(isinstance(value, str) for value in after)
+        ):
+            raise ValueError("Auto-tag candidate cursor must contain three strings.")
+
+        joins = [
+            "LEFT JOIN document_annotations AS annotations ",
+            "ON annotations.doc_id = entries.doc_id ",
+        ]
+        filters: list[str] = []
+        parameters: list[Any] = []
+        if normalized_scope == "latest_index_run":
+            normalized_run = str(run_id or "").strip()
+            if not normalized_run:
+                return []
+            joins.append(
+                "JOIN index_run_entries AS run_entries "
+                "ON run_entries.doc_id = entries.doc_id "
+            )
+            filters.extend(
+                ["run_entries.run_id = ?", "run_entries.change_type = 'inserted'"]
+            )
+            parameters.append(normalized_run)
+        elif normalized_scope == "untagged":
+            filters.append(
+                "(annotations.doc_id IS NULL "
+                "OR annotations.source_sha256 != entries.sha256)"
+            )
+        elif normalized_scope in {"failed", "failed_all"}:
+            filters.extend(
+                [
+                    "annotations.source_sha256 = entries.sha256",
+                    "annotations.status = 'failed'",
+                ]
+            )
+            if normalized_scope == "failed":
+                filters.append("annotations.retry_eligible = 1")
+
+        if normalized_root is not None:
+            filters.append("entries.root_id = ?")
+            parameters.append(normalized_root)
+        if after is not None:
+            after_root, after_path, after_doc_id = after
+            filters.append(
+                "(entries.root_id > ? "
+                "OR (entries.root_id = ? AND entries.relative_path > ?) "
+                "OR (entries.root_id = ? AND entries.relative_path = ? "
+                "AND entries.doc_id > ?))"
+            )
+            parameters.extend(
+                [
+                    after_root,
+                    after_root,
+                    after_path,
+                    after_root,
+                    after_path,
+                    after_doc_id,
+                ]
+            )
+
+        where = f"WHERE {' AND '.join(filters)}" if filters else ""
+        rows = self.connection.execute(
+            "SELECT entries.* FROM entries " + "".join(joins) + f"{where} "
+            "ORDER BY entries.root_id, entries.relative_path, entries.doc_id "
+            "LIMIT ?",
+            (*parameters, limit),
+        ).fetchall()
+        return [self._entry_from_row(row) for row in rows]
+
+    def page_document_annotations_with_entries(
+        self,
+        status: str,
+        *,
+        root_id: str | None = None,
+        run_id: str | None = None,
+        after: tuple[str, str] | None = None,
+        limit: int = 256,
+    ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+        """Read a bounded annotation page together with its entry in one query."""
+
+        normalized_status = str(status).strip()
+        if not normalized_status:
+            raise ValueError("Annotation status must not be empty.")
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= 1_000
+        ):
+            raise ValueError("Annotation page limit must be between 1 and 1000.")
+        normalized_root = str(root_id).strip() if root_id is not None else None
+        if normalized_root == "":
+            raise ValueError("root_id must not be empty when supplied.")
+        if after is not None and (
+            not isinstance(after, tuple)
+            or len(after) != 2
+            or not all(isinstance(value, str) for value in after)
+        ):
+            raise ValueError("Annotation cursor must contain two strings.")
+
+        filters = ["annotations.status = ?"]
+        parameters: list[Any] = [normalized_status]
+        if normalized_root is not None:
+            filters.append("entries.root_id = ?")
+            parameters.append(normalized_root)
+        if run_id is not None:
+            normalized_run = str(run_id).strip()
+            if not normalized_run:
+                return []
+            filters.append(
+                "EXISTS (SELECT 1 FROM index_run_entries AS run_entries "
+                "WHERE run_entries.run_id = ? "
+                "AND run_entries.doc_id = entries.doc_id "
+                "AND run_entries.change_type = 'inserted')"
+            )
+            parameters.append(normalized_run)
+        if after is not None:
+            after_updated_at, after_doc_id = after
+            filters.append(
+                "(annotations.updated_at < ? "
+                "OR (annotations.updated_at = ? AND annotations.doc_id > ?))"
+            )
+            parameters.extend([after_updated_at, after_updated_at, after_doc_id])
+
+        rows = self.connection.execute(
+            _joined_annotation_select() + " FROM document_annotations AS annotations "
+            "JOIN entries ON entries.doc_id = annotations.doc_id "
+            f"WHERE {' AND '.join(filters)} "
+            "ORDER BY annotations.updated_at DESC, annotations.doc_id "
+            "LIMIT ?",
+            (*parameters, limit),
+        ).fetchall()
+        decoded = [_decode_joined_annotation_row(row) for row in rows]
+        return [
+            (annotation, entry)
+            for entry, annotation in decoded
+            if annotation is not None
+        ]
+
+    def iter_entries_for_folders_with_annotations(
+        self,
+        folders: Iterable[tuple[str, str]],
+        *,
+        folder_batch_size: int = 100,
+        row_batch_size: int = 500,
+    ) -> Iterator[list[tuple[dict[str, Any], dict[str, Any] | None]]]:
+        """Yield only entries in requested direct folders with joined annotations."""
+
+        normalized = list(
+            dict.fromkeys(
+                (str(root_id), str(relative_folder))
+                for root_id, relative_folder in folders
+            )
+        )
+        if not normalized:
+            return
+        if not 1 <= folder_batch_size <= 200:
+            raise ValueError("folder_batch_size must be between 1 and 200.")
+        if not 1 <= row_batch_size <= 2_000:
+            raise ValueError("row_batch_size must be between 1 and 2000.")
+
+        for offset in range(0, len(normalized), folder_batch_size):
+            chunk = normalized[offset : offset + folder_batch_size]
+            predicates = " OR ".join(
+                "(entries.root_id = ? AND entries.parent_directory = ?)" for _ in chunk
+            )
+            parameters = tuple(value for folder in chunk for value in folder)
+            cursor = self.connection.execute(
+                _joined_annotation_select() + " FROM entries "
+                "LEFT JOIN document_annotations AS annotations "
+                "ON annotations.doc_id = entries.doc_id "
+                f"WHERE {predicates} "
+                "ORDER BY entries.root_id, entries.relative_path, entries.doc_id",
+                parameters,
+            )
+            batch: list[tuple[dict[str, Any], dict[str, Any] | None]] = []
+            for row in cursor:
+                batch.append(
+                    _decode_joined_annotation_row(row, annotation_optional=True)
+                )
+                if len(batch) >= row_batch_size:
+                    yield batch
+                    batch = []
+            if batch:
+                yield batch
 
     def list_folders(
         self,
@@ -880,11 +1247,11 @@ class IndexState:
         relative_folder: str,
         *,
         include_subfolders: bool = False,
-        chunk_size: int = 256,
+        chunk_size: int = DEFAULT_STATE_READ_PAGE_SIZE,
     ) -> Iterator[list[dict[str, Any]]]:
         if isinstance(chunk_size, bool) or not isinstance(chunk_size, int):
             raise ValueError("Folder chunk_size must be an integer.")
-        if not 1 <= chunk_size <= 1_000:
+        if not 1 <= chunk_size <= MAX_STATE_READ_PAGE_SIZE:
             raise ValueError("Folder chunk_size must be between 1 and 1000.")
         offset = 0
         while True:
@@ -1127,16 +1494,21 @@ class IndexState:
     ) -> None:
         if status not in {"pending_review", "accepted", "rejected", "failed"}:
             raise ValueError("Invalid document annotation status.")
+        policy_json = json.dumps(policy or {}, ensure_ascii=False)
+        retry_eligible = (
+            _annotation_retry_eligible(policy_json, error) if status == "failed" else 1
+        )
         with self.connection:
             self.connection.execute(
                 "INSERT INTO document_annotations("
-                "doc_id, source_sha256, cache_key, status, proposed_tags_json, "
+                "doc_id, source_sha256, cache_key, status, retry_eligible, "
+                "proposed_tags_json, "
                 "accepted_tags_json, rejected_tags_json, description, entities_json, "
                 "warnings_json, structured_json, policy_json, error) "
-                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(doc_id) DO UPDATE SET "
                 "source_sha256=excluded.source_sha256, cache_key=excluded.cache_key, "
-                "status=excluded.status, "
+                "status=excluded.status, retry_eligible=excluded.retry_eligible, "
                 "proposed_tags_json=excluded.proposed_tags_json, "
                 "accepted_tags_json=excluded.accepted_tags_json, "
                 "rejected_tags_json=excluded.rejected_tags_json, "
@@ -1151,6 +1523,7 @@ class IndexState:
                     source_sha256,
                     cache_key,
                     status,
+                    retry_eligible,
                     json.dumps(list(normalize_tags(proposed_tags)), ensure_ascii=False),
                     json.dumps(list(normalize_tags(accepted_tags)), ensure_ascii=False),
                     json.dumps(list(normalize_tags(rejected_tags)), ensure_ascii=False),
@@ -1158,7 +1531,7 @@ class IndexState:
                     json.dumps(entities or {}, ensure_ascii=False),
                     json.dumps(list(warnings), ensure_ascii=False),
                     json.dumps(structured or {}, ensure_ascii=False),
-                    json.dumps(policy or {}, ensure_ascii=False),
+                    policy_json,
                     error,
                 ),
             )
@@ -1191,17 +1564,44 @@ class IndexState:
             )
         return [self._document_annotation_from_row(row) for row in rows]
 
-    def count_document_annotations(self, status: str | None = None) -> int:
-        if status is None:
-            row = self.connection.execute(
-                "SELECT COUNT(*) AS annotation_count FROM document_annotations"
-            ).fetchone()
-        else:
-            row = self.connection.execute(
-                "SELECT COUNT(*) AS annotation_count FROM document_annotations "
-                "WHERE status = ?",
-                (status,),
-            ).fetchone()
+    def count_document_annotations(
+        self,
+        status: str | None = None,
+        *,
+        root_id: str | None = None,
+        run_id: str | None = None,
+    ) -> int:
+        filters: list[str] = []
+        parameters: list[Any] = []
+        if status is not None:
+            filters.append("document_annotations.status = ?")
+            parameters.append(status)
+        if root_id is not None:
+            normalized_root = str(root_id).strip()
+            if not normalized_root:
+                return 0
+            filters.append("entries.root_id = ?")
+            parameters.append(normalized_root)
+        if run_id is not None:
+            normalized_run = str(run_id).strip()
+            if not normalized_run:
+                return 0
+            filters.append(
+                "EXISTS (SELECT 1 FROM index_run_entries AS run_entries "
+                "WHERE run_entries.run_id = ? "
+                "AND run_entries.doc_id = entries.doc_id "
+                "AND run_entries.change_type = 'inserted')"
+            )
+            parameters.append(normalized_run)
+        requires_entry_join = root_id is not None or run_id is not None
+        from_sql = "document_annotations"
+        if requires_entry_join:
+            from_sql += " JOIN entries ON entries.doc_id = document_annotations.doc_id"
+        where = f" WHERE {' AND '.join(filters)}" if filters else ""
+        row = self.connection.execute(
+            f"SELECT COUNT(*) AS annotation_count FROM {from_sql}{where}",
+            parameters,
+        ).fetchone()
         return int(row["annotation_count"]) if row is not None else 0
 
     def page_document_annotations(
@@ -1565,11 +1965,81 @@ class IndexState:
         )
         return [self._entry_from_row(row) for row in rows]
 
+    def iter_entries_for_root(
+        self,
+        root_id: str,
+        *,
+        chunk_size: int = DEFAULT_STATE_READ_PAGE_SIZE,
+    ) -> Iterator[list[dict[str, Any]]]:
+        """Yield one root in bounded stable pages for rebind validation."""
+
+        normalized_root = str(root_id).strip()
+        if not normalized_root:
+            raise ValueError("root_id must not be empty.")
+        if isinstance(chunk_size, bool) or not isinstance(chunk_size, int):
+            raise ValueError("Root entry chunk_size must be an integer.")
+        if not 1 <= chunk_size <= MAX_STATE_READ_PAGE_SIZE:
+            raise ValueError("Root entry chunk_size must be between 1 and 1000.")
+        after_path = ""
+        after_doc_id = ""
+        first = True
+        while True:
+            if first:
+                rows = self.connection.execute(
+                    "SELECT * FROM entries WHERE root_id = ? "
+                    "ORDER BY relative_path, doc_id LIMIT ?",
+                    (normalized_root, chunk_size),
+                ).fetchall()
+                first = False
+            else:
+                rows = self.connection.execute(
+                    "SELECT * FROM entries WHERE root_id = ? AND "
+                    "(relative_path, doc_id) > (?, ?) "
+                    "ORDER BY relative_path, doc_id LIMIT ?",
+                    (
+                        normalized_root,
+                        after_path,
+                        after_doc_id,
+                        chunk_size,
+                    ),
+                ).fetchall()
+            if not rows:
+                return
+            yield [self._entry_from_row(row) for row in rows]
+            last = rows[-1]
+            after_path = str(last["relative_path"])
+            after_doc_id = str(last["doc_id"])
+
     def find_doc_id_by_sha(self, sha256: str) -> str | None:
         row = self.connection.execute(
-            "SELECT doc_id FROM entries WHERE sha256 = ? LIMIT 1", (sha256,)
+            "SELECT doc_id FROM entries WHERE sha256 = ? ORDER BY doc_id LIMIT 1",
+            (sha256,),
         ).fetchone()
         return str(row["doc_id"]) if row else None
+
+    def find_doc_ids_by_sha_many(self, shas: Iterable[str]) -> dict[str, str]:
+        """Return one deterministic existing document id for each known hash.
+
+        ``json_each`` keeps this to one SQLite statement without depending on
+        the connection's parameter limit.  The covering ``(sha256, doc_id)``
+        index lets SQLite select the lexicographically first id for each hash
+        without loading all matching entries into Python.
+        """
+
+        normalized = list(dict.fromkeys(str(sha256) for sha256 in shas))
+        if not normalized:
+            return {}
+        rows = self.connection.execute(
+            "WITH requested(sha256) AS ("
+            "SELECT DISTINCT CAST(value AS TEXT) FROM json_each(?)"
+            ") "
+            "SELECT requested.sha256, MIN(entries.doc_id) AS doc_id "
+            "FROM requested JOIN entries "
+            "ON entries.sha256 = requested.sha256 "
+            "GROUP BY requested.sha256",
+            (json.dumps(normalized, ensure_ascii=True),),
+        )
+        return {str(row["sha256"]): str(row["doc_id"]) for row in rows}
 
     def find_entry_for_path(self, path: Path) -> dict[str, Any] | None:
         resolved = path.expanduser().resolve()
@@ -1777,7 +2247,7 @@ class IndexState:
         return decoded
 
     @classmethod
-    def _document_annotation_from_row(cls, row: sqlite3.Row) -> dict[str, Any]:
+    def _document_annotation_from_row(cls, row: Mapping[str, Any]) -> dict[str, Any]:
         item = dict(row)
         item["proposed_tags"] = cls._decode_tags(str(item.pop("proposed_tags_json")))
         item["accepted_tags"] = cls._decode_tags(str(item.pop("accepted_tags_json")))
@@ -1841,7 +2311,7 @@ class IndexState:
         return item
 
     @classmethod
-    def _entry_from_row(cls, row: sqlite3.Row) -> dict[str, Any]:
+    def _entry_from_row(cls, row: Mapping[str, Any]) -> dict[str, Any]:
         entry = dict(row)
         entry["tags"] = cls._decode_tags(str(entry.pop("tags_json")))
         entry["folder_tags"] = cls._decode_tags(
@@ -2415,3 +2885,67 @@ def _page_folder_entries(
         )
         entries.append(entry)
     return total, entries
+
+
+def _joined_annotation_select() -> str:
+    entry_columns = ", ".join(
+        f"entries.{column} AS entry_{column}" for column in ENTRY_COLUMNS
+    )
+    annotation_columns = ", ".join(
+        f"annotations.{column} AS annotation_{column}"
+        for column in DOCUMENT_ANNOTATION_COLUMNS
+    )
+    return f"SELECT {entry_columns}, {annotation_columns}"
+
+
+def _decode_joined_annotation_row(
+    row: Mapping[str, Any],
+    *,
+    annotation_optional: bool = False,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    entry = IndexState._entry_from_row(
+        {column: row[f"entry_{column}"] for column in ENTRY_COLUMNS}
+    )
+    if row["annotation_doc_id"] is None:
+        if annotation_optional:
+            return entry, None
+        raise ConfigurationError("Joined annotation row is missing its annotation.")
+    annotation = IndexState._document_annotation_from_row(
+        {column: row[f"annotation_{column}"] for column in DOCUMENT_ANNOTATION_COLUMNS}
+    )
+    return entry, annotation
+
+
+def _annotation_retry_eligible(policy_value: Any, error: Any) -> int:
+    """Return the persisted retry decision used by failed auto-tag queries."""
+
+    policy: Mapping[str, Any]
+    if isinstance(policy_value, Mapping):
+        policy = policy_value
+    else:
+        try:
+            decoded = json.loads(str(policy_value or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            decoded = {}
+        policy = decoded if isinstance(decoded, Mapping) else {}
+
+    explicit = policy.get("retry_eligible")
+    if isinstance(explicit, bool):
+        return int(explicit)
+    category = str(policy.get("failure_category") or "").strip().casefold()
+    if category:
+        return int(category not in {"content_policy", "provider_auth", "systemic"})
+
+    text = str(error or "").casefold()
+    blocked_markers = (
+        "data_inspection_failed",
+        "datainspectionfailed",
+        "inappropriate content",
+        "content policy",
+        "invalid api key",
+        "invalidapikey",
+        "unauthorized",
+        "authentication",
+        "permission denied",
+    )
+    return int(not any(marker in text for marker in blocked_markers))

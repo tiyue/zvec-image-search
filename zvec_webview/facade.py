@@ -320,6 +320,7 @@ class PreviewFacade:
         credential_store: CredentialStore | None = None,
         image_registry: ImageRegistry | None = None,
         executor: ThreadPoolExecutor | None = None,
+        background_executor: ThreadPoolExecutor | None = None,
         activity_store: ActivityStore | None = None,
         search_learning_service: SearchLearningService | None = None,
         data_migration_coordinator: DataMigrationCoordinator | None = None,
@@ -392,9 +393,17 @@ class PreviewFacade:
         self._observer_job_history_fallback = observer_job_history_fallback
         self._executor = executor or ThreadPoolExecutor(
             max_workers=8,
-            thread_name_prefix="zvec-webview",
+            thread_name_prefix="zvec-webview-control",
         )
         self._owns_executor = executor is None
+        # Long job/search waiters must never consume every control worker.  The
+        # gateway uses the control pool for startup, health, cancellation and UI
+        # refresh requests that need to remain responsive while jobs run.
+        self._background_executor = background_executor or ThreadPoolExecutor(
+            max_workers=16,
+            thread_name_prefix="zvec-webview-background",
+        )
+        self._owns_background_executor = background_executor is None
         self._lock = threading.RLock()
         self._backend_state = "idle"
         self._backend_error: JsonObject | None = None
@@ -1271,7 +1280,7 @@ class PreviewFacade:
         with self._lock:
             self._searches[operation.operation_id] = operation
             self._trim_operations_locked()
-            operation.future = self._executor.submit(
+            operation.future = self._background_executor.submit(
                 self._wait_search_worker, operation.operation_id
             )
         self._record_search_operation(operation)
@@ -1454,7 +1463,7 @@ class PreviewFacade:
                 self._migration_operations[operation.operation_id] = operation
                 self._trim_migration_operations_locked()
                 try:
-                    operation.future = self._executor.submit(
+                    operation.future = self._background_executor.submit(
                         self._run_data_migration_worker,
                         operation.operation_id,
                     )
@@ -1602,7 +1611,7 @@ class PreviewFacade:
                 self._migration_operations[operation.operation_id] = operation
                 self._trim_migration_operations_locked()
                 try:
-                    operation.future = self._executor.submit(
+                    operation.future = self._background_executor.submit(
                         self._run_data_migration_recovery_worker,
                         operation.operation_id,
                     )
@@ -1686,7 +1695,7 @@ class PreviewFacade:
         with self._lock:
             self._tasks[operation.operation_id] = operation
             self._trim_operations_locked()
-            operation.future = self._executor.submit(
+            operation.future = self._background_executor.submit(
                 self._wait_task_worker, operation.operation_id
             )
         self._record_job_snapshot(submission.submitted_job)
@@ -2918,6 +2927,11 @@ class PreviewFacade:
                 self._invalidate_catalog()
                 if self._owns_executor:
                     self._executor.shutdown(wait=False, cancel_futures=True)
+                if self._owns_background_executor:
+                    self._background_executor.shutdown(
+                        wait=False,
+                        cancel_futures=True,
+                    )
 
     def _start_backend_worker(self) -> None:
         try:
@@ -3135,7 +3149,7 @@ class PreviewFacade:
                 return
             self._organize.loading = True
             self._organize.error = None
-        self._executor.submit(self._refresh_organize_worker)
+        self._background_executor.submit(self._refresh_organize_worker)
 
     def _refresh_organize_worker(self) -> None:
         try:
@@ -3911,7 +3925,7 @@ def _library_request(
             cluster_types=cast(
                 Any,
                 _string_tuple(
-                    payload.get("cluster_types", ("exact", "perceptual", "semantic")),
+                    payload.get("cluster_types", ("exact", "perceptual")),
                     "cluster_types",
                 ),
             ),

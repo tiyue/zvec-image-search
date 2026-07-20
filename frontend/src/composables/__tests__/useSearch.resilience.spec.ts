@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { ApiError } from "../../api/client";
 import type { SearchApi } from "../../api/client";
 import type { SearchPageResponse, SearchSubmission } from "../../types/contracts";
 import { useSearch } from "../useSearch";
@@ -135,6 +136,35 @@ describe("useSearch resilience", () => {
     expect(search.searching.value).toBe(false);
     expect(search.status.value).toBe("succeeded");
     expect(search.items.value[0]?.id).toBe("image-2");
+  });
+
+  it("automatically retries bounded queue backpressure without leaving the UI busy", async () => {
+    vi.useFakeTimers();
+    const api = fakeApi();
+    const submit = vi.mocked(api.submit);
+    submit
+      .mockRejectedValueOnce(
+        new ApiError("图库任务队列已满", 429, {
+          error: { details: { retry_after_seconds: 1 } },
+        }),
+      )
+      .mockRejectedValueOnce(new ApiError("图库任务队列已满", 429))
+      .mockResolvedValueOnce(resultPayload("自动重试", 3));
+    const onDiagnostic = vi.fn();
+    const search = useSearch(api, { onDiagnostic });
+    search.query.value = "自动重试";
+
+    const pending = search.submit();
+    await vi.advanceTimersByTimeAsync(3_000);
+
+    await expect(pending).resolves.toBe(true);
+    expect(submit).toHaveBeenCalledTimes(3);
+    expect(search.searching.value).toBe(false);
+    expect(search.items.value[0]?.id).toBe("image-3");
+    expect(onDiagnostic).toHaveBeenCalledWith(
+      "search_queue_backpressure",
+      expect.objectContaining({ attempt: 1, delay_ms: 1_000 }),
+    );
   });
 
   it("keeps a late cancelled response from replacing a newer result", async () => {

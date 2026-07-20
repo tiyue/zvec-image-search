@@ -59,6 +59,8 @@ def _run_packaging_self_test(output_path: Path) -> int:
         import image_vector_service.data_migration as data_migration
         import image_vector_service.folder_deletion as folder_deletion
         import image_vector_service.image_clustering as image_clustering
+        import image_vector_service.large_cluster_adapter as large_cluster_adapter
+        import image_vector_service.large_image_clustering as large_image_clustering
         import image_vector_service.learning_ranker as learning_ranker
         import image_vector_service.library_browser as library_browser
         import image_vector_service.migration_recovery as migration_recovery
@@ -147,6 +149,8 @@ def _run_packaging_self_test(output_path: Path) -> int:
                     migration_recovery.__name__,
                     folder_deletion.__name__,
                     image_clustering.__name__,
+                    large_cluster_adapter.__name__,
+                    large_image_clustering.__name__,
                     library_browser.__name__,
                     learning_ranker.__name__,
                     search_features.__name__,

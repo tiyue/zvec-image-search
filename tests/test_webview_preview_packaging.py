@@ -147,6 +147,8 @@ class WebviewPreviewSourceContractTest(unittest.TestCase):
             "active_learning_review_store.py",
             "cluster_operation_store.py",
             "image_clustering.py",
+            "large_cluster_adapter.py",
+            "large_image_clustering.py",
             "search_learning_runtime.py",
         ):
             self.assertIn(required_source, packaging_source)
@@ -258,6 +260,8 @@ class WebviewPreviewSourceContractTest(unittest.TestCase):
         self.assertIn('"image_vector_service.migration_recovery"', spec)
         self.assertIn('"image_vector_service.folder_deletion"', spec)
         self.assertIn('"image_vector_service.image_clustering"', spec)
+        self.assertIn('"image_vector_service.large_cluster_adapter"', spec)
+        self.assertIn('"image_vector_service.large_image_clustering"', spec)
         self.assertIn('"image_vector_service.library_browser"', spec)
         self.assertIn('"image_vector_service.search_learning_service"', spec)
         self.assertIn('"image_vector_service.search_learning_evaluator"', spec)
@@ -276,6 +280,8 @@ class WebviewPreviewSourceContractTest(unittest.TestCase):
             "image_vector_service.active_learning_review_store",
             "image_vector_service.cluster_operation_store",
             "image_vector_service.image_clustering",
+            "image_vector_service.large_cluster_adapter",
+            "image_vector_service.large_image_clustering",
             "image_vector_service.search_learning_runtime",
         ):
             self.assertIn(f"import {runtime_module}", frozen_entry)
@@ -300,6 +306,8 @@ class WebviewPreviewSourceContractTest(unittest.TestCase):
                 "image_vector_service.migration_recovery",
                 "image_vector_service.folder_deletion",
                 "image_vector_service.image_clustering",
+                "image_vector_service.large_cluster_adapter",
+                "image_vector_service.large_image_clustering",
                 "image_vector_service.library_browser",
                 "image_vector_service.learning_ranker",
                 "image_vector_service.search_features",
@@ -376,6 +384,14 @@ class WebviewPreviewSourceContractTest(unittest.TestCase):
         self.assertIn("image_vector_service.migration_recovery", result["modules"])
         self.assertIn("image_vector_service.library_browser", result["modules"])
         self.assertIn("image_vector_service.image_clustering", result["modules"])
+        self.assertIn(
+            "image_vector_service.large_cluster_adapter",
+            result["modules"],
+        )
+        self.assertIn(
+            "image_vector_service.large_image_clustering",
+            result["modules"],
+        )
         self.assertIn("image_vector_service.search_learning_store", result["modules"])
         self.assertIn(
             "image_vector_service.search_learning_evaluator",

@@ -8,7 +8,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from PIL import Image
 
@@ -19,12 +19,14 @@ from image_vector_service.dashscope_client import (
     EmbeddingResponse,
 )
 from image_vector_service.image_data_uri import EncodedImageDataUri
-from image_vector_service.models import FileFailure, ScanResult
+from image_vector_service.models import FileFailure
 from image_vector_service.result_exporter import (
+    RESULT_MANIFEST_SCHEMA_VERSION,
     RESULT_OWNERSHIP_KIND,
     RESULT_OWNERSHIP_MARKER,
     RESULT_OWNERSHIP_SCHEMA_VERSION,
 )
+from image_vector_service.search_result_store import RESULT_STORE_FILENAME
 from image_vector_service.service import ImageVectorService
 
 
@@ -228,7 +230,11 @@ class ImageVectorServiceTest(unittest.TestCase):
         (cls.images_dir / "notes.txt").write_text("not an image", encoding="utf-8")
         (cls.images_dir / "broken.jpg").write_bytes(b"not a jpeg")
 
-        cls.config = ServiceConfig(workspace=cls.temp_dir)
+        cls.config = ServiceConfig(
+            workspace=cls.temp_dir,
+            library_id="library-main",
+            library_image_root=cls.images_dir,
+        )
         cls.fake_client = FakeEmbeddingClient(cls.config.dimension)
         cls.service = ImageVectorService(
             config=cls.config,
@@ -270,11 +276,18 @@ class ImageVectorServiceTest(unittest.TestCase):
         output_dir = Path(report.output_dir)
         self.assertTrue(output_dir.is_dir())
         self.assertEqual(report.result_count, 2)
+        self.assertEqual(report.result_storage, "copied")
+        self.assertTrue(all(item.copied_file for item in report.results))
         self.assertTrue((output_dir / "results.json").is_file())
         manifest = json.loads((output_dir / "results.json").read_text("utf-8"))
         self.assertEqual(manifest["query_type"], "text")
         self.assertEqual(manifest["ranking_mode"], "distance")
         self.assertEqual(len(manifest["results"]), 2)
+        self.assertEqual(
+            manifest["manifest_schema_version"], RESULT_MANIFEST_SCHEMA_VERSION
+        )
+        self.assertEqual(manifest["result_store"]["result_count"], 2)
+        self.assertTrue((output_dir / manifest["result_store"]["path"]).is_file())
         self.assertIn("score_semantics", manifest)
         self.assertFalse(manifest["search_quality"]["configured"])
         for result in manifest["results"]:
@@ -369,6 +382,34 @@ class ImageVectorServiceTest(unittest.TestCase):
         )
         self.assertEqual(staged_report.embedding_sources, {"image": "index"})
 
+        with patch("image_vector_service.result_exporter.shutil.copy2") as copy_file:
+            source_only_image = self.service.search_by_image(
+                str(staged_copy),
+                top_k=3,
+                copy_files=False,
+                report_result_limit=1,
+            )
+            source_only_combined = self.service.search_by_image_and_text(
+                str(staged_copy),
+                "red",
+                top_k=3,
+                copy_files=False,
+                report_result_limit=1,
+            )
+
+        copy_file.assert_not_called()
+        for source_only in (source_only_image, source_only_combined):
+            self.assertEqual(source_only.result_storage, "source_only")
+            self.assertEqual(source_only.result_count, 2)
+            self.assertEqual(len(source_only.results), 1)
+            self.assertTrue(source_only.results_truncated)
+            self.assertIsNone(source_only.results[0].copied_file)
+            self.assertNotEqual(source_only.results[0].relative_path, "red.png")
+            self.assertEqual(
+                {path.name for path in Path(source_only.output_dir).iterdir()},
+                {RESULT_OWNERSHIP_MARKER, "results.json", RESULT_STORE_FILENAME},
+            )
+
         # Federated search prepares the staged image once, then asks every
         # Collection for candidates.  The per-Collection path must therefore
         # exclude by content hash and still return the requested usable budget.
@@ -459,11 +500,22 @@ class ImageVectorServiceTest(unittest.TestCase):
             (self.images_dir / "yellow.png").unlink()
 
     def test_06_sync_is_fail_closed_and_supports_dry_run(self):
-        incomplete = ScanResult(
-            complete=False,
-            failures=[FileFailure(str(self.images_dir), "permission denied")],
-        )
-        with patch("image_vector_service.service.scan_folder", return_value=incomplete):
+        incomplete = MagicMock()
+        incomplete.scanned = 0
+        incomplete.supported = 0
+        incomplete.skipped = 0
+        incomplete.peak_in_flight = 0
+        incomplete.warnings = []
+        incomplete.failure_count = 0
+        incomplete.failures = [FileFailure(str(self.images_dir), "permission denied")]
+        incomplete.record_count = 0
+        incomplete.complete = False
+        incomplete.iter_staged_records_by_sha256.return_value = iter(())
+        incomplete.count_stale_doc_ids.return_value = 0
+        with patch(
+            "image_vector_service.service.scan_folder_to_staging",
+            return_value=incomplete,
+        ):
             report = self.service.sync_folder(str(self.images_dir))
         self.assertTrue(report.sync_aborted)
         self.assertEqual(report.deleted, 0)
@@ -649,12 +701,10 @@ class ImageTagSearchTest(unittest.TestCase):
         self.service.index_folder(str(self.warm_dir), tags=["warm"])
         root_id = str(self.service.list_roots()[0]["root_id"])
         self.service.state.set_root_tags(root_id, ["legacy-root-default"])
-        repository = self.service.repository
         self.service.close()
         self.service = ImageVectorService(
             config=self.config,
             embedding_client=self.client,
-            repository=repository,
         )
         self.service.index_folder(str(self.warm_dir))
         self.assertTrue(all(root["tags"] == [] for root in self.service.list_roots()))
@@ -780,9 +830,14 @@ class ImageTagSearchTest(unittest.TestCase):
         self.service.index_folder(str(self.cool_dir), tags=["\u5d29\u574f"])
         request_count = self.client.request_count
 
-        prefix = self.service.search_by_tags("\u539f", top_k=10)
-        suffix = self.service.search_by_tags("\u795e", top_k=10)
-        missing = self.service.search_by_tags("\u4e0d\u5b58\u5728", top_k=10)
+        with patch.object(
+            self.service.state,
+            "entries_for_any_effective_tags",
+            side_effect=AssertionError("tag search must use bounded SQL Top-N"),
+        ):
+            prefix = self.service.search_by_tags("\u539f", top_k=10)
+            suffix = self.service.search_by_tags("\u795e", top_k=10)
+            missing = self.service.search_by_tags("\u4e0d\u5b58\u5728", top_k=10)
 
         self.assertEqual(prefix.result_count, 1)
         self.assertEqual(suffix.result_count, 1)

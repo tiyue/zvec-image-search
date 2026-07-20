@@ -155,6 +155,45 @@ class BoundedImageScannerTest(unittest.TestCase):
         self.assertLessEqual(peak_active, 4)
         self.assertLessEqual(result.peak_in_flight, 6)
 
+    def test_incremental_state_lookup_is_batched_instead_of_n_plus_one(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="zvec_scan_lookup_batch_") as temporary:
+            root = Path(temporary)
+            _write_images(root, 40)
+            initial = scan_folder(root, "lookup-root", max_workers=2)
+            previous = {
+                record.doc_id: record.state_dict() for record in initial.records
+            }
+            lookup_calls: list[tuple[str, ...]] = []
+
+            def lookup_many(doc_ids):
+                requested = tuple(doc_ids)
+                lookup_calls.append(requested)
+                return {
+                    doc_id: previous[doc_id]
+                    for doc_id in requested
+                    if doc_id in previous
+                }
+
+            with patch(
+                "image_vector_service.image_scanner.inspect_image",
+                side_effect=AssertionError("unchanged files must not be inspected"),
+            ):
+                result = scan_folder(
+                    root,
+                    "lookup-root",
+                    previous_lookup=lambda _doc_id: (_ for _ in ()).throw(
+                        AssertionError("single-row lookup must not be used")
+                    ),
+                    previous_lookup_many=lookup_many,
+                    lookup_batch_size=7,
+                    max_workers=2,
+                )
+
+        self.assertEqual(len(result.records), 40)
+        self.assertEqual(len(result.fast_unchanged_ids), 40)
+        self.assertEqual(len(lookup_calls), 6)
+        self.assertTrue(all(len(batch) <= 7 for batch in lookup_calls))
+
 
 class IndexPipelineIsolationTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -232,6 +271,25 @@ class IndexPipelineIsolationTest(unittest.TestCase):
             service.config.max_inflight_request_bytes,
         )
 
+    def test_completed_network_batches_share_one_local_bulk_commit(self) -> None:
+        _write_images(self.images, 40)
+        client = _ConcurrentEmbeddingClient(1024, delay=0)
+        service = self._service(client, batch_size=1)
+        try:
+            with patch.object(
+                service.repository,
+                "upsert_record_vectors",
+                wraps=service.repository.upsert_record_vectors,
+            ) as bulk_upsert:
+                report = service.index_folder(str(self.images))
+        finally:
+            service.close()
+
+        self.assertEqual(report.inserted, 40)
+        self.assertEqual(report.failed, 0)
+        # Forty one-image API responses are buffered into one local Zvec write.
+        self.assertEqual(bulk_upsert.call_count, 1)
+
     def test_one_bad_image_is_quarantined_and_other_images_continue(self) -> None:
         _write_images(self.images, 4)
         Image.new("RGB", (24, 24), (255, 0, 255)).save(self.images / "bad.png")
@@ -267,7 +325,7 @@ class IndexPipelineIsolationTest(unittest.TestCase):
         try:
             with patch.object(
                 service.repository,
-                "upsert_records",
+                "upsert_record_vectors",
                 side_effect=OSError(errno.ENOSPC, "disk full"),
             ):
                 report = service.index_folder(str(self.images))

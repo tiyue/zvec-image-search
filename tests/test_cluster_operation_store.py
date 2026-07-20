@@ -4,10 +4,12 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 from image_vector_service.cluster_operation_store import (
     ClusterOperationItemInput,
     ClusterOperationStore,
+    ClusterOperationStoreUnavailable,
     ClusterOperationValidationError,
     InvalidClusterRuleCursor,
 )
@@ -671,6 +673,38 @@ class ClusterOperationStoreTests(unittest.TestCase):
         finally:
             connection.close()
         self.assertEqual(user_version, 77)
+
+    def test_failed_connection_setup_closes_partial_handle(self) -> None:
+        connection = MagicMock()
+        connection.execute.side_effect = sqlite3.OperationalError("pragma failed")
+
+        with (
+            patch(
+                "image_vector_service.cluster_operation_store.sqlite3.connect",
+                return_value=connection,
+            ),
+            self.assertRaisesRegex(sqlite3.OperationalError, "pragma failed"),
+        ):
+            self.store._connect()
+
+        connection.close.assert_called_once_with()
+
+    def test_failed_write_begin_closes_connection(self) -> None:
+        connection = MagicMock()
+        connection.execute.side_effect = sqlite3.OperationalError("database is busy")
+
+        with (
+            patch.object(self.store, "_connect", return_value=connection),
+            self.assertRaisesRegex(
+                ClusterOperationStoreUnavailable,
+                "Unable to open the cluster operation database for writing",
+            ),
+            self.store._write_connection(),
+        ):
+            self.fail("BEGIN IMMEDIATE failure must not yield a connection")
+
+        connection.rollback.assert_called_once_with()
+        connection.close.assert_called_once_with()
 
 
 if __name__ == "__main__":

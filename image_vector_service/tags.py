@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from collections.abc import Iterable
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 _IMAGE_COUNT_PATTERN = re.compile(
     r"(?i)\d+(?:\.\d+)?\s*(?:p|张|枚|幅|图|pics?|pictures?|images?|files?)"
@@ -77,19 +77,34 @@ def folder_tags_for_image(image_path: Path, root_path: Path) -> tuple[str, ...]:
 
     image = image_path.expanduser().resolve()
     root = root_path.expanduser().resolve()
-    parent = image.parent
     try:
-        parent.relative_to(root)
+        relative = image.relative_to(root)
     except ValueError as exc:
         raise ValueError(f"Image is outside the configured root: {image}") from exc
 
-    while True:
-        tag = clean_generated_tag(parent.name)
+    return folder_tags_for_relative_path(relative.as_posix(), root.name)
+
+
+def folder_tags_for_relative_path(
+    relative_path: str,
+    root_name: str,
+) -> tuple[str, ...]:
+    """Derive folder tags from an already validated portable relative path.
+
+    Index staging stores only normalized relative paths.  Using that value here
+    avoids a filesystem ``resolve`` for every unchanged image while preserving
+    the same nearest-meaningful-folder behavior as ``folder_tags_for_image``.
+    """
+
+    portable = PurePosixPath(str(relative_path).replace("\\", "/"))
+    if portable.is_absolute() or not portable.name or ".." in portable.parts:
+        raise ValueError("Image relative path is invalid.")
+    parent_names = portable.parts[:-1]
+    for name in (*reversed(parent_names), root_name):
+        tag = clean_generated_tag(name)
         if tag:
             return (tag,)
-        if parent == root:
-            return ()
-        parent = parent.parent
+    return ()
 
 
 def build_tags_filter(tags: Iterable[str] | None, mode: str = "all") -> str | None:

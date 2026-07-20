@@ -6,7 +6,7 @@ import tempfile
 import time
 import unittest
 import uuid
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -186,12 +186,16 @@ class FolderDeletionManagerTest(unittest.TestCase):
         )
         self.repository = _Repository(("doc-portrait",))
 
-    def _manager(self) -> FolderDeletionManager:
+    def _manager(
+        self,
+        mutation_observer: Callable[[str, int], None] | None = None,
+    ) -> FolderDeletionManager:
         return FolderDeletionManager(
             config=self.config,
             state=self.state,
             repository=self.repository,
             library_id="library-a",
+            mutation_observer=mutation_observer,
         )
 
     def _root_folder_key(self) -> str:
@@ -231,7 +235,10 @@ class FolderDeletionManagerTest(unittest.TestCase):
         return doc_id
 
     def test_preview_then_commit_removes_only_after_explicit_confirmation(self) -> None:
-        manager = self._manager()
+        observed: list[tuple[str, int]] = []
+        manager = self._manager(
+            lambda operation_id, deleted: observed.append((operation_id, deleted))
+        )
         self.addCleanup(manager.close)
 
         preview = manager.preview(folder_key=self.folder_key)
@@ -266,6 +273,10 @@ class FolderDeletionManagerTest(unittest.TestCase):
         self.assertEqual(self.state.get_many(["doc-portrait"]), {})
         self.assertNotIn("doc-portrait", self.repository.documents)
         self.assertEqual(self.repository.embedding_api_requests, 0)
+        self.assertEqual(
+            observed,
+            [(str(preview["operation_id"]), 1)],
+        )
 
     def test_commit_rejects_changes_made_after_the_preview(self) -> None:
         manager = self._manager()
@@ -357,7 +368,10 @@ class FolderDeletionManagerTest(unittest.TestCase):
         self.assertFalse(self.folder.exists())
         self.assertIn("doc-portrait", self.repository.documents)
 
-        recovered_manager = self._manager()
+        observed: list[tuple[str, int]] = []
+        recovered_manager = self._manager(
+            lambda recovered_id, deleted: observed.append((recovered_id, deleted))
+        )
         self.addCleanup(recovered_manager.close)
         report = recovered_manager.recover_incomplete()
 
@@ -374,6 +388,7 @@ class FolderDeletionManagerTest(unittest.TestCase):
         self.assertEqual(self.state.get_many(["doc-portrait"]), {})
         self.assertNotIn("doc-portrait", self.repository.documents)
         self.assertEqual(self.repository.embedding_api_requests, 0)
+        self.assertEqual(observed, [(operation_id, 1)])
 
     def test_recovery_finishes_sqlite_when_collection_delete_already_committed(
         self,

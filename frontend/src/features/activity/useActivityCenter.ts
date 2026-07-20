@@ -317,6 +317,9 @@ export function useActivityCenter(
   const logsError = ref("");
   const followingLogs = ref(true);
   const visible = ref(true);
+  const documentVisible = ref(
+    typeof document === "undefined" || document.visibilityState !== "hidden",
+  );
   const jobCursor = ref("");
   const logCursor = ref("");
   const jobNextCursor = ref("");
@@ -332,6 +335,9 @@ export function useActivityCenter(
   const logPage = computed(() => logCursorHistory.value.length + 1);
   const hasPreviousJobs = computed(() => jobCursorHistory.value.length > 0);
   const hasPreviousLogs = computed(() => logCursorHistory.value.length > 0);
+  const hasActiveJobs = computed(() =>
+    jobs.value.some((job) => ACTIVE_STATUSES.has(job.status)),
+  );
   const selectedLogs = computed(() => {
     const selection = selectedLogSequences.value;
     return logs.value.filter((item) => selection.has(item.sequence));
@@ -359,8 +365,11 @@ export function useActivityCenter(
 
   function schedulePoll(): void {
     clearPollTimer();
-    if (!pollingEnabled || !visible.value) return;
-    const interval = Math.max(1_000, events.pollIntervalMs ?? 3_000);
+    if (!pollingEnabled || !visible.value || !documentVisible.value) return;
+    const interval = Math.max(
+      1_000,
+      events.pollIntervalMs ?? (hasActiveJobs.value ? 1_000 : 5_000),
+    );
     pollTimer = window.setTimeout(async () => {
       pollTimer = null;
       const requests: Array<Promise<boolean>> = [];
@@ -700,6 +709,17 @@ export function useActivityCenter(
     exportController?.abort();
   }
 
+  function handleDocumentVisibilityChange(): void {
+    documentVisible.value = document.visibilityState !== "hidden";
+    if (!documentVisible.value) {
+      clearPollTimer();
+      jobsController?.abort();
+      logsController?.abort();
+      return;
+    }
+    schedulePoll();
+  }
+
   function startPolling(): void {
     pollingEnabled = true;
     schedulePoll();
@@ -711,17 +731,20 @@ export function useActivityCenter(
   }
 
   async function refreshAll(): Promise<boolean> {
+    if (!visible.value || !documentVisible.value) return true;
     const [jobsLoaded, logsLoaded] = await Promise.all([loadJobs(), loadLogs()]);
     return jobsLoaded && logsLoaded;
   }
 
   onMounted(() => {
+    document.addEventListener("visibilitychange", handleDocumentVisibilityChange);
     if (events.autoStart === false) return;
     pollingEnabled = true;
     void refreshAll().finally(schedulePoll);
   });
 
   onBeforeUnmount(() => {
+    document.removeEventListener("visibilitychange", handleDocumentVisibilityChange);
     stopPolling();
     jobsController?.abort();
     logsController?.abort();
