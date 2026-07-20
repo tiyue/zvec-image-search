@@ -198,9 +198,9 @@ npm.cmd run build
 
 ```text
 python -m pip install --requirement requirements-webview-preview-lock.txt
-python scripts/provision_nsis.py --output-directory build/tools/nsis-3.12
-python scripts/build_webview_preview.py --dry-run
-python scripts/build_webview_preview.py --makensis build/tools/nsis-3.12/nsis-3.12/Bin/makensis.exe
+python scripts/provision_nsis.py --output-directory build/tools/nsis-3.12-python
+python scripts/build_webview_preview.py --dry-run --makensis build/tools/nsis-3.12-python/payload/nsis-3.12/makensis.exe
+python scripts/build_webview_preview.py --makensis build/tools/nsis-3.12-python/payload/nsis-3.12/makensis.exe
 ```
 
 构建脚本必须验证 Vite manifest、资源闭包、冻结入口、x64 WebView2、payload 清单、便携 ZIP 和 NSIS 安装器；冻结自检还会导入搜索学习、主动学习、聚类持久层、活动记录、安全删除和图库目录模块，并实际验证 SQLite WAL 及本地学习状态库可写。
