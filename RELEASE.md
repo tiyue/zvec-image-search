@@ -1,10 +1,17 @@
-# Zvec 0.5.0-rc.1 Android 局域网预览版
+# Zvec 0.5.0-rc.2 Android 局域网预览版
 
 本版提供 Windows x64 原生 Python 后端和 Vue 3 桌面界面。发布包冻结 Python、WebView2 桥接和前端静态资源；用户运行时不需要 Node.js、PowerShell、.NET、Docker、WSL 或单独安装 Python。
 
 当前状态：Windows x64、未签名候选。尚未达到已签名稳定版发布门槛。
 
 ## 本版更新
+
+### 配对可靠性热修复
+
+- Windows 批准结果支持幂等恢复；批准响应短暂丢失后，重复查询同一请求仍可完成连接。
+- Android 在等待和领取批准结果时复用同一配对请求，临时网络故障不会悄然创建另一组验证码。
+- 自动发现不可用时可通过私网 IP 直接连接，连接前会明确校验目标地址与端口。
+- 配对诊断进一步区分待批准、已批准、已拒绝、已过期和凭据恢复失败，便于定位“电脑已批准但手机无反应”。
 
 ### Vue 3 桌面界面
 
@@ -138,14 +145,14 @@
 以下是完成最终构建和校验后采用的文件名。本说明不代表这些文件已经由当前源码重新生成；实际交付必须同时提供 SHA-256 和验证报告。
 
 ```text
-Zvec-Desktop-0.5.0-rc.1-win-x64-unsigned-setup.exe
-Zvec-Desktop-0.5.0-rc.1-win-x64-portable.zip
-Zvec-Webview-Preview-0.5.0-rc.1-win-x64-portable.zip
-Zvec-Webview-Preview-0.5.0-rc.1-win-x64-unsigned-setup.exe
-Zvec-LAN-Viewer-0.5.0-rc.1-android-debug-preview.apk
+Zvec-Desktop-0.5.0-rc.2-win-x64-unsigned-setup.exe
+Zvec-Desktop-0.5.0-rc.2-win-x64-portable.zip
+Zvec-Webview-Preview-0.5.0-rc.2-win-x64-portable.zip
+Zvec-Webview-Preview-0.5.0-rc.2-win-x64-unsigned-setup.exe
+Zvec-LAN-Viewer-0.5.0-rc.2-android-debug-preview.apk
 ```
 
-候选包只要包含该 debug APK，发布装配策略就会将 `effective_prerelease` 设为 `true`。触发 GitHub Release 时必须使用带预发布后缀的 SemVer；本次使用 `0.5.0-rc.1`，不能把 debug APK 挂在稳定版标签下。
+候选包只要包含该 debug APK，发布装配策略就会将 `effective_prerelease` 设为 `true`。触发 GitHub Release 时必须使用带预发布后缀的 SemVer；本次使用 `0.5.0-rc.2`，不能把 debug APK 挂在稳定版标签下。
 
 Vue Preview 使用独立入口：
 

@@ -12,8 +12,8 @@ android {
         applicationId = "com.zvec.lanviewer"
         minSdk = 26
         targetSdk = 34
-        versionCode = 500001
-        versionName = "0.5.0-rc.1"
+        versionCode = 500002
+        versionName = "0.5.0-rc.2"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables.useSupportLibrary = true

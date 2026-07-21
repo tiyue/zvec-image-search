@@ -43,7 +43,7 @@ function fakeApi(): SearchApi {
       total_pages: 0,
       items: [],
     })),
-    submit: vi.fn(async (body: SearchSubmission) => resultPayload(body.text, 1)),
+    submit: vi.fn(async (body: SearchSubmission) => resultPayload(body.text ?? "", 1)),
     page: vi.fn(async (operationId: string) => resultPayload(operationId, 1)),
     cancel: vi.fn(async (operationId: string) => ({
       id: operationId,
@@ -61,7 +61,7 @@ describe("useSearch resilience", () => {
     const api = fakeApi();
     const submit = vi.mocked(api.submit);
     let sequence = 0;
-    submit.mockImplementation(async (body) => resultPayload(body.text, sequence += 1));
+    submit.mockImplementation(async (body) => resultPayload(body.text ?? "", sequence += 1));
     const search = useSearch(api);
     search.mode.value = "tags";
 
@@ -73,11 +73,34 @@ describe("useSearch resilience", () => {
 
     expect(submit).toHaveBeenCalledTimes(3);
     expect(submit.mock.calls.map(([body]) => [body.text, body.mode])).toEqual([
-      ["原", "tags"],
-      ["神", "tags"],
-      ["原神", "tags"],
+      ["原", "tag"],
+      ["神", "tag"],
+      ["原神", "tag"],
     ]);
     expect(search.items.value[0]?.id).toBe("image-3");
+  });
+
+  it("derives image, combined and tag API modes from the visible inputs", async () => {
+    const api = fakeApi();
+    const submit = vi.mocked(api.submit);
+    const search = useSearch(api);
+
+    search.setQueryImage("query-1", "query.jpg");
+    await expect(search.submit()).resolves.toBe(true);
+    expect(submit.mock.calls[0]?.[0]).toMatchObject({ mode: "image", query_image_id: "query-1" });
+
+    search.query.value = "红色和服";
+    await expect(search.submit()).resolves.toBe(true);
+    expect(submit.mock.calls[1]?.[0]).toMatchObject({
+      mode: "combined",
+      text: "红色和服",
+      query_image_id: "query-1",
+    });
+
+    search.mode.value = "tags";
+    await expect(search.submit()).resolves.toBe(true);
+    expect(submit.mock.calls[2]?.[0]).toMatchObject({ mode: "tag", text: "红色和服" });
+    expect(submit.mock.calls[2]?.[0]).not.toHaveProperty("query_image_id");
   });
 
   it("uses the watchdog to recover when the search request never settles", async () => {

@@ -1,4 +1,7 @@
-@file:OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
+@file:OptIn(
+    androidx.compose.foundation.ExperimentalFoundationApi::class,
+    androidx.compose.material3.ExperimentalMaterial3Api::class,
+)
 
 package com.zvec.lanviewer.ui
 
@@ -10,6 +13,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
@@ -48,6 +52,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
@@ -74,6 +79,10 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntSize
@@ -160,7 +169,7 @@ fun ZvecApp(viewModel: AppViewModel) {
             )
             ConnectionPhase.CONNECTING -> CenterStatus(
                 title = "正在连接",
-                detail = state.serverName ?: "Zvec 电脑",
+                detail = state.connectionDetail ?: state.serverName ?: "Zvec 电脑",
                 modifier = Modifier.padding(padding),
             )
             ConnectionPhase.PAIRING -> PairingScreen(
@@ -339,47 +348,98 @@ private fun SearchScreen(
     onOpen: (Int) -> Unit,
     onDisconnect: () -> Unit,
 ) {
+    var selectedTab by remember { mutableStateOf(MobileTab.SEARCH) }
+    LaunchedEffect(state.activeSearchId, state.results.size) {
+        if (state.activeSearchId != null && state.results.isNotEmpty()) selectedTab = MobileTab.RESULTS
+    }
+
     Column(modifier.fillMaxSize().statusBarsPadding()) {
         Row(
-            modifier = Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface).padding(16.dp),
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Column(Modifier.weight(1f)) {
-                Text("Zvec", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-                Text(state.serverName.orEmpty(), style = MaterialTheme.typography.bodySmall)
+                Text("Zvec", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
+                Text(state.serverName.orEmpty(), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.secondary)
             }
-            TextButton(onClick = onDisconnect) { Text("断开") }
+            Text("● 已连接", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.secondary)
         }
 
-        SearchControls(
-            state = state,
-            onMode = onMode,
-            onText = onText,
-            onTopK = onTopK,
-            onLibrary = onLibrary,
-            onPickImage = onPickImage,
-            onCancelUpload = onCancelUpload,
-            onClearImage = onClearImage,
-            onSearch = onSearch,
-            onCancelSearch = onCancelSearch,
-        )
+        Box(Modifier.weight(1f).fillMaxWidth()) {
+            when (selectedTab) {
+                MobileTab.SEARCH -> SearchControls(
+                    state = state,
+                    onMode = onMode,
+                    onText = onText,
+                    onTopK = onTopK,
+                    onLibrary = onLibrary,
+                    onPickImage = onPickImage,
+                    onCancelUpload = onCancelUpload,
+                    onClearImage = onClearImage,
+                    onSearch = onSearch,
+                    onCancelSearch = onCancelSearch,
+                )
+                MobileTab.RESULTS -> if (state.results.isEmpty()) {
+                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        when {
+                            state.isSearching || state.isLoadingNextPage -> CircularProgressIndicator()
+                            else -> Text("搜索后在这里查看结果", color = MaterialTheme.colorScheme.secondary)
+                        }
+                    }
+                } else {
+                    ResultsGrid(
+                        state = state,
+                        mediaUrl = mediaUrl,
+                        onOpen = onOpen,
+                        onLoadMore = onLoadMore,
+                        modifier = Modifier.fillMaxSize(),
+                    )
+                }
+                MobileTab.DEVICE -> DevicePanel(state = state, onDisconnect = onDisconnect)
+            }
+        }
 
-        if (state.results.isEmpty()) {
-            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                when {
-                    state.isSearching || state.isLoadingNextPage -> CircularProgressIndicator()
-                    else -> Text("输入条件开始搜索", color = MaterialTheme.colorScheme.secondary)
+        MobileBottomBar(selected = selectedTab, onSelected = { selectedTab = it })
+    }
+}
+
+private enum class MobileTab { SEARCH, RESULTS, DEVICE }
+
+@Composable
+private fun MobileBottomBar(selected: MobileTab, onSelected: (MobileTab) -> Unit) {
+    Row(
+        modifier = Modifier.fillMaxWidth().navigationBarsPadding().background(MaterialTheme.colorScheme.surface).padding(horizontal = 10.dp, vertical = 6.dp),
+        horizontalArrangement = Arrangement.SpaceAround,
+    ) {
+        listOf(
+            Triple(MobileTab.SEARCH, "⌕", "搜索"),
+            Triple(MobileTab.RESULTS, "▧", "结果"),
+            Triple(MobileTab.DEVICE, "▣", "设备"),
+        ).forEach { (tab, glyph, label) ->
+            TextButton(onClick = { onSelected(tab) }, modifier = Modifier.weight(1f)) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text(glyph, fontSize = 18.sp, color = if (selected == tab) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.secondary)
+                    Text(label, style = MaterialTheme.typography.labelSmall, color = if (selected == tab) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.secondary)
                 }
             }
-        } else {
-            ResultsGrid(
-                state = state,
-                mediaUrl = mediaUrl,
-                onOpen = onOpen,
-                onLoadMore = onLoadMore,
-                modifier = Modifier.weight(1f),
-            )
         }
+    }
+}
+
+@Composable
+private fun DevicePanel(state: AppUiState, onDisconnect: () -> Unit) {
+    Column(
+        modifier = Modifier.fillMaxSize().padding(20.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Text("连接设备", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
+        Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) {
+            Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text(state.serverName ?: "Zvec 电脑", fontWeight = FontWeight.SemiBold)
+                Text("已连接 · ${state.libraries.size} 个图库", style = MaterialTheme.typography.bodySmall)
+            }
+        }
+        OutlinedButton(onClick = onDisconnect, modifier = Modifier.fillMaxWidth()) { Text("断开并重新发现") }
     }
 }
 
@@ -396,63 +456,116 @@ private fun SearchControls(
     onSearch: () -> Unit,
     onCancelSearch: () -> Unit,
 ) {
-    Column(
-        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            items(SearchMode.entries.size) { index ->
-                val mode = SearchMode.entries[index]
-                FilterChip(
-                    selected = state.searchMode == mode,
-                    onClick = { onMode(mode) },
-                    label = { Text(mode.label()) },
+    var optionsOpen by remember { mutableStateOf(false) }
+    val canSearch = state.queryImage?.uploading != true && when (state.searchMode) {
+        SearchMode.TAG -> state.searchText.isNotBlank()
+        else -> state.searchText.isNotBlank() || state.queryImage?.queryImageId != null
+    }
+
+    if (optionsOpen) {
+        ModalBottomSheet(onDismissRequest = { optionsOpen = false }) {
+            Column(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp).navigationBarsPadding(),
+                verticalArrangement = Arrangement.spacedBy(14.dp),
+            ) {
+                Text("搜索设置", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
+                OutlinedTextField(
+                    value = state.topKText,
+                    onValueChange = onTopK,
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("结果数量") },
+                    singleLine = true,
                 )
+                if (state.libraries.isNotEmpty()) {
+                    Text("搜索图库（不选表示全部）", style = MaterialTheme.typography.labelLarge)
+                    LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        items(state.libraries.size, key = { state.libraries[it].id }) { index ->
+                            val library = state.libraries[index]
+                            LibraryChip(library, library.id in state.selectedLibraryIds) { onLibrary(library.id) }
+                        }
+                    }
+                }
+                Button(onClick = { optionsOpen = false }, modifier = Modifier.fillMaxWidth()) { Text("完成") }
+                Spacer(Modifier.height(12.dp))
             }
         }
+    }
 
-        if (state.searchMode != SearchMode.IMAGE) {
-            OutlinedTextField(
-                value = state.searchText,
-                onValueChange = onText,
-                modifier = Modifier.fillMaxWidth(),
-                label = { Text(if (state.searchMode == SearchMode.TAG) "标签" else "搜索文字") },
-                singleLine = true,
-            )
-        }
+    Column(
+        modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp),
+        verticalArrangement = Arrangement.Center,
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Text("你想找什么？", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Medium)
+        Spacer(Modifier.height(6.dp))
+        Text("搜索电脑上的本地图库", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.secondary)
+        Spacer(Modifier.height(22.dp))
 
-        if (state.searchMode == SearchMode.IMAGE || state.searchMode == SearchMode.COMBINED) {
-            QueryImageControl(state.queryImage, onPickImage, onCancelUpload, onClearImage)
-        }
-
-        if (state.libraries.isNotEmpty()) {
-            Text("图库（不选表示全部）", style = MaterialTheme.typography.labelLarge)
-            LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                items(state.libraries.size, key = { state.libraries[it].id }) { index ->
-                    val library = state.libraries[index]
-                    LibraryChip(library, library.id in state.selectedLibraryIds) { onLibrary(library.id) }
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(28.dp),
+            color = MaterialTheme.colorScheme.surface,
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+            shadowElevation = 2.dp,
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth().height(56.dp).padding(horizontal = 7.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                if (state.searchMode != SearchMode.TAG) {
+                    TextButton(onClick = onPickImage, modifier = Modifier.size(42.dp), contentPadding = PaddingValues(0.dp)) {
+                        Text("＋", fontSize = 22.sp, color = MaterialTheme.colorScheme.secondary)
+                    }
+                }
+                BasicTextField(
+                    value = state.searchText,
+                    onValueChange = onText,
+                    modifier = Modifier.weight(1f).padding(horizontal = 6.dp),
+                    singleLine = true,
+                    textStyle = MaterialTheme.typography.bodyLarge.copy(color = MaterialTheme.colorScheme.onSurface),
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                    keyboardActions = KeyboardActions(onSearch = { if (canSearch) onSearch() }),
+                    decorationBox = { field ->
+                        if (state.searchText.isBlank()) {
+                            Text(
+                                if (state.searchMode == SearchMode.TAG) "输入标签" else "描述人物、场景或动作",
+                                color = MaterialTheme.colorScheme.secondary,
+                                style = MaterialTheme.typography.bodyMedium,
+                            )
+                        }
+                        field()
+                    },
+                )
+                TextButton(onClick = { onMode(if (state.searchMode == SearchMode.TAG) SearchMode.TEXT else SearchMode.TAG) }) {
+                    Text(if (state.searchMode == SearchMode.TAG) "标签" else "语义", color = MaterialTheme.colorScheme.secondary)
+                }
+                Button(
+                    onClick = if (state.isSearching) onCancelSearch else onSearch,
+                    enabled = if (state.isSearching) true else canSearch,
+                    modifier = Modifier.size(42.dp),
+                    contentPadding = PaddingValues(0.dp),
+                    shape = RoundedCornerShape(50),
+                ) {
+                    Text(if (state.isSearching) "×" else "↑", fontSize = 20.sp)
                 }
             }
         }
 
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-            OutlinedTextField(
-                value = state.topKText,
-                onValueChange = onTopK,
-                modifier = Modifier.width(132.dp),
-                label = { Text("结果数") },
-                singleLine = true,
-            )
-            Button(
-                onClick = if (state.isSearching) onCancelSearch else onSearch,
-                enabled = state.queryImage?.uploading != true,
-                modifier = Modifier.weight(1f).height(56.dp),
-            ) {
-                Text(if (state.isSearching) "取消搜索" else "搜索")
-            }
+        if (state.queryImage != null && state.searchMode != SearchMode.TAG) {
+            Spacer(Modifier.height(10.dp))
+            QueryImageControl(state.queryImage, onPickImage, onCancelUpload, onClearImage)
         }
-        state.searchStatus?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
-        state.errorMessage?.let { ErrorBanner(it) }
+
+        Spacer(Modifier.height(12.dp))
+        TextButton(onClick = { optionsOpen = true }) { Text("☷  搜索设置", color = MaterialTheme.colorScheme.secondary) }
+        state.searchStatus?.let {
+            Spacer(Modifier.height(6.dp))
+            Text(it, style = MaterialTheme.typography.bodySmall)
+        }
+        state.errorMessage?.let {
+            Spacer(Modifier.height(8.dp))
+            ErrorBanner(it)
+        }
     }
 }
 
@@ -522,7 +635,7 @@ private fun ResultsGrid(
             }
     }
     LazyVerticalGrid(
-        columns = GridCells.Adaptive(140.dp),
+        columns = GridCells.Fixed(2),
         state = gridState,
         modifier = modifier,
         contentPadding = PaddingValues(8.dp),
@@ -556,7 +669,7 @@ private fun ResultCard(item: SearchItem, url: String, onClick: () -> Unit) {
             model = ImageRequest.Builder(context).data(url).size(640).crossfade(true).build(),
             contentDescription = item.name,
             contentScale = ContentScale.Crop,
-            modifier = Modifier.fillMaxWidth().height(150.dp).background(MaterialTheme.colorScheme.surfaceVariant),
+            modifier = Modifier.fillMaxWidth().height(190.dp).background(MaterialTheme.colorScheme.surfaceVariant),
         )
         Column(Modifier.padding(8.dp)) {
             Text(item.name.ifBlank { "未命名图片" }, maxLines = 1, overflow = TextOverflow.Ellipsis)

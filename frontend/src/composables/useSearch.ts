@@ -4,9 +4,11 @@ import { ApiError, searchApi, type SearchApi } from "../api/client";
 import type {
   LibrarySummary,
   SearchMode,
+  SearchRequestMode,
   SearchPageResponse,
   SearchResultItem,
   SearchResultWire,
+  SearchSubmission,
 } from "../types/contracts";
 
 const PAGE_SIZE = 15 as const;
@@ -207,7 +209,21 @@ function positiveInteger(value: unknown): number | null {
   return Number.isFinite(parsed) && Number.isInteger(parsed) ? parsed : null;
 }
 
-export function useSearch(api: SearchApi = searchApi, events: SearchEvents = {}) {
+function deriveRequestMode(
+  uiMode: SearchMode,
+  hasText: boolean,
+  hasImage: boolean,
+): SearchRequestMode {
+  if (uiMode === "tags") return "tag";
+  if (hasImage && hasText) return "combined";
+  if (hasImage) return "image";
+  return "text";
+}
+
+export function useSearch(
+  api: SearchApi = searchApi,
+  events: SearchEvents = {},
+) {
   const query = ref("");
   const mode = ref<SearchMode>("semantic");
   const libraryId = ref("");
@@ -552,17 +568,21 @@ export function useSearch(api: SearchApi = searchApi, events: SearchEvents = {})
 
   async function submit(): Promise<boolean> {
     const searchText = query.value.trim();
-    if (!searchText) {
-      events.onError?.("请输入搜索内容", "可以输入人物、作品、动作、神态或标签。");
+    const hasText = !!searchText;
+    const hasImage = !!queryImageId.value;
+    const requestMode = deriveRequestMode(mode.value, hasText, hasImage);
+
+    if (!hasText && !hasImage) {
+      events.onError?.("请输入文字或添加图片", "可以输入人物、作品、动作、神态、标签，或选择一张查询图片。");
+      return false;
+    }
+    if (mode.value === "tags" && !hasText) {
+      events.onError?.("请输入标签", "标签搜索需要至少输入一个标签。");
       return false;
     }
     const topK = positiveInteger(resultLimit.value);
     if (topK === null) {
       events.onError?.("取图数量无效", "请输入大于或等于 1 的整数。");
-      return false;
-    }
-    if (mode.value === "combined" && !queryImageId.value) {
-      events.onError?.("请选择查询图片", "图文联合搜索必须同时包含文字和图片。");
       return false;
     }
 
@@ -579,22 +599,24 @@ export function useSearch(api: SearchApi = searchApi, events: SearchEvents = {})
     const startedAt = Date.now();
     armSearchWatchdog(localGeneration, controller);
     emitDiagnostic("search_submit_started", {
-      mode: mode.value,
+      mode: requestMode,
       top_k: topK,
       library_count: libraryId.value ? 1 : libraries.value.filter((item) => item.enabled !== false).length,
-      has_query_image: Boolean(queryImageId.value),
+      has_query_image: hasImage,
       query_length: searchText.length,
     });
     try {
-      const body = {
-        text: searchText,
-        mode: mode.value,
+      const body: SearchSubmission = {
+        ...(hasText ? { text: searchText } : {}),
+        mode: requestMode,
         library_ids: libraryId.value ? [libraryId.value] : [],
         top_k: topK,
         page: 1 as const,
         page_size: PAGE_SIZE,
-        ...(mode.value === "combined" ? { query_image_id: queryImageId.value } : {}),
       };
+      if (hasImage && requestMode !== "tag") {
+        body.query_image_id = queryImageId.value;
+      }
       let payload: SearchPageResponse | null = null;
       for (let attempt = 0; attempt <= MAX_QUEUE_RETRIES; attempt += 1) {
         try {

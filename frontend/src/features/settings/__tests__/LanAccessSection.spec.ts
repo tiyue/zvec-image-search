@@ -62,6 +62,7 @@ describe("LanAccessSection", () => {
     expect(wrapper.text()).toContain("192.168.1.20:38522");
     expect(wrapper.text()).toContain("Galaxy Tab");
     expect(wrapper.text()).toContain("483921");
+    expect(wrapper.text()).toContain("手机没有显示验证码时不要批准");
     expect(wrapper.text()).not.toContain("Bearer");
     expect(wrapper.text()).not.toContain("token");
   });

@@ -33,11 +33,12 @@ data class AppUiState(
     val pairingCode: String? = null,
     val pairingSecondsRemaining: Long = 0L,
     val serverName: String? = null,
+    val connectionDetail: String? = null,
     val libraries: List<LibraryDto> = emptyList(),
     val selectedLibraryIds: Set<String> = emptySet(),
     val searchMode: SearchMode = SearchMode.TEXT,
     val searchText: String = "",
-    val topKText: String = "1000",
+    val topKText: String = "36",
     val queryImage: QueryImageUiState? = null,
     val isSearching: Boolean = false,
     val searchStatus: String? = null,
@@ -51,7 +52,33 @@ data class AppUiState(
     val transferFraction: Float? = null,
 )
 
+/**
+ * The phone exposes only semantic and tag choices. Image and combined modes
+ * are derived from the actual inputs so the UI cannot send contradictory
+ * combinations to the desktop service.
+ */
+internal fun resolveSearchMode(visibleMode: SearchMode, hasText: Boolean, hasImage: Boolean): SearchMode = when {
+    visibleMode == SearchMode.TAG -> SearchMode.TAG
+    hasImage && hasText -> SearchMode.COMBINED
+    hasImage -> SearchMode.IMAGE
+    else -> SearchMode.TEXT
+}
+
+internal fun AppUiState.resolvedSearchMode(): SearchMode = resolveSearchMode(
+    visibleMode = searchMode,
+    hasText = searchText.isNotBlank(),
+    hasImage = queryImage?.queryImageId != null,
+)
+
 sealed interface AppEvent {
     data class Message(val text: String) : AppEvent
     data class Share(val uri: Uri, val mimeType: String) : AppEvent
 }
+
+internal fun AppUiState.afterPairingApproved(): AppUiState = copy(
+    phase = ConnectionPhase.CONNECTING,
+    pairingCode = null,
+    pairingSecondsRemaining = 0L,
+    connectionDetail = "电脑已批准，正在载入图库…",
+    errorMessage = null,
+)

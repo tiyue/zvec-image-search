@@ -19,6 +19,7 @@ from zvec_lan import (
     PairingError,
     PairingExpired,
     PairingManager,
+    PairingNotFound,
     PairingSecretRejected,
     PairingTransitionRejected,
 )
@@ -71,10 +72,130 @@ class PairingStateMachineTests(unittest.TestCase):
         self.assertEqual(view.expires_at - view.created_at, 300)
         self.assertEqual(view.expires_in_seconds(clock()), 300)
 
-    def test_approval_returns_token_exactly_once_even_with_concurrent_polls(
+    def test_same_device_and_secret_retry_reuses_pending_request(self) -> None:
+        clock = _Clock()
+        pairing_ids = iter(("pairing-id-original-1234",))
+        codes = iter(("123456",))
+        manager = PairingManager(
+            clock=clock,
+            pairing_id_factory=lambda: next(pairing_ids),
+            code_factory=lambda: next(codes),
+        )
+        original = manager.create_request(
+            device_id="android-install-1",
+            device_name="Pixel Tablet",
+            client_secret=CLIENT_SECRET,
+        )
+
+        clock.now += 37
+        retried = manager.create_request(
+            device_id="android-install-1",
+            device_name="Renamed Tablet",
+            client_secret=CLIENT_SECRET,
+        )
+
+        self.assertIs(retried, original)
+        self.assertEqual(retried.device_name, "Pixel Tablet")
+        self.assertEqual(retried.expires_at, 1_300.0)
+        self.assertEqual(manager.pending_requests(), (original,))
+
+    def test_same_create_retry_reuses_fast_approved_request_and_token(self) -> None:
+        clock = _Clock()
+        manager = _manager(clock=clock)
+        original = manager.create_request(
+            device_id="android-install-1",
+            device_name="Pixel Tablet",
+            client_secret=CLIENT_SECRET,
+        )
+        approved = manager.approve(original.pairing_id)
+
+        clock.now += 120
+        retried = manager.create_request(
+            device_id="android-install-1",
+            device_name="Pixel Tablet",
+            client_secret=CLIENT_SECRET,
+        )
+
+        self.assertIs(retried, approved)
+        self.assertEqual(retried.pairing_id, original.pairing_id)
+        self.assertEqual(retried.comparison_code, original.comparison_code)
+        self.assertEqual(retried.status, "approved")
+        self.assertEqual(manager.start_payload(retried)["expires_in_seconds"], 180)
+        polled = manager.poll(retried.pairing_id, client_secret=CLIENT_SECRET)
+        self.assertEqual(polled.status, "approved")
+        self.assertEqual(polled.token, DEVICE_TOKEN)
+
+    def test_same_device_with_new_secret_replaces_pending_request(self) -> None:
+        pairing_ids = iter(("pairing-id-original-5678", "pairing-id-replacement-9"))
+        codes = iter(("234567", "345678"))
+        manager = PairingManager(
+            pairing_id_factory=lambda: next(pairing_ids),
+            code_factory=lambda: next(codes),
+        )
+        original = manager.create_request(
+            device_id="android-install-1",
+            device_name="Pixel Tablet",
+            client_secret=CLIENT_SECRET,
+        )
+
+        replacement = manager.create_request(
+            device_id="android-install-1",
+            device_name="Pixel Tablet",
+            client_secret=OTHER_SECRET,
+        )
+
+        self.assertNotEqual(replacement.pairing_id, original.pairing_id)
+        self.assertNotEqual(replacement.comparison_code, original.comparison_code)
+        self.assertEqual(manager.pending_requests(), (replacement,))
+        with self.assertRaises(PairingNotFound):
+            manager.poll(original.pairing_id, client_secret=CLIENT_SECRET)
+
+    def test_expired_same_secret_retry_allocates_a_new_request(self) -> None:
+        clock = _Clock()
+        pairing_ids = iter(("pairing-id-expired-1234", "pairing-id-current-5678"))
+        codes = iter(("456789", "567890"))
+        manager = PairingManager(
+            clock=clock,
+            pairing_id_factory=lambda: next(pairing_ids),
+            code_factory=lambda: next(codes),
+        )
+        expired = manager.create_request(
+            device_id="android-install-1",
+            device_name="Pixel Tablet",
+            client_secret=CLIENT_SECRET,
+        )
+
+        clock.now += 300
+        current = manager.create_request(
+            device_id="android-install-1",
+            device_name="Pixel Tablet",
+            client_secret=CLIENT_SECRET,
+        )
+
+        self.assertNotEqual(current.pairing_id, expired.pairing_id)
+        self.assertNotEqual(current.comparison_code, expired.comparison_code)
+        self.assertEqual(current.created_at, 1_300.0)
+        self.assertEqual(manager.pending_requests(), (current,))
+        with self.assertRaises(PairingNotFound):
+            manager.poll(expired.pairing_id, client_secret=CLIENT_SECRET)
+
+    def test_approval_reuses_one_token_and_credential_for_concurrent_polls(
         self,
     ) -> None:
-        manager = _manager()
+        store = MemoryCredentialStore()
+        generated_tokens: list[str] = []
+
+        def generate_token() -> str:
+            generated_tokens.append(DEVICE_TOKEN)
+            return DEVICE_TOKEN
+
+        manager = PairingManager(
+            store,
+            clock=_Clock(),
+            token_factory=generate_token,
+            pairing_id_factory=lambda: "pairing-id-1234567890",
+            code_factory=lambda: "003721",
+        )
         view = manager.create_request(
             device_id="android-install-1",
             device_name="Pixel Tablet",
@@ -90,14 +211,42 @@ class PairingStateMachineTests(unittest.TestCase):
                 client_secret=CLIENT_SECRET,
             ).token
 
-        with ThreadPoolExecutor(max_workers=12) as executor:
+        with (
+            patch.object(store, "put", wraps=store.put) as put,
+            ThreadPoolExecutor(max_workers=12) as executor,
+        ):
             tokens = list(executor.map(lambda _index: poll(), range(12)))
 
-        self.assertEqual(tokens.count(DEVICE_TOKEN), 1)
-        self.assertEqual(tokens.count(None), 11)
+        self.assertEqual(tokens, [DEVICE_TOKEN] * 12)
+        self.assertEqual(generated_tokens, [DEVICE_TOKEN])
+        put.assert_called_once()
+        self.assertEqual(len(store.list_clients()), 1)
         self.assertIsNotNone(manager.authenticate(DEVICE_TOKEN))
 
-    def test_secret_and_token_are_never_retained_in_plaintext(self) -> None:
+    def test_approved_token_recovery_expires_but_credential_remains_valid(
+        self,
+    ) -> None:
+        clock = _Clock()
+        manager = _manager(clock=clock)
+        view = manager.create_request(
+            device_id="android-install-1",
+            device_name="Pixel Tablet",
+            client_secret=CLIENT_SECRET,
+        )
+        manager.approve(view.pairing_id)
+        issued = manager.poll(view.pairing_id, client_secret=CLIENT_SECRET)
+        recovered = manager.poll(view.pairing_id, client_secret=CLIENT_SECRET)
+
+        self.assertEqual(issued.token, DEVICE_TOKEN)
+        self.assertEqual(recovered.token, DEVICE_TOKEN)
+        clock.now += 300
+        with self.assertRaises(PairingExpired):
+            manager.poll(view.pairing_id, client_secret=CLIENT_SECRET)
+        with self.assertRaises(PairingNotFound):
+            manager.poll(view.pairing_id, client_secret=CLIENT_SECRET)
+        self.assertIsNotNone(manager.authenticate(DEVICE_TOKEN))
+
+    def test_secrets_are_not_exposed_by_repr_or_persistent_records(self) -> None:
         store = MemoryCredentialStore()
         manager = _manager(store)
         view = manager.create_request(
@@ -111,12 +260,29 @@ class PairingStateMachineTests(unittest.TestCase):
         token = manager.poll(view.pairing_id, client_secret=CLIENT_SECRET).token
 
         self.assertEqual(token, DEVICE_TOKEN)
+        self.assertNotIn(DEVICE_TOKEN, repr(manager.__dict__))
         records = store.list_clients()
         self.assertEqual(len(records), 1)
         self.assertNotIn(CLIENT_SECRET, repr(records))
         self.assertNotIn(DEVICE_TOKEN, repr(records))
         self.assertEqual(len(records[0].token_hash), 64)
         self.assertEqual(len(records[0].client_secret_hash), 64)
+
+    def test_token_revoke_discards_approved_recovery_record(self) -> None:
+        manager = _manager()
+        view = manager.create_request(
+            device_id="android-install-1",
+            device_name="Pixel Tablet",
+            client_secret=CLIENT_SECRET,
+        )
+        manager.approve(view.pairing_id)
+        token = manager.poll(view.pairing_id, client_secret=CLIENT_SECRET).token
+        assert token is not None
+
+        self.assertTrue(manager.revoke(token))
+        self.assertIsNone(manager.authenticate(token))
+        with self.assertRaises(PairingNotFound):
+            manager.poll(view.pairing_id, client_secret=CLIENT_SECRET)
 
     def test_reject_wrong_secret_and_expiry_are_distinct_states(self) -> None:
         clock = _Clock()
@@ -185,12 +351,22 @@ class PairingStateMachineTests(unittest.TestCase):
             pairing_id_factory=lambda: f"pairing-id-{next(ids):020d}",
             code_factory=lambda: f"{next(codes):06d}",
         )
+        views = []
         for index in range(32):
-            manager.create_request(
-                device_id=f"android-install-{index}",
-                device_name=f"Device {index}",
-                client_secret=CLIENT_SECRET,
+            views.append(
+                manager.create_request(
+                    device_id=f"android-install-{index}",
+                    device_name=f"Device {index}",
+                    client_secret=CLIENT_SECRET,
+                )
             )
+
+        retry_at_capacity = manager.create_request(
+            device_id="android-install-0",
+            device_name="Device 0",
+            client_secret=CLIENT_SECRET,
+        )
+        self.assertIs(retry_at_capacity, views[0])
 
         with self.assertRaises(PairingCapacityExceeded):
             manager.create_request(
@@ -230,6 +406,8 @@ class PairingStateMachineTests(unittest.TestCase):
         self.assertFalse(hasattr(clients[0], "client_secret_hash"))
         self.assertTrue(manager.revoke_client("android-install-1"))
         self.assertIsNone(manager.authenticate(DEVICE_TOKEN))
+        with self.assertRaises(PairingNotFound):
+            manager.poll(view.pairing_id, client_secret=CLIENT_SECRET)
         self.assertFalse(manager.revoke_client("android-install-1"))
 
     def test_repairing_same_device_gets_a_new_internal_session_scope(self) -> None:
@@ -261,6 +439,8 @@ class PairingStateMachineTests(unittest.TestCase):
             device_name="Pixel Tablet",
             client_secret=OTHER_SECRET,
         )
+        with self.assertRaises(PairingNotFound):
+            manager.poll(first.pairing_id, client_secret=CLIENT_SECRET)
         manager.approve(second.pairing_id)
         second_token = manager.poll(
             second.pairing_id,
@@ -375,6 +555,8 @@ class JsonCredentialStoreTests(unittest.TestCase):
                 manager.revoke_client("android-install-1")
 
             self.assertIsNone(manager.authenticate(DEVICE_TOKEN))
+            with self.assertRaises(PairingNotFound):
+                manager.poll(view.pairing_id, client_secret=CLIENT_SECRET)
             restarted = PairingManager(JsonCredentialStore(path))
             self.assertIsNone(restarted.authenticate(DEVICE_TOKEN))
 

@@ -47,7 +47,6 @@ from .pairing import (
     PairingManager,
     PairingNotFound,
     PairingSecretRejected,
-    pairing_payload,
 )
 from .uploads import (
     EmptyUpload,
@@ -643,7 +642,7 @@ class _LanRequestHandler(BaseHTTPRequestHandler):
         )
         self._send_json(
             HTTPStatus.CREATED,
-            pairing_payload(view, now=view.created_at),
+            self.gateway._pairing.start_payload(view),
         )
 
     def _poll_pair_request(self, pairing_id: str) -> None:

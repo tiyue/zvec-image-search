@@ -34,6 +34,7 @@ data class PairStartResponse(
     @SerialName("pairing_id") val pairingId: String,
     @SerialName("comparison_code") val comparisonCode: String,
     @SerialName("expires_in_seconds") val expiresInSeconds: Long = 300,
+    @SerialName("expires_at") val expiresAt: String? = null,
     val status: String = "pending",
 )
 

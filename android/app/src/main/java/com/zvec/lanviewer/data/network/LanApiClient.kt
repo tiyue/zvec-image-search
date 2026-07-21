@@ -18,7 +18,10 @@ import com.zvec.lanviewer.data.model.SearchRequest
 import com.zvec.lanviewer.data.model.StatusResponse
 import com.zvec.lanviewer.data.model.UploadProgress
 import com.zvec.lanviewer.data.security.SecureTokenStore
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withContext
+import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -33,10 +36,12 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import java.io.IOException
+import java.net.Proxy
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
+@OptIn(ExperimentalSerializationApi::class)
 class LanApiClient(
     private val connectionReader: ConnectionReader,
     tokenStore: SecureTokenStore,
@@ -48,6 +53,7 @@ class LanApiClient(
     },
 ) {
     val httpClient: OkHttpClient
+    private val pairingHttpClient: OkHttpClient
 
     init {
         require(maxConcurrentRequests in 1..64) { "并发数必须在 1..64 之间" }
@@ -57,6 +63,9 @@ class LanApiClient(
         }
         httpClient = OkHttpClient.Builder()
             .dispatcher(dispatcher)
+            // Android may inherit a system/VPN proxy. Private RFC1918 Zvec traffic must
+            // stay on the local network and must never depend on that proxy being healthy.
+            .proxy(Proxy.NO_PROXY)
             .connectTimeout(8, TimeUnit.SECONDS)
             .readTimeout(60, TimeUnit.SECONDS)
             .writeTimeout(0, TimeUnit.MILLISECONDS)
@@ -66,26 +75,36 @@ class LanApiClient(
             .followSslRedirects(false)
             .addInterceptor(AuthInterceptor(tokenStore, connectionReader))
             .build()
+        // Pairing owns an explicit, exactly-once retry with an identical body. Disable
+        // OkHttp's hidden retry only for these calls so production can never exceed 2 sends.
+        pairingHttpClient = httpClient.newBuilder()
+            .retryOnConnectionFailure(false)
+            .readTimeout(8, TimeUnit.SECONDS)
+            .build()
     }
 
-    suspend fun startPairing(baseUrl: String, request: PairRequest): PairStartResponse =
-        executeJson(
-            Request.Builder()
-                .url(endpoint(baseUrl, "api", "v1", "pair-requests"))
-                .post(json.encodeToString(request).jsonBody())
-                .build(),
-        )
+    suspend fun startPairing(baseUrl: String, request: PairRequest): PairStartResponse {
+        // Serialize once so a response-lost retry is byte-for-byte identical. The desktop
+        // treats device_id + client_secret as the idempotency key and returns the original
+        // comparison code instead of creating an orphan request with a different code.
+        val wireRequest = Request.Builder()
+            .url(endpoint(baseUrl, "api", "v1", "pair-requests"))
+            .post(json.encodeToString(request).jsonBody())
+            .build()
+        return executePairingJson(wireRequest)
+    }
 
     suspend fun pollPairing(
         baseUrl: String,
         pairingId: String,
         clientSecret: String,
-    ): PairPollResponse = executeJson(
-        Request.Builder()
+    ): PairPollResponse {
+        val wireRequest = Request.Builder()
             .url(endpoint(baseUrl, "api", "v1", "pair-requests", pairingId, "poll"))
             .post(json.encodeToString(PairPollRequest(clientSecret)).jsonBody())
-            .build(),
-    )
+            .build()
+        return executePairingJson(wireRequest)
+    }
 
     suspend fun status(): StatusResponse = executeJson(
         Request.Builder().url(currentEndpoint("api", "v1", "status")).get().build(),
@@ -139,29 +158,31 @@ class LanApiClient(
             .addQueryParameter("page_size", pageSize.toString())
             .build()
         val response = httpClient.newCall(Request.Builder().url(url).get().build()).awaitResponse()
-        response.use {
-            if (it.code == 202) {
-                val body = it.body?.string() ?: throw IOException("服务器返回了空的搜索状态")
-                val pending = try {
-                    json.decodeFromString<SearchPendingResponse>(body)
-                } catch (error: Exception) {
-                    throw IOException("服务器搜索状态格式不兼容", error)
+        return withContext(Dispatchers.IO) {
+            response.use {
+                if (it.code == 202) {
+                    val body = it.body?.string() ?: throw IOException("服务器返回了空的搜索状态")
+                    val pending = try {
+                        json.decodeFromString<SearchPendingResponse>(body)
+                    } catch (error: Exception) {
+                        throw IOException("服务器搜索状态格式不兼容", error)
+                    }
+                    val retryAfter = it.header("Retry-After")?.toLongOrNull()
+                        ?: pending.retryAfterSeconds
+                    return@withContext SearchPageResult.Pending(
+                        status = pending.status,
+                        retryAfterSeconds = retryAfter.coerceIn(1L, 30L),
+                    )
                 }
-                val retryAfter = it.header("Retry-After")?.toLongOrNull()
-                    ?: pending.retryAfterSeconds
-                return SearchPageResult.Pending(
-                    status = pending.status,
-                    retryAfterSeconds = retryAfter.coerceIn(1L, 30L),
-                )
+                if (!it.isSuccessful) throw decodeError(it)
+                val body = it.body?.string() ?: throw IOException("服务器返回了空响应")
+                val pageResponse = try {
+                    json.decodeFromString<SearchPageResponse>(body)
+                } catch (error: Exception) {
+                    throw IOException("服务器搜索结果格式不兼容", error)
+                }
+                SearchPageResult.Ready(pageResponse)
             }
-            if (!it.isSuccessful) throw decodeError(it)
-            val body = it.body?.string() ?: throw IOException("服务器返回了空响应")
-            val pageResponse = try {
-                json.decodeFromString<SearchPageResponse>(body)
-            } catch (error: Exception) {
-                throw IOException("服务器搜索结果格式不兼容", error)
-            }
-            return SearchPageResult.Ready(pageResponse)
         }
     }
 
@@ -198,23 +219,41 @@ class LanApiClient(
 
     private suspend inline fun <reified T> executeJson(
         request: Request,
+        client: OkHttpClient = httpClient,
         noinline onCancel: () -> Unit = {},
     ): T {
-        val response = httpClient.newCall(request).awaitResponse(onCancel)
-        response.use {
-            if (!it.isSuccessful) throw decodeError(it)
-            val body = it.body?.string() ?: throw IOException("服务器返回了空响应")
-            return try {
-                json.decodeFromString(body)
-            } catch (error: Exception) {
-                throw IOException("服务器响应格式不兼容", error)
+        val response = client.newCall(request).awaitResponse(onCancel)
+        return withContext(Dispatchers.IO) {
+            response.use {
+                if (!it.isSuccessful) throw decodeError(it)
+                val body = it.body?.string() ?: throw IOException("服务器返回了空响应")
+                try {
+                    json.decodeFromString<T>(body)
+                } catch (error: Exception) {
+                    throw IOException("服务器响应格式不兼容", error)
+                }
             }
         }
     }
 
+    private suspend inline fun <reified T> executePairingJson(request: Request): T = try {
+        executeJson(request, pairingHttpClient)
+    } catch (error: ApiException) {
+        // A received HTTP response is deterministic; retrying 4xx/5xx can create noise
+        // and must not conceal the server's actionable error code.
+        throw error
+    } catch (_: IOException) {
+        // Retry exactly once only when the transport or response body was interrupted.
+        // Pairing create/poll are idempotent for the same device secret on the desktop.
+        executeJson(request, pairingHttpClient)
+    }
+
     private suspend fun executeUnit(request: Request) {
-        httpClient.newCall(request).awaitResponse().use {
-            if (!it.isSuccessful) throw decodeError(it)
+        val response = httpClient.newCall(request).awaitResponse()
+        withContext(Dispatchers.IO) {
+            response.use {
+                if (!it.isSuccessful) throw decodeError(it)
+            }
         }
     }
 
@@ -248,8 +287,8 @@ internal suspend fun Call.awaitResponse(onCancel: () -> Unit = {}): Response =
             cancel()
         }
         enqueue(object : Callback {
-            override fun onFailure(call: Call, error: IOException) {
-                if (continuation.isActive) continuation.resumeWithException(error)
+            override fun onFailure(call: Call, e: IOException) {
+                if (continuation.isActive) continuation.resumeWithException(e)
             }
 
             override fun onResponse(call: Call, response: Response) {

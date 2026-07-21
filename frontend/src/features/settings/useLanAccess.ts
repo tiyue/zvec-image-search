@@ -202,7 +202,7 @@ export function useLanAccess(
 
   const stop = () => runAction("stop", (signal) => api.stop(signal), "局域网访问已停止");
   const approve = (id: string) =>
-    runAction(`approve:${id}`, (signal) => api.approve(id, signal), "Android 设备已允许");
+    runAction(`approve:${id}`, (signal) => api.approve(id, signal), "已允许，等待 Android 完成连接");
   const reject = (id: string) =>
     runAction(`reject:${id}`, (signal) => api.reject(id, signal), "配对请求已拒绝");
   const revokeDevice = () =>

@@ -6,13 +6,10 @@ import GalleryGrid from "./components/GalleryGrid.vue";
 import ImagePreview from "./components/ImagePreview.vue";
 import PaginationBar from "./components/PaginationBar.vue";
 import StatusToast from "./components/StatusToast.vue";
+import AppIcon from "./components/AppIcon.vue";
 import { useNativeImageActions } from "./composables/useNativeImageActions";
 import { useSearch } from "./composables/useSearch";
 import { installGlobalDiagnostics, reportFrontendDiagnostic } from "./diagnostics";
-import {
-  SEARCH_RESULTS_KEEP_LATEST,
-  useSearchResultsCleanup,
-} from "./features/cleanup/useSearchResultsCleanup";
 import { OrganizePage } from "./features/organize";
 import { canRecordFeedback, useSearchFeedback } from "./features/search-learning";
 import { SettingsPage } from "./features/settings";
@@ -25,48 +22,57 @@ import type {
   ToastMessage,
 } from "./types/contracts";
 
-type PageName = "search" | "tasks" | "organize" | "settings";
+type PageName = "search" | "tasks" | "batch" | "groups" | "learning" | "settings";
 
 const pageDefinitions: Array<{
   id: PageName;
   label: string;
   description: string;
-  glyph: string;
-  shortcut: `Alt+${1 | 2 | 3 | 4}`;
+  icon: "search" | "tasks" | "tags" | "groups" | "learning";
+  shortcut: `Alt+${1 | 2 | 3 | 4 | 5}`;
 }> = [
   {
     id: "search",
     label: "图片搜索",
     description: "语义、图片与标签",
-    glyph: "⌕",
+    icon: "search",
     shortcut: "Alt+1",
   },
   {
     id: "tasks",
     label: "图库任务",
     description: "索引、同步与标注",
-    glyph: "☷",
+    icon: "tasks",
     shortcut: "Alt+2",
   },
   {
-    id: "organize",
+    id: "batch",
     label: "批量标签",
     description: "文件夹标签与别名",
-    glyph: "✓",
+    icon: "tags",
     shortcut: "Alt+3",
   },
   {
-    id: "settings",
-    label: "设置",
-    description: "图库、模型与密钥",
-    glyph: "⚙",
+    id: "groups",
+    label: "相似分组",
+    description: "重复图与语义近邻",
+    icon: "groups",
     shortcut: "Alt+4",
+  },
+  {
+    id: "learning",
+    label: "待学习样本",
+    description: "审核高价值图片",
+    icon: "learning",
+    shortcut: "Alt+5",
   },
 ];
 
 const activePage = ref<PageName>("search");
 const visitedPages = ref<PageName[]>(["search"]);
 const recentSearches = ref<string[]>([]);
+const sidebarCollapsed = ref(false);
+const searchHasRun = ref(false);
 
 const toasts = ref<ToastMessage[]>([]);
 let toastSequence = 0;
@@ -91,16 +97,13 @@ const nativeActions = useNativeImageActions({
   onInfo: (title, message) => addToast(title, message, "info"),
 });
 const searchFeedback = useSearchFeedback();
-const resultsCleanup = useSearchResultsCleanup(undefined, {
-  onError: (title, message) => addToast(title, message, "error"),
-  onInfo: (title, message) => addToast(title, message, "info"),
-});
 
 const searchWorkspace = ref<HTMLElement | null>(null);
 const searchInput = ref<HTMLInputElement | null>(null);
 const paginationBar = ref<{ focusInput: () => void } | null>(null);
 const previewVisible = ref(true);
 const queryDropActive = ref(false);
+const modeMenuOpen = ref(false);
 const selectedImageIds = ref<string[]>([]);
 const selectionAnchorId = ref("");
 const contextMenu = ref({ visible: false, x: 0, y: 0, imageId: "" });
@@ -110,6 +113,28 @@ let previewMedia: MediaQueryList | null = null;
 let removeGlobalDiagnostics: (() => void) | null = null;
 
 const selectedCount = computed(() => selectedImageIds.value.length);
+const hasSearchActivity = computed(
+  () => searchHasRun.value || search.searching.value,
+);
+const canSubmitSearch = computed(() => {
+  if (search.searching.value) return false;
+  if (search.mode.value === "tags") return Boolean(search.query.value.trim());
+  return Boolean(search.query.value.trim() || search.queryImageId.value);
+});
+const inferredSearchLabel = computed(() => {
+  if (search.mode.value === "tags") return "标签搜索";
+  if (search.queryImageId.value && search.query.value.trim()) return "图文组合";
+  if (search.queryImageId.value) return "以图搜图";
+  return "语义搜索";
+});
+const organizeTab = computed<"batch" | "clusters" | "learning">(() => {
+  if (activePage.value === "groups") return "clusters";
+  if (activePage.value === "learning") return "learning";
+  return "batch";
+});
+const organizeVisited = computed(() =>
+  visitedPages.value.some((page) => page === "batch" || page === "groups" || page === "learning"),
+);
 const activeActionIds = computed(() => {
   if (selectedImageIds.value.length > 0) return selectedImageIds.value;
   const fallback = contextMenu.value.imageId || search.selectedId.value;
@@ -150,6 +175,7 @@ const activeLibraryLabel = computed(() => {
 
 async function submitSearch(): Promise<void> {
   if (search.searching.value) return;
+  searchHasRun.value = true;
   clearSelection();
   const recentQuery = search.query.value.trim();
   const succeeded = await search.submit();
@@ -415,18 +441,27 @@ function focusSearch(selectText = false): void {
   });
 }
 
+watch(
+  () => search.mode.value,
+  (next) => {
+    if (next === "tags") {
+      search.setQueryImage();
+    }
+  },
+);
+
+function selectSearchMode(mode: "semantic" | "tags"): void {
+  search.mode.value = mode;
+  modeMenuOpen.value = false;
+}
+
 function newSearch(): void {
   search.query.value = "";
   search.setQueryImage();
   clearSelection();
+  modeMenuOpen.value = false;
+  searchHasRun.value = false;
   focusSearch();
-}
-
-async function addQueryImageFromSidebar(): Promise<void> {
-  setPage("search");
-  search.mode.value = "combined";
-  await nextTick();
-  await chooseQueryImage();
 }
 
 function reuseSearch(value: string): void {
@@ -462,12 +497,12 @@ function handleLibrariesUpdated(libraries: SettingsLibrary[]): void {
 function handleGlobalKeydown(event: KeyboardEvent): void {
   // Use the physical digit code as a fallback so Alt shortcuts work under
   // keyboard layouts that transform event.key. Ignore AltGr (Ctrl+Alt).
-  const shortcutKey = /^Digit([1-4])$/u.exec(event.code)?.[1] ?? event.key;
+  const shortcutKey = /^Digit([1-5])$/u.exec(event.code)?.[1] ?? event.key;
   if (
     event.altKey &&
     !event.ctrlKey &&
     !event.metaKey &&
-    ["1", "2", "3", "4"].includes(shortcutKey)
+    ["1", "2", "3", "4", "5"].includes(shortcutKey)
   ) {
     event.preventDefault();
     const page = pageDefinitions[Number(shortcutKey) - 1]?.id;
@@ -563,12 +598,29 @@ watch(
 </script>
 
 <template>
-  <div class="app-shell">
+  <div class="app-shell" :class="{ 'sidebar-collapsed': sidebarCollapsed }">
     <aside class="sidebar" aria-label="主导航">
-      <div class="brand-block">
-        <span class="brand-mark" aria-hidden="true">▧</span>
-        <span><strong>Zvec</strong><small>智能图片库</small></span>
+      <div class="sidebar-head">
+        <button
+          class="brand-mark"
+          type="button"
+          :aria-label="sidebarCollapsed ? '展开侧边栏' : 'Zvec'"
+          :title="sidebarCollapsed ? '展开侧边栏' : 'Zvec'"
+          @click="sidebarCollapsed = false"
+        >
+          <AppIcon name="logo" :size="21" />
+        </button>
+        <strong class="brand-name">Zvec</strong>
+        <button class="icon-button sidebar-toggle" type="button" :aria-label="sidebarCollapsed ? '展开侧边栏' : '收起侧边栏'" @click="sidebarCollapsed = !sidebarCollapsed">
+          <AppIcon name="panel" />
+        </button>
       </div>
+
+      <button class="new-search-button" type="button" title="新建搜索" @click="newSearch">
+        <AppIcon name="compose" />
+        <span>新建搜索</span>
+      </button>
+
       <nav class="nav-list">
         <button
           v-for="page in pageDefinitions"
@@ -582,234 +634,140 @@ watch(
           :title="`${page.label}（${page.shortcut}）`"
           @click="setPage(page.id)"
         >
-          <span class="nav-glyph" aria-hidden="true">{{ page.glyph }}</span>
+          <AppIcon :name="page.icon" />
           <span><strong>{{ page.label }}</strong><small>{{ page.description }}</small></span>
         </button>
       </nav>
-      <div class="sidebar-content">
-        <section class="sidebar-section sidebar-quick-actions" aria-labelledby="quick-actions-title">
-          <p id="quick-actions-title">快捷操作</p>
-          <button type="button" @click="newSearch">
-            <span aria-hidden="true">＋</span>
-            <strong>新建搜索</strong>
-          </button>
-          <button type="button" @click="addQueryImageFromSidebar">
-            <span aria-hidden="true">▧</span>
-            <strong>添加查询图片</strong>
-          </button>
-          <button
-            class="cleanup-results-action"
-            data-testid="cleanup-search-results"
-            type="button"
-            :disabled="resultsCleanup.running.value"
-            :aria-busy="resultsCleanup.running.value"
-            @click="resultsCleanup.submit"
-          >
-            <span aria-hidden="true">⌫</span>
-            <span class="quick-action-copy">
-              <strong>{{ resultsCleanup.running.value ? "正在清理" : "清理搜索结果" }}</strong>
-              <small>默认保留最近 {{ SEARCH_RESULTS_KEEP_LATEST }} 次</small>
-            </span>
-          </button>
-          <output
-            v-if="resultsCleanup.job.value"
-            class="sidebar-cleanup-status"
-            data-testid="cleanup-search-results-status"
-            aria-live="polite"
-            aria-atomic="true"
-          >
-            <span class="cleanup-status-heading">
-              <strong>{{ resultsCleanup.statusLabel.value }}</strong>
-              <small>{{ resultsCleanup.job.value.progressPercent }}%</small>
-            </span>
-            <progress
-              :value="resultsCleanup.job.value.progressPercent"
-              max="100"
-              aria-label="清理搜索结果进度"
-            />
-            <span class="cleanup-counts">
-              <small>删除 {{ resultsCleanup.job.value.deleted }}</small>
-              <small>跳过 {{ resultsCleanup.job.value.skipped }}</small>
-              <small>失败 {{ resultsCleanup.job.value.failed }}</small>
-            </span>
-          </output>
-        </section>
 
-        <section class="sidebar-section sidebar-overview" aria-labelledby="work-overview-title">
-          <p id="work-overview-title">工作概览</p>
-          <dl>
-            <div><dt>图库</dt><dd :title="activeLibraryLabel">{{ activeLibraryLabel }}</dd></div>
-            <div><dt>结果</dt><dd>{{ search.totalItems.value.toLocaleString("zh-CN") }} 张</dd></div>
-            <div><dt>状态</dt><dd>{{ statusLabel }}</dd></div>
-          </dl>
-        </section>
+      <section v-if="recentSearches.length" class="sidebar-recents" aria-labelledby="recent-title">
+        <p id="recent-title">最近</p>
+        <button v-for="recent in recentSearches" :key="recent" type="button" :title="recent" @click="reuseSearch(recent)">
+          {{ recent }}
+        </button>
+      </section>
 
-        <section v-if="recentSearches.length" class="sidebar-section sidebar-recents" aria-labelledby="recent-title">
-          <p id="recent-title">最近搜索</p>
-          <button
-            v-for="recent in recentSearches"
-            :key="recent"
-            type="button"
-            :title="recent"
-            @click="reuseSearch(recent)"
-          >
-            {{ recent }}
-          </button>
-        </section>
-      </div>
-      <div class="sidebar-footer" aria-label="本地服务状态">
-        <span class="local-dot" aria-hidden="true" />
-        <span><strong>{{ search.connectionMessage.value }}</strong><small>{{ activeLibraryLabel }}</small></span>
-      </div>
+      <button class="settings-button" type="button" :class="{ 'is-active': activePage === 'settings' }" title="设置" @click="setPage('settings')">
+        <AppIcon name="settings" />
+        <span><strong>设置</strong><small>{{ search.connectionMessage.value }}</small></span>
+      </button>
     </aside>
 
     <main class="page-host">
-      <section v-show="activePage === 'search'" class="search-page" data-page-section="search">
-        <form class="search-toolbar card" @submit.prevent>
-          <label class="search-field">
-            <span class="search-icon" aria-hidden="true">⌕</span>
-            <span class="sr-only">搜索内容</span>
-            <input
-              ref="searchInput"
-              v-model="search.query.value"
-              aria-keyshortcuts="Control+K Meta+K /"
-              type="search"
-              maxlength="4096"
-              autocomplete="off"
-              placeholder="输入人物、角色、作品、动作、神态或标签"
-              @keydown.enter="handleSearchInputEnter"
-            />
-          </label>
-          <label class="compact-field">
-            <span>本次搜索数量</span>
-            <span class="number-field-with-unit">
-              <input
-                v-model="search.resultLimit.value"
-                aria-label="本次搜索图片数量"
-                type="number"
-                min="1"
-                step="1"
-                inputmode="numeric"
-                title="输入本次搜索需要返回的图片总数，不设固定上限"
-              />
-              <span aria-hidden="true">张</span>
-            </span>
-          </label>
-          <label class="compact-field">
-            <span>搜索方式</span>
-            <select v-model="search.mode.value">
-              <option value="semantic">语义搜索</option>
-              <option value="tags">标签搜索</option>
-              <option value="combined">图文联合</option>
-            </select>
-          </label>
-          <label class="compact-field">
-            <span>图库</span>
-            <select v-model="search.libraryId.value">
-              <option value="">全部图库</option>
-              <option v-for="library in search.libraries.value" :key="library.id" :value="library.id">
-                {{ library.name }}
-              </option>
-            </select>
-          </label>
-          <div class="search-actions">
-            <output
-              class="selection-count toolbar-selection-count"
-              aria-live="polite"
-              aria-atomic="true"
-              :aria-label="`已选择 ${selectedCount} 张图片`"
-            >
-              <span class="selection-count-dot" aria-hidden="true" />
-              <span>已选择 <strong>{{ selectedCount }}</strong> 张</span>
-            </output>
-            <button
-              class="button button-primary"
-              type="button"
-              data-testid="submit-search"
-              :disabled="search.searching.value"
-              @click="submitSearch"
-            >
-              {{ search.searching.value ? "搜索中" : "开始搜索" }}
-            </button>
-            <button
-              v-if="search.searching.value"
-              class="button button-quiet"
-              type="button"
-              @click="search.cancel"
-            >
-              取消
-            </button>
+      <header class="app-topbar">
+        <div v-if="activePage === 'search' || activePage === 'tasks'" class="top-switch" aria-label="主要视图">
+          <button type="button" :class="{ active: activePage === 'search' }" @click="setPage('search')">搜索</button>
+          <button type="button" :class="{ active: activePage === 'tasks' }" @click="setPage('tasks')">图库任务</button>
+        </div>
+        <button class="icon-button help-button" type="button" aria-label="帮助" title="快捷键：Ctrl+K 搜索，Alt+1–5 切换模块">
+          <AppIcon name="help" :size="17" />
+        </button>
+      </header>
+
+      <section v-show="activePage === 'search'" class="search-page" :class="{ 'is-landing': !hasSearchActivity }" data-page-section="search">
+        <div v-if="!hasSearchActivity" class="search-surface">
+          <div class="search-hero">
+            <h1>你今天想找什么？</h1>
+            <p>用自然语言、标签或参考图片搜索本地图库。</p>
           </div>
-          <div
-            v-if="search.mode.value === 'combined'"
-            class="query-image-control"
-            :class="{ 'is-drag-active': queryDropActive }"
-            tabindex="0"
-            aria-label="查询图片拖放或粘贴区域"
+
+          <form
+            class="search-composer-wrap"
+            @submit.prevent="submitSearch"
             @dragenter.prevent="queryDropActive = true"
             @dragover="handleQueryDragOver"
             @dragleave="handleQueryDragLeave"
             @drop="handleQueryDrop"
             @paste="handleQueryPaste"
           >
-            <span class="query-drop-icon" aria-hidden="true">＋</span>
-            <span class="query-drop-copy">
-              <strong>查询图片</strong>
-              <small>拖动图片到这里，或点击此区域后按 Ctrl+V 粘贴</small>
-            </span>
-            <button class="button button-secondary button-small" type="button" @click="chooseQueryImage">
-              {{ search.queryImageId.value ? "更换图片" : "选择图片" }}
-            </button>
-            <span v-if="search.queryImageId.value" class="query-image-chip">
-              {{ search.queryImageName.value }}
-              <button type="button" aria-label="移除查询图片" @click="search.setQueryImage()">×</button>
-            </span>
-          </div>
-        </form>
+            <div class="search-composer" :class="{ 'is-drag-active': queryDropActive }">
+              <button v-if="search.mode.value !== 'tags'" class="composer-icon-button" type="button" aria-label="选择查询图片" title="选择查询图片" @click="chooseQueryImage">
+                <AppIcon name="plus" />
+              </button>
+              <AppIcon v-else class="composer-leading-icon" name="tags" />
+              <input
+                ref="searchInput"
+                v-model="search.query.value"
+                aria-label="搜索内容"
+                aria-keyshortcuts="Control+K Meta+K /"
+                type="search"
+                maxlength="4096"
+                autocomplete="off"
+                :placeholder="search.mode.value === 'tags' ? '输入标签，多个标签用空格分隔' : '搜索人物、场景、动作或作品'"
+                @keydown.enter="handleSearchInputEnter"
+              />
+              <div class="composer-mode">
+                <button
+                  class="composer-mode-trigger"
+                  type="button"
+                  aria-label="搜索方式"
+                  aria-haspopup="menu"
+                  :aria-expanded="modeMenuOpen"
+                  @click="modeMenuOpen = !modeMenuOpen"
+                >
+                  {{ search.mode.value === "tags" ? "标签" : "语义" }}
+                  <AppIcon name="chevron-down" :size="13" />
+                </button>
+                <div v-if="modeMenuOpen" class="composer-mode-menu" role="menu" aria-label="选择搜索方式">
+                  <button type="button" role="menuitem" :class="{ active: search.mode.value === 'semantic' }" @click="selectSearchMode('semantic')">语义</button>
+                  <button type="button" role="menuitem" :class="{ active: search.mode.value === 'tags' }" @click="selectSearchMode('tags')">标签</button>
+                </div>
+              </div>
+              <button class="search-submit-button" type="button" data-testid="submit-search" :disabled="!search.searching.value && !canSubmitSearch" :aria-label="search.searching.value ? '取消搜索' : '搜索'" @click="search.searching.value ? search.cancel() : submitSearch()">
+                <span v-if="search.searching.value" aria-hidden="true">×</span>
+                <AppIcon v-else name="arrow-up" />
+              </button>
+            </div>
 
-        <div ref="searchWorkspace" class="search-workspace">
+            <div v-if="search.queryImageId.value && search.mode.value !== 'tags'" class="query-image-chip">
+              <AppIcon name="image" :size="17" />
+              <span><strong>{{ search.queryImageName.value }}</strong><small>只传图片为以图搜图；输入文字后为图文组合</small></span>
+              <button type="button" aria-label="移除查询图片" @click="search.setQueryImage()">×</button>
+            </div>
+
+            <div class="search-meta-row">
+              <span>当前将执行：<strong>{{ inferredSearchLabel }}</strong></span>
+              <details class="search-settings">
+                <summary><AppIcon name="sliders" :size="16" />搜索设置</summary>
+                <div class="search-settings-panel">
+                  <label>
+                    <span>图库</span>
+                    <select v-model="search.libraryId.value">
+                      <option value="">全部图库</option>
+                      <option v-for="library in search.libraries.value" :key="library.id" :value="library.id">{{ library.name }}</option>
+                    </select>
+                  </label>
+                  <label>
+                    <span>结果数量</span>
+                    <input v-model="search.resultLimit.value" aria-label="本次搜索图片数量" type="number" min="1" step="1" inputmode="numeric" />
+                  </label>
+                </div>
+              </details>
+            </div>
+          </form>
+        </div>
+
+        <div v-if="hasSearchActivity" ref="searchWorkspace" class="search-workspace">
           <section class="gallery-panel card" aria-labelledby="gallery-title">
             <header class="panel-heading">
               <div>
-                <p class="eyebrow">搜索结果</p>
-                <h2 id="gallery-title">
-                  相关图片 · {{ search.totalItems.value.toLocaleString("zh-CN") }} 张
-                </h2>
+                <h2 id="gallery-title">{{ search.totalItems.value.toLocaleString("zh-CN") }} 张图片</h2>
+                <p>{{ inferredSearchLabel }} · {{ activeLibraryLabel }}</p>
               </div>
-              <div class="panel-heading-actions">
-                <output
-                  class="status-pill"
-                  role="status"
-                  aria-live="polite"
-                  aria-atomic="true"
-                  :title="search.message.value"
-                >
-                  {{ statusLabel }}
-                  <span class="sr-only">。{{ search.title.value }}。{{ search.message.value }}</span>
-                </output>
+              <div class="result-status-actions">
+                <output class="status-pill" role="status" aria-live="polite" :title="search.message.value">{{ statusLabel }}</output>
+                <button v-if="search.searching.value" class="result-cancel-button" type="button" data-testid="cancel-search" @click="search.cancel()">取消</button>
               </div>
             </header>
             <div class="gallery-operations">
               <div v-if="selectedCount" class="selection-toolbar" aria-label="批量图片操作">
-                <span>Ctrl 点击多选，Shift 点击连续选择，Ctrl+A 选择本页</span>
-                <button class="button button-quiet button-small" type="button" @click="copySelectedFiles(activeActionIds, 'selection_toolbar_copy')">
-                  复制文件
-                </button>
-                <button
-                  class="button button-secondary button-small"
-                  type="button"
-                  :disabled="nativeActions.exporting.value"
-                  @click="exportSelectedImages(activeActionIds, 'selection_toolbar_export')"
-                >
+                <span>已选择 {{ selectedCount }} 张；Ctrl 点击多选，Shift 点击连续选择</span>
+                <button class="button button-quiet button-small" type="button" @click="copySelectedFiles(activeActionIds, 'selection_toolbar_copy')">复制文件</button>
+                <button class="button button-secondary button-small" type="button" :disabled="nativeActions.exporting.value" @click="exportSelectedImages(activeActionIds, 'selection_toolbar_export')">
                   {{ nativeActions.exporting.value ? "导出中…" : "导出所选" }}
                 </button>
-                <button class="button button-quiet button-small" type="button" @click="clearSelection">
-                  清除
-                </button>
+                <button class="button button-quiet button-small" type="button" @click="clearSelection">清除</button>
               </div>
-              <div v-if="nativeActions.exporting.value" class="export-progress" role="status">
-                {{ nativeActions.exportJob.value?.message }}
-              </div>
+              <div v-if="nativeActions.exporting.value" class="export-progress" role="status">{{ nativeActions.exportJob.value?.message }}</div>
             </div>
             <GalleryGrid
               :items="search.items.value"
@@ -846,41 +804,16 @@ watch(
         </div>
       </section>
 
-      <div
-        v-if="visitedPages.includes('tasks')"
-        v-show="activePage === 'tasks'"
-        class="feature-page"
-        data-page-section="tasks"
-      >
-        <TasksPage
-          :libraries="search.libraries.value"
-          :visible="activePage === 'tasks'"
-          @toast="handleFeatureToast"
-        />
+      <div v-if="visitedPages.includes('tasks')" v-show="activePage === 'tasks'" class="feature-page" data-page-section="tasks">
+        <TasksPage :libraries="search.libraries.value" :visible="activePage === 'tasks'" @toast="handleFeatureToast" />
       </div>
 
-      <div
-        v-if="visitedPages.includes('organize')"
-        v-show="activePage === 'organize'"
-        class="feature-page"
-        data-page-section="organize"
-      >
-        <OrganizePage
-          @toast="handleFeatureToast"
-          @open-image="nativeActions.open"
-        />
+      <div v-if="organizeVisited" v-show="activePage === 'batch' || activePage === 'groups' || activePage === 'learning'" class="feature-page" data-page-section="organize">
+        <OrganizePage :active-tab="organizeTab" :show-tabs="false" @toast="handleFeatureToast" @open-image="nativeActions.open" />
       </div>
 
-      <div
-        v-if="visitedPages.includes('settings')"
-        v-show="activePage === 'settings'"
-        class="feature-page"
-        data-page-section="settings"
-      >
-        <SettingsPage
-          @toast="handleFeatureToast"
-          @libraries-updated="handleLibrariesUpdated"
-        />
+      <div v-if="visitedPages.includes('settings')" v-show="activePage === 'settings'" class="settings-feature-page" data-page-section="settings">
+        <SettingsPage @toast="handleFeatureToast" @libraries-updated="handleLibrariesUpdated" />
       </div>
     </main>
 

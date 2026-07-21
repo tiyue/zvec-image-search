@@ -14,7 +14,7 @@ import threading
 import time
 from collections.abc import Callable, Sequence
 from contextlib import suppress
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, Protocol
@@ -421,15 +421,15 @@ class AuthenticatedClient:
 class _PairingRecord:
     view: PairingView
     client_secret_hash: str
-    token_issued: bool = False
+    issued_token: str | None = field(default=None, repr=False)
 
 
 class PairingManager:
     """Five-minute, user-approved pairing state machine.
 
-    The manager never retains a plaintext client secret or bearer token.  The
-    bearer token is generated inside the first approved poll and returned while
-    the same lock atomically marks it issued.
+    The manager never retains a plaintext client secret.  A newly issued bearer
+    token is held only in the expiring in-memory pairing record so a client with
+    the same secret can recover from a lost HTTP response; it is never persisted.
     """
 
     def __init__(
@@ -485,10 +485,22 @@ class PairingManager:
         with self._lock:
             self._prune_terminal_requests(now)
             for pairing_id, existing in tuple(self._requests.items()):
-                if (
-                    existing.view.device_id == normalized_id
-                    and self._effective_status(existing, now) == "pending"
-                ):
+                if existing.view.device_id == normalized_id:
+                    # A mobile client may retry after the HTTP response is lost.
+                    # Reusing the request even after a fast desktop approval
+                    # keeps both screens on the same comparison code and lets
+                    # the subsequent poll recover the approved token.
+                    if self._effective_status(existing, now) in {
+                        "pending",
+                        "approved",
+                    } and hmac.compare_digest(
+                        existing.client_secret_hash,
+                        secret_hash,
+                    ):
+                        return existing.view
+                    # A device has at most one recoverable pairing.  Starting a
+                    # different request also retires an approved recovery token
+                    # so an older poll cannot resurrect a replaced credential.
                     self._requests.pop(pairing_id, None)
             pending_count = sum(
                 self._effective_status(record, now) == "pending"
@@ -527,13 +539,14 @@ class PairingManager:
                 raise PairingSecretRejected("client secret was rejected")
             status = self._effective_status(record, self._clock())
             if status == "expired":
+                self._requests.pop(normalized_id, None)
                 raise PairingExpired("pairing request expired")
             if status == "rejected":
                 return PairPollResult(status="rejected")
             if status == "pending":
                 return PairPollResult(status="pending")
-            if record.token_issued:
-                return PairPollResult(status="approved")
+            if record.issued_token is not None:
+                return PairPollResult(status="approved", token=record.issued_token)
             token = self._validated_generated_token(self._token_factory())
             token_hash = _hash_token(token)
             session_id = _session_scope(token_hash)
@@ -580,8 +593,13 @@ class PairingManager:
                         "previous device session could not be cleaned"
                     ) from exc
                 self._pending_session_cleanup.pop(record.view.device_id, None)
-            self._requests[normalized_id] = replace(record, token_issued=True)
+            self._requests[normalized_id] = replace(record, issued_token=token)
             return PairPollResult(status="approved", token=token)
+
+    def start_payload(self, view: PairingView) -> dict[str, object]:
+        """Serialize a pairing start response using the manager's TTL clock."""
+
+        return pairing_payload(view, now=self._clock())
 
     def approve(self, pairing_id: str) -> PairingView:
         return self._transition(pairing_id, target="approved")
@@ -597,10 +615,11 @@ class PairingManager:
                 status = self._effective_status(record, now)
                 if status == "pending":
                     values.append(record.view)
-                elif status == "expired" and record.view.status != "expired":
+                elif status == "expired":
                     self._requests[pairing_id] = replace(
                         record,
                         view=replace(record.view, status="expired"),
+                        issued_token=None,
                     )
             return tuple(values)
 
@@ -632,11 +651,19 @@ class PairingManager:
         session_id = _session_scope(token_hash)
         with self._lock:
             self._active_sessions.pop(session_id, None)
+            for pairing_id, record in tuple(self._requests.items()):
+                issued_token = record.issued_token
+                if issued_token is not None and hmac.compare_digest(
+                    _hash_token(issued_token),
+                    token_hash,
+                ):
+                    self._requests.pop(pairing_id, None)
             return self._credentials.delete_by_token_hash(token_hash)
 
     def revoke_client(self, device_id: str) -> bool:
         normalized_id = _validated_id(device_id, "device_id")
         with self._lock:
+            self._discard_requests_for_device(normalized_id)
             clients = tuple(
                 client
                 for client in self._credentials.list_clients()
@@ -654,6 +681,7 @@ class PairingManager:
 
         if device_id is None:
             with self._lock:
+                self._requests.clear()
                 self._active_sessions.clear()
                 return self._credentials.delete_all()
         return self.revoke_client(device_id)
@@ -700,14 +728,22 @@ class PairingManager:
         record: _PairingRecord,
         now: float,
     ) -> PairingStatus:
-        if record.view.status == "pending" and now >= record.view.expires_at:
+        if (
+            record.view.status in {"pending", "approved"}
+            and now >= record.view.expires_at
+        ):
             return "expired"
         return record.view.status
 
     def _prune_terminal_requests(self, now: float) -> None:
         for pairing_id, record in tuple(self._requests.items()):
             status = self._effective_status(record, now)
-            if status in {"expired", "rejected"} or record.token_issued:
+            if status in {"expired", "rejected"}:
+                self._requests.pop(pairing_id, None)
+
+    def _discard_requests_for_device(self, device_id: str) -> None:
+        for pairing_id, record in tuple(self._requests.items()):
+            if record.view.device_id == device_id:
                 self._requests.pop(pairing_id, None)
 
     def _new_unique_pairing_id(self) -> str:

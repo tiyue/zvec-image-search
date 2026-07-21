@@ -26,11 +26,17 @@ import type {
 } from "./types";
 import { parseTagInput, useOrganize } from "./useOrganize";
 
+type WorkspaceTab = "batch" | "clusters" | "learning";
+
 const props = withDefaults(defineProps<{
   api?: OrganizeApi;
   autoLoad?: boolean;
+  activeTab?: WorkspaceTab;
+  showTabs?: boolean;
 }>(), {
   autoLoad: true,
+  activeTab: "batch",
+  showTabs: true,
 });
 
 const emit = defineEmits<{
@@ -52,9 +58,10 @@ const galleryCapacity = ref<OrganizeGalleryCapacity>(
 const editorOpen = ref(false);
 const deleteConfirmation = ref("");
 const deleteTargetKey = ref("");
-const activeWorkspaceTab = ref<"batch" | "clusters" | "learning">("batch");
-const visitedWorkspaceTabs = ref<Set<"batch" | "clusters" | "learning">>(
-  new Set(["batch"]),
+const folderPanelCollapsed = ref(true);
+const activeWorkspaceTab = ref<WorkspaceTab>(props.activeTab);
+const visitedWorkspaceTabs = ref<Set<WorkspaceTab>>(
+  new Set([props.activeTab]),
 );
 let galleryObserver: ResizeObserver | null = null;
 let galleryResizeTimer: number | null = null;
@@ -76,11 +83,16 @@ function changeLibrary(event: Event): void {
   void organize.selectLibrary((event.target as HTMLSelectElement).value);
 }
 
-function selectWorkspaceTab(tab: "batch" | "clusters" | "learning"): void {
+function selectWorkspaceTab(tab: WorkspaceTab): void {
   activeWorkspaceTab.value = tab;
   visitedWorkspaceTabs.value = new Set([...visitedWorkspaceTabs.value, tab]);
   if (tab !== "batch") editorOpen.value = false;
 }
+
+watch(
+  () => props.activeTab,
+  (tab) => selectWorkspaceTab(tab),
+);
 
 function handleImageClick(image: OrganizeImage, event: MouseEvent): void {
   organize.selectImage(image.id, {
@@ -220,8 +232,8 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <section class="organize-page" aria-labelledby="batch-tag-title">
-    <header class="page-heading">
+  <section class="organize-page" :class="{ 'embedded-navigation': !showTabs }" aria-labelledby="batch-tag-title">
+    <header v-if="showTabs" class="page-heading">
       <div>
         <p class="eyebrow">批量标签</p>
         <h1 id="batch-tag-title">按文件夹快速整理图片</h1>
@@ -257,7 +269,7 @@ onBeforeUnmount(() => {
       </div>
     </header>
 
-    <nav class="workspace-tabs" aria-label="智能整理功能">
+    <nav v-if="showTabs" class="workspace-tabs" aria-label="智能整理功能">
       <button
         type="button"
         :class="{ active: activeWorkspaceTab === 'batch' }"
@@ -287,15 +299,49 @@ onBeforeUnmount(() => {
       </button>
     </nav>
 
-    <div v-show="activeWorkspaceTab === 'batch'" class="batch-tag-workspace">
-      <aside class="folder-panel panel" aria-labelledby="folder-panel-title">
+    <div v-show="activeWorkspaceTab === 'batch'" class="batch-tag-workspace" :class="{ 'is-folder-collapsed': folderPanelCollapsed }">
+      <aside class="folder-panel panel" :class="{ 'is-collapsed': folderPanelCollapsed }" aria-labelledby="folder-panel-title">
         <header class="panel-heading">
+          <button class="folder-panel-toggle" type="button" :aria-label="folderPanelCollapsed ? '展开文件夹导航' : '收起文件夹导航'" @click="folderPanelCollapsed = !folderPanelCollapsed">
+            {{ folderPanelCollapsed ? "›" : "‹" }}
+          </button>
           <div>
             <p class="eyebrow">图库导航</p>
             <h2 id="folder-panel-title">文件夹</h2>
           </div>
           <span class="count-pill">{{ organize.folderTotal.value }}</span>
         </header>
+
+        <div v-if="!showTabs" class="folder-library-control">
+          <label>
+            <span class="sr-only">当前图库</span>
+            <select
+              :value="organize.selectedLibraryId.value"
+              aria-label="当前图库"
+              @change="changeLibrary"
+            >
+              <option v-if="!organize.libraries.value?.length" value="">尚未配置图库</option>
+              <option
+                v-for="library in organize.libraries.value"
+                :key="library.id"
+                :value="library.id"
+                :disabled="library.enabled === false"
+              >
+                {{ library.name }}{{ library.is_default ? "（默认）" : "" }}
+              </option>
+            </select>
+          </label>
+          <button
+            class="folder-library-refresh"
+            type="button"
+            :disabled="organize.folderLoading.value || organize.imageLoading.value"
+            aria-label="刷新图库"
+            title="刷新图库"
+            @click="organize.load"
+          >
+            ↻
+          </button>
+        </div>
 
         <div class="root-list" aria-label="图库根目录">
           <div
@@ -793,6 +839,7 @@ onBeforeUnmount(() => {
 
 <style scoped>
 .organize-page { display: grid; height: 100%; min-height: 0; grid-template-rows: auto auto minmax(0,1fr); gap: 12px; overflow: hidden; color: #17203a; }
+.organize-page.embedded-navigation { grid-template-rows:minmax(0,1fr); gap:0; }
 .page-heading, .heading-actions, .panel-heading, .gallery-heading, .selection-toolbar, .selection-actions, .pagination-bar, .progress-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .page-heading { align-items: flex-end; padding: 2px 2px 4px; }
 .page-heading h1 { margin: 2px 0 0; font-size: clamp(23px, 2vw, 31px); line-height: 1.15; }
@@ -814,9 +861,18 @@ textarea { resize: vertical; line-height: 1.5; }
 .workspace-tabs button { display: grid; min-width: 150px; gap: 1px; padding: 7px 13px; border: 0; border-radius: 9px; color: #6c7589; background: transparent; text-align: left; cursor: pointer; }
 .workspace-tabs button strong { font-size: 11px; }.workspace-tabs button small { font-size: 9px; opacity: .78; }
 .workspace-tabs button.active { color: #5143c2; background: #fff; box-shadow: 0 3px 12px rgba(53,59,86,.1); }
-.organize-intelligence-workspace { min-height: 0; }
+.organize-intelligence-workspace { height:100%; min-height:0; }
 .batch-tag-workspace { display: grid; height: 100%; min-height: 0; grid-template-columns: 320px minmax(0,1fr) 380px; gap: 14px; }
+.batch-tag-workspace.is-folder-collapsed { grid-template-columns:44px minmax(0,1fr) 380px; gap:10px; }
 .folder-panel { display: grid; grid-template-rows: auto auto auto minmax(0,1fr) auto; padding: 14px; overflow: hidden; }
+.folder-panel-toggle { display:grid; width:28px; height:28px; flex:0 0 auto; place-items:center; padding:0; border:0; border-radius:8px; color:#555; font:inherit; font-size:20px; background:#ededed; }
+.folder-library-control { display:grid; grid-template-columns:minmax(0,1fr) 38px; align-items:center; gap:6px; margin-top:10px; }
+.folder-library-control label { min-width:0; }
+.folder-library-control select { width:100%; height:38px; padding:0 8px; font-size:11px; }
+.folder-library-refresh { display:grid; width:38px; height:38px; place-items:center; padding:0; border:1px solid #dedede; border-radius:9px; color:#555; font:inherit; font-size:16px; background:#f5f5f5; }
+.folder-panel.is-collapsed { padding:7px; }
+.folder-panel.is-collapsed .panel-heading { justify-content:center; }
+.folder-panel.is-collapsed .panel-heading>div,.folder-panel.is-collapsed .panel-heading>.count-pill,.folder-panel.is-collapsed>:not(.panel-heading) { display:none; }
 .tag-editor { padding: 14px; overflow: auto; }
 .gallery-panel { display: grid; grid-template-rows: auto auto minmax(0,1fr) auto; padding: 14px; overflow: hidden; }
 .panel-heading h2, .gallery-heading h2 { margin: 2px 0 0; font-size: 18px; }
@@ -835,8 +891,9 @@ textarea { resize: vertical; line-height: 1.5; }
 .root-copy strong, .root-copy small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .root-copy strong { font-size: 13px; }
 .root-copy small { color: #7a8297; font-size: 11px; }
-.folder-search { display: grid; grid-template-columns: minmax(0,1fr) 35px; gap: 6px; margin-top: 12px; }
-.folder-search input { width: 100%; }
+.folder-search { display:grid; grid-template-columns:minmax(0,1fr) 38px; align-items:center; gap:6px; margin-top:12px; }
+.folder-search input { width:100%; height:38px; }
+.folder-search .icon-button { width:38px; height:38px; padding:0; }
 .icon-button { border: 0; border-radius: 10px; color: white; background: #6557df; font-size: 18px; cursor: pointer; }
 .folder-list { display: grid; align-content: start; gap: 6px; min-height: 0; margin-top: 10px; overflow: auto; padding-right: 3px; }
 .folder-item { display: grid; grid-template-columns: minmax(0,1fr) 28px; gap: 4px; width: 100%; border: 1px solid transparent; border-radius: 11px; background: transparent; color: inherit; transition: .12s ease; }
@@ -858,7 +915,7 @@ textarea { resize: vertical; line-height: 1.5; }
 .gallery-metrics { display: grid; justify-items: end; }
 .gallery-metrics strong { color: #5545d1; font-size: 23px; }
 .gallery-metrics span { color: #7b8396; font-size: 11px; }
-.selection-toolbar { padding: 10px 0; }
+.selection-toolbar { padding:10px 14px; }
 .selection-summary { display: grid; gap: 2px; }
 .selection-summary strong { font-size: 13px; }
 .selection-summary span { color: #7c8498; font-size: 11px; }

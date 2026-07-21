@@ -1,4 +1,5 @@
-export type SearchMode = "semantic" | "tags" | "combined";
+export type SearchMode = "semantic" | "tags";
+export type SearchRequestMode = "text" | "tag" | "image" | "combined";
 export type MatchState = "high" | "possible" | "weak" | string;
 
 export interface LibrarySummary {
@@ -111,8 +112,8 @@ export interface SearchResultWire {
 }
 
 export interface SearchSubmission {
-  text: string;
-  mode: SearchMode;
+  text?: string;
+  mode: SearchRequestMode;
   library_ids: string[];
   top_k: number;
   page: 1;

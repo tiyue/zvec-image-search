@@ -40,6 +40,8 @@ const externalProcessingConfirmed = ref(false);
 const allScopeConfirmed = ref(false);
 const notice = ref("");
 const noticeKind = ref<"success" | "error">("success");
+const composerOpen = ref(false);
+const activityTab = ref<"history" | "logs">("history");
 
 const enabledLibraries = computed(() => props.libraries.filter((library) => library.enabled !== false));
 const isAiTask = computed(
@@ -149,6 +151,7 @@ async function submit(): Promise<void> {
   }
   const submitted = await jobsState.submitJob(request);
   if (submitted) {
+    composerOpen.value = false;
     externalProcessingConfirmed.value = false;
     allScopeConfirmed.value = false;
     await Promise.all([
@@ -177,26 +180,14 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <section class="tasks-page" aria-labelledby="tasks-title">
-    <div class="summary-grid" aria-label="任务处理策略">
-      <article>
-        <span class="summary-icon is-violet" aria-hidden="true">⇄</span>
-        <div><small>执行方式</small><strong>受控并发</strong></div>
-        <p>按模型限额调度，避免窗口卡死</p>
-      </article>
-      <article>
-        <span class="summary-icon is-green" aria-hidden="true">✓</span>
-        <div><small>任务控制</small><strong>安全取消</strong></div>
-        <p>仅停止所选任务，不影响其他队列</p>
-      </article>
-      <article>
-        <span class="summary-icon is-amber" aria-hidden="true">!</span>
-        <div><small>失败处理</small><strong>错误图片隔离</strong></div>
-        <p>单张失败会记录，剩余图片继续处理</p>
-      </article>
-    </div>
+  <section class="tasks-page" :class="{ 'has-composer': composerOpen }" aria-labelledby="tasks-title">
+    <header class="tasks-toolbar">
+      <button class="new-task-button" type="button" @click="composerOpen = !composerOpen">
+        {{ composerOpen ? "收起任务设置" : "＋ 新建任务" }}
+      </button>
+    </header>
 
-    <section class="composer panel">
+    <section v-if="composerOpen" class="composer panel">
       <div class="section-heading">
         <div>
           <p class="eyebrow">新建任务</p>
@@ -330,8 +321,14 @@ onBeforeUnmount(() => {
       </p>
     </section>
 
+    <nav class="task-view-tabs" aria-label="任务视图">
+      <button type="button" :class="{ active: activityTab === 'history' }" @click="activityTab = 'history'">任务历史</button>
+      <button type="button" :class="{ active: activityTab === 'logs' }" @click="activityTab = 'logs'">操作日志</button>
+    </nav>
+
     <div class="workspace-grid">
       <JobHistoryTable
+        v-if="activityTab === 'history'"
         :items="activityState.jobs.value"
         :filters="activityState.jobFilters.value"
         :libraries="enabledLibraries"
@@ -360,6 +357,7 @@ onBeforeUnmount(() => {
       />
 
       <ActivityLogTable
+        v-else
         :items="activityState.logs.value"
         :filters="activityState.logFilters.value"
         :libraries="enabledLibraries"
@@ -395,11 +393,19 @@ onBeforeUnmount(() => {
   min-width: 0;
   min-height: 0;
   grid-template-rows: auto auto minmax(0, 1fr);
-  gap: 14px;
+  gap: 10px;
   overflow: hidden;
   color: var(--text, #171e2e);
   font-family: "Segoe UI", "Microsoft YaHei UI", sans-serif;
 }
+.tasks-page.has-composer { grid-template-rows:auto minmax(0,auto) auto minmax(240px,1fr); overflow:auto; }
+
+.tasks-toolbar { display:flex; min-height:52px; align-items:center; justify-content:center; }
+.new-task-button { min-height:38px; padding:0 17px; border:1px solid #dedede; border-radius:19px; color:#333; font:inherit; font-size:13px; font-weight:650; background:#ededed; }
+.new-task-button:hover { background:#e5e5e5; }
+.task-view-tabs { display:flex; min-height:39px; align-items:flex-end; gap:20px; border-bottom:1px solid #e7e7e7; }
+.task-view-tabs button { height:39px; padding:0 2px; border:0; border-bottom:2px solid transparent; color:#777; font:inherit; background:transparent; }
+.task-view-tabs button.active { border-bottom-color:#333; color:#171717; }
 
 .summary-grid {
   display: grid;
@@ -647,7 +653,7 @@ button:disabled { opacity: 0.55; cursor: default; }
   height: 100%;
   min-width: 0;
   min-height: 0;
-  grid-template-columns: minmax(0, 58fr) minmax(0, 42fr);
+  grid-template-columns: minmax(0, 1fr);
   gap: 12px;
   overflow: hidden;
 }

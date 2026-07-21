@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 from zvec_lan import (
     DISCOVERY_REQUEST_PREFIX,
@@ -21,6 +22,7 @@ from zvec_lan import (
     LanGatewayServer,
     LibraryInfo,
     MediaSource,
+    MemoryCredentialStore,
     PairingManager,
     QueryImageStore,
     SearchPage,
@@ -231,6 +233,7 @@ class LanHttpApiTests(unittest.TestCase):
         *,
         connection_idle_timeout: float = 60.0,
         max_connections: int = 64,
+        pairing_manager: PairingManager | None = None,
         query_images: QueryImageStore | None = None,
     ) -> tuple[LanApiServer, Any, QueryImageStore]:
         uploads = query_images or QueryImageStore(
@@ -241,7 +244,9 @@ class LanHttpApiTests(unittest.TestCase):
             name="Zvec on TEST-PC",
             search_backend=self.backend,
             media_resolver=self.resolver,
-            pairing_manager=self.pairing,
+            pairing_manager=(
+                self.pairing if pairing_manager is None else pairing_manager
+            ),
             query_images=uploads,
             host="127.0.0.1",
             port=0,
@@ -274,7 +279,7 @@ class LanHttpApiTests(unittest.TestCase):
             authenticated=authenticated,
         )
 
-    def test_http_pairing_flow_returns_token_once(self) -> None:
+    def test_http_pairing_flow_reuses_token_for_approved_poll_retry(self) -> None:
         secret = _secret(2)
         started = self.json_request(
             "POST",
@@ -311,7 +316,272 @@ class LanHttpApiTests(unittest.TestCase):
         self.assertEqual(approved.status, 200)
         self.assertEqual(approved.json()["status"], "approved")
         self.assertIn("token", approved.json())
-        self.assertEqual(repeated.json(), {"status": "approved"})
+        self.assertEqual(repeated.json(), approved.json())
+
+    def test_http_pairing_retry_after_lost_response_reuses_request(self) -> None:
+        secret = _secret(3)
+        payload = json.dumps(
+            {
+                "device_id": "android-install-lost-response",
+                "device_name": "Android Tablet",
+                "client_secret": secret,
+            },
+            separators=(",", ":"),
+        ).encode()
+        abandoned = socket.create_connection(("127.0.0.1", self.address.port), 2)
+        abandoned.settimeout(2)
+        try:
+            abandoned.sendall(
+                (
+                    "POST /api/v1/pair-requests HTTP/1.1\r\n"
+                    f"Host: 127.0.0.1:{self.address.port}\r\n"
+                    "Content-Type: application/json\r\n"
+                    f"Content-Length: {len(payload)}\r\n"
+                    "Connection: close\r\n"
+                    "\r\n"
+                ).encode()
+                + payload
+            )
+            deadline = time.monotonic() + 2
+            original = None
+            while time.monotonic() < deadline:
+                original = next(
+                    (
+                        view
+                        for view in self.pairing.pending_requests()
+                        if view.device_id == "android-install-lost-response"
+                    ),
+                    None,
+                )
+                if original is not None:
+                    break
+                time.sleep(0.01)
+            self.assertIsNotNone(original)
+        finally:
+            # Simulate an app that disconnects without consuming the response.
+            abandoned.close()
+
+        request_payload = json.loads(payload)
+        first_retry = self.json_request(
+            "POST",
+            "/api/v1/pair-requests",
+            request_payload,
+            authenticated=False,
+        )
+        second_retry = self.json_request(
+            "POST",
+            "/api/v1/pair-requests",
+            request_payload,
+            authenticated=False,
+        )
+
+        self.assertEqual(first_retry.status, 201)
+        self.assertEqual(second_retry.status, 201)
+        first_json = first_retry.json()
+        second_json = second_retry.json()
+        for field in ("pairing_id", "comparison_code", "expires_at", "status"):
+            self.assertEqual(first_json[field], second_json[field])
+        self.assertLessEqual(
+            second_json["expires_in_seconds"],
+            first_json["expires_in_seconds"],
+        )
+        assert original is not None
+        self.assertEqual(first_json["pairing_id"], original.pairing_id)
+        self.assertEqual(
+            first_json["comparison_code"],
+            original.comparison_code,
+        )
+        self.assertEqual(self.pairing.pending_requests(), (original,))
+
+    def test_http_idempotent_pairing_retry_reports_remaining_ttl(self) -> None:
+        now = [1_000.0]
+        manager = PairingManager(
+            clock=lambda: now[0],
+            pairing_id_factory=lambda: "pairing-id-countdown-1",
+            code_factory=lambda: "654321",
+        )
+        _server, address, _uploads = self.start_extra_server(pairing_manager=manager)
+        payload = json.dumps(
+            {
+                "device_id": "android-install-countdown",
+                "device_name": "Android Tablet",
+                "client_secret": _secret(6),
+            },
+            separators=(",", ":"),
+        ).encode()
+
+        first = self.request(
+            "POST",
+            "/api/v1/pair-requests",
+            body=payload,
+            headers={"Content-Type": "application/json"},
+            authenticated=False,
+            port=address.port,
+        )
+        now[0] += 120
+        retried = self.request(
+            "POST",
+            "/api/v1/pair-requests",
+            body=payload,
+            headers={"Content-Type": "application/json"},
+            authenticated=False,
+            port=address.port,
+        )
+
+        self.assertEqual(first.status, 201)
+        self.assertEqual(retried.status, 201)
+        first_json = first.json()
+        retried_json = retried.json()
+        for field in ("pairing_id", "comparison_code", "expires_at", "status"):
+            self.assertEqual(first_json[field], retried_json[field])
+        self.assertEqual(first_json["expires_in_seconds"], 300)
+        self.assertEqual(retried_json["expires_in_seconds"], 180)
+
+    def test_http_create_retry_after_fast_approval_recovers_original_token(
+        self,
+    ) -> None:
+        now = [2_000.0]
+        expected_token = _secret(7)
+        manager = PairingManager(
+            clock=lambda: now[0],
+            token_factory=lambda: expected_token,
+            pairing_id_factory=lambda: "pairing-id-fast-approval",
+            code_factory=lambda: "112233",
+        )
+        _server, address, _uploads = self.start_extra_server(pairing_manager=manager)
+        secret = _secret(8)
+        create_payload = json.dumps(
+            {
+                "device_id": "android-install-fast-approval",
+                "device_name": "Android Tablet",
+                "client_secret": secret,
+            },
+            separators=(",", ":"),
+        ).encode()
+        first = self.request(
+            "POST",
+            "/api/v1/pair-requests",
+            body=create_payload,
+            headers={"Content-Type": "application/json"},
+            authenticated=False,
+            port=address.port,
+        )
+        first_json = first.json()
+        manager.approve(first_json["pairing_id"])
+
+        now[0] += 120
+        retried = self.request(
+            "POST",
+            "/api/v1/pair-requests",
+            body=create_payload,
+            headers={"Content-Type": "application/json"},
+            authenticated=False,
+            port=address.port,
+        )
+        poll_payload = json.dumps(
+            {"client_secret": secret},
+            separators=(",", ":"),
+        ).encode()
+        polled = self.request(
+            "POST",
+            f"/api/v1/pair-requests/{first_json['pairing_id']}/poll",
+            body=poll_payload,
+            headers={"Content-Type": "application/json"},
+            authenticated=False,
+            port=address.port,
+        )
+
+        self.assertEqual(first.status, 201)
+        self.assertEqual(retried.status, 201)
+        retried_json = retried.json()
+        for field in ("pairing_id", "comparison_code", "expires_at"):
+            self.assertEqual(first_json[field], retried_json[field])
+        self.assertEqual(first_json["status"], "pending")
+        self.assertEqual(retried_json["status"], "approved")
+        self.assertEqual(retried_json["expires_in_seconds"], 180)
+        self.assertEqual(
+            polled.json(),
+            {"status": "approved", "token": expected_token},
+        )
+
+    def test_http_lost_approved_response_recovers_the_same_token(self) -> None:
+        secret = _secret(4)
+        expected_token = _secret(5)
+        generated_tokens: list[str] = []
+        store = MemoryCredentialStore()
+
+        def generate_token() -> str:
+            generated_tokens.append(expected_token)
+            return expected_token
+
+        manager = PairingManager(store, token_factory=generate_token)
+        _server, address, _uploads = self.start_extra_server(pairing_manager=manager)
+        start_payload = json.dumps(
+            {
+                "device_id": "android-install-lost-token",
+                "device_name": "Android Tablet",
+                "client_secret": secret,
+            },
+            separators=(",", ":"),
+        ).encode()
+        started = self.request(
+            "POST",
+            "/api/v1/pair-requests",
+            body=start_payload,
+            headers={"Content-Type": "application/json"},
+            authenticated=False,
+            port=address.port,
+        )
+        self.assertEqual(started.status, 201)
+        pairing_id = started.json()["pairing_id"]
+        manager.approve(pairing_id)
+        poll_payload = json.dumps(
+            {"client_secret": secret},
+            separators=(",", ":"),
+        ).encode()
+        abandoned = socket.create_connection(("127.0.0.1", address.port), 2)
+        abandoned.settimeout(2)
+        with patch.object(store, "put", wraps=store.put) as put:
+            try:
+                abandoned.sendall(
+                    (
+                        f"POST /api/v1/pair-requests/{pairing_id}/poll HTTP/1.1\r\n"
+                        f"Host: 127.0.0.1:{address.port}\r\n"
+                        "Content-Type: application/json\r\n"
+                        f"Content-Length: {len(poll_payload)}\r\n"
+                        "Connection: close\r\n"
+                        "\r\n"
+                    ).encode()
+                    + poll_payload
+                )
+                deadline = time.monotonic() + 2
+                while (
+                    manager.authenticate(expected_token) is None
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.01)
+                self.assertIsNotNone(manager.authenticate(expected_token))
+            finally:
+                # The server committed the credential, but the app never read it.
+                abandoned.close()
+
+            recovered = self.request(
+                "POST",
+                f"/api/v1/pair-requests/{pairing_id}/poll",
+                body=poll_payload,
+                headers={"Content-Type": "application/json"},
+                authenticated=False,
+                port=address.port,
+            )
+
+            self.assertEqual(recovered.status, 200)
+            self.assertEqual(
+                recovered.json(),
+                {"status": "approved", "token": expected_token},
+            )
+            self.assertEqual(generated_tokens, [expected_token])
+            put.assert_called_once()
+            self.assertEqual(len(store.list_clients()), 1)
 
     def test_host_and_browser_headers_are_rejected_before_pairing(self) -> None:
         payload = {

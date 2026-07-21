@@ -166,75 +166,28 @@ describe("App page shell", () => {
     vi.unstubAllGlobals();
   });
 
-  it("starts on the compact search page and exposes all four navigation items", async () => {
+  it("starts on the compact search page and exposes the five preserved workspaces", async () => {
     wrapper = mountApp();
     await flushPromises();
 
-    expect(wrapper.findAll(".nav-item")).toHaveLength(4);
+    expect(wrapper.findAll(".nav-item")).toHaveLength(5);
     expect(wrapper.get(".nav-item[data-page='search']").attributes("aria-current")).toBe("page");
     expect(wrapper.get("[data-page-section='search']").isVisible()).toBe(true);
     expect(wrapper.find("[data-page-section='search'] .page-heading").exists()).toBe(false);
     expect(wrapper.find("input[aria-label='本次搜索图片数量']").exists()).toBe(true);
-    expect(wrapper.get(".toolbar-selection-count").text()).toContain("已选择 0 张");
-    expect(wrapper.get(".sidebar-footer").attributes("aria-label")).toBe("本地服务状态");
-    expect(wrapper.get("[data-testid='cleanup-search-results']").text()).toContain(
-      "默认保留最近 3 次",
-    );
-    expect(wrapper.find(".gallery-pagination").exists()).toBe(true);
-    expect(wrapper.find("button[aria-label='首页']").exists()).toBe(true);
-    expect(wrapper.find("button[aria-label='末页']").exists()).toBe(true);
+    expect(wrapper.find("[data-testid='cleanup-search-results']").exists()).toBe(false);
+    expect(wrapper.find(".sidebar-overview").exists()).toBe(false);
+    expect(wrapper.find(".gallery-pagination").exists()).toBe(false);
+    expect(wrapper.get(".settings-button").text()).toContain("设置");
   });
 
-  it("runs search-result cleanup from the global quick actions and shows its summary", async () => {
-    const fetchMock = vi.mocked(fetch);
-    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
-      const url = String(input);
-      if (url.includes("api/bootstrap")) {
-        return Promise.resolve(
-          jsonResponse({
-            service: { status: "ready", ready: true },
-            libraries: [{ id: "library-1", name: "图片数据库", enabled: true }],
-          }),
-        );
-      }
-      if (url === "api/jobs" && init?.method === "POST") {
-        return Promise.resolve(
-          jsonResponse({
-            job: {
-              id: "cleanup-now",
-              status: "succeeded",
-              result: { deleted: 12, skipped: 2, failed: 1 },
-            },
-          }),
-        );
-      }
-      return Promise.resolve(jsonResponse(latestPayload));
-    });
+  it("collapses the navigation to the icon rail without removing destinations", async () => {
     wrapper = mountApp();
     await flushPromises();
 
-    await wrapper.get("[data-testid='cleanup-search-results']").trigger("click");
-    await flushPromises();
-
-    const request = fetchMock.mock.calls.find(
-      ([input, init]) => String(input) === "api/jobs" && init?.method === "POST",
-    );
-    expect(JSON.parse(String(request?.[1]?.body))).toEqual({
-      task_type: "search_results_cleanup",
-      keep_latest: 3,
-    });
-    expect(wrapper.get("[data-testid='cleanup-search-results-status']").text()).toContain(
-      "清理完成",
-    );
-    expect(wrapper.get("[data-testid='cleanup-search-results-status']").text()).toContain(
-      "删除 12",
-    );
-    expect(wrapper.get("[data-testid='cleanup-search-results-status']").text()).toContain(
-      "跳过 2",
-    );
-    expect(wrapper.get("[data-testid='cleanup-search-results-status']").text()).toContain(
-      "失败 1",
-    );
+    await wrapper.get(".sidebar-toggle").trigger("click");
+    expect(wrapper.get(".app-shell").classes()).toContain("sidebar-collapsed");
+    expect(wrapper.findAll(".nav-item")).toHaveLength(5);
   });
 
   it("keeps the requested result count uncapped without a redundant fixed-page summary", async () => {
@@ -249,7 +202,10 @@ describe("App page shell", () => {
     expect((limit.element as HTMLInputElement).value).toBe("1000000");
     expect(wrapper.find(".search-summary").exists()).toBe(false);
     expect(wrapper.find(".summary-metrics").exists()).toBe(false);
-    expect(wrapper.get("#gallery-title").text()).toContain("相关图片 · 0 张");
+    await wrapper.get("input[type='search']").setValue("人物写真");
+    await wrapper.get("[data-testid='submit-search']").trigger("click");
+    await flushPromises();
+    expect(wrapper.get("#gallery-title").text()).toContain("0 张图片");
     expect(wrapper.get(".status-pill").attributes("aria-live")).toBe("polite");
     expect(wrapper.get(".status-pill").text()).toContain("无可靠结果");
   });
@@ -283,22 +239,22 @@ describe("App page shell", () => {
     expect(wrapper.get(".status-pill").text()).toContain("搜索中");
     expect(wrapper.get(".status-pill").attributes("role")).toBe("status");
 
-    await wrapper.get(".search-actions .button-quiet").trigger("click");
+    await wrapper.get("[data-testid='cancel-search']").trigger("click");
     await flushPromises();
     expect(wrapper.get(".status-pill").text()).toContain("已取消");
-    expect(wrapper.get(".status-pill .sr-only").text()).toContain("搜索已停止");
 
+    await wrapper.get(".new-search-button").trigger("click");
+    await wrapper.get("input[type='search']").setValue("原神");
     await wrapper.get("[data-testid='submit-search']").trigger("click");
     await flushPromises();
     expect(wrapper.get(".status-pill").text()).toContain("搜索失败");
-    expect(wrapper.get(".status-pill .sr-only").text()).toContain("无法连接本地服务");
   });
 
   it("opens an editable settings surface and synchronizes saved libraries back to search", async () => {
     wrapper = mountApp();
     await flushPromises();
 
-    await wrapper.get(".nav-item[data-page='settings']").trigger("click");
+    await wrapper.get(".settings-button").trigger("click");
     expect(wrapper.get("[data-page-section='settings']").isVisible()).toBe(true);
     expect(wrapper.find("[data-testid='settings-page'] input[name='image_root']").exists()).toBe(true);
     expect(
@@ -314,7 +270,7 @@ describe("App page shell", () => {
     wrapper = mountApp();
     await flushPromises();
 
-    await wrapper.get(".nav-item[data-page='organize']").trigger("click");
+    await wrapper.get(".nav-item[data-page='batch']").trigger("click");
     await wrapper.get("[data-testid='organize-open-image']").trigger("click");
 
     expect(nativeActionMocks.open).toHaveBeenCalledWith("organize-image-1");
@@ -336,10 +292,13 @@ describe("App page shell", () => {
     await flushPromises();
 
     expect(wrapper.find(".preview-card").exists()).toBe(false);
+    await wrapper.get("input[type='search']").setValue("人物写真");
+    await wrapper.get("[data-testid='submit-search']").trigger("click");
+    await flushPromises();
     expect(wrapper.find(".gallery-panel").exists()).toBe(true);
   });
 
-  it("supports Alt+1 through Alt+4 plus slash, Ctrl+K and Ctrl+G", async () => {
+  it("supports Alt+1 through Alt+5 plus slash, Ctrl+K and Ctrl+G", async () => {
     latestPayload = {
       ...latestPayload,
       total_items: 30,
@@ -348,14 +307,15 @@ describe("App page shell", () => {
     wrapper = mountApp();
     await flushPromises();
 
-    const destinations = ["search", "tasks", "organize", "settings"];
+    const destinations = ["search", "tasks", "batch", "groups", "learning"];
     for (const [index, page] of destinations.entries()) {
       const digit = String(index + 1);
       window.dispatchEvent(
         new KeyboardEvent("keydown", { key: digit, code: `Digit${digit}`, altKey: true }),
       );
       await wrapper.vm.$nextTick();
-      expect(wrapper.get(`[data-page-section='${page}']`).isVisible()).toBe(true);
+      const section = page === "search" || page === "tasks" ? page : "organize";
+      expect(wrapper.get(`[data-page-section='${section}']`).isVisible()).toBe(true);
       expect(wrapper.get(`.nav-item[data-page='${page}']`).attributes("aria-current")).toBe("page");
     }
 
@@ -366,7 +326,7 @@ describe("App page shell", () => {
     expect(document.activeElement).toBe(wrapper.get("input[type='search']").element);
 
     await wrapper.get("input[type='search']").setValue("雷电将军");
-    await wrapper.get(".nav-item[data-page='settings']").trigger("click");
+    await wrapper.get(".settings-button").trigger("click");
     window.dispatchEvent(new KeyboardEvent("keydown", { key: "k", ctrlKey: true }));
     await wrapper.vm.$nextTick();
     await wrapper.vm.$nextTick();
@@ -376,6 +336,8 @@ describe("App page shell", () => {
     expect(searchInput.selectionStart).toBe(0);
     expect(searchInput.selectionEnd).toBe(searchInput.value.length);
 
+    await wrapper.get("[data-testid='submit-search']").trigger("click");
+    await flushPromises();
     window.dispatchEvent(new KeyboardEvent("keydown", { key: "g", ctrlKey: true }));
     await wrapper.vm.$nextTick();
     await wrapper.vm.$nextTick();
@@ -417,6 +379,9 @@ describe("App page shell", () => {
     };
     wrapper = mountApp();
     await flushPromises();
+    await wrapper.get("input[type='search']").setValue("人物写真");
+    await wrapper.get("[data-testid='submit-search']").trigger("click");
+    await flushPromises();
 
     await wrapper.get(".thumbnail-stage").trigger("dblclick");
     expect(nativeActionMocks.open).toHaveBeenCalledWith("image-1");
@@ -432,12 +397,11 @@ describe("App page shell", () => {
       id: "query-drop-1",
       name: "粘贴图片.png",
     });
-    await wrapper.get("select").setValue("combined");
     const file = new File([new Uint8Array([1, 2, 3])], "粘贴图片.png", {
       type: "image/png",
     });
 
-    await wrapper.get(".query-image-control").trigger("drop", {
+    await wrapper.get(".search-composer-wrap").trigger("drop", {
       dataTransfer: { files: [file] },
     });
     await flushPromises();
@@ -479,14 +443,14 @@ describe("App page shell", () => {
     };
     wrapper = mountApp();
     await flushPromises();
+    await wrapper.get("input[type='search']").setValue("人物写真");
+    await wrapper.get("[data-testid='submit-search']").trigger("click");
+    await flushPromises();
     const cards = wrapper.findAll("button.image-card");
 
     await cards[0].trigger("click");
     await cards[1].trigger("click", { ctrlKey: true });
-    expect(wrapper.get(".toolbar-selection-count").text()).toContain("已选择 2 张");
-    expect(wrapper.get(".toolbar-selection-count").attributes("aria-label")).toBe(
-      "已选择 2 张图片",
-    );
+    expect(wrapper.get(".selection-toolbar").text()).toContain("已选择 2 张");
     expect(wrapper.find(".panel-heading .selection-count").exists()).toBe(false);
 
     await cards[1].trigger("contextmenu", { clientX: 400, clientY: 300 });

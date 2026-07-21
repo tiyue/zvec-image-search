@@ -30,6 +30,7 @@ describe("TasksPage", () => {
       props: { libraries: [{ id: "people", name: "人物图库", enabled: true }] },
     });
     await flushPromises();
+    await wrapper.get(".new-task-button").trigger("click");
 
     await wrapper.get('select[name="task_type"]').setValue("index_and_auto_tag");
     await wrapper.get("form").trigger("submit");
@@ -76,6 +77,7 @@ describe("TasksPage", () => {
         props: { libraries: [{ id: "people", name: "人物图库", enabled: true }] },
       });
       await flushPromises();
+      await wrapper.get(".new-task-button").trigger("click");
 
       await wrapper.get('select[name="task_type"]').setValue(taskType);
       const policy = wrapper.get('[data-testid="task-execution-policy"]');
@@ -130,6 +132,7 @@ describe("TasksPage", () => {
       props: { libraries: [{ id: "people", name: "人物图库", enabled: true }] },
     });
     await flushPromises();
+    await wrapper.get(".new-task-button").trigger("click");
 
     await wrapper.get('select[name="task_type"]').setValue("auto_tag");
     expect(wrapper.get('select[name="auto_tag_scope"]').text()).toContain(
@@ -234,13 +237,13 @@ describe("TasksPage", () => {
 
     expect(wrapper.findAll(".job-history-table tr.activity-row")).toHaveLength(2);
     expect(wrapper.text()).toContain("同步图库");
-    expect(wrapper.text()).toContain("单张失败会记录，剩余图片继续处理");
+    expect(wrapper.text()).toContain("同步图库");
 
     await wrapper.get(".error-count-button").trigger("click");
     await flushPromises();
     expect(wrapper.text()).toContain("bad.jpg");
     expect(wrapper.text()).toContain("文件无法读取");
-    expect(wrapper.text()).toContain("当前任务：job-partial");
+    expect(wrapper.text()).toContain("job-partial");
     expect(fetchMock.mock.calls.some(([path]) =>
       String(path).includes("category=image_failure") && String(path).includes("job_id=job-partial"),
     )).toBe(true);

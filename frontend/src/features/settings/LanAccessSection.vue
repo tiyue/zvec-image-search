@@ -119,6 +119,9 @@ function readableTime(value: string): string {
         <div><h3 id="pairing-title">待确认设备</h3><p>Android 自动发现电脑后，必须在这里确认相同的6位验证码。</p></div>
         <span>{{ lan.status.value?.pendingPairings.length || 0 }} 个</span>
       </header>
+      <p v-if="lan.status.value?.pendingPairings.length" class="pairing-safety" role="note">
+        只有 Android 已经显示相同验证码时才能允许。手机没有显示验证码时不要批准，请等待手机自动重试。
+      </p>
       <div v-if="lan.status.value?.pendingPairings.length" class="pairing-list">
         <article v-for="pairing in lan.status.value.pendingPairings" :key="pairing.id">
           <div>
@@ -159,6 +162,7 @@ function readableTime(value: string): string {
 .lan-form{display:grid;grid-template-columns:1fr 1fr 150px;gap:11px}.lan-form>label:not(.lan-enabled){display:grid;gap:5px;font-size:12px;font-weight:750}.lan-form input,.lan-form select{width:100%;height:40px;border:1px solid #d5dae6;border-radius:10px;padding:0 10px;color:#17203a;background:#fff;font:inherit}.lan-enabled{display:flex;grid-column:1/-1;align-items:flex-start;gap:9px;padding:10px;border-radius:11px;background:#f7f8fc}.lan-enabled span{display:grid;gap:2px}.lan-enabled small{color:#747d90}.lan-actions{grid-column:1/-1;justify-content:flex-end;flex-wrap:wrap}
 .lan-runtime{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin:0}.lan-runtime div{padding:10px 12px;border-radius:11px;background:#f3f4fb}.lan-runtime dt{color:#737d91;font-size:10px}.lan-runtime dd{margin:4px 0 0;overflow:hidden;font-size:12px;font-weight:800;text-overflow:ellipsis;white-space:nowrap}
 .pairing-panel{display:grid;gap:10px;padding:13px;border:1px solid #e1e5ee;border-radius:13px}.pairing-panel header>span{font-size:11px;font-weight:800}.pairing-list{display:grid;gap:8px}.pairing-list article{padding:10px;border-radius:10px;background:#f8f7ff}.pairing-list article>div{display:flex;align-items:center;gap:8px}.pairing-list article>div:first-child{display:grid;gap:3px}.pairing-list span,.paired-device span{color:#727b8f;font-size:11px}.pairing-list b{color:#4f42bb;font-size:16px;letter-spacing:.14em}.lan-empty{margin:0;padding:14px;color:#798297;text-align:center;background:#f7f8fb;border-radius:10px}
+.pairing-safety{margin:0;padding:9px 11px;border-radius:10px;color:#7a4a0b;background:#fff6e7;font-size:12px;line-height:1.5}
 .paired-device{padding:12px 14px;border:1px solid #cbe9dd;border-radius:13px;background:#effaf5}.lan-error{margin:0;color:#a13d50}.lan-status{min-height:18px;margin:0;color:#6f7890;font-size:11px}
 @media(max-width:900px){.lan-form,.lan-runtime{grid-template-columns:1fr}.pairing-list article,.paired-device,.lan-heading{align-items:stretch;flex-direction:column}.pairing-list article>div:last-child{justify-content:flex-end}}
 </style>

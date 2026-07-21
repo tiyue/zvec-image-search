@@ -126,7 +126,7 @@ describe("App search submission entry points", () => {
     expect(searchBodies).toHaveLength(1);
     expect(searchBodies[0]).toMatchObject({
       text: "人物写真",
-      mode: "semantic",
+      mode: "text",
       top_k: 56,
     });
   });
@@ -140,6 +140,6 @@ describe("App search submission entry points", () => {
     await flushPromises();
 
     expect(searchBodies).toHaveLength(1);
-    expect(searchBodies[0]).toMatchObject({ text: "角色动作", mode: "semantic" });
+    expect(searchBodies[0]).toMatchObject({ text: "角色动作", mode: "text" });
   });
 });

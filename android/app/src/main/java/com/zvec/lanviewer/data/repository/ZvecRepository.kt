@@ -11,6 +11,7 @@ import com.zvec.lanviewer.data.local.SavedConnection
 import com.zvec.lanviewer.data.model.DiscoveredServer
 import com.zvec.lanviewer.data.model.DownloadProgress
 import com.zvec.lanviewer.data.model.LibrariesResponse
+import com.zvec.lanviewer.data.model.PairPollResponse
 import com.zvec.lanviewer.data.model.PairRequest
 import com.zvec.lanviewer.data.model.PairStartResponse
 import com.zvec.lanviewer.data.model.QueryImageResponse
@@ -36,6 +37,10 @@ data class PairingAttempt(
     val comparisonCode: String,
     val expiresInSeconds: Long,
     internal val clientSecret: String,
+)
+
+internal class PairingTokenMissingException : IOException(
+    "电脑已批准配对，但没有返回设备令牌（approved_token_missing）。请更新电脑端后重新配对",
 )
 
 class ZvecRepository(
@@ -82,18 +87,7 @@ class ZvecRepository(
 
     suspend fun pollPairing(attempt: PairingAttempt): String {
         val response = api.pollPairing(attempt.baseUrl, attempt.pairingId, attempt.clientSecret)
-        return when (response.status.lowercase()) {
-            "pending" -> "pending"
-            "approved" -> {
-                val token = response.token?.takeIf(String::isNotBlank)
-                    ?: throw IOException("配对已批准，但服务器未返回访问令牌")
-                tokenStore.write(token)
-                "approved"
-            }
-            "rejected", "denied" -> "rejected"
-            "expired" -> "expired"
-            else -> throw IOException("未知配对状态")
-        }
+        return applyPairingPollResponse(response, tokenStore)
     }
 
     suspend fun status(): StatusResponse = api.status()
@@ -160,6 +154,22 @@ class ZvecRepository(
         tokenStore.clear()
         connectionStore.clear()
     }
+}
+
+internal fun applyPairingPollResponse(
+    response: PairPollResponse,
+    tokenStore: SecureTokenStore,
+): String = when (response.status.lowercase()) {
+    "pending" -> "pending"
+    "approved" -> {
+        val token = response.token?.takeIf(String::isNotBlank)
+            ?: throw PairingTokenMissingException()
+        tokenStore.write(token)
+        "approved"
+    }
+    "rejected", "denied" -> "rejected"
+    "expired" -> "expired"
+    else -> throw IOException("未知配对状态")
 }
 
 internal fun canRetainBearer(previous: SavedConnection?, next: SavedConnection): Boolean =

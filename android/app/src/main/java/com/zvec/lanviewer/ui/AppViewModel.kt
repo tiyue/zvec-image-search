@@ -3,6 +3,7 @@ package com.zvec.lanviewer.ui
 import android.content.ContentResolver
 import android.content.Context
 import android.net.Uri
+import android.os.SystemClock
 import android.provider.OpenableColumns
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
@@ -17,9 +18,12 @@ import com.zvec.lanviewer.data.model.SearchPageResponse
 import com.zvec.lanviewer.data.model.SearchPageResult
 import com.zvec.lanviewer.data.network.ApiException
 import com.zvec.lanviewer.data.repository.PairingAttempt
+import com.zvec.lanviewer.data.repository.PairingTokenMissingException
 import com.zvec.lanviewer.data.repository.ZvecRepository
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -29,6 +33,7 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeout
 import kotlinx.collections.immutable.persistentListOf
 import java.io.IOException
 
@@ -42,7 +47,9 @@ class AppViewModel(
     private val _events = MutableSharedFlow<AppEvent>(extraBufferCapacity = 4)
     val events: SharedFlow<AppEvent> = _events.asSharedFlow()
 
-    private var pairingJob: Job? = null
+    private val connectionFlight = KeyedSingleFlight(viewModelScope)
+    private var discoveryJob: Job? = null
+    private val discoveryGeneration = OperationGeneration()
     private var uploadJob: Job? = null
     private var pageJob: Job? = null
     private var searchJob: Job? = null
@@ -53,29 +60,46 @@ class AppViewModel(
     }
 
     fun discover() {
-        viewModelScope.launch {
+        connectionFlight.cancel()
+        discover(preservedError = null)
+    }
+
+    private fun discover(preservedError: String?) {
+        cancelDiscovery()
+        val generation = discoveryGeneration.begin()
+        val next = viewModelScope.launch(start = CoroutineStart.LAZY) {
             _state.update {
                 it.copy(
                     phase = ConnectionPhase.DISCOVERY,
                     isDiscovering = true,
-                    errorMessage = null,
+                    errorMessage = preservedError,
                     pairingCode = null,
+                    connectionDetail = null,
                 )
             }
             try {
                 val servers = repository.discover()
+                if (!discoveryGeneration.isCurrent(generation)) return@launch
                 _state.update {
                     it.copy(
                         isDiscovering = false,
                         discoveredServers = servers,
-                        errorMessage = if (servers.isEmpty()) "未自动发现电脑，可在下方手工输入 IP。" else null,
+                        errorMessage = preservedError
+                            ?: if (servers.isEmpty()) "未自动发现电脑，可在下方手工输入 IP。" else null,
                     )
                 }
             } catch (error: Throwable) {
                 if (error is CancellationException) throw error
-                _state.update { it.copy(isDiscovering = false, errorMessage = userMessage(error)) }
+                if (discoveryGeneration.isCurrent(generation)) {
+                    _state.update { it.copy(isDiscovering = false, errorMessage = userMessage(error)) }
+                }
             }
         }
+        discoveryJob = next
+        next.invokeOnCompletion {
+            if (discoveryJob === next) discoveryJob = null
+        }
+        next.start()
     }
 
     fun connect(server: DiscoveredServer) {
@@ -104,19 +128,21 @@ class AppViewModel(
     }
 
     fun cancelPairing() {
-        pairingJob?.cancel()
-        pairingJob = null
+        connectionFlight.cancel()
         _state.update {
             it.copy(
                 phase = ConnectionPhase.DISCOVERY,
                 pairingCode = null,
                 pairingSecondsRemaining = 0,
+                connectionDetail = null,
             )
         }
     }
 
     fun setSearchMode(mode: SearchMode) {
-        _state.update { it.copy(searchMode = mode, errorMessage = null) }
+        val visibleMode = if (mode == SearchMode.TAG) SearchMode.TAG else SearchMode.TEXT
+        if (visibleMode == SearchMode.TAG) clearQueryImage()
+        _state.update { it.copy(searchMode = visibleMode, errorMessage = null) }
     }
 
     fun setSearchText(text: String) {
@@ -207,14 +233,15 @@ class AppViewModel(
         pageJob?.cancel()
         searchJob = viewModelScope.launch {
             val snapshot = _state.value
+            val requestMode = snapshot.resolvedSearchMode()
             val topK = snapshot.topKText.toIntOrNull()?.takeIf { it > 0 }
             val validationError = when {
                 topK == null -> "结果数量必须是正整数"
-                snapshot.searchMode in setOf(SearchMode.TEXT, SearchMode.TAG) && snapshot.searchText.isBlank() ->
+                requestMode in setOf(SearchMode.TEXT, SearchMode.TAG) && snapshot.searchText.isBlank() ->
                     "请输入搜索文字"
-                snapshot.searchMode in setOf(SearchMode.IMAGE, SearchMode.COMBINED) &&
+                requestMode in setOf(SearchMode.IMAGE, SearchMode.COMBINED) &&
                     snapshot.queryImage?.queryImageId == null -> "请先选择并上传查询图片"
-                snapshot.searchMode == SearchMode.COMBINED && snapshot.searchText.isBlank() ->
+                requestMode == SearchMode.COMBINED && snapshot.searchText.isBlank() ->
                     "图文联合搜索还需要输入文字"
                 else -> null
             }
@@ -237,9 +264,9 @@ class AppViewModel(
                 snapshot.activeSearchId?.let { runCatching { repository.deleteSearch(it) } }
                 val created = repository.createSearch(
                     SearchRequest(
-                        mode = snapshot.searchMode,
+                        mode = requestMode,
                         text = snapshot.searchText.trim().takeIf(String::isNotBlank),
-                        queryImageId = snapshot.queryImage?.queryImageId,
+                        queryImageId = snapshot.queryImage?.queryImageId.takeIf { requestMode != SearchMode.TAG },
                         libraryIds = snapshot.selectedLibraryIds.toList(),
                         topK = requireNotNull(topK),
                     ),
@@ -388,7 +415,8 @@ class AppViewModel(
     fun disconnect() {
         val activeSearchId = _state.value.activeSearchId
         val queryImageId = _state.value.queryImage?.queryImageId
-        pairingJob?.cancel()
+        cancelDiscovery()
+        connectionFlight.cancel()
         uploadJob?.cancel()
         pageJob?.cancel()
         searchJob?.cancel()
@@ -403,40 +431,55 @@ class AppViewModel(
     }
 
     private fun restoreOrDiscover() {
+        cancelDiscovery()
         val saved = repository.savedConnection()
         if (saved == null || !repository.hasToken()) {
             discover()
             return
         }
         _state.update { it.copy(phase = ConnectionPhase.CONNECTING) }
-        viewModelScope.launch {
+        var rediscoveryMessage: String? = null
+        connectionFlight.launch(
+            key = saved.baseUrl,
+            onComplete = {
+                // Completion clears the single-flight slot before discovery starts, so a
+                // discovery result can never race a stale restore job.
+                rediscoveryMessage?.let { message -> discover(preservedError = message) }
+            },
+        ) {
             try {
-                loadReadyState()
-            } catch (_: Throwable) {
-                _state.update { it.copy(phase = ConnectionPhase.DISCOVERY) }
-                discover()
+                loadReadyStateWithRetry()
+            } catch (error: Throwable) {
+                if (error is CancellationException) throw error
+                rediscoveryMessage = pairingErrorMessage(PairingStage.RESTORE, error)
+                failPairing(requireNotNull(rediscoveryMessage))
             }
         }
     }
 
     private fun connect(connection: SavedConnection) {
-        pairingJob?.cancel()
-        repository.selectConnection(connection)
-        _state.update {
-            it.copy(
-                phase = ConnectionPhase.CONNECTING,
-                errorMessage = null,
-                serverName = connection.displayName,
-            )
-        }
-        viewModelScope.launch {
+        cancelDiscovery()
+        connectionFlight.launch(connection.baseUrl) {
+            repository.selectConnection(connection)
+            _state.update {
+                it.copy(
+                    phase = ConnectionPhase.CONNECTING,
+                    isDiscovering = false,
+                    errorMessage = null,
+                    serverName = connection.displayName,
+                    pairingCode = null,
+                    pairingSecondsRemaining = 0,
+                    connectionDetail = null,
+                )
+            }
             if (repository.hasToken()) {
                 try {
-                    loadReadyState()
+                    loadReadyStateWithRetry()
                     return@launch
                 } catch (error: Throwable) {
+                    if (error is CancellationException) throw error
                     if (error !is ApiException || error.httpStatus != 401) {
-                        _state.update { it.copy(phase = ConnectionPhase.DISCOVERY, errorMessage = userMessage(error)) }
+                        failPairing(PairingStage.RESTORE, error)
                         return@launch
                     }
                 }
@@ -446,54 +489,123 @@ class AppViewModel(
     }
 
     private suspend fun startPairing(baseUrl: String) {
-        try {
-            val attempt = repository.beginPairing(baseUrl)
-            _state.update {
-                it.copy(
-                    phase = ConnectionPhase.PAIRING,
-                    pairingCode = formatPairingCode(attempt.comparisonCode),
-                    pairingSecondsRemaining = attempt.expiresInSeconds,
-                    errorMessage = null,
-                )
-            }
-            pairingJob = viewModelScope.launch {
-                try {
-                    pollUntilComplete(attempt)
-                } catch (error: Throwable) {
-                    if (error is CancellationException) throw error
-                    _state.update {
-                        it.copy(phase = ConnectionPhase.DISCOVERY, errorMessage = userMessage(error))
-                    }
-                }
-            }
+        val attempt = try {
+            repository.beginPairing(baseUrl)
         } catch (error: Throwable) {
             if (error is CancellationException) throw error
-            _state.update { it.copy(phase = ConnectionPhase.DISCOVERY, errorMessage = userMessage(error)) }
+            failPairing(PairingStage.CREATE, error)
+            return
+        }
+        _state.update {
+            it.copy(
+                phase = ConnectionPhase.PAIRING,
+                pairingCode = formatPairingCode(attempt.comparisonCode),
+                pairingSecondsRemaining = normalizedPairingDurationSeconds(attempt.expiresInSeconds),
+                connectionDetail = null,
+                errorMessage = null,
+            )
+        }
+
+        val completion = try {
+            pollUntilComplete(attempt)
+        } catch (error: Throwable) {
+            if (error is CancellationException) throw error
+            failPairing(PairingStage.POLL, error)
+            return
+        }
+        when (completion) {
+            PairingCompletion.APPROVED -> try {
+                _state.update(AppUiState::afterPairingApproved)
+                loadReadyStateWithRetry()
+            } catch (error: Throwable) {
+                if (error is CancellationException) throw error
+                failPairing(PairingStage.COMPLETE, error)
+            }
+            PairingCompletion.REJECTED -> failPairing("电脑端拒绝了配对请求")
+            PairingCompletion.EXPIRED -> failPairing("配对请求已过期，请重试")
         }
     }
 
-    private suspend fun pollUntilComplete(attempt: PairingAttempt) {
-        val expiresAt = System.currentTimeMillis() + attempt.expiresInSeconds * 1000L
-        while (System.currentTimeMillis() < expiresAt) {
-            delay(POLL_INTERVAL_MS)
-            val remaining = ((expiresAt - System.currentTimeMillis()) / 1000L).coerceAtLeast(0L)
-            _state.update { it.copy(pairingSecondsRemaining = remaining) }
-            when (repository.pollPairing(attempt)) {
-                "pending" -> Unit
-                "approved" -> {
-                    loadReadyState()
-                    return
-                }
-                "rejected" -> {
-                    _state.update {
-                        it.copy(phase = ConnectionPhase.DISCOVERY, errorMessage = "电脑端拒绝了配对请求")
+    private suspend fun pollUntilComplete(attempt: PairingAttempt): PairingCompletion {
+        // Never compare the desktop's wall-clock expires_at with the phone clock: skew can
+        // otherwise make a fresh request expire immediately. elapsedRealtime is monotonic.
+        val expiresAt = pairingDeadlineElapsedMillis(
+            nowElapsedMillis = SystemClock.elapsedRealtime(),
+            expiresInSeconds = attempt.expiresInSeconds,
+        )
+        var lastTransportError: IOException? = null
+        val recoveryPolicy = PairingPollRecoveryPolicy()
+        while (SystemClock.elapsedRealtime() < expiresAt) {
+            val beforeDelay = SystemClock.elapsedRealtime()
+            val remainingBeforeDelay = expiresAt - beforeDelay
+            if (remainingBeforeDelay <= 0L) break
+            delay(minOf(POLL_INTERVAL_MS, remainingBeforeDelay))
+            val remainingMillis = expiresAt - SystemClock.elapsedRealtime()
+            if (remainingMillis <= 0L) break
+            _state.update { it.copy(pairingSecondsRemaining = remainingMillis / 1_000L) }
+            val status = try {
+                withTimeout(remainingMillis) {
+                    repository.pollPairing(attempt).also {
+                        lastTransportError = null
+                        recoveryPolicy.onSuccessfulStatus()
                     }
-                    return
                 }
-                "expired" -> break
+            } catch (_: TimeoutCancellationException) {
+                break
+            } catch (error: ApiException) {
+                throw error
+            } catch (error: PairingTokenMissingException) {
+                if (!recoveryPolicy.shouldRetryApprovedWithoutToken()) throw error
+                continue
+            } catch (error: IOException) {
+                // A momentary Wi-Fi handoff must not discard an already-approved request.
+                lastTransportError = error
+                continue
+            }
+            when (status) {
+                "pending" -> Unit
+                "approved" -> return PairingCompletion.APPROVED
+                "rejected" -> return PairingCompletion.REJECTED
+                "expired" -> return PairingCompletion.EXPIRED
             }
         }
-        _state.update { it.copy(phase = ConnectionPhase.DISCOVERY, errorMessage = "配对请求已过期，请重试") }
+        lastTransportError?.let { throw it }
+        return PairingCompletion.EXPIRED
+    }
+
+    private suspend fun loadReadyStateWithRetry() {
+        try {
+            loadReadyState()
+        } catch (error: ApiException) {
+            throw error
+        } catch (_: IOException) {
+            // The token has already been persisted after approval. One transport retry lets
+            // a brief Wi-Fi transition recover without forcing the user to approve again.
+            delay(CONNECTION_RETRY_DELAY_MS)
+            loadReadyState()
+        }
+    }
+
+    private fun failPairing(stage: PairingStage, error: Throwable) {
+        failPairing(pairingErrorMessage(stage, error))
+    }
+
+    private fun failPairing(message: String) {
+        _state.update {
+            it.copy(
+                phase = ConnectionPhase.DISCOVERY,
+                pairingCode = null,
+                pairingSecondsRemaining = 0,
+                connectionDetail = null,
+                errorMessage = message,
+            )
+        }
+    }
+
+    private fun cancelDiscovery() {
+        discoveryGeneration.invalidate()
+        discoveryJob?.cancel()
+        discoveryJob = null
     }
 
     private suspend fun loadReadyState() {
@@ -512,6 +624,7 @@ class AppViewModel(
                 libraries = libraries.libraries,
                 errorMessage = null,
                 pairingCode = null,
+                connectionDetail = null,
             )
         }
     }
@@ -560,9 +673,23 @@ class AppViewModel(
 
     companion object {
         private const val POLL_INTERVAL_MS = 2_000L
+        private const val CONNECTION_RETRY_DELAY_MS = 350L
         private const val SEARCH_TIMEOUT_MS = 5 * 60 * 1000L
     }
 }
+
+private enum class PairingCompletion {
+    APPROVED,
+    REJECTED,
+    EXPIRED,
+}
+
+internal fun pairingDeadlineElapsedMillis(nowElapsedMillis: Long, expiresInSeconds: Long): Long {
+    return nowElapsedMillis + normalizedPairingDurationSeconds(expiresInSeconds) * 1_000L
+}
+
+internal fun normalizedPairingDurationSeconds(expiresInSeconds: Long): Long =
+    expiresInSeconds.coerceIn(0L, 10L * 60L)
 
 internal const val SEARCH_PAGE_SIZE = 100
 

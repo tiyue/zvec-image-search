@@ -90,6 +90,27 @@ describe("App search feedback wiring", () => {
             }],
           }));
         }
+        if (path === "api/search") {
+          return Promise.resolve(response({
+            id: "search-1",
+            status: "succeeded",
+            page: 1,
+            page_size: 15,
+            total_items: 1,
+            total_pages: 1,
+            items: [{
+              id: "image-1",
+              search_session_id: "search-1",
+              library_id: "lib-1",
+              doc_id: "doc-1",
+              name: "雷电将军.jpg",
+              relative_path: "原神/雷电将军.jpg",
+              library_name: "人物图库",
+              rank: 1,
+              confidence: 0.91,
+            }],
+          }));
+        }
         if (path === "api/search-learning/status") {
           return Promise.resolve(response({
             available: true,
@@ -163,12 +184,20 @@ describe("App search feedback wiring", () => {
     await wrapper.vm.$nextTick();
   }
 
+  async function runVisibleSearch(): Promise<void> {
+    if (!wrapper) throw new Error("app is not mounted");
+    await wrapper.get("input[type='search']").setValue("雷电将军");
+    await wrapper.get("[data-testid='submit-search']").trigger("click");
+    await flushPromises();
+  }
+
   it("loads session state and records explicit plus successful implicit actions", async () => {
     wrapper = mount(App, {
       attachTo: document.body,
       global: { stubs: { TasksPage: true, OrganizePage: true, SettingsPage: true } },
     });
     await flushPromises();
+    await runVisibleSearch();
 
     expect(vi.mocked(fetch).mock.calls.some(([path]) =>
       String(path).startsWith("api/search-feedback?session_id=search-1"),
@@ -220,6 +249,7 @@ describe("App search feedback wiring", () => {
       global: { stubs: { TasksPage: true, OrganizePage: true, SettingsPage: true } },
     });
     await flushPromises();
+    await runVisibleSearch();
 
     await wrapper.get(".thumbnail-stage").trigger("dblclick");
     await flushPromises();
