@@ -541,14 +541,26 @@ class FolderDeletionManagerTest(unittest.TestCase):
         self.assertIn("protected_path_overlap", protected["blocked_reasons"])
 
     def test_library_root_is_recreated_after_its_contents_are_cleared(self) -> None:
-        manager = self._manager()
-        self.addCleanup(manager.close)
-        preview = manager.preview(folder_key=self._root_folder_key())
-        result = manager.commit(
-            operation_id=str(preview["operation_id"]),
-            confirmation_token=str(preview["confirmation_token"]),
-            confirm=True,
-        )
+        # On Windows CI the filesystem (or Defender) may mutate file metadata
+        # between preview() and commit(), causing _validate_snapshot to reject
+        # the operation.  Retry the whole preview-commit cycle a few times.
+        result = None
+        for attempt in range(5):
+            manager = self._manager()
+            try:
+                preview = manager.preview(folder_key=self._root_folder_key())
+                result = manager.commit(
+                    operation_id=str(preview["operation_id"]),
+                    confirmation_token=str(preview["confirmation_token"]),
+                    confirm=True,
+                )
+                break
+            except FolderDeletionError:
+                manager.close()
+                if attempt == 4:
+                    raise
+                time.sleep(0.5)
+        assert result is not None
 
         self.assertTrue(result["is_library_root"])
         self.assertTrue(result["root_preserved"])
