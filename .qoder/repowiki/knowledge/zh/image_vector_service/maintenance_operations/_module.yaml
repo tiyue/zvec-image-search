@@ -1,0 +1,15 @@
+schema_version: 1
+module_path: image_vector_service/maintenance_operations
+title: maintenance_operations
+scope:
+    - image_vector_service/data_migration.py
+    - image_vector_service/path_migration.py
+    - image_vector_service/migration_recovery.py
+    - image_vector_service/metadata_backfill.py
+    - image_vector_service/folder_deletion.py
+    - image_vector_service/workspace_backup.py
+    - image_vector_service/result_exporter.py
+    - image_vector_service/image_scanner.py
+source_files: []
+depends_on: []
+related_to: []

@@ -484,6 +484,13 @@ jobs:
 
   assemble:
     name: Assemble release candidate
+    if: >-
+      always() &&
+      needs.prepare.result == 'success' &&
+      needs.desktop-selection.result == 'success' &&
+      needs.webview-preview.result == 'success' &&
+      needs.native-package.result == 'success' &&
+      needs.android-preview.result == 'success'
     needs:
       - prepare
       - desktop-selection

@@ -1,0 +1,10 @@
+schema_version: 1
+module_path: image_vector_service/active_learning_review
+title: active_learning_review
+scope:
+    - image_vector_service/active_learning.py
+    - image_vector_service/active_learning_review_store.py
+    - image_vector_service/search_quality.py
+source_files: []
+depends_on: []
+related_to: []

@@ -1,0 +1,200 @@
+# 知识卡导出索引文件
+schema_version: 1
+locale: zh-CN
+branch: codex/collection-local
+nodes_managed: true
+exported_at: "2026-07-23T03:58:53Z"
+modules:
+    desktop_app:
+        dir_name: desktop_app
+        title: desktop_app
+        scope:
+            - zvec_desktop/
+        source_files: []
+        children: []
+        depends_on: []
+        related_to: []
+    frontend_vue:
+        dir_name: frontend_vue
+        title: frontend_vue
+        scope:
+            - frontend/
+        source_files: []
+        children: []
+        depends_on: []
+        related_to: []
+    image_vector_service:
+        dir_name: image_vector_service
+        title: image_vector_service
+        scope:
+            - image_vector_service/
+        source_files: []
+        children:
+            - image_vector_service/active_learning_review
+            - image_vector_service/clustering_auto_tagging
+            - image_vector_service/maintenance_operations
+            - image_vector_service/persistence_repository
+            - image_vector_service/search_learning_pipeline
+            - image_vector_service/search_ranking
+            - image_vector_service/shared_infrastructure
+        depends_on: []
+        related_to: []
+    image_vector_service/active_learning_review:
+        dir_name: active_learning_review
+        title: active_learning_review
+        scope:
+            - image_vector_service/active_learning.py
+            - image_vector_service/active_learning_review_store.py
+            - image_vector_service/search_quality.py
+        source_files: []
+        children: []
+        depends_on: []
+        related_to: []
+    image_vector_service/clustering_auto_tagging:
+        dir_name: clustering_auto_tagging
+        title: clustering_auto_tagging
+        scope:
+            - image_vector_service/image_clustering.py
+            - image_vector_service/large_image_clustering.py
+            - image_vector_service/large_cluster_adapter.py
+            - image_vector_service/vision_tagging_client.py
+            - image_vector_service/dashscope_client.py
+            - image_vector_service/auto_tag_cache.py
+            - image_vector_service/annotation_service.py
+            - image_vector_service/model_catalog.py
+        source_files: []
+        children: []
+        depends_on: []
+        related_to: []
+    image_vector_service/maintenance_operations:
+        dir_name: maintenance_operations
+        title: maintenance_operations
+        scope:
+            - image_vector_service/data_migration.py
+            - image_vector_service/path_migration.py
+            - image_vector_service/migration_recovery.py
+            - image_vector_service/metadata_backfill.py
+            - image_vector_service/folder_deletion.py
+            - image_vector_service/workspace_backup.py
+            - image_vector_service/result_exporter.py
+            - image_vector_service/image_scanner.py
+        source_files: []
+        children: []
+        depends_on: []
+        related_to: []
+    image_vector_service/persistence_repository:
+        dir_name: persistence_repository
+        title: persistence_repository
+        scope:
+            - image_vector_service/zvec_repository.py
+            - image_vector_service/state.py
+            - image_vector_service/collection_write_coordinator.py
+            - image_vector_service/collection_write_outbox.py
+            - image_vector_service/scan_staging.py
+            - image_vector_service/cluster_operation_store.py
+            - image_vector_service/activity_store.py
+            - image_vector_service/search_result_store.py
+            - image_vector_service/optimize_policy.py
+        source_files: []
+        children: []
+        depends_on: []
+        related_to: []
+    image_vector_service/search_learning_pipeline:
+        dir_name: search_learning_pipeline
+        title: search_learning_pipeline
+        scope:
+            - image_vector_service/search_learning_config.py
+            - image_vector_service/search_learning_runtime.py
+            - image_vector_service/search_learning_service.py
+            - image_vector_service/search_learning_store.py
+            - image_vector_service/learning_ranker.py
+            - image_vector_service/search_learning_evaluator.py
+        source_files: []
+        children: []
+        depends_on: []
+        related_to: []
+    image_vector_service/search_ranking:
+        dir_name: 搜索排序与结果融合层
+        title: 搜索排序与结果融合层
+        scope:
+            - image_vector_service/hybrid_search.py
+            - image_vector_service/metadata_search.py
+            - image_vector_service/tag_search.py
+            - image_vector_service/rank_fusion.py
+            - image_vector_service/result_diversity.py
+            - image_vector_service/search_features.py
+            - image_vector_service/federated_search.py
+            - image_vector_service/library_browser.py
+            - image_vector_service/source_resolver.py
+            - image_vector_service/logical_paths.py
+            - image_vector_service/tags.py
+            - image_vector_service/tag_aliases.py
+            - image_vector_service/tag_rank_query.py
+            - image_vector_service/metadata_text.py
+            - image_vector_service/image_data_uri.py
+        source_files: []
+        children: []
+        depends_on: []
+        related_to: []
+    image_vector_service/shared_infrastructure:
+        dir_name: shared_infrastructure
+        title: shared_infrastructure
+        scope:
+            - image_vector_service/config.py
+            - image_vector_service/models.py
+            - image_vector_service/process_lock.py
+            - image_vector_service/backend_instance_lock.py
+            - image_vector_service/rate_limiter.py
+            - image_vector_service/app_logging.py
+            - image_vector_service/failure_sink.py
+            - image_vector_service/large_library_policy.py
+        source_files: []
+        children: []
+        depends_on: []
+        related_to: []
+    lan_layer:
+        dir_name: lan_layer
+        title: lan_layer
+        scope:
+            - zvec_lan/
+        source_files: []
+        children: []
+        depends_on: []
+        related_to: []
+    scripts_packaging:
+        dir_name: scripts_packaging
+        title: scripts_packaging
+        scope:
+            - scripts/
+            - installer/
+        source_files: []
+        children: []
+        depends_on: []
+        related_to: []
+    tests:
+        dir_name: tests
+        title: tests
+        scope:
+            - tests/
+        source_files: []
+        children: []
+        depends_on: []
+        related_to: []
+    tools:
+        dir_name: tools
+        title: tools
+        scope:
+            - tools/
+        source_files: []
+        children: []
+        depends_on: []
+        related_to: []
+    webview_bridge:
+        dir_name: webview_bridge
+        title: webview_bridge
+        scope:
+            - zvec_webview/
+        source_files: []
+        children: []
+        depends_on: []
+        related_to: []

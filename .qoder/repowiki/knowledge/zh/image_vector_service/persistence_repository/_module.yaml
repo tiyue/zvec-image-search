@@ -1,0 +1,16 @@
+schema_version: 1
+module_path: image_vector_service/persistence_repository
+title: persistence_repository
+scope:
+    - image_vector_service/zvec_repository.py
+    - image_vector_service/state.py
+    - image_vector_service/collection_write_coordinator.py
+    - image_vector_service/collection_write_outbox.py
+    - image_vector_service/scan_staging.py
+    - image_vector_service/cluster_operation_store.py
+    - image_vector_service/activity_store.py
+    - image_vector_service/search_result_store.py
+    - image_vector_service/optimize_policy.py
+source_files: []
+depends_on: []
+related_to: []

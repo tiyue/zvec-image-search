@@ -1,0 +1,13 @@
+schema_version: 1
+module_path: image_vector_service/search_learning_pipeline
+title: search_learning_pipeline
+scope:
+    - image_vector_service/search_learning_config.py
+    - image_vector_service/search_learning_runtime.py
+    - image_vector_service/search_learning_service.py
+    - image_vector_service/search_learning_store.py
+    - image_vector_service/learning_ranker.py
+    - image_vector_service/search_learning_evaluator.py
+source_files: []
+depends_on: []
+related_to: []

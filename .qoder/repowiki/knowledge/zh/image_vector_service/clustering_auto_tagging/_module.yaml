@@ -1,0 +1,15 @@
+schema_version: 1
+module_path: image_vector_service/clustering_auto_tagging
+title: clustering_auto_tagging
+scope:
+    - image_vector_service/image_clustering.py
+    - image_vector_service/large_image_clustering.py
+    - image_vector_service/large_cluster_adapter.py
+    - image_vector_service/vision_tagging_client.py
+    - image_vector_service/dashscope_client.py
+    - image_vector_service/auto_tag_cache.py
+    - image_vector_service/annotation_service.py
+    - image_vector_service/model_catalog.py
+source_files: []
+depends_on: []
+related_to: []
