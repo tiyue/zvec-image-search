@@ -245,6 +245,8 @@ class LanApiClient(
     } catch (_: IOException) {
         // Retry exactly once only when the transport or response body was interrupted.
         // Pairing create/poll are idempotent for the same device secret on the desktop.
+        // Brief pause gives MockWebServer time to re-accept after DISCONNECT policies.
+        kotlinx.coroutines.delay(100)
         executeJson(request, pairingHttpClient)
     }
 
