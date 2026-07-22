@@ -12,7 +12,12 @@ describe("ImagePreview", () => {
 
     expect(wrapper.text()).toContain("选择一张图片查看标签与详情");
     expect(wrapper.find("img").exists()).toBe(false);
-    expect(wrapper.findAll("button").every((button) => button.element.disabled)).toBe(true);
+    expect(
+      wrapper.findAll(".preview-actions button").every(
+        (button) => (button.element as HTMLButtonElement).disabled,
+      ),
+    ).toBe(true);
+    expect((wrapper.get(".preview-close").element as HTMLButtonElement).disabled).toBe(false);
   });
 
   it("shows tags, calibrated confidence and the original score", () => {
@@ -78,12 +83,21 @@ describe("ImagePreview", () => {
     const wrapper = mount(ImagePreview, {
       props: { item: makeSearchItem(), highResolution: true, previewVisible: true },
     });
-    const [openButton, revealButton] = wrapper.findAll("button");
+    const [openButton, revealButton] = wrapper.findAll(".preview-actions button");
 
     await openButton.trigger("click");
     await revealButton.trigger("click");
 
     expect(wrapper.emitted("open")).toEqual([["image-1"]]);
     expect(wrapper.emitted("reveal")).toEqual([["image-1"]]);
+  });
+
+  it("emits close from the dialog heading", async () => {
+    const wrapper = mount(ImagePreview, {
+      props: { item: makeSearchItem(), highResolution: true, previewVisible: true },
+    });
+
+    await wrapper.get(".preview-close").trigger("click");
+    expect(wrapper.emitted("close")).toEqual([[]]);
   });
 });

@@ -31,6 +31,7 @@ body { min-width: 560px; overflow: hidden; color: var(--text); font-size:14px; b
 button, input, select { font: inherit; }
 button { cursor: pointer; }
 button:disabled { cursor: not-allowed; opacity: .58; }
+button:focus-visible { outline: 2px solid #b9b9b9; outline-offset: 2px; }
 .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0,0,0,0); }
 
 .app-shell { display: grid; width: 100%; height: 100%; grid-template-columns: var(--sidebar-width) minmax(0,1fr); }
@@ -346,3 +347,39 @@ body { background:#fff; color:#0d0d0d; }
 .feature-page .organize-page :is(.mini-tag,.draft-tag,.alias-count,.alias-entry,.operation-preview,.progress-card),
 .feature-page .intelligence-panel :is(.cluster-type-chip,.anchor-chip,.cluster-operation-summary,.cluster-identity-editor),
 .feature-page .learning-panel :is(.sample-kind span,.reason-list span,.suggested-tags span,.review-summary) { border-color:#e1e1e1 !important; background:#f3f3f3 !important; }
+
+/* Search results use the approved edge-to-edge gallery. Details are available
+   from the image context menu and open as a focused dialog instead of taking
+   permanent horizontal space from the gallery. */
+.search-page:not(.is-landing) { padding:0; gap:0; }
+.search-page:not(.is-landing) .search-workspace { display:block; height:100%; overflow:hidden; }
+.search-page:not(.is-landing) .gallery-panel { height:100%; padding:0; border:0; border-radius:0; box-shadow:none; }
+.search-page:not(.is-landing) .panel-heading { min-height:52px; margin:0; padding:7px 14px; border-bottom:1px solid #ededed; }
+.search-page:not(.is-landing) .gallery-operations { padding:0 14px; }
+.search-page:not(.is-landing) .selection-toolbar { margin:8px 0; }
+.search-page:not(.is-landing) .gallery-frame { padding:0; }
+
+.image-preview-backdrop {
+  position:fixed;
+  z-index:1200;
+  inset:0;
+  display:grid;
+  place-items:center;
+  padding:28px;
+  background:rgb(0 0 0 / 18%);
+  backdrop-filter:blur(2px);
+}
+.preview-dialog {
+  width:min(560px,calc(100vw - 40px));
+  max-height:calc(100vh - 56px);
+  padding:18px;
+  border:1px solid #dedede;
+  border-radius:16px;
+  background:#fff;
+  box-shadow:0 22px 70px rgb(0 0 0 / 18%);
+}
+
+@media (max-width:680px) {
+  .image-preview-backdrop { padding:12px; }
+  .preview-dialog { width:100%; max-height:calc(100vh - 24px); padding:14px; }
+}

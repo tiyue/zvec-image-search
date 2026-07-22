@@ -355,7 +355,7 @@ describe("App page shell", () => {
     expect(wrapper.get("[data-testid='tasks-page']").attributes("data-visible")).toBe("false");
   });
 
-  it("connects gallery double click and preview folder action to the native bridge", async () => {
+  it("connects gallery double click and context-menu detail actions to the native bridge", async () => {
     latestPayload = {
       id: "latest-with-image",
       status: "succeeded",
@@ -386,6 +386,15 @@ describe("App page shell", () => {
     await wrapper.get(".thumbnail-stage").trigger("dblclick");
     expect(nativeActionMocks.open).toHaveBeenCalledWith("image-1");
 
+    await wrapper.get(".image-card").trigger("contextmenu", { clientX: 400, clientY: 300 });
+    const detailButton = Array.from(
+      document.body.querySelectorAll<HTMLButtonElement>(".gallery-context-menu button"),
+    ).find((button) => button.textContent?.includes("打开详情"));
+    expect(detailButton).toBeDefined();
+    detailButton?.click();
+    await flushPromises();
+
+    expect(wrapper.find(".preview-dialog").exists()).toBe(true);
     await wrapper.get(".preview-actions .button-quiet").trigger("click");
     expect(nativeActionMocks.reveal).toHaveBeenCalledWith("image-1");
   });

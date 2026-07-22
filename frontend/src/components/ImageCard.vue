@@ -127,11 +127,11 @@ function openContextMenu(event: MouseEvent): void {
   grid-template-rows: minmax(0, 1fr) auto;
   padding: 0;
   overflow: hidden;
-  border: 1px solid var(--border, #e1e6ef);
-  border-radius: 14px;
+  border: 1px solid #e7e7e7;
+  border-radius: 8px;
   color: var(--text, #171e2e);
   text-align: left;
-  background: #f5f7fb;
+  background: #f2f2f2;
   cursor: pointer;
   transition:
     transform 150ms ease,
@@ -141,18 +141,18 @@ function openContextMenu(event: MouseEvent): void {
 
 .image-card:hover {
   z-index: 1;
-  border-color: #b8baf8;
-  box-shadow: 0 12px 30px rgb(23 32 51 / 13%);
-  transform: translateY(-2px);
+  border-color: #bdbdbd;
+  box-shadow: 0 6px 18px rgb(0 0 0 / 10%);
+  transform: none;
 }
 
 .image-card.is-selected {
-  border-color: var(--brand, #6258e7);
-  box-shadow: 0 0 0 2px rgb(89 91 220 / 15%), 0 10px 24px rgb(23 32 51 / 10%);
+  border-color: #777;
+  box-shadow: 0 0 0 2px rgb(0 0 0 / 10%);
 }
 
 .image-card.is-primary {
-  box-shadow: 0 0 0 3px rgb(89 91 220 / 20%), 0 12px 28px rgb(23 32 51 / 13%);
+  box-shadow: 0 0 0 2px rgb(0 0 0 / 14%);
 }
 
 .thumbnail-stage {
@@ -162,9 +162,7 @@ function openContextMenu(event: MouseEvent): void {
   min-height: 0;
   place-items: center;
   overflow: hidden;
-  background:
-    radial-gradient(circle at 50% 12%, rgb(119 108 242 / 10%), transparent 38%),
-    linear-gradient(160deg, #171d2b, #121827);
+  background:linear-gradient(145deg,#f0f0f0,#e4e4e4);
 }
 
 /* Product invariant: user images must never be cropped. */
@@ -209,7 +207,7 @@ function openContextMenu(event: MouseEvent): void {
   color: #fff;
   font-size: 12px;
   font-weight: 800;
-  background: #0d1322;
+  background: #666;
 }
 
 .card-rank {
@@ -233,8 +231,8 @@ function openContextMenu(event: MouseEvent): void {
   color: #fff;
   font-size: 14px;
   font-weight: 900;
-  background: var(--brand, #6258e7);
-  box-shadow: 0 3px 10px rgb(23 32 51 / 24%);
+  background: #555;
+  box-shadow: 0 3px 10px rgb(0 0 0 / 18%);
 }
 
 .match-stripe {
@@ -243,7 +241,7 @@ function openContextMenu(event: MouseEvent): void {
   right: 0;
   bottom: 0;
   width: 3px;
-  background: var(--brand, #6258e7);
+  background: #777;
 }
 
 .match-stripe.is-high {

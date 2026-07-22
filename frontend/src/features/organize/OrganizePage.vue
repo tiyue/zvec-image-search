@@ -58,7 +58,7 @@ const galleryCapacity = ref<OrganizeGalleryCapacity>(
 const editorOpen = ref(false);
 const deleteConfirmation = ref("");
 const deleteTargetKey = ref("");
-const folderPanelCollapsed = ref(true);
+const folderPanelCollapsed = ref(false);
 const activeWorkspaceTab = ref<WorkspaceTab>(props.activeTab);
 const visitedWorkspaceTabs = ref<Set<WorkspaceTab>>(
   new Set([props.activeTab]),
@@ -302,9 +302,6 @@ onBeforeUnmount(() => {
     <div v-show="activeWorkspaceTab === 'batch'" class="batch-tag-workspace" :class="{ 'is-folder-collapsed': folderPanelCollapsed }">
       <aside class="folder-panel panel" :class="{ 'is-collapsed': folderPanelCollapsed }" aria-labelledby="folder-panel-title">
         <header class="panel-heading">
-          <button class="folder-panel-toggle" type="button" :aria-label="folderPanelCollapsed ? '展开文件夹导航' : '收起文件夹导航'" @click="folderPanelCollapsed = !folderPanelCollapsed">
-            {{ folderPanelCollapsed ? "›" : "‹" }}
-          </button>
           <div>
             <p class="eyebrow">图库导航</p>
             <h2 id="folder-panel-title">文件夹</h2>
@@ -463,6 +460,9 @@ onBeforeUnmount(() => {
 
       <main class="gallery-panel panel" aria-labelledby="folder-gallery-title">
         <header class="gallery-heading">
+          <button class="folder-panel-toggle" type="button" :aria-label="folderPanelCollapsed ? '展开文件夹导航' : '收起文件夹导航'" @click="folderPanelCollapsed = !folderPanelCollapsed">
+            {{ folderPanelCollapsed ? "›" : "‹" }}
+          </button>
           <div>
             <p class="eyebrow">当前文件夹</p>
             <h2 id="folder-gallery-title">
@@ -1012,8 +1012,48 @@ textarea { resize: vertical; line-height: 1.5; }
 .delete-modal footer { justify-content: flex-end; }
 .delete-blocked { padding: 9px 10px; border-radius: 9px; color: #9f3647 !important; background: #fff0f2; }
 
-@media (max-width: 1700px) {
+/* Fullscreen desktop treatment from the approved prototype. The three
+   work areas are continuous white panes; controls, selection and behavior stay
+   intact while the old purple dashboard framing is removed. */
+.organize-page { color:#242424; }
+.batch-tag-workspace { grid-template-columns:260px minmax(380px,1fr) 300px; gap:0; background:#fff; }
+.batch-tag-workspace.is-folder-collapsed { grid-template-columns:0 minmax(380px,1fr) 300px; gap:0; }
+.folder-panel { grid-column:1; }
+.gallery-panel { grid-column:2; }
+.tag-editor { grid-column:3; }
+.folder-panel,.gallery-panel,.tag-editor { border:0; border-radius:0; background:#fff; box-shadow:none; }
+.folder-panel { padding:14px 12px 14px 0; }
+.folder-panel.is-collapsed { display:none; }
+.gallery-panel { padding:14px; }
+.tag-editor { padding:14px; }
+.panel-heading .eyebrow,.gallery-heading .eyebrow,.tag-editor .eyebrow { display:none; }
+.folder-panel-toggle { width:32px; height:32px; border:0; border-radius:8px; color:#666; background:transparent; }
+.folder-panel-toggle:hover { color:#171717; background:#f2f2f2; }
+.gallery-heading { justify-content:flex-start; }
+.gallery-heading>div:first-of-type { min-width:0; flex:1; }
+.gallery-metrics strong { color:#242424; font-weight:600; }
+.root-row,.folder-item { border:0; border-radius:8px; background:transparent; box-shadow:none; }
+.root-row:hover,.folder-item:hover,.root-row.active,.folder-item.active { border-color:transparent; color:#242424; background:#f2f2f2; box-shadow:none; }
+.root-row.direct-selected { box-shadow:none; }
+.root-icon,.folder-glyph { color:#777; background:transparent; }
+.folder-library-control select,.folder-search input,input,select,textarea { border-color:#dedede; color:#242424; background:#fff; }
+.folder-library-refresh,.folder-search .icon-button { border-color:#dedede; color:#555; background:#f5f5f5; }
+.selection-toolbar { margin-bottom:10px; padding:8px 10px; border:0; border-radius:10px; background:#f7f7f7; }
+.toolbar-button,.toolbar-button.quiet,.editor-toggle,.folder-load-more { border-color:#dedede; color:#333; background:#f5f5f5; font-weight:500; }
+.image-grid { grid-template-columns:repeat(4,minmax(0,1fr)); gap:8px; }
+.image-tile { border:0; border-radius:10px; background:#f2f2f2; box-shadow:none; }
+.image-tile:hover { transform:translateY(-2px); box-shadow:0 4px 12px -2px rgb(0 0 0 / 10%); }
+.image-tile.selected { border-color:#777; outline:2px solid #777; outline-offset:-2px; box-shadow:none; }
+.thumbnail-stage { background:linear-gradient(140deg,#f2f2f2,#e9e9e9); }
+.mini-tag,.draft-tag,.state-tag,.alias-entry { color:#555; background:#f0f0f0; }
+.selection-card,.operation-preview,.progress-card,.alias-dictionary { border-color:#e5e5e5; background:#f7f7f7; box-shadow:none; }
+.button.primary { color:#fff; background:#606060; }
+.button.secondary { border-color:#dedede; color:#333; background:#f3f3f3; }
+.progress-track { background:#e3e3e3; }.progress-track span { background:#777; }
+
+@media (max-width: 1180px) {
   .batch-tag-workspace { grid-template-columns: 300px minmax(0,1fr); }
+  .batch-tag-workspace.is-folder-collapsed { grid-template-columns:0 minmax(0,1fr); }
   .editor-toggle { display: inline-flex; }
   .tag-editor { position: fixed; z-index: 35; top: 16px; right: 16px; bottom: 16px; display: block; width: min(390px,calc(100vw - 48px)); transform: translateX(calc(100% + 32px)); transition: transform .18s ease; box-shadow: 0 24px 70px rgba(18,24,42,.24); }
   .tag-editor.is-open { transform: translateX(0); }

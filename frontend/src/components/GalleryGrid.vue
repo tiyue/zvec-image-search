@@ -85,7 +85,7 @@ function isSelected(id: string): boolean {
   height: 100%;
   grid-template-columns: repeat(5, minmax(0, 1fr));
   grid-template-rows: repeat(3, minmax(0, 1fr));
-  gap: 9px;
+  gap: 3px;
   overflow: hidden;
   transition: opacity 100ms ease;
 }
@@ -111,8 +111,8 @@ function isSelected(id: string): boolean {
 .loading-spinner {
   width: 25px;
   height: 25px;
-  border: 3px solid rgb(89 91 220 / 18%);
-  border-top-color: var(--brand, #6258e7);
+  border: 3px solid rgb(0 0 0 / 12%);
+  border-top-color: #555;
   border-radius: 999px;
   animation: gallery-spin 700ms linear infinite;
 }
@@ -151,8 +151,8 @@ function isSelected(id: string): boolean {
   place-items: center;
   margin-bottom: 9px;
   border-radius: 15px;
-  color: var(--brand, #6258e7);
-  background: var(--brand-soft, #f0efff);
+  color: #555;
+  background: #f2f2f2;
 }
 
 .state-orb svg {

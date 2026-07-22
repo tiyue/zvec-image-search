@@ -658,10 +658,22 @@ button:disabled { opacity: 0.55; cursor: default; }
   overflow: hidden;
 }
 
+/* Match the approved fullscreen desktop preview: the task view is a flat
+   workspace, not a card floating inside another padded card. */
+.tasks-page { gap:0; color:#242424; }
+.tasks-toolbar { margin:4px 0 16px; }
+.new-task-button { min-height:36px; padding:7px 16px; border:1px solid rgb(0 0 0 / 4%); border-radius:999px; color:#3f3f3f; background:#ececec; font-weight:500; }
+.new-task-button:hover { color:#0d0d0d; background:#e3e3e3; }
+.task-view-tabs { min-height:40px; gap:20px; border-bottom:1px solid #e5e5e5; }
+.task-view-tabs button { color:#777; font-weight:400; }
+.task-view-tabs button.active { border-bottom-color:#171717; color:#171717; }
+.workspace-grid { gap:0; }
+.composer { border-color:#e5e5e5; border-radius:12px; background:#fff; box-shadow:none; }
+
 @media (max-width: 1180px) {
   .workspace-grid {
     grid-template-columns: 1fr;
-    grid-template-rows: minmax(360px, 1fr) minmax(360px, 1fr);
+    grid-template-rows: minmax(360px, 1fr);
     padding-right: 4px;
     overflow-y: auto;
     scrollbar-gutter: stable;

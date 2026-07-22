@@ -15,6 +15,7 @@ withDefaults(defineProps<{
 });
 
 const emit = defineEmits<{
+  detail: [];
   open: [];
   reveal: [];
   copyImage: [];
@@ -44,6 +45,7 @@ const emit = defineEmits<{
         <strong>已选择 {{ selectionCount }} 张</strong>
         <small>支持 Ctrl / Shift 跨页保留选择</small>
       </header>
+      <button type="button" role="menuitem" @click="emit('detail'); emit('close')">打开详情</button>
       <button type="button" role="menuitem" @click="emit('open'); emit('close')">系统打开</button>
       <button type="button" role="menuitem" @click="emit('reveal'); emit('close')">所在文件夹</button>
       <hr />
@@ -158,8 +160,8 @@ const emit = defineEmits<{
 .gallery-context-menu button:not(:disabled):hover,
 .gallery-context-menu button:not(:disabled):focus-visible {
   outline: 0;
-  color: var(--brand-strong, #443ab7);
-  background: var(--brand-soft, #f0efff);
+  color: #171717;
+  background: #f1f1f1;
 }
 
 .gallery-context-menu button:disabled {

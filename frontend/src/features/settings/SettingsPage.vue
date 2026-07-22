@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref } from "vue";
 
+import AppIcon from "../../components/AppIcon.vue";
 import {
   SearchLearningSettingsCard,
   type SearchLearningApi,
@@ -40,6 +41,7 @@ const settings = useSettings(props.api, {
 });
 const apiKey = ref("");
 const choosingDirectory = ref("");
+const activeSection = ref<"libraries" | "models" | "learning" | "lan" | "migration">("libraries");
 
 function selectDefault(libraryId: string): void {
   settings.libraryDrafts.value.forEach((draft) => {
@@ -123,7 +125,33 @@ function chooseResultsDirectory(): void {
       </button>
     </header>
 
-    <section class="settings-card panel libraries-card" aria-labelledby="libraries-title">
+    <div class="settings-layout">
+      <nav class="settings-nav" aria-label="设置分组">
+        <button type="button" :class="{ active: activeSection === 'libraries' }" @click="activeSection = 'libraries'">
+          <AppIcon name="tasks" :size="17" />
+          <span>图库</span>
+        </button>
+        <button type="button" :class="{ active: activeSection === 'models' }" @click="activeSection = 'models'">
+          <AppIcon name="settings" :size="17" />
+          <span>模型与密钥</span>
+        </button>
+        <button type="button" :class="{ active: activeSection === 'learning' }" @click="activeSection = 'learning'">
+          <AppIcon name="learning" :size="17" />
+          <span>搜索学习</span>
+        </button>
+        <button type="button" :class="{ active: activeSection === 'lan' }" @click="activeSection = 'lan'">
+          <AppIcon name="groups" :size="17" />
+          <span>局域网访问</span>
+        </button>
+        <button type="button" :class="{ active: activeSection === 'migration' }" @click="activeSection = 'migration'">
+          <AppIcon name="compose" :size="17" />
+          <span>数据迁移</span>
+        </button>
+      </nav>
+
+      <div class="settings-content">
+
+    <section v-show="activeSection === 'libraries'" class="settings-card panel libraries-card" aria-labelledby="libraries-title">
       <header class="section-heading">
         <div><p class="eyebrow">图库与路径</p><h2 id="libraries-title">已配置图库</h2></div>
         <div class="section-actions">
@@ -338,6 +366,7 @@ function chooseResultsDirectory(): void {
     </section>
 
     <DataMigrationSection
+      v-show="activeSection === 'migration'"
       :api="props.migrationApi"
       :config-path="settings.configPath.value"
       :libraries="settings.libraries.value"
@@ -346,16 +375,18 @@ function chooseResultsDirectory(): void {
     />
 
     <LanAccessSection
+      v-show="activeSection === 'lan'"
       :api="props.lanApi"
       @toast="(title, message, kind) => emit('toast', title, message, kind)"
     />
 
     <SearchLearningSettingsCard
+      v-show="activeSection === 'learning'"
       :api="props.learningApi"
       @toast="(title, message, kind) => emit('toast', title, message, kind)"
     />
 
-    <div class="settings-grid">
+    <div v-show="activeSection === 'models'" class="settings-grid">
       <section class="settings-card panel" aria-labelledby="models-title">
         <header class="section-heading">
           <div><p class="eyebrow">阿里云模型</p><h2 id="models-title">模型角色</h2></div>
@@ -445,6 +476,8 @@ function chooseResultsDirectory(): void {
         </div>
       </section>
     </div>
+      </div>
+    </div>
   </section>
 </template>
 
@@ -497,11 +530,43 @@ label small { color: #8a91a2; font-weight: 500; }
 .credential-note { margin-top: 14px; padding: 11px; border-radius: 10px; background: #f7f8fc; color: #6f788e; font-size: 12px; }
 .empty-state { display: grid; place-items: center; gap: 5px; min-height: 150px; color: #7d8598; text-align: center; }
 .empty-state span { font-size: 12px; }
+
+/* The standalone desktop preview is the visual source of truth: settings are
+   grouped in a quiet left rail instead of stacking every feature at once. */
+.settings-page { height:100%; min-height:0; grid-template-rows:minmax(0,1fr); gap:0; overflow:hidden; color:#242424; }
+.page-heading { display:none; }
+.settings-layout { display:grid; height:100%; min-height:0; grid-template-columns:142px minmax(0,1fr); gap:16px; }
+.settings-nav { display:grid; min-height:0; align-content:start; gap:2px; padding-right:10px; border-right:1px solid #e5e5e5; }
+.settings-nav button { display:flex; min-height:38px; align-items:center; gap:8px; padding:8px; border:0; border-radius:8px; color:#707070; font:inherit; text-align:left; background:transparent; }
+.settings-nav button:hover,.settings-nav button.active { color:#171717; background:#f2f2f2; }
+.settings-content { min-width:0; min-height:0; overflow:auto; padding:0 4px 20px 0; scrollbar-gutter:stable; }
+.settings-card { padding:0; }
+.panel { border:0; border-radius:0; background:#fff; box-shadow:none; }
+.section-heading { padding-bottom:10px; border-bottom:1px solid #e7e7e7; }
+.section-heading h2 { color:#242424; font-size:18px; font-weight:600; }
+.eyebrow { display:none; }
+.section-copy { color:#777; }
+.button { min-height:36px; border:1px solid #dedede; border-radius:9px; color:#333; background:#f3f3f3; font-weight:500; transform:none !important; }
+.button.primary { color:#fff; border-color:#606060; background:#606060; }
+.button.secondary { color:#333; border-color:#dedede; background:#f3f3f3; }
+.path-picker { border-color:#dedede; color:#444; background:#f5f5f5; font-weight:500; }
+.results-form,.library-editor,.new-library-editor,.toggle-option,.credential-note { border-color:#e5e5e5; background:#fff; box-shadow:none; }
+.results-form { padding:12px 0; border-radius:0; border-bottom:1px solid #e7e7e7; }
+.library-editor { padding:13px 0; border-width:0 0 1px; border-radius:0; }
+.status-pill { color:#555; background:#f0f0f0; }
+.settings-content :deep(.panel),.settings-content :deep(.lan-card),.settings-content :deep(.migration-card) { border:0; border-radius:0; background:#fff; box-shadow:none; }
+.settings-content :deep(.eyebrow) { display:none; }
+.settings-content :deep(.button.primary) { color:#fff; border-color:#606060; background:#606060; }
+.settings-content :deep(.button.secondary) { color:#333; border-color:#dedede; background:#f3f3f3; }
+.settings-content :deep(input:focus),.settings-content :deep(select:focus),.settings-content :deep(textarea:focus) { border-color:#9d9d9d; box-shadow:0 0 0 3px rgb(0 0 0 / 7%); }
 @media (max-width: 1100px) {
   .settings-grid { grid-template-columns: 1fr; }
   .library-fields { grid-template-columns: 1fr; }
 }
 @media (max-width: 720px) {
+  .settings-layout { grid-template-columns:1fr; }
+  .settings-nav { grid-template-columns:repeat(5,minmax(0,1fr)); padding:0 0 8px; overflow:auto; border-right:0; border-bottom:1px solid #e5e5e5; }
+  .settings-nav button { justify-content:center; white-space:nowrap; }
   .page-heading, .library-editor footer, .credential-note { align-items: stretch; flex-direction: column; }
   .results-form, .credential-form, .library-options, .library-options.single-option { grid-template-columns: 1fr; }
   .section-actions { align-items: flex-end; flex-direction: column; }

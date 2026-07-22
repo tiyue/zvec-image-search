@@ -101,7 +101,7 @@ const searchFeedback = useSearchFeedback();
 const searchWorkspace = ref<HTMLElement | null>(null);
 const searchInput = ref<HTMLInputElement | null>(null);
 const paginationBar = ref<{ focusInput: () => void } | null>(null);
-const previewVisible = ref(true);
+const previewVisible = ref(false);
 const queryDropActive = ref(false);
 const modeMenuOpen = ref(false);
 const selectedImageIds = ref<string[]>([]);
@@ -109,7 +109,6 @@ const selectionAnchorId = ref("");
 const contextMenu = ref({ visible: false, x: 0, y: 0, imageId: "" });
 const knownSearchItems = new Map<string, SearchResultItem>();
 let knownFeedbackSessions = "";
-let previewMedia: MediaQueryList | null = null;
 let removeGlobalDiagnostics: (() => void) | null = null;
 
 const selectedCount = computed(() => selectedImageIds.value.length);
@@ -331,6 +330,20 @@ function closeContextMenu(): void {
   contextMenu.value = { ...contextMenu.value, visible: false };
 }
 
+function openImageDetails(): void {
+  const imageId = contextImageId();
+  if (!imageId) return;
+  search.select(imageId, true);
+  previewVisible.value = true;
+  search.setPreviewEnabled(true);
+  closeContextMenu();
+}
+
+function closeImageDetails(): void {
+  previewVisible.value = false;
+  search.setPreviewEnabled(false);
+}
+
 function contextImageId(): string {
   return contextMenu.value.imageId || activeActionIds.value[0] || "";
 }
@@ -535,6 +548,8 @@ function handleGlobalKeydown(event: KeyboardEvent): void {
   } else if (event.key === "/" && !editing && !event.ctrlKey && !event.metaKey) {
     event.preventDefault();
     focusSearch();
+  } else if (event.key === "Escape" && previewVisible.value) {
+    closeImageDetails();
   } else if (event.key === "Escape" && contextMenu.value.visible) {
     closeContextMenu();
   } else if (event.key === "Escape" && activePage.value === "search" && search.searching.value) {
@@ -542,16 +557,9 @@ function handleGlobalKeydown(event: KeyboardEvent): void {
   }
 }
 
-function updatePreviewVisibility(event?: MediaQueryListEvent): void {
-  previewVisible.value = event ? event.matches : Boolean(previewMedia?.matches);
-  search.setPreviewEnabled(previewVisible.value);
-}
-
 onMounted(() => {
   removeGlobalDiagnostics = installGlobalDiagnostics();
-  previewMedia = window.matchMedia("(min-width: 1201px)");
-  updatePreviewVisibility();
-  previewMedia.addEventListener("change", updatePreviewVisibility);
+  search.setPreviewEnabled(false);
   window.addEventListener("keydown", handleGlobalKeydown);
   window.addEventListener("pointerdown", handleWindowPointerDown);
   window.addEventListener("resize", handleWindowResize);
@@ -562,7 +570,6 @@ onMounted(() => {
 onBeforeUnmount(() => {
   removeGlobalDiagnostics?.();
   removeGlobalDiagnostics = null;
-  previewMedia?.removeEventListener("change", updatePreviewVisibility);
   window.removeEventListener("keydown", handleGlobalKeydown);
   window.removeEventListener("pointerdown", handleWindowPointerDown);
   window.removeEventListener("resize", handleWindowResize);
@@ -792,15 +799,6 @@ watch(
               @jump="changePage"
             />
           </section>
-          <ImagePreview
-            v-if="previewVisible"
-            class="preview-card card"
-            :item="search.selectedItem.value"
-            :high-resolution="search.highResolutionPreview.value"
-            :preview-visible="previewVisible"
-            @open="openSearchImage"
-            @reveal="nativeActions.reveal"
-          />
         </div>
       </section>
 
@@ -830,6 +828,7 @@ watch(
       :feedback-available="contextFeedbackAvailable"
       :feedback-pending="searchFeedback.isPending(contextFeedbackItem)"
       :feedback-action="contextFeedbackEvent?.action ?? ''"
+      @detail="openImageDetails"
       @open="openSearchImage(contextImageId())"
       @reveal="nativeActions.reveal(contextImageId())"
       @copy-image="copySelectedImage"
@@ -842,5 +841,22 @@ watch(
       @clear="clearSelection"
       @close="closeContextMenu"
     />
+
+    <div
+      v-if="previewVisible"
+      class="image-preview-backdrop"
+      role="presentation"
+      @click.self="closeImageDetails"
+    >
+      <ImagePreview
+        class="preview-dialog"
+        :item="search.selectedItem.value"
+        :high-resolution="search.highResolutionPreview.value"
+        :preview-visible="previewVisible"
+        @close="closeImageDetails"
+        @open="openSearchImage"
+        @reveal="nativeActions.reveal"
+      />
+    </div>
   </div>
 </template>

@@ -10,6 +10,7 @@ const props = defineProps<{
 }>();
 
 const emit = defineEmits<{
+  close: [];
   open: [id: string];
   reveal: [id: string];
 }>();
@@ -114,7 +115,10 @@ function revealImage(): void {
         <p class="eyebrow">当前选择</p>
         <h2>标签与详细信息</h2>
       </div>
-      <span class="rank-badge">{{ item ? String(item.rank).padStart(2, "0") : "—" }}</span>
+      <div class="preview-heading-actions">
+        <span class="rank-badge">{{ item ? String(item.rank).padStart(2, "0") : "—" }}</span>
+        <button class="preview-close" type="button" aria-label="关闭详情" @click="emit('close')">×</button>
+      </div>
     </header>
 
     <div class="preview-overview" :class="{ 'is-empty': !item }">
@@ -236,6 +240,33 @@ function revealImage(): void {
   margin-bottom: 11px;
 }
 
+.preview-heading-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.preview-close {
+  display: grid;
+  width: 30px;
+  height: 30px;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  color: #666;
+  font: inherit;
+  font-size: 21px;
+  line-height: 1;
+  background: transparent;
+  cursor: pointer;
+}
+
+.preview-close:hover {
+  color: #111;
+  background: #f1f1f1;
+}
+
 .preview-heading h2,
 .preview-copy h3 {
   margin: 0;
@@ -249,7 +280,7 @@ function revealImage(): void {
 
 .eyebrow {
   margin: 0 0 2px;
-  color: var(--brand, #6258e7);
+  color: #777;
   font-size: 12px;
   font-weight: 750;
   letter-spacing: 0.09em;
@@ -269,10 +300,10 @@ function revealImage(): void {
   min-width: 27px;
   min-height: 27px;
   padding: 0 7px;
-  color: #fff;
+  color: #555;
   font-size: 12px;
   font-weight: 800;
-  background: #0d1322;
+  background: #f1f1f1;
 }
 
 .preview-overview {
@@ -298,11 +329,9 @@ function revealImage(): void {
   min-height: 0;
   place-items: center;
   overflow: hidden;
-  border: 1px solid rgb(255 255 255 / 5%);
+  border: 1px solid #e7e7e7;
   border-radius: 12px;
-  background:
-    radial-gradient(circle at 50% 12%, rgb(119 108 242 / 10%), transparent 38%),
-    linear-gradient(160deg, #171d2b, #121827);
+  background: #f5f5f5;
 }
 
 /* Keep the complete portrait/landscape visible; letterboxing is intentional. */
@@ -332,10 +361,10 @@ function revealImage(): void {
   width: 42px;
   height: 42px;
   place-items: center;
-  border: 1px solid rgb(255 255 255 / 8%);
+  border: 1px solid #dedede;
   border-radius: 16px;
   color: #a9b2c4;
-  background: rgb(255 255 255 / 4%);
+  background: #fff;
 }
 
 .preview-placeholder-icon svg {
@@ -396,10 +425,10 @@ function revealImage(): void {
   align-items: center;
   padding: 3px 7px;
   border-radius: 999px;
-  color: var(--brand-strong, #443ab7);
+  color: #444;
   font-size: 12px;
   font-weight: 700;
-  background: var(--brand-soft, #f0efff);
+  background: #f1f1f1;
 }
 
 .preview-tag-group + .preview-tag-group {
@@ -423,14 +452,14 @@ function revealImage(): void {
 .tag {
   min-height: 22px;
   padding: 2px 7px;
-  color: var(--brand-strong, #443ab7);
+  color: #444;
   font-size: 12px;
-  background: var(--brand-soft, #f0efff);
+  background: #f1f1f1;
 }
 
 .tag-match {
-  border: 1px solid #d7d4ff;
-  background: #e8e6ff;
+  border: 1px solid #d6d6d6;
+  background: #e9e9e9;
 }
 
 .empty-inline {
@@ -505,9 +534,9 @@ function revealImage(): void {
 }
 
 .button-secondary {
-  border-color: #d6d4ff;
-  color: var(--brand-strong, #443ab7);
-  background: var(--brand-soft, #f0efff);
+  border-color: #d9d9d9;
+  color: #333;
+  background: #f1f1f1;
 }
 
 .button-quiet {
