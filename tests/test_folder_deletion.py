@@ -552,6 +552,11 @@ class FolderDeletionManagerTest(unittest.TestCase):
 
         self.assertTrue(result["is_library_root"])
         self.assertTrue(result["root_preserved"])
+        # On Windows CI the filesystem may need a moment to recreate the directory.
+        for _ in range(10):
+            if self.images.is_dir():
+                break
+            time.sleep(0.2)
         self.assertTrue(self.images.is_dir())
         self.assertEqual(list(self.images.iterdir()), [])
 
