@@ -251,7 +251,7 @@ class LanApiClient(
         val retryClient = pairingHttpClient.newBuilder()
             .connectionPool(ConnectionPool())
             .build()
-        kotlinx.coroutines.delay(500)
+        kotlinx.coroutines.delay(2000)
         try {
             executeJson(request, retryClient)
         } finally {

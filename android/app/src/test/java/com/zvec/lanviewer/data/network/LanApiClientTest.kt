@@ -79,7 +79,7 @@ class LanApiClientTest {
             tokenStore = InMemoryTokenStore(),
             maxConcurrentRequests = 10,
         )
-        server.enqueue(MockResponse().setSocketPolicy(SocketPolicy.DISCONNECT_AFTER_REQUEST))
+        server.enqueue(MockResponse().setSocketPolicy(SocketPolicy.DISCONNECT_DURING_RESPONSE_BODY))
         server.enqueue(
             MockResponse().setResponseCode(201).setBody(
                 """{"pairing_id":"p-reused","comparison_code":"003721","expires_in_seconds":260,"expires_at":"2026-07-21T12:34:56Z","status":"pending"}""",
