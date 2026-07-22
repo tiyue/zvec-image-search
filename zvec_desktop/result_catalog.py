@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import math
 import os
@@ -36,6 +38,9 @@ RESULT_STORAGE_COPIED = "copied"
 RESULT_STORAGE_SOURCE_ONLY = "source_only"
 DEFAULT_MANIFEST_CACHE_ENTRIES = 8
 DEFAULT_MANIFEST_CACHE_RESULTS = 100_000
+_HISTORY_ID_ALPHABET = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+)
 IMAGE_SUFFIXES = frozenset(
     {
         ".avif",
@@ -148,6 +153,18 @@ class SearchResultPage:
     @property
     def has_next(self) -> bool:
         return self.page < self.total_pages
+
+
+@dataclass(frozen=True, slots=True)
+class SearchHistoryEntry:
+    """One persisted search result set that can be reopened safely."""
+
+    history_id: str
+    label: str
+    query_type: str
+    created_at: str
+    total_items: int
+    status: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -348,6 +365,104 @@ class ResultCatalog:
                 if attempt:
                     raise
         raise AssertionError("unreachable")
+
+    def list_history(self, *, limit: int = 12) -> tuple[SearchHistoryEntry, ...]:
+        """List recent valid immediate-child manifests without exposing paths."""
+
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= 50
+        ):
+            raise ResultCatalogError(
+                "history limit must be an integer between 1 and 50."
+            )
+        self._refresh_source_root_state()
+        root = self.results_directory
+        if not root.is_dir():
+            return ()
+        entries: list[tuple[float, int, str, SearchHistoryEntry]] = []
+        try:
+            directories = list(root.iterdir())
+        except OSError as exc:
+            raise ResultCatalogError(
+                f"Could not list results directory: {root}"
+            ) from exc
+        for directory in directories:
+            if not directory.is_dir() or _is_link_like(directory):
+                continue
+            manifest_path = directory / "results.json"
+            if not manifest_path.is_file() or _is_link_like(manifest_path):
+                continue
+            try:
+                snapshot = self._manifest_snapshot(manifest_path)
+                if (
+                    snapshot.result_store is None
+                    and snapshot.raw_result_count
+                    and len(snapshot.results) != snapshot.raw_result_count
+                ):
+                    continue
+                entry = _history_entry(snapshot)
+            except ResultCatalogError:
+                # A partially written result must not create a dead history row.
+                continue
+            entries.append(
+                (
+                    snapshot.created_timestamp,
+                    snapshot.version.mtime_ns,
+                    directory.name.casefold(),
+                    entry,
+                )
+            )
+        entries.sort(key=lambda item: item[:3], reverse=True)
+        return tuple(item[3] for item in entries[:limit])
+
+    def history_entry(self, history_id: str) -> SearchHistoryEntry:
+        """Return display metadata for one opaque persisted history id."""
+
+        self._refresh_source_root_state()
+        manifest_path = self._history_manifest_path(history_id)
+        return _history_entry(self._manifest_snapshot(manifest_path))
+
+    def load_history(
+        self,
+        history_id: str,
+        page: int = 1,
+        page_size: int = DEFAULT_PAGE_SIZE,
+    ) -> SearchResultPage:
+        """Load a persisted result set by its opaque immediate-child id."""
+
+        return self.load_manifest(
+            self._history_manifest_path(history_id),
+            page=page,
+            page_size=page_size,
+        )
+
+    def _history_manifest_path(self, history_id: str) -> Path:
+        if not isinstance(history_id, str):
+            raise ResultCatalogError("Search history id must be text.")
+        normalized = history_id.strip()
+        if (
+            not normalized
+            or len(normalized) > 200
+        ):
+            raise ResultCatalogError("Search history id is invalid.")
+        directory_name = _decode_history_id(normalized)
+        if (
+            directory_name in {".", ".."}
+            or "/" in directory_name
+            or "\\" in directory_name
+            or "\x00" in directory_name
+        ):
+            raise ResultCatalogError("Search history id is invalid.")
+        manifest_path = self._resolve_manifest_path(
+            self.results_directory / directory_name / "results.json"
+        )
+        if manifest_path.parent.parent != self.results_directory.resolve():
+            raise ResultCatalogError(
+                "Search history must be an immediate result directory."
+            )
+        return manifest_path
 
     def load_manifest(
         self,
@@ -1544,6 +1659,80 @@ def _created_timestamp(value: Any) -> float:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.timestamp()
+
+
+def _history_entry(snapshot: _ManifestSnapshot) -> SearchHistoryEntry:
+    query = snapshot.manifest_metadata.get("query")
+    query_values = query if isinstance(query, Mapping) else {}
+    query_type = snapshot.query_type.strip().lower() or "unknown"
+    query_text = _history_text(query_values.get("text"))
+    image_name = _history_filename(query_values.get("image"))
+    if query_type == "image_text":
+        label = query_text or (f"图文组合 · {image_name}" if image_name else "图文组合")
+    elif query_type == "image":
+        label = f"以图搜图 · {image_name}" if image_name else "以图搜图"
+    elif query_type == "tag":
+        label = query_text or "标签搜索"
+    else:
+        label = query_text or "语义搜索"
+    raw_created_at = snapshot.manifest_metadata.get("created_at")
+    if isinstance(raw_created_at, str) and raw_created_at.strip():
+        created_at = raw_created_at.strip()
+    else:
+        timestamp = snapshot.created_timestamp
+        if not math.isfinite(timestamp):
+            timestamp = snapshot.version.mtime_ns / 1_000_000_000
+        created_at = datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
+    return SearchHistoryEntry(
+        history_id=_encode_history_id(snapshot.path.parent.name),
+        label=label[:120],
+        query_type=query_type,
+        created_at=created_at,
+        total_items=snapshot.raw_result_count,
+        status=snapshot.status,
+    )
+
+
+def _history_text(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    return " ".join(value.split())[:120]
+
+
+def _history_filename(value: Any) -> str:
+    text = _history_text(value)
+    if not text:
+        return ""
+    # Manifests normally store only the basename. Strip both separator styles
+    # defensively so an older manifest can never disclose a local directory.
+    return PureWindowsPath(PurePosixPath(text).name).name[:80]
+
+
+def _encode_history_id(directory_name: str) -> str:
+    encoded = base64.urlsafe_b64encode(directory_name.encode("utf-8")).decode("ascii")
+    return "v1_" + encoded.rstrip("=")
+
+
+def _decode_history_id(history_id: str) -> str:
+    if not history_id.startswith("v1_"):
+        raise ResultCatalogError("Search history id is invalid.")
+    encoded = history_id[3:]
+    if not encoded or any(
+        character not in _HISTORY_ID_ALPHABET for character in encoded
+    ):
+        raise ResultCatalogError("Search history id is invalid.")
+    try:
+        padded = encoded + "=" * (-len(encoded) % 4)
+        directory_name = base64.b64decode(
+            padded,
+            altchars=b"-_",
+            validate=True,
+        ).decode("utf-8")
+    except (binascii.Error, UnicodeDecodeError) as exc:
+        raise ResultCatalogError("Search history id is invalid.") from exc
+    if _encode_history_id(directory_name) != history_id:
+        raise ResultCatalogError("Search history id is invalid.")
+    return directory_name
 
 
 def _is_link_like(path: Path) -> bool:

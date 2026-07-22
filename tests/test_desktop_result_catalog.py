@@ -195,6 +195,40 @@ class ResultCatalogTests(unittest.TestCase):
         )
         self.assertEqual(page.source_label, "最新搜索")
 
+    def test_search_history_lists_and_reopens_persisted_result_sets(self) -> None:
+        self._manifest(
+            "旧搜索", "2026-07-18T12:00:00+08:00", copied_file="旧图.jpg"
+        )
+        new = self._manifest(
+            "最新搜索", "2026-07-18T13:00:00+08:00", copied_file="新图.jpg"
+        )
+        payload = json.loads((new / "results.json").read_text(encoding="utf-8"))
+        payload["query"] = {"text": "红色和服 室内", "tags": []}
+        self._write_json(new / "results.json", payload)
+
+        catalog = ResultCatalog.from_config(self.config_path)
+        history = catalog.list_history(limit=12)
+
+        self.assertEqual(history[0].label, "红色和服 室内")
+        self.assertTrue(history[0].history_id.startswith("v1_"))
+        self.assertNotIn("最新搜索", history[0].history_id)
+        self.assertEqual(history[1].label, "语义搜索")
+        self.assertEqual(history[0].total_items, 1)
+        reopened = catalog.load_history(history[0].history_id, page=1, page_size=15)
+        self.assertEqual(reopened.items[0].name, "新图.jpg")
+
+    def test_search_history_rejects_path_traversal(self) -> None:
+        self._manifest(
+            "安全搜索", "2026-07-18T13:00:00+08:00", copied_file="图片.jpg"
+        )
+        catalog = ResultCatalog.from_config(self.config_path)
+
+        for history_id in ("../安全搜索", r"..\安全搜索", ".", ""):
+            with self.subTest(history_id=history_id), self.assertRaisesRegex(
+                ResultCatalogError, "history id"
+            ):
+                catalog.load_history(history_id)
+
     def test_load_latest_falls_back_when_newest_manifest_is_incomplete(self) -> None:
         complete = self._manifest(
             "完整搜索", "2026-07-18T12:00:00+08:00", copied_file="完整.jpg"

@@ -73,9 +73,24 @@ export interface SearchPageResponse {
   has_previous?: boolean;
   has_next?: boolean;
   source_label?: string;
+  query_type?: string;
+  history_id?: string;
   summary?: Record<string, unknown>;
   error?: { code?: string; message?: string };
   job?: { id?: string; status?: string };
+}
+
+export interface SearchHistoryEntry {
+  id: string;
+  label: string;
+  query_type: string;
+  created_at: string;
+  total_items: number;
+  status: string;
+}
+
+export interface SearchHistoryResponse {
+  items: SearchHistoryEntry[];
 }
 
 export interface SearchResultWire {

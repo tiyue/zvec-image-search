@@ -125,7 +125,7 @@ function openContextMenu(event: MouseEvent): void {
   padding: 0;
   overflow: hidden;
   border: 0;
-  border-radius: 0;
+  border-radius: 10px;
   color: var(--text, #171e2e);
   text-align: left;
   background: #f2f2f2;

@@ -1286,6 +1286,60 @@ class PreviewFacade:
             elapsed_ms=None,
         )
 
+    def search_history(self, *, limit: int = 12) -> JsonObject:
+        """Return persisted result sets as safe, reopenable sidebar records."""
+
+        try:
+            entries = self._catalog().list_history(limit=limit)
+        except ResultCatalogError as exc:
+            raise FacadeError("search_history_failed", str(exc), status=500) from exc
+        return {
+            "items": [
+                {
+                    "id": entry.history_id,
+                    "label": entry.label,
+                    "query_type": entry.query_type,
+                    "created_at": entry.created_at,
+                    "total_items": entry.total_items,
+                    "status": entry.status,
+                }
+                for entry in entries
+            ]
+        }
+
+    def historical_results(
+        self,
+        history_id: str,
+        *,
+        page: int = 1,
+        page_size: int = 15,
+    ) -> JsonObject:
+        """Reopen one persisted search result set after a process restart."""
+
+        catalog = self._catalog()
+        try:
+            entry = catalog.history_entry(history_id)
+            result_page = catalog.load_history(
+                history_id,
+                page=page,
+                page_size=page_size,
+            )
+        except ResultCatalogError as exc:
+            raise FacadeError(
+                "search_history_not_found",
+                "这条搜索记录已被清理或无法读取。",
+                status=404,
+            ) from exc
+        response = self._page_response(
+            result_page,
+            operation_id=f"history:{entry.history_id}",
+            query=entry.label,
+            status=result_page.status,
+            elapsed_ms=None,
+        )
+        response["history_id"] = entry.history_id
+        return response
+
     def submit_search(self, payload: Mapping[str, Any]) -> JsonObject:
         self._ensure_migration_not_active()
         service = self._ready_search_service()
@@ -3285,12 +3339,14 @@ class PreviewFacade:
         page: SearchResultPage,
         *,
         operation_id: str,
-        query: JsonObject,
+        query: JsonObject | str,
         status: str,
         elapsed_ms: int | None,
     ) -> JsonObject:
         items: list[JsonObject] = []
-        query_library_ids = query.get("library_ids")
+        query_library_ids = (
+            query.get("library_ids") if isinstance(query, Mapping) else None
+        )
         fallback_library_id = (
             str(query_library_ids[0])
             if isinstance(query_library_ids, Sequence)
@@ -3309,7 +3365,11 @@ class PreviewFacade:
                 item["library_id"] = library_id
                 item["doc_id"] = doc_id
                 items.append(item)
-                if operation_id != "latest" and library_id:
+                if (
+                    operation_id != "latest"
+                    and not operation_id.startswith("history:")
+                    and library_id
+                ):
                     with suppress(Exception):
                         self._search_learning.store.ensure_candidate(
                             session_id=operation_id,
@@ -3346,6 +3406,7 @@ class PreviewFacade:
             "has_next": page.has_next,
             "summary": page.summary,
             "source_label": page.source_label,
+            "query_type": page.query_type,
             "sort_mode": page.sort_mode,
             "ranking_diagnostics": page.ranking_diagnostics or {},
         }

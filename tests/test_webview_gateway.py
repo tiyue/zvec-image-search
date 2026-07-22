@@ -41,6 +41,7 @@ class _Facade:
         self.activity_log_query: dict[str, Any] | None = None
         self.frontend_activities: list[dict[str, Any]] = []
         self.frontend_activity_failure = False
+        self.history_request: dict[str, Any] | None = None
         self.activity_error: FacadeError | None = None
         self.migration_recovery_body: dict[str, Any] | None = None
         self.fixed_evaluation_body: dict[str, Any] | None = None
@@ -102,6 +103,38 @@ class _Facade:
 
     def latest_results(self, *, page: int, page_size: int) -> dict[str, Any]:
         return {"id": "latest", "page": page, "page_size": page_size, "items": []}
+
+    def search_history(self, *, limit: int) -> dict[str, Any]:
+        self.history_request = {"kind": "list", "limit": limit}
+        return {
+            "items": [
+                {
+                    "id": "search-folder-1",
+                    "label": "红色和服 室内",
+                    "query_type": "text",
+                    "created_at": "2026-07-22T17:00:00+08:00",
+                    "total_items": 36,
+                    "status": "succeeded",
+                }
+            ]
+        }
+
+    def historical_results(
+        self, history_id: str, *, page: int, page_size: int
+    ) -> dict[str, Any]:
+        self.history_request = {
+            "kind": "page",
+            "history_id": history_id,
+            "page": page,
+            "page_size": page_size,
+        }
+        return {
+            "id": f"history:{history_id}",
+            "history_id": history_id,
+            "page": page,
+            "page_size": page_size,
+            "items": [],
+        }
 
     def submit_search(self, payload: dict[str, Any]) -> dict[str, Any]:
         self.search_body = payload
@@ -570,6 +603,32 @@ class GatewayTests(unittest.TestCase):
         resolved = self.registry.resolve(payload["id"])
         self.assertTrue(resolved.is_file())
         self.assertEqual(resolved.suffix, ".png")
+
+    def test_search_history_routes_list_and_reopen_persisted_results(self) -> None:
+        status, _headers, history = _json(
+            self.server.url + "api/results/history?limit=8"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(history["items"][0]["label"], "红色和服 室内")
+        self.assertEqual(self.facade.history_request, {"kind": "list", "limit": 8})
+
+        status, _headers, page = _json(
+            self.server.url
+            + "api/results/history/"
+            + quote("search-folder-1")
+            + "?page=2&page_size=15"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(page["history_id"], "search-folder-1")
+        self.assertEqual(
+            self.facade.history_request,
+            {
+                "kind": "page",
+                "history_id": "search-folder-1",
+                "page": 2,
+                "page_size": 15,
+            },
+        )
 
     def test_rejects_invalid_query_image_upload(self) -> None:
         request = Request(

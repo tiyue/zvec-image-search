@@ -18,6 +18,7 @@ import { TasksPage } from "./features/tasks";
 import type {
   GalleryContextIntent,
   GallerySelectionIntent,
+  SearchHistoryEntry,
   SearchResultItem,
   ToastMessage,
 } from "./types/contracts";
@@ -70,7 +71,6 @@ const pageDefinitions: Array<{
 
 const activePage = ref<PageName>("search");
 const visitedPages = ref<PageName[]>(["search"]);
-const recentSearches = ref<string[]>([]);
 const sidebarCollapsed = ref(false);
 const searchHasRun = ref(false);
 
@@ -121,6 +121,16 @@ const canSubmitSearch = computed(() => {
   return Boolean(search.query.value.trim() || search.queryImageId.value);
 });
 const inferredSearchLabel = computed(() => {
+  if (hasSearchActivity.value) {
+    const resultLabels: Record<string, string> = {
+      text: "语义搜索",
+      tag: "标签搜索",
+      image: "以图搜图",
+      image_text: "图文组合",
+    };
+    const resultLabel = resultLabels[search.resultQueryType.value];
+    if (resultLabel) return resultLabel;
+  }
   if (search.mode.value === "tags") return "标签搜索";
   if (search.queryImageId.value && search.query.value.trim()) return "图文组合";
   if (search.queryImageId.value) return "以图搜图";
@@ -176,15 +186,7 @@ async function submitSearch(): Promise<void> {
   if (search.searching.value) return;
   searchHasRun.value = true;
   clearSelection();
-  const recentQuery = search.query.value.trim();
-  const succeeded = await search.submit();
-  if (succeeded && recentQuery) {
-    recentSearches.value = [
-      recentQuery,
-      ...recentSearches.value.filter((value) => value !== recentQuery),
-    ].slice(0, 3);
-    window.localStorage.setItem("zvec.recent-searches", JSON.stringify(recentSearches.value));
-  }
+  await search.submit();
 }
 
 function handleSearchInputEnter(event: KeyboardEvent): void {
@@ -478,9 +480,25 @@ function newSearch(): void {
   focusSearch();
 }
 
-function reuseSearch(value: string): void {
-  search.query.value = value;
-  focusSearch(true);
+async function openSearchHistory(entry: SearchHistoryEntry): Promise<void> {
+  setPage("search");
+  clearSelection();
+  searchHasRun.value = true;
+  if (!(await search.openHistory(entry.id, entry.label))) {
+    searchHasRun.value = false;
+  }
+}
+
+function historyTime(value: string): string {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return "";
+  return new Intl.DateTimeFormat("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(parsed);
 }
 
 function handleFeatureToast(
@@ -561,14 +579,6 @@ function handleGlobalKeydown(event: KeyboardEvent): void {
 onMounted(() => {
   removeGlobalDiagnostics = installGlobalDiagnostics();
   search.setPreviewEnabled(false);
-  try {
-    const saved = JSON.parse(window.localStorage.getItem("zvec.recent-searches") ?? "[]");
-    if (Array.isArray(saved)) {
-      recentSearches.value = saved.filter((value): value is string => typeof value === "string").slice(0, 12);
-    }
-  } catch {
-    recentSearches.value = [];
-  }
   window.addEventListener("keydown", handleGlobalKeydown);
   window.addEventListener("pointerdown", handleWindowPointerDown);
   window.addEventListener("resize", handleWindowResize);
@@ -655,10 +665,17 @@ watch(
         </button>
       </nav>
 
-      <section v-if="recentSearches.length" class="sidebar-recents" aria-labelledby="recent-title">
-        <p id="recent-title">最近结果</p>
-        <button v-for="recent in recentSearches" :key="recent" type="button" :title="recent" @click="reuseSearch(recent)">
-          {{ recent }}
+      <section v-if="search.history.value.length" class="sidebar-recents" aria-labelledby="recent-title">
+        <p id="recent-title">搜索记录</p>
+        <button
+          v-for="entry in search.history.value"
+          :key="entry.id"
+          type="button"
+          :title="`${entry.label} · ${entry.total_items} 张`"
+          @click="openSearchHistory(entry)"
+        >
+          <strong>{{ entry.label }}</strong>
+          <small>{{ historyTime(entry.created_at) }} · {{ entry.total_items }} 张</small>
         </button>
       </section>
 
@@ -765,7 +782,7 @@ watch(
             <header class="panel-heading">
               <div>
                 <h2 id="gallery-title">{{ inferredSearchLabel }} · {{ search.totalItems.value.toLocaleString("zh-CN") }} 张 · {{ activeLibraryLabel }}<span class="sr-only">{{ search.totalItems.value.toLocaleString("zh-CN") }} 张图片</span></h2>
-                <p>{{ search.query.value || search.queryImageName.value || "当前搜索" }}</p>
+                <p>{{ search.title.value || "当前搜索" }}</p>
               </div>
               <div class="result-status-actions">
                 <button class="result-action-button" type="button" @click="searchInput?.focus()">筛选</button>

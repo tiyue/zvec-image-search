@@ -68,6 +68,43 @@ describe("useSearch", () => {
     expect(search.connectionMessage.value).toBe("本地服务已就绪");
   });
 
+  it("lists persisted history and reopens its matching result pages", async () => {
+    const api = fakeApi();
+    api.history = vi.fn(async () => ({
+      items: [{
+        id: "history-red-kimono",
+        label: "红色和服 室内",
+        query_type: "text",
+        created_at: "2026-07-22T17:00:00+08:00",
+        total_items: 30,
+        status: "succeeded",
+      }],
+    }));
+    api.historyPage = vi.fn(async (historyId, page) => ({
+      ...pagePayload(page, 2, historyId),
+      id: `history:${historyId}`,
+      history_id: historyId,
+      query: "红色和服 室内",
+      query_type: "text",
+    }));
+    const search = useSearch(api);
+
+    await search.initialize();
+    expect(search.history.value).toHaveLength(1);
+    expect(await search.openHistory("history-red-kimono")).toBe(true);
+    expect(search.title.value).toBe("红色和服 室内");
+    expect(search.items.value[0]?.id).toBe("image-1");
+
+    expect(await search.goToPage(2)).toBe(true);
+    expect(search.items.value[0]?.id).toBe("image-16");
+    expect(api.historyPage).toHaveBeenLastCalledWith(
+      "history-red-kimono",
+      2,
+      15,
+      expect.any(AbortSignal),
+    );
+  });
+
   it("delays full previews and discards superseded selections", async () => {
     const search = useSearch(fakeApi());
     await search.initialize();

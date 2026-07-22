@@ -3,6 +3,7 @@ import { computed, ref, shallowRef } from "vue";
 import { ApiError, searchApi, type SearchApi } from "../api/client";
 import type {
   LibrarySummary,
+  SearchHistoryEntry,
   SearchMode,
   SearchRequestMode,
   SearchPageResponse,
@@ -26,7 +27,7 @@ const TERMINAL = new Set([
   "cancelled",
 ]);
 
-type SearchSource = "latest" | "search";
+type SearchSource = "latest" | "search" | "history";
 
 interface CacheEntry {
   payload: SearchPageResponse;
@@ -209,6 +210,25 @@ function positiveInteger(value: unknown): number | null {
   return Number.isFinite(parsed) && Number.isInteger(parsed) ? parsed : null;
 }
 
+function normalizeHistory(value: unknown): SearchHistoryEntry[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((raw) => {
+    if (!raw || typeof raw !== "object") return [];
+    const item = raw as Partial<SearchHistoryEntry>;
+    const id = text(item.id);
+    const label = text(item.label);
+    if (!id || !label) return [];
+    return [{
+      id,
+      label,
+      query_type: text(item.query_type, "unknown"),
+      created_at: text(item.created_at),
+      total_items: Math.max(0, integer(item.total_items)),
+      status: text(item.status, "succeeded"),
+    }];
+  }).slice(0, 12);
+}
+
 function deriveRequestMode(
   uiMode: SearchMode,
   hasText: boolean,
@@ -231,6 +251,7 @@ export function useSearch(
   const queryImageId = ref("");
   const queryImageName = ref("");
   const libraries = ref<LibrarySummary[]>([]);
+  const history = ref<SearchHistoryEntry[]>([]);
   const connectionMessage = ref("正在连接本地服务");
 
   const items = shallowRef<SearchResultItem[]>([]);
@@ -243,6 +264,7 @@ export function useSearch(
   const hasNext = ref(false);
   const duration = ref<number | null>(null);
   const title = ref("最近结果");
+  const resultQueryType = ref("unknown");
   const message = ref("正在读取本地结果");
   const status = ref("idle");
   const searching = ref(false);
@@ -250,6 +272,7 @@ export function useSearch(
 
   let source: SearchSource = "latest";
   let activeOperationId = "";
+  let activeHistoryId = "";
   let generation = 0;
   let scope = "";
   let snapshot = "";
@@ -371,8 +394,11 @@ export function useSearch(
   }
 
   function updateContext(payload: SearchPageResponse, nextSource: SearchSource): void {
-    const nextScope =
-      nextSource === "latest" ? "latest" : `search:${operationId(payload) || activeOperationId}`;
+    const nextScope = nextSource === "latest"
+      ? "latest"
+      : nextSource === "history"
+        ? `history:${text(payload.history_id, activeHistoryId)}`
+        : `search:${operationId(payload) || activeOperationId}`;
     const nextSnapshot = snapshotOf(payload);
     if ((scope && scope !== nextScope) || (snapshot && snapshot !== nextSnapshot)) {
       cache.clear();
@@ -442,6 +468,7 @@ export function useSearch(
     hasNext.value = payload.has_next ?? nextPage < nextPages;
     duration.value = finite(payload.elapsed_ms, payload.duration_ms);
     title.value = typeof payload.query === "string" ? payload.query : fallbackTitle;
+    resultQueryType.value = text(payload.query_type, "unknown");
     message.value =
       nextStatus === "failed"
         ? text(payload.error?.message, payload.message, "搜索失败")
@@ -453,9 +480,14 @@ export function useSearch(
   }
 
   function endpointPage(targetPage: number, signal: AbortSignal): Promise<SearchPageResponse> {
-    return source === "latest"
-      ? api.latest(targetPage, PAGE_SIZE, signal)
-      : api.page(activeOperationId, targetPage, PAGE_SIZE, signal);
+    if (source === "latest") return api.latest(targetPage, PAGE_SIZE, signal);
+    if (source === "history") {
+      if (!api.historyPage || !activeHistoryId) {
+        return Promise.reject(new ApiError("搜索历史暂不可用。", 503));
+      }
+      return api.historyPage(activeHistoryId, targetPage, PAGE_SIZE, signal);
+    }
+    return api.page(activeOperationId, targetPage, PAGE_SIZE, signal);
   }
 
   async function prefetch(targetPage: number, context: {
@@ -465,15 +497,31 @@ export function useSearch(
     totalPages: number;
     source: SearchSource;
     operationId: string;
+    historyId: string;
   }): Promise<void> {
     if (targetPage < 1 || targetPage > context.totalPages || cached(targetPage)) return;
     const controller = new AbortController();
     prefetchControllers.add(controller);
     try {
-      const payload =
-        context.source === "latest"
-          ? await api.latest(targetPage, PAGE_SIZE, controller.signal)
-          : await api.page(context.operationId, targetPage, PAGE_SIZE, controller.signal);
+      let payload: SearchPageResponse;
+      if (context.source === "latest") {
+        payload = await api.latest(targetPage, PAGE_SIZE, controller.signal);
+      } else if (context.source === "history") {
+        if (!api.historyPage) return;
+        payload = await api.historyPage(
+          context.historyId,
+          targetPage,
+          PAGE_SIZE,
+          controller.signal,
+        );
+      } else {
+        payload = await api.page(
+          context.operationId,
+          targetPage,
+          PAGE_SIZE,
+          controller.signal,
+        );
+      }
       if (
         generation !== context.generation ||
         scope !== context.scope ||
@@ -504,6 +552,7 @@ export function useSearch(
       totalPages: totalPages.value,
       source,
       operationId: activeOperationId,
+      historyId: activeHistoryId,
     };
     const callback = () => {
       idleHandle = null;
@@ -520,9 +569,10 @@ export function useSearch(
 
   async function initialize(): Promise<void> {
     const localGeneration = generation;
-    const [bootstrapResult, latestResult] = await Promise.allSettled([
+    const [bootstrapResult, latestResult, historyResult] = await Promise.allSettled([
       api.bootstrap(),
       api.latest(1, PAGE_SIZE),
+      api.history ? api.history() : Promise.resolve({ items: [] }),
     ]);
     if (localGeneration !== generation) return;
     if (bootstrapResult.status === "fulfilled") {
@@ -538,6 +588,54 @@ export function useSearch(
       apply(latestResult.value, "latest", "最近结果");
     } else {
       message.value = "暂无最近结果，可以开始新的搜索。";
+    }
+    if (historyResult.status === "fulfilled") {
+      history.value = normalizeHistory(historyResult.value.items);
+    }
+  }
+
+  async function refreshHistory(): Promise<void> {
+    if (!api.history) return;
+    try {
+      history.value = normalizeHistory((await api.history()).items);
+    } catch (error) {
+      emitDiagnostic("search_history_refresh_failed", {
+        error_name: error instanceof Error ? error.name : "UnknownError",
+      });
+    }
+  }
+
+  async function openHistory(historyId: string, fallbackTitle = "搜索记录"): Promise<boolean> {
+    if (!api.historyPage) {
+      events.onError?.("无法打开搜索记录", "当前桌面服务不支持恢复历史结果。请更新后重试。");
+      return false;
+    }
+    generation += 1;
+    const localGeneration = generation;
+    abortActivity(true);
+    activeOperationId = "";
+    activeHistoryId = historyId;
+    source = "history";
+    pageLoading.value = true;
+    status.value = "running";
+    message.value = "正在恢复历史搜索结果";
+    const controller = new AbortController();
+    foregroundController = controller;
+    try {
+      const payload = await api.historyPage(historyId, 1, PAGE_SIZE, controller.signal);
+      if (localGeneration !== generation || activeHistoryId !== historyId) return false;
+      apply(payload, "history", fallbackTitle);
+      return true;
+    } catch (error) {
+      if (!isAbortError(error)) {
+        status.value = "failed";
+        message.value = error instanceof Error ? error.message : String(error);
+        emitError("无法打开搜索记录", error);
+      }
+      return false;
+    } finally {
+      if (foregroundController === controller) foregroundController = null;
+      if (localGeneration === generation) pageLoading.value = false;
     }
   }
 
@@ -557,7 +655,7 @@ export function useSearch(
       if (localGeneration !== generation || operation !== activeOperationId) return;
       const nextStatus = statusOf(payload);
       if (TERMINAL.has(nextStatus)) {
-        apply(payload, "search", query.value.trim() || "搜索结果");
+        apply(payload, "search", query.value.trim() || queryImageName.value || "搜索结果");
         return;
       }
       status.value = nextStatus || "running";
@@ -595,6 +693,7 @@ export function useSearch(
     status.value = "running";
     message.value = "正在等待本地后端返回结果";
     activeOperationId = "";
+    activeHistoryId = "";
     source = "search";
     const startedAt = Date.now();
     armSearchWatchdog(localGeneration, controller);
@@ -652,7 +751,7 @@ export function useSearch(
       });
       const nextStatus = statusOf(payload);
       if (TERMINAL.has(nextStatus) || payloadItems(payload).length) {
-        apply(payload, "search", searchText);
+        apply(payload, "search", searchText || queryImageName.value || "以图搜图");
       } else if (activeOperationId) {
         emitDiagnostic("search_poll_started", { initial_status: nextStatus || "running" });
         await poll(activeOperationId, localGeneration, controller.signal);
@@ -664,6 +763,7 @@ export function useSearch(
         total_items: totalItems.value,
         elapsed_ms: Math.max(0, Date.now() - startedAt),
       });
+      void refreshHistory();
       return true;
     } catch (error) {
       if (localGeneration === generation) {
@@ -776,6 +876,7 @@ export function useSearch(
     queryImageId,
     queryImageName,
     libraries,
+    history,
     connectionMessage,
     items,
     selectedId,
@@ -789,11 +890,14 @@ export function useSearch(
     hasNext,
     duration,
     title,
+    resultQueryType,
     message,
     status,
     searching,
     pageLoading,
     initialize,
+    refreshHistory,
+    openHistory,
     submit,
     cancel,
     goToPage,

@@ -456,6 +456,30 @@ def _handler_type(gateway: GatewayServer) -> type[BaseHTTPRequestHandler]:
                     ),
                 )
                 return
+            if method == "GET" and segments == ("results", "history"):
+                _reject_unknown_query(query_values, {"limit"})
+                self._json(
+                    HTTPStatus.OK,
+                    gateway._facade.search_history(
+                        limit=_query_int(query_values, "limit", 12, 1, 50),
+                    ),
+                )
+                return
+            if (
+                method == "GET"
+                and len(segments) == 3
+                and segments[:2] == ("results", "history")
+            ):
+                _reject_unknown_query(query_values, {"page", "page_size"})
+                self._json(
+                    HTTPStatus.OK,
+                    gateway._facade.historical_results(
+                        segments[2],
+                        page=_query_int(query_values, "page", 1, 1, 100_000),
+                        page_size=_query_int(query_values, "page_size", 15, 1, 100),
+                    ),
+                )
+                return
             if method == "POST" and segments == ("search",):
                 self._json(
                     HTTPStatus.ACCEPTED,

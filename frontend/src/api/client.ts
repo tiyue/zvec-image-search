@@ -1,5 +1,6 @@
 import type {
   BootstrapResponse,
+  SearchHistoryResponse,
   SearchPageResponse,
   SearchSubmission,
 } from "../types/contracts";
@@ -18,6 +19,13 @@ export interface SearchApi {
     signal?: AbortSignal,
   ): Promise<SearchPageResponse>;
   cancel(operationId: string): Promise<SearchPageResponse>;
+  history?(signal?: AbortSignal): Promise<SearchHistoryResponse>;
+  historyPage?(
+    historyId: string,
+    page: number,
+    pageSize: 15,
+    signal?: AbortSignal,
+  ): Promise<SearchPageResponse>;
 }
 
 export const searchApi: SearchApi = {
@@ -42,4 +50,11 @@ export const searchApi: SearchApi = {
     requestJson<SearchPageResponse>(`api/search/${encodeURIComponent(operationId)}`, {
       method: "DELETE",
     }),
+  history: (signal) =>
+    requestJson<SearchHistoryResponse>("api/results/history?limit=12", { signal }),
+  historyPage: (historyId, page, pageSize, signal) =>
+    requestJson<SearchPageResponse>(
+      `api/results/history/${encodeURIComponent(historyId)}?page=${page}&page_size=${pageSize}`,
+      { signal },
+    ),
 };
