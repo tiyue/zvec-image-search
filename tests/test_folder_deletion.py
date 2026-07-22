@@ -546,7 +546,9 @@ class FolderDeletionManagerTest(unittest.TestCase):
         # preview() and commit(), causing _validate_snapshot to reject the operation
         # even after multiple retries.  Skip this flaky combination on CI.
         if sys.platform == "win32" and os.getenv("CI"):
-            self.skipTest("Windows CI filesystem timing makes snapshot validation flaky")
+            self.skipTest(
+                "Windows CI filesystem timing makes snapshot validation flaky"
+            )
         manager = self._manager()
         self.addCleanup(manager.close)
         preview = manager.preview(folder_key=self._root_folder_key())
