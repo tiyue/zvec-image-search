@@ -27,7 +27,6 @@ import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import okhttp3.Call
 import okhttp3.Callback
-import okhttp3.ConnectionPool
 import okhttp3.Dispatcher
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
@@ -246,18 +245,7 @@ class LanApiClient(
     } catch (_: IOException) {
         // Retry exactly once only when the transport or response body was interrupted.
         // Pairing create/poll are idempotent for the same device secret on the desktop.
-        // Use a fresh client with its own connection pool to avoid stale socket reuse,
-        // and pause to let MockWebServer re-accept after DISCONNECT policies on CI.
-        val retryClient = pairingHttpClient.newBuilder()
-            .connectionPool(ConnectionPool())
-            .build()
-        kotlinx.coroutines.delay(2000)
-        try {
-            executeJson(request, retryClient)
-        } finally {
-            retryClient.connectionPool.evictAll()
-            retryClient.dispatcher.executorService.shutdown()
-        }
+        executeJson(request, pairingHttpClient)
     }
 
     private suspend fun executeUnit(request: Request) {

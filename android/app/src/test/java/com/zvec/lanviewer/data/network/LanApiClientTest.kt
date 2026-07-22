@@ -7,8 +7,10 @@ import com.zvec.lanviewer.data.model.SearchPageResult
 import com.zvec.lanviewer.data.repository.applyPairingPollResponse
 import com.zvec.lanviewer.data.security.InMemoryTokenStore
 import kotlinx.coroutines.runBlocking
+import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
+import okhttp3.mockwebserver.RecordedRequest
 import okhttp3.mockwebserver.SocketPolicy
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -79,12 +81,25 @@ class LanApiClientTest {
             tokenStore = InMemoryTokenStore(),
             maxConcurrentRequests = 10,
         )
-        server.enqueue(MockResponse().setSocketPolicy(SocketPolicy.DISCONNECT_DURING_RESPONSE_BODY))
-        server.enqueue(
-            MockResponse().setResponseCode(201).setBody(
-                """{"pairing_id":"p-reused","comparison_code":"003721","expires_in_seconds":260,"expires_at":"2026-07-21T12:34:56Z","status":"pending"}""",
-            ),
-        )
+        // Use a Dispatcher to reliably disconnect only the first pairing request.
+        // This avoids MockWebServer socket-policy timing issues on CI.
+        var pairingAttempts = 0
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                if (request.path?.startsWith("/api/v1/pair-requests") == true &&
+                    request.method == "POST" &&
+                    !request.path!!.contains("/poll")) {
+                    return if (pairingAttempts++ == 0) {
+                        MockResponse().setSocketPolicy(SocketPolicy.DISCONNECT_DURING_RESPONSE_BODY)
+                    } else {
+                        MockResponse().setResponseCode(201).setBody(
+                            """{"pairing_id":"p-reused","comparison_code":"003721","expires_in_seconds":260,"expires_at":"2026-07-21T12:34:56Z","status":"pending"}""",
+                        )
+                    }
+                }
+                return MockResponse().setResponseCode(404)
+            }
+        }
         val request = PairRequest("stable-device", "Galaxy Tab", "same-client-secret")
 
         val response = retryingClient.startPairing(baseUrl, request)
@@ -127,15 +142,24 @@ class LanApiClientTest {
         )
         val interruptedBody =
             """{"status":"approved","token":"issued-token","padding":"${"x".repeat(4096)}"}"""
-        server.enqueue(
-            MockResponse().setResponseCode(200)
-                .setBody(interruptedBody)
-                .setSocketPolicy(SocketPolicy.DISCONNECT_DURING_RESPONSE_BODY),
-        )
-        server.enqueue(
-            MockResponse().setResponseCode(200)
-                .setBody("""{"status":"approved","token":"issued-token"}"""),
-        )
+        // Use a Dispatcher to reliably disconnect only the first poll request.
+        var pollAttempts = 0
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                if (request.path?.contains("/api/v1/pair-requests/pairing-1/poll") == true &&
+                    request.method == "POST") {
+                    return if (pollAttempts++ == 0) {
+                        MockResponse().setResponseCode(200)
+                            .setBody(interruptedBody)
+                            .setSocketPolicy(SocketPolicy.DISCONNECT_DURING_RESPONSE_BODY)
+                    } else {
+                        MockResponse().setResponseCode(200)
+                            .setBody("""{"status":"approved","token":"issued-token"}""")
+                    }
+                }
+                return MockResponse().setResponseCode(404)
+            }
+        }
 
         val response = retryingClient.pollPairing(baseUrl, "pairing-1", "same-client-secret")
         val first = server.takeRequest()
