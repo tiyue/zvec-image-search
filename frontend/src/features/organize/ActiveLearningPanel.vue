@@ -172,7 +172,7 @@ onMounted(() => {
     <section class="decision-toolbar" aria-label="批量审核操作">
       <div class="selection-summary">
         <strong>已选 {{ learning.selectedCount.value }} 张</strong>
-        <span>已设置 {{ learning.pendingDecisionCount.value }} 项决定</span>
+        <span class="sr-only">已设置 {{ learning.pendingDecisionCount.value }} 项决定</span>
       </div>
       <div class="selection-buttons">
         <button type="button" @click="learning.selectAll">全选本轮</button>
@@ -338,4 +338,10 @@ onMounted(() => {
 .learning-footer{border-top-color:#e5e5e5;color:#777}.learning-footer strong{color:#555}
 @media(max-width:1180px){.learning-grid{grid-template-columns:1fr}.learning-card{grid-template-columns:24px 62px minmax(0,1fr) minmax(148px,auto)}}
 @media(max-width:700px){.learning-panel{height:auto;overflow:visible}.learning-card{grid-template-columns:24px 54px minmax(0,1fr)}.learning-image{width:54px;height:54px}.single-decisions{grid-column:2/-1;grid-row:auto}.decision-state,.review-failure{grid-column:1/-1}}
+.learning-panel{display:grid;height:100%;min-height:0;grid-template-rows:50px auto auto auto minmax(0,1fr) auto;gap:0;overflow:hidden;border:0;border-radius:0;color:#222;background:#fff;box-shadow:none}
+.learning-heading{display:flex;min-height:50px;align-items:center;justify-content:flex-end;padding:0;border:0}.learning-heading>div:first-child{display:none}.learning-controls{display:flex;align-items:flex-end;gap:7px}.learning-controls label{display:grid;gap:3px;color:#777;font-size:10px}.learning-controls input{width:76px;height:34px;padding:0 9px;border:1px solid #dedede;border-radius:8px;background:#fff}.learning-button{min-height:34px;padding:0 10px;border:1px solid #dedede;border-radius:8px;font-weight:400}.learning-button.primary{color:#fff;border-color:#aaa;background:#aaa}.learning-button.secondary{color:#555;background:#f5f5f5}
+.learning-notice{display:flex;min-height:52px;align-items:center;gap:10px;margin:0 0 12px;padding:9px 12px;border:1px solid rgb(36 122 89 / 18%);border-radius:10px;color:#555;background:rgb(36 122 89 / 6%)}.learning-notice>span{color:#47806b}.learning-notice strong{font-size:12px;font-weight:500}.learning-notice small{display:block;margin-top:2px;color:#777;font-size:10px}
+.learning-feedback{display:grid;gap:7px}.learning-status,.review-summary{border-color:#e1e1e1!important;border-radius:8px!important;color:#555!important;background:#f6f6f6!important}
+.decision-toolbar{display:grid;min-height:56px;grid-template-columns:auto auto minmax(160px,1fr) auto auto;align-items:center;gap:8px;margin:12px 0;padding:8px 10px;border:0;border-radius:10px;background:#f2f2f2}.selection-summary{display:flex;align-items:center;gap:7px}.selection-summary strong{font-size:12px;font-weight:500}.selection-buttons,.batch-decisions{display:flex;gap:5px}.selection-buttons button,.batch-decisions button{min-height:30px;padding:0 8px;border:1px solid #dedede;border-radius:8px;color:#444;background:#fff}.edit-tag-input input{width:100%;height:34px;border:1px solid #dedede;border-radius:8px;background:#fff}.submit-review{white-space:nowrap}
+.learning-empty{display:grid;min-height:0;place-items:center;align-content:center;color:#777}.learning-empty strong{font-weight:500}.learning-empty span{margin-top:4px;font-size:11px}.learning-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px 18px;padding:0;align-content:start;overflow:auto}.learning-footer{min-height:36px;border-top:1px solid #e5e5e5;color:#777}
 </style>

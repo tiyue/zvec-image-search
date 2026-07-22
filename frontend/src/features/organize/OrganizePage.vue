@@ -304,7 +304,7 @@ onBeforeUnmount(() => {
         <header class="panel-heading">
           <div>
             <p class="eyebrow">图库导航</p>
-            <h2 id="folder-panel-title">文件夹</h2>
+            <h2 id="folder-panel-title">图库与文件夹</h2>
           </div>
           <span class="count-pill">{{ organize.folderTotal.value }}</span>
         </header>
@@ -593,6 +593,15 @@ onBeforeUnmount(() => {
           </div>
         </header>
 
+        <section v-if="!organize.selectedCount.value" class="tag-editor-empty">
+          <span aria-hidden="true">◇</span>
+          <div><strong>开始批量操作</strong><p>在左侧选择文件夹，然后点击中间图片进行选中</p></div>
+          <div class="empty-editor-actions"><button type="button" disabled>添加标签</button><button type="button" disabled>移除标签</button><button type="button" disabled>替换人工标签</button></div>
+        </section>
+
+        <details class="tag-editor-tools" :open="Boolean(organize.selectedCount.value)">
+        <summary>标签与别名设置</summary>
+        <div class="tag-editor-tools-content">
         <section class="selection-card">
           <strong>{{ organize.selectionDescription.value }}</strong>
           <p v-if="organize.selectionPreviewIncomplete.value">
@@ -756,6 +765,8 @@ onBeforeUnmount(() => {
           <span aria-hidden="true">↶</span>
           <span><strong>撤销最近一次批量操作</strong><small>恢复人工标签和相关索引状态</small></span>
         </button>
+        </div>
+        </details>
       </aside>
     </div>
 
@@ -864,7 +875,7 @@ textarea { resize: vertical; line-height: 1.5; }
 .organize-intelligence-workspace { height:100%; min-height:0; }
 .batch-tag-workspace { display: grid; height: 100%; min-height: 0; grid-template-columns: 320px minmax(0,1fr) 380px; gap: 14px; }
 .batch-tag-workspace.is-folder-collapsed { grid-template-columns:44px minmax(0,1fr) 380px; gap:10px; }
-.folder-panel { display: grid; grid-template-rows: auto auto auto minmax(0,1fr) auto; padding: 14px; overflow: hidden; }
+.folder-panel { display: grid; grid-template-rows: auto auto auto auto minmax(0,1fr) auto; padding: 14px; overflow: hidden; }
 .folder-panel-toggle { display:grid; width:28px; height:28px; flex:0 0 auto; place-items:center; padding:0; border:0; border-radius:8px; color:#555; font:inherit; font-size:20px; background:#ededed; }
 .folder-library-control { display:grid; grid-template-columns:minmax(0,1fr) 38px; align-items:center; gap:6px; margin-top:10px; }
 .folder-library-control label { min-width:0; }
@@ -1026,6 +1037,8 @@ textarea { resize: vertical; line-height: 1.5; }
 .folder-panel.is-collapsed { display:none; }
 .gallery-panel { padding:14px; }
 .tag-editor { padding:14px; }
+.tag-editor-empty{display:grid;min-height:calc(100% - 52px);grid-template-rows:1fr auto;place-items:center;align-content:center;gap:12px;color:#888;text-align:center}.tag-editor-empty>span{align-self:end;font-size:28px;color:#aaa}.tag-editor-empty>div:not(.empty-editor-actions){align-self:start}.tag-editor-empty strong{display:block;color:#777;font-size:13px;font-weight:400}.tag-editor-empty p{margin:5px 0 0;font-size:11px;line-height:1.5}.empty-editor-actions{align-self:end;display:grid;width:100%;gap:6px}.empty-editor-actions button{min-height:32px;border:1px solid #e5e5e5;border-radius:8px;color:#aaa;background:#fafafa}
+.tag-editor-tools{margin-top:8px}.tag-editor-tools>summary{padding:7px 0;color:#777;font-size:11px;text-align:center;cursor:pointer;list-style:none}.tag-editor-tools[open]>summary{margin-bottom:6px;border-bottom:1px solid #e7e7e7}.tag-editor-tools-content{display:grid}
 .panel-heading .eyebrow,.gallery-heading .eyebrow,.tag-editor .eyebrow { display:none; }
 .folder-panel-toggle { width:32px; height:32px; border:0; border-radius:8px; color:#666; background:transparent; }
 .folder-panel-toggle:hover { color:#171717; background:#f2f2f2; }

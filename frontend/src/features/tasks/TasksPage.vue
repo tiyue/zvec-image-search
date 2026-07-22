@@ -31,7 +31,7 @@ const emit = defineEmits<{
   toast: [title: string, message: string, kind: "success" | "error"];
 }>();
 
-const taskType = ref<LibraryTaskType>("index");
+const taskType = ref<LibraryTaskType>("index_and_auto_tag");
 const libraryId = ref("");
 const maxImages = ref(300);
 const autoTagScope = ref<AutoTagScope>("untagged");
@@ -47,7 +47,9 @@ const enabledLibraries = computed(() => props.libraries.filter((library) => libr
 const isAiTask = computed(
   () => taskType.value === "index_and_auto_tag" || taskType.value === "auto_tag",
 );
-const isAutoTagTask = computed(() => taskType.value === "auto_tag");
+const isAutoTagTask = computed(
+  () => taskType.value === "index_and_auto_tag" || taskType.value === "auto_tag",
+);
 const executionPolicy = computed(() => {
   if (taskType.value === "auto_tag") {
     return "智能标注使用 auto_tag_concurrency，并受 60 RPM 与 100,000 TPM 限流；单图失败会隔离并继续。";
@@ -190,21 +192,22 @@ onBeforeUnmount(() => {
     <section v-if="composerOpen" class="composer panel">
       <div class="section-heading">
         <div>
-          <p class="eyebrow">新建任务</p>
-          <h2 id="tasks-title">并行处理图库</h2>
+          <p class="eyebrow">任务配置</p>
+          <h2 id="tasks-title">新建图库任务</h2>
           <p>索引、同步和智能标注可同时排队，由本地后端统一控制速度。</p>
         </div>
         <span class="limit-chip">60 RPM · 100,000 TPM</span>
+        <button class="composer-close" type="button" aria-label="关闭新建任务" @click="composerOpen = false">×</button>
       </div>
 
       <form class="task-form" novalidate @submit.prevent="submit">
         <label>
           <span>任务类型</span>
           <select v-model="taskType" name="task_type">
-            <option value="index">建立索引</option>
-            <option value="sync">同步图库</option>
             <option value="index_and_auto_tag">索引并智能标注</option>
+            <option value="index">建立索引</option>
             <option value="auto_tag">智能标注</option>
+            <option value="sync">同步图库</option>
           </select>
         </label>
         <label>
@@ -723,4 +726,25 @@ button:disabled { opacity: 0.55; cursor: default; }
   .consent-field { grid-column: auto; }
   .section-heading { flex-direction: column; }
 }
+
+/* Approved full-screen task view. */
+.tasks-page{position:relative;display:grid;height:100%;grid-template-rows:66px 42px minmax(0,1fr);gap:0;overflow:hidden;color:#222}
+.tasks-toolbar{display:flex;min-height:66px;align-items:center;justify-content:center}
+.new-task-button{min-height:38px;padding:0 17px;border:1px solid #dedede;border-radius:19px;color:#333;font:inherit;font-size:13px;font-weight:400;background:#ededed}
+.new-task-button:hover{background:#e5e5e5}
+.task-view-tabs{display:flex;min-height:42px;align-items:flex-end;gap:20px;border-bottom:1px solid #e7e7e7}
+.task-view-tabs button{height:40px;padding:0 2px;border:0;border-bottom:2px solid transparent;color:#777;font:inherit;background:transparent}.task-view-tabs button.active{border-bottom-color:#333;color:#171717}
+.task-view-tabs button:focus-visible{outline:0;box-shadow:none}
+.workspace-grid{height:100%;min-height:0;overflow:hidden}
+.tasks-page.has-composer::before{content:"";position:fixed;z-index:1100;inset:0;background:rgb(0 0 0 / 15%)}
+.tasks-page.has-composer{grid-template-rows:66px 42px minmax(0,1fr);overflow:hidden}
+.composer{position:fixed;z-index:1200;left:50%;top:50%;width:min(430px,calc(100vw - 40px));max-height:calc(100vh - 56px);overflow:auto;transform:translate(-50%,-50%);padding:18px;border:1px solid #e2e2e2;border-radius:14px;background:#fff;box-shadow:0 20px 64px rgb(0 0 0 / 16%)}
+.composer .section-heading{display:flex;margin:0 0 14px;padding:0;border:0}.composer .section-heading .eyebrow,.composer .section-heading>div>p:last-child,.composer .limit-chip{display:none}.composer .section-heading h2{margin:0;font-size:16px;font-weight:500}
+.composer-close{position:absolute;top:11px;right:11px;display:grid;width:30px;height:30px;place-items:center;padding:0;border:0;border-radius:8px;color:#777;font-size:20px;line-height:1;background:transparent}.composer-close:hover{color:#171717;background:#f1f1f1}
+.task-form{display:grid!important;grid-template-columns:1fr!important;gap:10px!important}.task-form>label{display:grid;gap:5px}.task-form>label>span:first-child{color:#333;font-size:12px}.task-form input,.task-form select{width:100%;height:40px;padding:0 10px;border:1px solid #dedede;border-radius:9px;background:#fff}.task-form small{color:#858585;font-size:11px}
+.task-policy-note{order:20;padding:10px;border:0;border-radius:9px;color:#777;background:#f2f2f2}.task-policy-note strong{display:none}.task-policy-note small{font-size:11px}
+.risk-field,.consent-field{grid-column:1 / -1!important;display:flex!important;align-items:flex-start!important;justify-content:space-between;gap:16px;padding:4px 0!important;border:0!important;background:transparent!important}.risk-field input,.consent-field input{order:2;width:auto;height:auto;margin:3px 0 0}.risk-field>span,.consent-field>span{display:grid;flex:1}.risk-field strong,.consent-field strong{font-size:12px;font-weight:400}
+.task-policy-note{grid-column:1 / -1!important}
+.form-actions{order:30;display:flex!important;justify-content:flex-end;gap:7px;margin-top:2px}.estimate-button,.primary-button{min-height:34px;padding:0 11px;border:1px solid #dedede;border-radius:9px;color:#333;background:#fff}.primary-button{color:#fff;border-color:#444;background:#444}
+.estimate-result,.notice{border-radius:9px;box-shadow:none}
 </style>

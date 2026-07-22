@@ -75,18 +75,19 @@ function isSelected(id: string): boolean {
   min-width: 0;
   min-height: 0;
   height: 100%;
-  overflow: hidden;
+  overflow: auto;
 }
 
 .gallery-grid {
   display: grid;
   min-width: 0;
   min-height: 0;
-  height: 100%;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
-  grid-template-rows: repeat(3, minmax(0, 1fr));
-  gap: 3px;
-  overflow: hidden;
+  height: auto;
+  min-height: 100%;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  grid-auto-rows: minmax(116px, 1fr);
+  gap: 2px;
+  overflow: visible;
   transition: opacity 100ms ease;
 }
 
@@ -165,22 +166,7 @@ function isSelected(id: string): boolean {
   stroke-width: 1.8;
 }
 
-@media (max-width: 1200px) {
-  .gallery-frame {
-    overflow: auto;
-    scrollbar-gutter: stable;
-  }
-
-  .gallery-grid {
-    height: auto;
-    min-height: 100%;
-    grid-template-columns: repeat(3, minmax(150px, 1fr));
-    grid-template-rows: none;
-    grid-auto-rows: 210px;
-    overflow: visible;
-  }
-
-}
+@media (max-width: 1200px) { .gallery-grid { grid-template-columns: repeat(4, minmax(150px, 1fr)); } }
 
 @media (max-width: 680px) {
   .gallery-grid {

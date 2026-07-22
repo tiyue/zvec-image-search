@@ -48,21 +48,21 @@ const pageDefinitions: Array<{
   {
     id: "batch",
     label: "批量标签",
-    description: "文件夹标签与别名",
+    description: "添加、移除与替换",
     icon: "tags",
     shortcut: "Alt+3",
   },
   {
     id: "groups",
     label: "相似分组",
-    description: "重复图与语义近邻",
+    description: "重复图与近似图",
     icon: "groups",
     shortcut: "Alt+4",
   },
   {
     id: "learning",
     label: "待学习样本",
-    description: "审核高价值图片",
+    description: "审核搜索与分组反馈",
     icon: "learning",
     shortcut: "Alt+5",
   },
@@ -183,6 +183,7 @@ async function submitSearch(): Promise<void> {
       recentQuery,
       ...recentSearches.value.filter((value) => value !== recentQuery),
     ].slice(0, 3);
+    window.localStorage.setItem("zvec.recent-searches", JSON.stringify(recentSearches.value));
   }
 }
 
@@ -560,6 +561,14 @@ function handleGlobalKeydown(event: KeyboardEvent): void {
 onMounted(() => {
   removeGlobalDiagnostics = installGlobalDiagnostics();
   search.setPreviewEnabled(false);
+  try {
+    const saved = JSON.parse(window.localStorage.getItem("zvec.recent-searches") ?? "[]");
+    if (Array.isArray(saved)) {
+      recentSearches.value = saved.filter((value): value is string => typeof value === "string").slice(0, 12);
+    }
+  } catch {
+    recentSearches.value = [];
+  }
   window.addEventListener("keydown", handleGlobalKeydown);
   window.addEventListener("pointerdown", handleWindowPointerDown);
   window.addEventListener("resize", handleWindowResize);
@@ -615,9 +624,9 @@ watch(
           :title="sidebarCollapsed ? '展开侧边栏' : 'Zvec'"
           @click="sidebarCollapsed = false"
         >
-          <AppIcon name="logo" :size="21" />
+          <span aria-hidden="true">Z</span>
         </button>
-        <strong class="brand-name">Zvec</strong>
+        <span class="brand-copy"><strong class="brand-name">Zvec</strong><small>智能图片库</small></span>
         <button class="icon-button sidebar-toggle" type="button" :aria-label="sidebarCollapsed ? '展开侧边栏' : '收起侧边栏'" @click="sidebarCollapsed = !sidebarCollapsed">
           <AppIcon name="panel" />
         </button>
@@ -647,7 +656,7 @@ watch(
       </nav>
 
       <section v-if="recentSearches.length" class="sidebar-recents" aria-labelledby="recent-title">
-        <p id="recent-title">最近</p>
+        <p id="recent-title">最近结果</p>
         <button v-for="recent in recentSearches" :key="recent" type="button" :title="recent" @click="reuseSearch(recent)">
           {{ recent }}
         </button>
@@ -655,7 +664,7 @@ watch(
 
       <button class="settings-button" type="button" :class="{ 'is-active': activePage === 'settings' }" title="设置" @click="setPage('settings')">
         <AppIcon name="settings" />
-        <span><strong>设置</strong><small>{{ search.connectionMessage.value }}</small></span>
+        <span><strong>设置</strong><small>图库、模型与访问</small></span>
       </button>
     </aside>
 
@@ -674,7 +683,6 @@ watch(
         <div v-if="!hasSearchActivity" class="search-surface">
           <div class="search-hero">
             <h1>你今天想找什么？</h1>
-            <p>用自然语言、标签或参考图片搜索本地图库。</p>
           </div>
 
           <form
@@ -732,7 +740,6 @@ watch(
             </div>
 
             <div class="search-meta-row">
-              <span>当前将执行：<strong>{{ inferredSearchLabel }}</strong></span>
               <details class="search-settings">
                 <summary><AppIcon name="sliders" :size="16" />搜索设置</summary>
                 <div class="search-settings-panel">
@@ -757,15 +764,18 @@ watch(
           <section class="gallery-panel card" aria-labelledby="gallery-title">
             <header class="panel-heading">
               <div>
-                <h2 id="gallery-title">{{ search.totalItems.value.toLocaleString("zh-CN") }} 张图片</h2>
-                <p>{{ inferredSearchLabel }} · {{ activeLibraryLabel }}</p>
+                <h2 id="gallery-title">{{ inferredSearchLabel }} · {{ search.totalItems.value.toLocaleString("zh-CN") }} 张 · {{ activeLibraryLabel }}<span class="sr-only">{{ search.totalItems.value.toLocaleString("zh-CN") }} 张图片</span></h2>
+                <p>{{ search.query.value || search.queryImageName.value || "当前搜索" }}</p>
               </div>
               <div class="result-status-actions">
-                <output class="status-pill" role="status" aria-live="polite" :title="search.message.value">{{ statusLabel }}</output>
+                <button class="result-action-button" type="button" @click="searchInput?.focus()">筛选</button>
+                <button class="result-action-button" type="button" :disabled="!search.items.value.length || nativeActions.exporting.value" @click="exportSelectedImages(search.items.value.map((item) => item.id), 'result_header_export')">导出</button>
+                <output class="status-pill" :class="{ 'is-passive': !search.searching.value && search.status.value !== 'failed' }" role="status" aria-live="polite" :title="search.message.value">{{ statusLabel }}</output>
                 <button v-if="search.searching.value" class="result-cancel-button" type="button" data-testid="cancel-search" @click="search.cancel()">取消</button>
               </div>
             </header>
             <div class="gallery-operations">
+              <button v-if="!selectedCount && search.items.value.length" class="select-page-button" type="button" @click="selectCurrentPage">全选当前页</button>
               <div v-if="selectedCount" class="selection-toolbar" aria-label="批量图片操作">
                 <span>已选择 {{ selectedCount }} 张；Ctrl 点击多选，Shift 点击连续选择</span>
                 <button class="button button-quiet button-small" type="button" @click="copySelectedFiles(activeActionIds, 'selection_toolbar_copy')">复制文件</button>

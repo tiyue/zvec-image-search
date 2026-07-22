@@ -26,11 +26,12 @@ const imageSource = computed(() => props.item.thumbnailUrl || props.item.imageUr
 const loadingMode = computed(() => (props.index < 5 ? "eager" : "lazy"));
 const fetchPriority = computed(() => (props.index < 3 ? "high" : "low"));
 const rankLabel = computed(() => String(props.item.rank || props.index + 1).padStart(2, "0"));
-const matchClass = computed(() => ({
-  "is-high": props.item.matchState === "high",
-  "is-weak": props.item.matchState === "weak",
-}));
-
+const scoreLabel = computed(() => {
+  const score = props.item.confidence ?? props.item.rawScore;
+  if (score === null || score === undefined || !Number.isFinite(Number(score))) return "—";
+  const normalized = Number(score) <= 1 ? Number(score) * 100 : Number(score);
+  return `${Math.round(normalized)}%`;
+});
 watch(imageSource, () => {
   imageFailed.value = false;
 });
@@ -99,13 +100,9 @@ function openContextMenu(event: MouseEvent): void {
             <circle cx="15.8" cy="9.2" r="1.35" />
           </svg>
         </span>
+        <span class="score-badge" :aria-label="`匹配度 ${scoreLabel}`">{{ scoreLabel }}</span>
         <span class="rank-badge card-rank" :aria-label="`排名 ${item.rank}`">{{ rankLabel }}</span>
         <span v-if="selected" class="selection-check" aria-hidden="true">✓</span>
-        <span class="match-stripe" :class="matchClass" aria-hidden="true" />
-      </span>
-      <span class="image-card-copy">
-        <strong :title="item.name">{{ item.name }}</strong>
-        <small :title="item.libraryName">{{ item.libraryName }}</small>
       </span>
     </button>
   </article>
@@ -124,11 +121,11 @@ function openContextMenu(event: MouseEvent): void {
   height: 100%;
   min-width: 0;
   min-height: 0;
-  grid-template-rows: minmax(0, 1fr) auto;
+  grid-template-rows: minmax(0, 1fr);
   padding: 0;
   overflow: hidden;
-  border: 1px solid #e7e7e7;
-  border-radius: 8px;
+  border: 0;
+  border-radius: 0;
   color: var(--text, #171e2e);
   text-align: left;
   background: #f2f2f2;
@@ -139,20 +136,16 @@ function openContextMenu(event: MouseEvent): void {
     box-shadow 150ms ease;
 }
 
-.image-card:hover {
-  z-index: 1;
-  border-color: #bdbdbd;
-  box-shadow: 0 6px 18px rgb(0 0 0 / 10%);
-  transform: none;
-}
+.image-card:hover { z-index: 1; filter: brightness(.97); }
 
 .image-card.is-selected {
-  border-color: #777;
-  box-shadow: 0 0 0 2px rgb(0 0 0 / 10%);
+  outline: 2px solid #171717;
+  outline-offset: -2px;
+  box-shadow: none;
 }
 
 .image-card.is-primary {
-  box-shadow: 0 0 0 2px rgb(0 0 0 / 14%);
+  box-shadow: none;
 }
 
 .thumbnail-stage {
@@ -196,26 +189,30 @@ function openContextMenu(event: MouseEvent): void {
   stroke-width: 1.7;
 }
 
-.rank-badge {
+.rank-badge, .score-badge {
   display: inline-flex;
-  min-width: 27px;
-  min-height: 27px;
+  min-width: 0;
+  min-height: 0;
   align-items: center;
   justify-content: center;
   padding: 0 7px;
   border-radius: 999px;
   color: #fff;
   font-size: 12px;
-  font-weight: 800;
-  background: #666;
+  font-weight: 500;
+  background: rgb(23 23 23 / 72%);
 }
 
 .card-rank {
   position: absolute;
   z-index: 1;
-  top: 6px;
+  top: auto;
+  bottom: 6px;
   left: 6px;
 }
+.card-rank::before { content:"#"; }
+
+.score-badge { position:absolute; z-index:1; top:6px; right:6px; }
 
 .selection-check {
   position: absolute;
@@ -235,44 +232,4 @@ function openContextMenu(event: MouseEvent): void {
   box-shadow: 0 3px 10px rgb(0 0 0 / 18%);
 }
 
-.match-stripe {
-  position: absolute;
-  top: 0;
-  right: 0;
-  bottom: 0;
-  width: 3px;
-  background: #777;
-}
-
-.match-stripe.is-high {
-  background: var(--success, #0e735f);
-}
-
-.match-stripe.is-weak {
-  background: var(--warning, #92500b);
-}
-
-.image-card-copy {
-  display: grid;
-  gap: 2px;
-  padding: 7px 8px 8px;
-  border-top: 1px solid var(--border, #e1e6ef);
-  background: var(--surface, #fff);
-}
-
-.image-card-copy strong,
-.image-card-copy small {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.image-card-copy strong {
-  font-size: 13px;
-}
-
-.image-card-copy small {
-  color: var(--muted, #596478);
-  font-size: 12px;
-}
 </style>

@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import { ref } from "vue";
 
-import AppIcon from "../../components/AppIcon.vue";
 import {
   SearchLearningSettingsCard,
   type SearchLearningApi,
@@ -41,7 +40,7 @@ const settings = useSettings(props.api, {
 });
 const apiKey = ref("");
 const choosingDirectory = ref("");
-const activeSection = ref<"libraries" | "models" | "learning" | "lan" | "migration">("libraries");
+const activeSection = ref<"libraries" | "models" | "credentials" | "learning" | "lan" | "migration">("libraries");
 
 function selectDefault(libraryId: string): void {
   settings.libraryDrafts.value.forEach((draft) => {
@@ -128,23 +127,21 @@ function chooseResultsDirectory(): void {
     <div class="settings-layout">
       <nav class="settings-nav" aria-label="设置分组">
         <button type="button" :class="{ active: activeSection === 'libraries' }" @click="activeSection = 'libraries'">
-          <AppIcon name="tasks" :size="17" />
-          <span>图库</span>
+          <span>图库与路径</span>
         </button>
         <button type="button" :class="{ active: activeSection === 'models' }" @click="activeSection = 'models'">
-          <AppIcon name="settings" :size="17" />
-          <span>模型与密钥</span>
+          <span>模型角色</span>
         </button>
-        <button type="button" :class="{ active: activeSection === 'learning' }" @click="activeSection = 'learning'">
-          <AppIcon name="learning" :size="17" />
-          <span>搜索学习</span>
+        <button type="button" :class="{ active: activeSection === 'credentials' }" @click="activeSection = 'credentials'">
+          <span>安全凭据</span>
         </button>
         <button type="button" :class="{ active: activeSection === 'lan' }" @click="activeSection = 'lan'">
-          <AppIcon name="groups" :size="17" />
           <span>局域网访问</span>
         </button>
+        <button type="button" :class="{ active: activeSection === 'learning' }" @click="activeSection = 'learning'">
+          <span>搜索学习</span>
+        </button>
         <button type="button" :class="{ active: activeSection === 'migration' }" @click="activeSection = 'migration'">
-          <AppIcon name="compose" :size="17" />
           <span>数据迁移</span>
         </button>
       </nav>
@@ -153,7 +150,7 @@ function chooseResultsDirectory(): void {
 
     <section v-show="activeSection === 'libraries'" class="settings-card panel libraries-card" aria-labelledby="libraries-title">
       <header class="section-heading">
-        <div><p class="eyebrow">图库与路径</p><h2 id="libraries-title">已配置图库</h2></div>
+         <div><p class="eyebrow">本地图库</p><h2 id="libraries-title">图库与路径</h2></div>
         <div class="section-actions">
           <span class="status-pill">{{ settings.libraryDrafts.value.length }} 个</span>
           <button
@@ -386,8 +383,8 @@ function chooseResultsDirectory(): void {
       @toast="(title, message, kind) => emit('toast', title, message, kind)"
     />
 
-    <div v-show="activeSection === 'models'" class="settings-grid">
-      <section class="settings-card panel" aria-labelledby="models-title">
+    <div v-show="activeSection === 'models' || activeSection === 'credentials'" class="settings-grid">
+      <section v-show="activeSection === 'models'" class="settings-card panel" aria-labelledby="models-title">
         <header class="section-heading">
           <div><p class="eyebrow">阿里云模型</p><h2 id="models-title">模型角色</h2></div>
           <span class="status-pill success">{{ settings.models.provider || "aliyun" }}</span>
@@ -439,7 +436,7 @@ function chooseResultsDirectory(): void {
         </form>
       </section>
 
-      <section class="settings-card panel credentials-card" aria-labelledby="credentials-title">
+      <section v-show="activeSection === 'credentials'" class="settings-card panel credentials-card" aria-labelledby="credentials-title">
         <header class="section-heading">
           <div><p class="eyebrow">安全凭据</p><h2 id="credentials-title">DashScope API Key</h2></div>
           <span class="status-pill" :class="settings.credentialsConfigured.value ? 'success' : ''">
@@ -534,13 +531,14 @@ label small { color: #8a91a2; font-weight: 500; }
 /* The standalone desktop preview is the visual source of truth: settings are
    grouped in a quiet left rail instead of stacking every feature at once. */
 .settings-page { height:100%; min-height:0; grid-template-rows:minmax(0,1fr); gap:0; overflow:hidden; color:#242424; }
-.page-heading { display:none; }
+.page-heading{display:contents}.page-heading>div{display:none}.page-heading>button{position:fixed;z-index:20;right:48px;top:9px;min-height:34px}
 .settings-layout { display:grid; height:100%; min-height:0; grid-template-columns:142px minmax(0,1fr); gap:16px; }
 .settings-nav { display:grid; min-height:0; align-content:start; gap:2px; padding-right:10px; border-right:1px solid #e5e5e5; }
 .settings-nav button { display:flex; min-height:38px; align-items:center; gap:8px; padding:8px; border:0; border-radius:8px; color:#707070; font:inherit; text-align:left; background:transparent; }
 .settings-nav button:hover,.settings-nav button.active { color:#171717; background:#f2f2f2; }
 .settings-content { min-width:0; min-height:0; overflow:auto; padding:0 4px 20px 0; scrollbar-gutter:stable; }
 .settings-card { padding:0; }
+.settings-grid{grid-template-columns:1fr}
 .panel { border:0; border-radius:0; background:#fff; box-shadow:none; }
 .section-heading { padding-bottom:10px; border-bottom:1px solid #e7e7e7; }
 .section-heading h2 { color:#242424; font-size:18px; font-weight:600; }

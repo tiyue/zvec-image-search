@@ -190,7 +190,7 @@ defineExpose({ focusInput });
 }
 
 .pagination-edge {
-  min-width: 56px !important;
+  display:none;
 }
 
 .pagination-jump {
@@ -247,7 +247,7 @@ defineExpose({ focusInput });
 }
 
 .pagination-copy {
-  display: grid;
+  display: none;
   flex: 0 0 104px;
   gap: 1px;
   color: var(--muted, #596478);

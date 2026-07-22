@@ -308,7 +308,7 @@ function revealImage(): void {
 
 .preview-overview {
   display: grid;
-  grid-template-columns: 84px minmax(0, 1fr);
+  grid-template-columns: 1fr;
   align-items: stretch;
   gap: 11px;
   min-width: 0;
@@ -325,7 +325,7 @@ function revealImage(): void {
 .preview-stage {
   position: relative;
   display: grid;
-  height: 104px;
+  height: 260px;
   min-height: 0;
   place-items: center;
   overflow: hidden;
@@ -393,7 +393,7 @@ function revealImage(): void {
 
 .preview-copy {
   min-width: 0;
-  padding: 4px 2px;
+  padding: 8px 0 2px;
 }
 
 .preview-copy h3 {
@@ -469,16 +469,20 @@ function revealImage(): void {
 
 .metadata-grid {
   display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 6px;
+  grid-template-columns: 1fr;
+  gap: 0;
   margin: 11px 0 0;
 }
 
 .metadata-grid > div {
   min-width: 0;
-  padding: 8px 9px;
-  border-radius: 10px;
-  background: var(--surface-soft, #f8f9fc);
+  display:grid;
+  grid-template-columns:74px minmax(0,1fr);
+  gap:8px;
+  padding: 8px 0;
+  border-bottom:1px solid var(--border, #e7e7e7);
+  border-radius: 0;
+  background: transparent;
 }
 
 .metadata-grid dt,
@@ -492,10 +496,10 @@ function revealImage(): void {
 }
 
 .metadata-grid dd {
-  margin-top: 2px;
+  margin-top: 0;
   overflow: hidden;
   font-size: 13px;
-  font-weight: 650;
+  font-weight: 400;
   text-overflow: ellipsis;
   white-space: nowrap;
 }

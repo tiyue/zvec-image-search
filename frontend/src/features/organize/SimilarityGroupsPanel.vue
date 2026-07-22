@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, toRef } from "vue";
+import { onMounted, ref, toRef } from "vue";
 
 import type {
   ClusterIdentityCategory,
@@ -23,6 +23,7 @@ const emit = defineEmits<{
 const groups = useSimilarityGroups(toRef(props, "libraryId"), props.api, {
   onToast: (title, message, kind) => emit("toast", title, message, kind),
 });
+const controlsOpen = ref(false);
 
 const runTypeOptions: Array<{ value: ClusterRunType; label: string; description: string }> = [
   { value: "exact", label: "完全重复", description: "SHA-256 完全一致" },
@@ -85,19 +86,17 @@ onMounted(() => {
 
 <template>
   <section class="intelligence-panel" aria-labelledby="similarity-groups-title">
-    <header class="intelligence-heading">
+    <header class="intelligence-heading group-summary-bar">
+      <h2 id="similarity-groups-title" class="sr-only">相似分组</h2>
+      <span>完全重复 · 视觉近似 · 内容相似 · {{ groups.total.value }} 组</span>
       <div>
-        <p class="intelligence-eyebrow">本地智能整理</p>
-        <h2 id="similarity-groups-title">相似分组</h2>
-        <p>默认查找重复图和近似图；内容相似可按需启用。</p>
-      </div>
-      <div class="no-cost-badge" title="聚类不会请求阿里云模型">
-        <span aria-hidden="true">◇</span>
-        不调用模型 · 无新增费用
+        <small class="no-cost-inline">不调用模型 · 无新增费用</small>
+        <button class="intelligence-button quiet" type="button" :aria-expanded="controlsOpen" @click="controlsOpen = !controlsOpen">调整参数</button>
+        <button class="intelligence-button primary" type="button" :disabled="groups.busy.value || !libraryId" @click="groups.runClustering">{{ groups.busy.value ? '后台处理中…' : '运行增量聚类' }}</button>
       </div>
     </header>
 
-    <div class="cluster-controls">
+    <div class="cluster-controls" :class="{ 'is-open': controlsOpen }">
       <label>
         <span>处理范围</span>
         <select v-model="groups.scope.value" :disabled="groups.busy.value">
@@ -123,25 +122,7 @@ onMounted(() => {
           </span>
         </label>
       </fieldset>
-      <div class="cluster-run-actions">
-        <button
-          v-if="groups.busy.value"
-          class="intelligence-button quiet danger"
-          type="button"
-          :disabled="groups.cancelling.value"
-          @click="groups.cancel"
-        >
-          {{ groups.cancelling.value ? "正在取消…" : "取消当前操作" }}
-        </button>
-        <button
-          class="intelligence-button primary"
-          type="button"
-          :disabled="groups.busy.value || !libraryId"
-          @click="groups.runClustering"
-        >
-          {{ groups.busy.value ? "后台处理中…" : "运行增量聚类" }}
-        </button>
-      </div>
+      <button v-if="groups.busy.value" class="intelligence-button quiet danger" type="button" :disabled="groups.cancelling.value" @click="groups.cancel">{{ groups.cancelling.value ? "正在取消…" : "取消当前操作" }}</button>
     </div>
 
     <div class="cluster-feedback">
@@ -176,6 +157,7 @@ onMounted(() => {
         </small>
       </section>
     </div>
+    <div class="group-run-summary"><span>{{ groups.statusMessage.value || "尚未运行增量聚类" }}</span><strong>{{ groups.total.value }} 组</strong></div>
 
     <header class="cluster-list-heading">
       <div>
@@ -457,4 +439,12 @@ onMounted(() => {
 @media(max-width:1180px){.cluster-list-heading{align-items:flex-start;flex-direction:column}.cluster-list-tools{width:100%;flex-wrap:wrap;justify-content:flex-start}.cluster-operation-summary{grid-template-columns:1fr auto}.cluster-operation-summary dl{grid-column:1/-1;grid-row:2}}
 @media(max-width:980px){.cluster-identity-editor{grid-template-columns:1fr 2fr}.cluster-identity-editor button{grid-column:1/-1}}
 @media(max-width:620px){.cluster-list-tools{display:grid;grid-template-columns:1fr 1fr}.cluster-list-tools label,.cluster-list-tools output{grid-column:1/-1}.cluster-operation-summary{grid-template-columns:1fr}.cluster-operation-summary dl{grid-template-columns:1fr}.cluster-identity-editor{grid-template-columns:1fr}.cluster-member-toolbar,.cluster-detail-pagination{align-items:flex-start;flex-direction:column}}
+.intelligence-panel{display:grid;height:100%;min-height:0;grid-template-rows:auto auto auto auto minmax(0,1fr) auto auto;gap:0;overflow:hidden;border:0;border-radius:0;color:#222;background:#fff;box-shadow:none}
+.group-summary-bar{display:flex!important;min-height:48px;align-items:center!important;justify-content:space-between;gap:10px;padding:8px 10px!important;border:0!important;border-radius:8px;background:#f2f2f2}.group-summary-bar>span{font-size:12px;color:#555}.group-summary-bar>div{display:flex;align-items:center;gap:6px}.no-cost-inline{color:#4d755f;font-size:10px}
+.intelligence-button{min-height:32px;padding:0 10px;border:1px solid #dedede;border-radius:8px;font-weight:400}.intelligence-button.primary{color:#fff;border-color:#606060;background:#606060}.intelligence-button.quiet{color:#444;background:#fff}
+.cluster-controls{display:grid!important;max-height:0;grid-template-columns:1.15fr minmax(0,2fr) auto;gap:7px;margin:0!important;padding:0!important;overflow:hidden;border:0!important;background:#fff!important;transition:max-height .2s ease,padding .2s}.cluster-controls.is-open{max-height:220px;margin-bottom:12px!important;padding-top:8px!important}.cluster-controls fieldset{display:flex;gap:7px;padding:0;border:0}.cluster-controls>label,.cluster-type-option{padding:8px!important;border:1px solid #e2e2e2!important;border-radius:9px;background:#fff!important}.cluster-type-option{flex:1}
+.cluster-feedback{gap:7px}.operation-status{margin-top:8px;border:0!important;border-radius:8px!important;background:#f2f2f2!important}.cluster-list-heading{min-height:48px;margin:0!important;padding:10px 0;border-bottom:1px solid #e7e7e7}.cluster-list-heading>div:first-child{gap:8px}.cluster-list-heading strong{font-size:14px;font-weight:500}.cluster-list-heading span,.cluster-list-tools>output{color:#777;font-weight:400}.cluster-list-tools label{display:flex!important;align-items:center!important;gap:6px!important}.cluster-list-tools select{height:32px;padding:0 9px;border-color:#dedede;border-radius:8px;background:#fff}
+.group-run-summary{display:flex;min-height:36px;align-items:center;justify-content:space-between;gap:10px;margin-top:8px;padding:7px 10px;border-radius:8px;color:#777;font-size:12px;background:#f7f7f7}.group-run-summary strong{color:#333;font-weight:500}
+.cluster-grid{grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;max-height:none!important;padding:8px 0;overflow:auto}.cluster-card{padding:6px;border:0;border-radius:10px;background:transparent;box-shadow:none}.cluster-card.selected{background:#f2f2f2}.cluster-select{top:8px;left:8px;color:#555;background:rgb(255 255 255 / 86%);backdrop-filter:none}.cluster-preview{background:transparent}.cluster-image-stage{border-radius:9px;background:linear-gradient(140deg,#f2f2f2,#e5e5e5)}.cluster-type-chip,.anchor-chip{color:#555;background:#ededed}.cluster-pagination{justify-content:center!important;min-height:46px;border-top:1px solid #e5e5e5;color:#777}.cluster-pagination>div{display:flex;gap:7px}.propagation-policy{min-height:34px;margin-top:0;padding:8px 10px;border:1px solid #eadfc9;border-radius:8px;color:#6f5c3e;background:#fffaf0}
+.cluster-modal-backdrop{background:rgb(0 0 0 / 15%)}.cluster-modal{width:min(520px,calc(100vw - 40px));max-height:calc(100vh - 56px);grid-template-rows:auto auto auto auto minmax(0,1fr) auto;padding:18px;border-color:#e3e3e3;border-radius:14px;background:#fff;box-shadow:0 24px 70px rgb(0 0 0 / 18%)}.cluster-modal>header .intelligence-eyebrow{display:none}.cluster-modal>header h3{font-size:15px;font-weight:500}.cluster-identity-editor{grid-template-columns:120px minmax(180px,1fr);padding:0;border:0;border-radius:0;background:#fff}.cluster-identity-editor button{grid-column:1/-1;justify-self:end}.cluster-member-grid{grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;overflow:auto}.cluster-member{border:0;border-radius:8px;background:#f3f3f3}.cluster-member-toolbar{border:0;border-radius:8px;background:#f2f2f2}
 </style>
