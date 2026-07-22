@@ -196,9 +196,7 @@ class ResultCatalogTests(unittest.TestCase):
         self.assertEqual(page.source_label, "最新搜索")
 
     def test_search_history_lists_and_reopens_persisted_result_sets(self) -> None:
-        self._manifest(
-            "旧搜索", "2026-07-18T12:00:00+08:00", copied_file="旧图.jpg"
-        )
+        self._manifest("旧搜索", "2026-07-18T12:00:00+08:00", copied_file="旧图.jpg")
         new = self._manifest(
             "最新搜索", "2026-07-18T13:00:00+08:00", copied_file="新图.jpg"
         )
@@ -218,14 +216,13 @@ class ResultCatalogTests(unittest.TestCase):
         self.assertEqual(reopened.items[0].name, "新图.jpg")
 
     def test_search_history_rejects_path_traversal(self) -> None:
-        self._manifest(
-            "安全搜索", "2026-07-18T13:00:00+08:00", copied_file="图片.jpg"
-        )
+        self._manifest("安全搜索", "2026-07-18T13:00:00+08:00", copied_file="图片.jpg")
         catalog = ResultCatalog.from_config(self.config_path)
 
         for history_id in ("../安全搜索", r"..\安全搜索", ".", ""):
-            with self.subTest(history_id=history_id), self.assertRaisesRegex(
-                ResultCatalogError, "history id"
+            with (
+                self.subTest(history_id=history_id),
+                self.assertRaisesRegex(ResultCatalogError, "history id"),
             ):
                 catalog.load_history(history_id)
 

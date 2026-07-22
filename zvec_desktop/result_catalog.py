@@ -442,10 +442,7 @@ class ResultCatalog:
         if not isinstance(history_id, str):
             raise ResultCatalogError("Search history id must be text.")
         normalized = history_id.strip()
-        if (
-            not normalized
-            or len(normalized) > 200
-        ):
+        if not normalized or len(normalized) > 200:
             raise ResultCatalogError("Search history id is invalid.")
         directory_name = _decode_history_id(normalized)
         if (
