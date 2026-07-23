@@ -484,7 +484,7 @@ describe("OrganizePage batch tags", () => {
       "lib-1",
       "folder-raiden",
       1,
-      32,
+      24,
       false,
       expect.any(AbortSignal),
     );
@@ -523,7 +523,7 @@ describe("OrganizePage batch tags", () => {
       "lib-1",
       "folder-raiden",
       1,
-      32,
+      24,
       false,
       expect.any(AbortSignal),
     );
@@ -534,7 +534,7 @@ describe("OrganizePage batch tags", () => {
       "lib-1",
       "folder-raiden",
       2,
-      32,
+      24,
       false,
       expect.any(AbortSignal),
     );
@@ -545,12 +545,12 @@ describe("OrganizePage batch tags", () => {
     await vi.advanceTimersByTimeAsync(160);
     await flushPromises();
 
-    // Page 2 at 32 items starts at item 33. With a 10-item page, page 4
-    // starts at item 31, so the former first visible item remains on screen.
+    // Page 2 at 24 items starts at item 25. With a 10-item page, page 3
+    // starts at item 21, so the former first visible item remains on screen.
     expect(api.listFolderImages).toHaveBeenLastCalledWith(
       "lib-1",
       "folder-raiden",
-      4,
+      3,
       10,
       false,
       expect.any(AbortSignal),

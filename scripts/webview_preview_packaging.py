@@ -377,11 +377,7 @@ def validate_static_inputs(plan: BuildPlan) -> None:
         / "webview_preview"
         / "hooks"
         / "hook-webview.py",
-        plan.repository_root
-        / "release"
-        / "webview_preview"
-        / "hooks"
-        / "hook-clr.py",
+        plan.repository_root / "release" / "webview_preview" / "hooks" / "hook-clr.py",
         plan.repository_root / "release" / "python_preview" / "hooks" / "hook-zvec.py",
         plan.spec_path,
         plan.icon_path,
