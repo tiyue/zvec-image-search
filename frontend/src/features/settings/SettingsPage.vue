@@ -166,31 +166,27 @@ function chooseResultsDirectory(): void {
       <p class="section-copy">所有字段都可以修改。路径变化可能需要在当前任务结束后重启软件。</p>
 
       <form class="results-form" @submit.prevent="settings.saveResults">
-        <label>
-          <span>全局搜索结果目录</span>
-          <span class="path-control">
-            <input
-              v-model="settings.resultsDirectory.value"
-              name="results_directory"
-              required
-              autocomplete="off"
-              spellcheck="false"
-              placeholder="D:\Zvec\results"
-            />
-            <button
-              class="path-picker"
-              type="button"
-              :disabled="Boolean(choosingDirectory)"
-              @click="chooseResultsDirectory"
-            >
-              {{ choosingDirectory === "results" ? "选择中…" : "选择" }}
-            </button>
-          </span>
-          <small>所有图库共用；必须是 Windows 绝对路径。</small>
-        </label>
+        <span class="results-form-label">全局搜索结果目录</span>
+        <input
+          v-model="settings.resultsDirectory.value"
+          name="results_directory"
+          required
+          autocomplete="off"
+          spellcheck="false"
+          placeholder="D:\Zvec\results"
+        />
+        <button
+          class="path-picker"
+          type="button"
+          :disabled="Boolean(choosingDirectory)"
+          @click="chooseResultsDirectory"
+        >
+          {{ choosingDirectory === "results" ? "选择中…" : "选择" }}
+        </button>
         <button class="button secondary" type="submit" :disabled="settings.savingResults.value">
           {{ settings.savingResults.value ? "保存中…" : "单独保存结果目录" }}
         </button>
+        <small class="results-form-hint">所有图库共用；必须是 Windows 绝对路径。</small>
       </form>
 
       <form
@@ -506,7 +502,9 @@ input:focus, select:focus { border-color: #796cf0; box-shadow: 0 0 0 3px rgba(12
 .path-picker:disabled { cursor: not-allowed; opacity: .5; }
 label { display: grid; gap: 5px; color: #626b82; font-size: 12px; font-weight: 700; }
 label small { color: #8a91a2; font-weight: 500; }
-.results-form { display: grid; grid-template-columns: minmax(280px,1fr) auto; gap: 12px; align-items: end; margin-top: 14px; padding: 12px; border-radius: 12px; background: #f5f4ff; }
+.results-form { display: grid; grid-template-columns: 1fr auto auto; gap: 8px 12px; align-items: center; margin-top: 14px; padding: 12px; border-radius: 12px; background: #f5f4ff; }
+.results-form-label { grid-column: 1 / -1; color: #626b82; font-size: 12px; font-weight: 700; }
+.results-form-hint { grid-column: 1 / -1; color: #8a91a2; font-size: 12px; font-weight: 500; }
 .library-list { display: grid; gap: 11px; margin-top: 13px; }
 .library-editor { padding: 13px; border: 1px solid #dfe3ec; border-radius: 13px; background: #fbfcff; }
 .new-library-editor { margin-top: 13px; border-color: #bfb7ff; background: linear-gradient(145deg, #fbfaff, #f5f7ff); box-shadow: 0 10px 26px rgba(90,73,205,.08); }
@@ -548,6 +546,7 @@ label small { color: #8a91a2; font-weight: 500; }
 .button.primary { color:#fff; border-color:#606060; background:#606060; }
 .button.secondary { color:#333; border-color:#dedede; background:#f3f3f3; }
 .path-picker { border-color:#dedede; color:#444; background:#f5f5f5; font-weight:500; }
+.results-form { grid-template-columns: 1fr auto auto; }
 .results-form,.library-editor,.new-library-editor,.toggle-option,.credential-note { border-color:#e5e5e5; background:#fff; box-shadow:none; }
 .results-form { padding:12px 0; border-radius:0; border-bottom:1px solid #e7e7e7; }
 .library-editor { padding:13px 0; border-width:0 0 1px; border-radius:0; }

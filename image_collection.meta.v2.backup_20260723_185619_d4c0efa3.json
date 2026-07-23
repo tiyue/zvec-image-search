@@ -1,0 +1,11 @@
+{
+  "schema_version": 2,
+  "model": "qwen3-vl-embedding",
+  "mode": "independent",
+  "dimension": 1024,
+  "metric": "COSINE",
+  "created_at": "2026-07-11T20:20:57.467773+00:00",
+  "collection_uuid": "76abd7f2-a52c-4857-8c2c-4adea4f1077e",
+  "migrated_from_schema": 1,
+  "migrated_at": "2026-07-12T00:38:22.768163+00:00"
+}

@@ -936,7 +936,7 @@ textarea { resize: vertical; line-height: 1.5; }
 .gallery-viewport { min-height: 0; overflow: hidden; }
 .image-grid { display: grid; height: 100%; min-height: 0; grid-template-columns: repeat(var(--organize-gallery-columns,5),minmax(0,1fr)); grid-template-rows: repeat(var(--organize-gallery-rows,3),minmax(0,1fr)); align-content: stretch; gap: 9px; overflow: hidden; padding: 2px 3px 8px 1px; }
 .image-grid.is-scroll-layout { grid-auto-rows: minmax(210px,auto); grid-template-rows: none; overflow: auto; }
-.image-tile { position: relative; min-width: 0; min-height: 0; overflow: hidden; border: 1px solid #e1e5ee; border-radius: 12px; background: #fff; content-visibility: auto; contain-intrinsic-size: 210px 168px; }
+.image-tile { position: relative; display: grid; grid-template-rows: minmax(0,1fr) auto; min-width: 0; min-height: 0; overflow: hidden; border: 1px solid #e1e5ee; border-radius: 12px; background: #fff; content-visibility: auto; contain-intrinsic-size: 210px 168px; }
 .image-tile.selected { border-color: #6d5ee3; box-shadow: 0 0 0 2px rgba(109,94,227,.16); }
 .image-select { display: grid; width: 100%; height: 100%; padding: 0; border: 0; color: inherit; background: transparent; text-align: left; cursor: pointer; grid-template-rows: minmax(0,1fr) auto; }
 .selection-marker { position: absolute; z-index: 2; top: 7px; left: 7px; display: grid; width: 21px; height: 21px; place-items: center; border: 1px solid rgba(255,255,255,.7); border-radius: 7px; color: white; background: rgba(22,27,45,.45); font-size: 12px; font-weight: 900; backdrop-filter: blur(6px); }

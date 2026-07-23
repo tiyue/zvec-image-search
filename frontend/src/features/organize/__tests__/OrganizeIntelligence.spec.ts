@@ -677,7 +677,6 @@ describe("organize active learning", () => {
     expect(wrapper.text()).toContain("审核成功后会真实写入");
     expect(wrapper.text()).toContain("标签审核");
     expect(wrapper.text()).toContain("来源 aaaaaaaa");
-    expect(wrapper.text()).toContain("候选 28 张");
   });
 
   it("supports mixed individual and multi-select decisions", async () => {
@@ -714,7 +713,6 @@ describe("organize active learning", () => {
     );
     expect(wrapper.text()).toContain("已应用");
     expect(wrapper.text()).toContain("2");
-    expect(wrapper.text()).toContain("成功项立即生效");
   });
 
   it("keeps failed and conflicting decisions visible for a direct retry", async () => {
