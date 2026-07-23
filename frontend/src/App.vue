@@ -691,9 +691,6 @@ watch(
           <button type="button" :class="{ active: activePage === 'search' }" @click="setPage('search')">搜索</button>
           <button type="button" :class="{ active: activePage === 'tasks' }" @click="setPage('tasks')">图库任务</button>
         </div>
-        <button class="icon-button help-button" type="button" aria-label="帮助" title="快捷键：Ctrl+K 搜索，Alt+1–5 切换模块">
-          <AppIcon name="help" :size="17" />
-        </button>
       </header>
 
       <section v-show="activePage === 'search'" class="search-page" :class="{ 'is-landing': !hasSearchActivity }" data-page-section="search">

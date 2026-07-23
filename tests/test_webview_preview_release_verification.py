@@ -33,6 +33,8 @@ def _payload(root: Path) -> Path:
     for relative in (
         "_internal/python312.dll",
         "_internal/pythonnet/runtime/Python.Runtime.dll",
+        "_internal/pythonnet/runtime/netstandard.dll",
+        "_internal/pythonnet/runtime/System.Runtime.dll",
         "_internal/webview/lib/Microsoft.Web.WebView2.Core.dll",
         "_internal/webview/lib/Microsoft.Web.WebView2.WinForms.dll",
         "_internal/webview/lib/WebBrowserInterop.x64.dll",

@@ -7,7 +7,7 @@ const GRID_GAP = 9;
 const MIN_COLUMNS = 2;
 const MAX_COLUMNS = 8;
 const MIN_ROWS = 2;
-const MAX_ROWS = 4;
+const MAX_ROWS = 3;
 
 export interface OrganizeGalleryCapacity {
   columns: number;

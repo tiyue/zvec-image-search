@@ -129,7 +129,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             storage_path=str(runtime.facade.config_home / "webview"),
         )
     except Exception as exc:
-        _report_startup_error(f"WebView2 窗口启动失败：{exc}")
+        _report_startup_error(_enrich_webview_error(f"WebView2 窗口启动失败：{exc}"))
         with suppress(BackendBusyError):
             runtime.close(force=False)
         return 1
@@ -175,6 +175,20 @@ def _notify_close_failed(window: Any) -> None:
         window.evaluate_js("window.dispatchEvent(new CustomEvent('zvec-close-failed'))")
     except Exception:
         return
+
+
+def _enrich_webview_error(message: str) -> str:
+    """Append actionable guidance when the error originates from pythonnet."""
+    low = message.casefold()
+    if "python.runtime" not in low and "clr_loader" not in low:
+        return message
+    return (
+        f"{message}\n\n"
+        "可能原因：.NET Framework 4.6.1+ 未安装，"
+        "或文件在下载/解压过程中损坏。\n"
+        "建议：1) 安装 .NET Framework 4.8 运行时；"
+        "2) 重新下载并解压压缩包。"
+    )
 
 
 def _report_startup_error(message: str) -> None:

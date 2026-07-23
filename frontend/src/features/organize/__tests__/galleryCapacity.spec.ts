@@ -7,7 +7,7 @@ import {
 
 describe("calculateOrganizeGalleryCapacity", () => {
   it.each([
-    { viewport: "2559×1398", width: 1547, height: 1030, columns: 8, rows: 4, pageSize: 32 },
+    { viewport: "2559×1398", width: 1547, height: 1030, columns: 8, rows: 3, pageSize: 24 },
     { viewport: "1920×1080", width: 908, height: 716, columns: 5, rows: 3, pageSize: 15 },
     { viewport: "1600×900", width: 980, height: 536, columns: 5, rows: 2, pageSize: 10 },
     { viewport: "1440×900", width: 860, height: 536, columns: 4, rows: 2, pageSize: 8 },
@@ -23,8 +23,8 @@ describe("calculateOrganizeGalleryCapacity", () => {
   it("keeps the maximum page bounded even on an oversized gallery", () => {
     expect(calculateOrganizeGalleryCapacity(4_000, 2_000)).toEqual({
       columns: 8,
-      rows: 4,
-      pageSize: 32,
+      rows: 3,
+      pageSize: 24,
       scrollRequired: false,
     });
   });

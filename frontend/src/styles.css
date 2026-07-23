@@ -123,7 +123,6 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .top-switch { display: grid; width: 216px; height: 38px; grid-template-columns: 1fr 1fr; gap: 2px; padding: 2px; border-radius: 19px; background: #f2f2f2; }
 .top-switch button { border: 0; border-radius: 17px; color: #777; font-size: 13px; background: transparent; }
 .top-switch button.active { color: #171717; background: #fff; box-shadow: 0 1px 4px rgb(0 0 0 / 13%); }
-.help-button { position: absolute; right: 12px; }
 
 /* Search */
 .search-page { height: 100%; overflow: hidden; background: #fff; }

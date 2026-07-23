@@ -91,11 +91,21 @@ _REQUIRED_RELATIVE_SUFFIXES = (
 _REQUIRED_NAMED_FILES = (
     "python312.dll",
     "Python.Runtime.dll",
+    "netstandard.dll",
+    "System.Runtime.dll",
     "Microsoft.Web.WebView2.Core.dll",
     "Microsoft.Web.WebView2.WinForms.dll",
     "WebBrowserInterop.x64.dll",
     "model-catalog.default.json",
     "Zvec.AppIcon.ico",
+)
+# Minimum .NET Standard 2.0 facade assemblies that must co-locate with
+# Python.Runtime.dll so the .NET Framework CLR can resolve its type
+# dependencies when loaded via clr_loader's custom AppDomain.
+_REQUIRED_PYTHONNET_RUNTIME_FILES = (
+    "pythonnet/runtime/Python.Runtime.dll",
+    "pythonnet/runtime/netstandard.dll",
+    "pythonnet/runtime/System.Runtime.dll",
 )
 _MAX_MANIFEST_BYTES = 16 * 1024 * 1024
 
@@ -367,6 +377,11 @@ def validate_static_inputs(plan: BuildPlan) -> None:
         / "webview_preview"
         / "hooks"
         / "hook-webview.py",
+        plan.repository_root
+        / "release"
+        / "webview_preview"
+        / "hooks"
+        / "hook-clr.py",
         plan.repository_root / "release" / "python_preview" / "hooks" / "hook-zvec.py",
         plan.spec_path,
         plan.icon_path,
@@ -539,6 +554,13 @@ def inspect_payload(payload_directory: Path) -> PayloadInspection:
     for required_name in _REQUIRED_NAMED_FILES:
         if required_name.casefold() not in folded_names:
             errors.append(f"Required runtime file is missing: {required_name}")
+    for required_suffix in _REQUIRED_PYTHONNET_RUNTIME_FILES:
+        if not any(
+            path.endswith(required_suffix.casefold()) for path in folded_relative
+        ):
+            errors.append(
+                f"Required pythonnet runtime file is missing: {required_suffix}"
+            )
     for suffix in _REQUIRED_RELATIVE_SUFFIXES:
         if not any(path.endswith(suffix.casefold()) for path in folded_relative):
             errors.append(f"Required web asset is missing: {suffix}")

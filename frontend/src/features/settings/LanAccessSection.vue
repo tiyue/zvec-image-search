@@ -76,10 +76,12 @@ function readableTime(value: string): string {
         <span>服务端口</span>
         <input v-model.number="lan.draft.port" name="lan_port" type="number" min="1" max="65535" />
       </label>
-      <label class="lan-enabled">
-        <input v-model="lan.draft.enabled" name="lan_enabled" type="checkbox" />
-        <span><strong>允许 Android 局域网访问</strong><small>软件退出后服务会立即停止。</small></span>
-      </label>
+      <div class="lan-toggle-row">
+        <label class="lan-enabled">
+          <span><strong>允许 Android 局域网访问</strong><small>软件退出后服务会立即停止。</small></span>
+          <input v-model="lan.draft.enabled" name="lan_enabled" type="checkbox" />
+        </label>
+      </div>
       <div class="lan-actions">
         <button class="button secondary" type="submit" :disabled="lan.busy.value">
           {{ lan.saving.value ? "保存中…" : "保存设置" }}
@@ -159,7 +161,7 @@ function readableTime(value: string): string {
 .lan-heading{align-items:flex-start}.lan-heading>div{display:block}.lan-heading h2,.pairing-panel h3,.paired-device h3{margin:2px 0 0}.lan-heading p:not(.eyebrow),.pairing-panel header p{margin:6px 0 0;color:#68718a}
 .eyebrow{margin:0;color:#6557e8;font-size:11px;font-weight:850;letter-spacing:.08em}.status-pill{padding:5px 9px;border-radius:999px;color:#6d7486;background:#eef1f6;font-size:11px;font-weight:800}.status-pill.success{color:#176b55;background:#e9f8f1}
 .lan-warning{display:grid;gap:3px;padding:11px 13px;border:1px solid #f0c488;border-radius:12px;color:#74450f;background:#fff8ec}.lan-warning span{font-size:12px;line-height:1.5}
-.lan-form{display:grid;grid-template-columns:1fr 1fr 150px;gap:11px}.lan-form>label:not(.lan-enabled){display:grid;gap:5px;font-size:12px;font-weight:750}.lan-form input,.lan-form select{width:100%;height:40px;border:1px solid #d5dae6;border-radius:10px;padding:0 10px;color:#17203a;background:#fff;font:inherit}.lan-enabled{display:flex;grid-column:1/-1;align-items:flex-start;gap:9px;padding:10px;border-radius:11px;background:#f7f8fc}.lan-enabled span{display:grid;gap:2px}.lan-enabled small{color:#747d90}.lan-actions{grid-column:1/-1;justify-content:flex-end;flex-wrap:wrap}
+.lan-form{display:grid;grid-template-columns:1fr 1fr 150px;gap:11px}.lan-form>label:not(.lan-enabled){display:grid;gap:5px;font-size:12px;font-weight:750}.lan-form input,.lan-form select{width:100%;height:40px;border:1px solid #d5dae6;border-radius:10px;padding:0 10px;color:#17203a;background:#fff;font:inherit}.lan-toggle-row{grid-column:1/-1;border-top:1px solid #e1e6ef;border-bottom:1px solid #e1e6ef}.lan-enabled{display:flex;align-items:center;justify-content:space-between;gap:16px;min-height:56px;padding:0}.lan-enabled span{display:grid;gap:3px}.lan-enabled small{color:#747d90}.lan-enabled input[type="checkbox"]{width:20px;height:20px;flex:0 0 auto;accent-color:#6557e8}.lan-actions{grid-column:1/-1;justify-content:flex-end;flex-wrap:wrap}
 .lan-runtime{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin:0}.lan-runtime div{padding:10px 12px;border-radius:11px;background:#f3f4fb}.lan-runtime dt{color:#737d91;font-size:10px}.lan-runtime dd{margin:4px 0 0;overflow:hidden;font-size:12px;font-weight:800;text-overflow:ellipsis;white-space:nowrap}
 .pairing-panel{display:grid;gap:10px;padding:13px;border:1px solid #e1e5ee;border-radius:13px}.pairing-panel header>span{font-size:11px;font-weight:800}.pairing-list{display:grid;gap:8px}.pairing-list article{padding:10px;border-radius:10px;background:#f8f7ff}.pairing-list article>div{display:flex;align-items:center;gap:8px}.pairing-list article>div:first-child{display:grid;gap:3px}.pairing-list span,.paired-device span{color:#727b8f;font-size:11px}.pairing-list b{color:#4f42bb;font-size:16px;letter-spacing:.14em}.lan-empty{margin:0;padding:14px;color:#798297;text-align:center;background:#f7f8fb;border-radius:10px}
 .pairing-safety{margin:0;padding:9px 11px;border-radius:10px;color:#7a4a0b;background:#fff6e7;font-size:12px;line-height:1.5}
