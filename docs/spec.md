@@ -75,7 +75,7 @@ Vue 3 + TypeScript + Vite SPA：
 - 功能模块（`src/features/`）：search-learning、organize、settings、tasks、activity、cleanup
 - API 层（`src/api/`）：`client.ts`、`gateway.ts`
 - 构建产物嵌入 `zvec_webview/frontend_dist/`
-- 缩略图显示策略：所有图片网格统一使用 `object-fit: contain` 确保全图可见不裁切；图库浏览 4 列 + dense 自动填充，待学习 2 列 + dense 自动填充，搜索结果 5×3 固定布局；横图（宽高比 > 1.5）自动跨 2 列
+- 缩略图显示策略：所有图片网格统一使用 `object-fit: contain` 确保全图可见不裁切；图库浏览 4 列 + dense 自动填充，待学习 2 列 + dense 自动填充，搜索结果 5×3 固定布局；横图（宽高比 > 1.5）自动跨 2 列；网格采用 masonry 瀑布流布局（`grid-auto-rows: 10px` + 动态 `grid-row: span N`），每张图的行跨度由宽高比和列宽自动计算，竖图高窄、横图矮宽，dense 模式自动填缝
 
 ### zvec_webview（WebView 宿主）
 

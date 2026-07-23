@@ -12,6 +12,9 @@ import PaginationBar from "../../components/PaginationBar.vue";
 import ActiveLearningPanel from "./ActiveLearningPanel.vue";
 import {
   calculateOrganizeGalleryCapacity,
+  GALLERY_META_OVERHEAD,
+  GRID_GAP,
+  gridRowSpan,
   gridSpan,
   type OrganizeGalleryCapacity,
 } from "./galleryCapacity";
@@ -53,6 +56,7 @@ const aliasCanonical = ref("");
 const aliasInput = ref("");
 const failedThumbnails = ref<Set<string>>(new Set());
 const galleryViewport = ref<HTMLElement | null>(null);
+const containerWidth = ref(0);
 const galleryCapacity = ref<OrganizeGalleryCapacity>(
   calculateOrganizeGalleryCapacity(0, 0),
 );
@@ -158,10 +162,24 @@ function formatBytes(value: number): string {
 function updateGalleryCapacity(reload: boolean): void {
   const element = galleryViewport.value;
   if (!element) return;
+  containerWidth.value = element.clientWidth;
   const next = calculateOrganizeGalleryCapacity(element.clientWidth, element.clientHeight);
   if (next.pageSize === galleryCapacity.value.pageSize) return;
   galleryCapacity.value = next;
   void organize.setImagePageSize(next.pageSize, reload);
+}
+
+function tileRowSpan(image: OrganizeImage): number {
+  const colSpan = gridSpan(image.width, image.height);
+  return gridRowSpan(
+    image.width,
+    image.height,
+    colSpan,
+    containerWidth.value,
+    4,
+    GRID_GAP,
+    GALLERY_META_OVERHEAD,
+  );
 }
 
 function scheduleGalleryCapacityUpdate(): void {
@@ -508,6 +526,7 @@ onBeforeUnmount(() => {
                 selected: organize.isImageSelected(image.id),
                 'span-2': gridSpan(image.width, image.height) === 2,
               }"
+              :style="{ gridRow: `span ${tileRowSpan(image)}` }"
               :data-image-id="image.id"
             >
               <button
@@ -929,7 +948,7 @@ textarea { resize: vertical; line-height: 1.5; }
 .toolbar-button { border: 1px solid #dde1ec; border-radius: 8px; padding: 6px 9px; color: #515b73; background: #f8f9fc; font: inherit; font-size: 11px; font-weight: 750; cursor: pointer; transition: .12s ease; }
 .toolbar-button.quiet { color: #8a5260; background: #fff6f7; }
 .gallery-viewport { min-height: 0; overflow: auto; }
-.image-grid { display: grid; min-height: 0; grid-template-columns: repeat(4, 1fr); grid-auto-flow: row dense; grid-auto-rows: 1fr; gap: 9px; overflow: auto; padding: 2px 3px 8px 1px; }
+.image-grid { display: grid; min-height: 0; grid-template-columns: repeat(4, 1fr); grid-auto-flow: row dense; grid-auto-rows: 10px; gap: 9px; overflow: auto; padding: 2px 3px 8px 1px; }
 .image-tile.span-2 { grid-column: span 2; }
 .image-tile { position: relative; display: grid; grid-template-rows: minmax(0,1fr) auto; min-width: 0; min-height: 0; overflow: hidden; border: 1px solid #e1e5ee; border-radius: 12px; background: #fff; content-visibility: auto; contain-intrinsic-size: 210px 168px; }
 .image-tile.selected { border-color: #6d5ee3; box-shadow: 0 0 0 2px rgba(109,94,227,.16); }
