@@ -28,6 +28,25 @@ class ServerAddressTest {
     }
 
     @Test
+    fun isValidIpv4AcceptsPublicAndPrivateAddresses() {
+        assertTrue(ServerAddress.isValidIpv4("192.168.1.20"))
+        assertTrue(ServerAddress.isValidIpv4("10.0.0.1"))
+        assertTrue(ServerAddress.isValidIpv4("39.105.48.52"))
+        assertTrue(ServerAddress.isValidIpv4("8.8.8.8"))
+        assertTrue(ServerAddress.isValidIpv4("127.0.0.1"))
+
+        listOf(
+            "192.168.01.20",
+            "256.1.1.1",
+            "1.2.3",
+            "1.2.3.4.5",
+            "zvec.local",
+            "::1",
+            "",
+        ).forEach { assertFalse("Expected rejection: $it", ServerAddress.isValidIpv4(it)) }
+    }
+
+    @Test
     fun normalizesPrivateManualAddress() {
         assertEquals(
             "http://192.168.1.20:38522",
@@ -36,11 +55,18 @@ class ServerAddressTest {
     }
 
     @Test
-    fun rejectsPublicDnsHttpsAndPathInputs() {
-        assertNull(ServerAddress.fromHostPort("8.8.8.8", 38522))
+    fun normalizesPublicManualAddress() {
+        assertEquals(
+            "http://39.105.48.52:38522",
+            ServerAddress.fromHostPort("39.105.48.52", 38522),
+        )
+    }
+
+    @Test
+    fun rejectsDnsHttpsAndPathInputs() {
         assertNull(ServerAddress.fromHostPort("zvec.local", 38522))
         assertNull(ServerAddress.fromHostPort("https://192.168.1.20", 38522))
         assertNull(ServerAddress.fromHostPort("http://192.168.1.20/admin", 38522))
-        assertNull(ServerAddress.fromHostPort("127.0.0.1", 38522))
+        assertNull(ServerAddress.fromHostPort("192.168.01.20", 38522))
     }
 }

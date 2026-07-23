@@ -1,6 +1,7 @@
 package com.zvec.lanviewer.ui
 
 import android.net.Uri
+import com.zvec.lanviewer.data.local.SavedFileRecord
 import com.zvec.lanviewer.data.model.DiscoveredServer
 import com.zvec.lanviewer.data.model.LibraryDto
 import com.zvec.lanviewer.data.model.SearchItem
@@ -50,6 +51,7 @@ data class AppUiState(
     val viewerIndex: Int? = null,
     val transferMessage: String? = null,
     val transferFraction: Float? = null,
+    val savedFiles: List<SavedFileRecord> = emptyList(),
 )
 
 /**

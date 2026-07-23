@@ -66,6 +66,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -92,6 +93,7 @@ import coil.compose.AsyncImage
 import coil.compose.SubcomposeAsyncImage
 import coil.compose.SubcomposeAsyncImageContent
 import coil.request.ImageRequest
+import com.zvec.lanviewer.data.local.SavedFileRecord
 import com.zvec.lanviewer.data.local.ServerAddress
 import com.zvec.lanviewer.data.model.DiscoveredServer
 import com.zvec.lanviewer.data.model.LibraryDto
@@ -100,6 +102,7 @@ import com.zvec.lanviewer.data.model.SearchMode
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filterNotNull
 import java.text.DecimalFormat
+import java.text.SimpleDateFormat
 
 @Composable
 fun ZvecApp(viewModel: AppViewModel) {
@@ -108,7 +111,7 @@ fun ZvecApp(viewModel: AppViewModel) {
     val snackbarHostState = remember { SnackbarHostState() }
     val currentItem = state.viewerIndex?.let(state.results::getOrNull)
 
-    val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+    val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
         uri?.let {
             runCatching {
                 context.contentResolver.takePersistableUriPermission(
@@ -185,7 +188,7 @@ fun ZvecApp(viewModel: AppViewModel) {
                 onText = viewModel::setSearchText,
                 onTopK = viewModel::setTopK,
                 onLibrary = viewModel::toggleLibrary,
-                onPickImage = { imagePicker.launch(arrayOf("image/*", "application/octet-stream")) },
+                onPickImage = { imagePicker.launch("image/*") },
                 onCancelUpload = viewModel::cancelQueryUpload,
                 onClearImage = viewModel::clearQueryImage,
                 onSearch = viewModel::search,
@@ -354,17 +357,6 @@ private fun SearchScreen(
     }
 
     Column(modifier.fillMaxSize().statusBarsPadding()) {
-        Row(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Column(Modifier.weight(1f)) {
-                Text("Zvec", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
-                Text(state.serverName.orEmpty(), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.secondary)
-            }
-            Text("● 已连接", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.secondary)
-        }
-
         Box(Modifier.weight(1f).fillMaxWidth()) {
             when (selectedTab) {
                 MobileTab.SEARCH -> SearchControls(
@@ -428,18 +420,54 @@ private fun MobileBottomBar(selected: MobileTab, onSelected: (MobileTab) -> Unit
 
 @Composable
 private fun DevicePanel(state: AppUiState, onDisconnect: () -> Unit) {
-    Column(
+    val context = LocalContext.current
+    LazyColumn(
         modifier = Modifier.fillMaxSize().padding(20.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        Text("连接设备", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
-        Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) {
-            Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                Text(state.serverName ?: "Zvec 电脑", fontWeight = FontWeight.SemiBold)
-                Text("已连接 · ${state.libraries.size} 个图库", style = MaterialTheme.typography.bodySmall)
+        item {
+            Text("连接设备", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
+        }
+        item {
+            Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) {
+                Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text(state.serverName ?: "Zvec 电脑", fontWeight = FontWeight.SemiBold)
+                    Text("已连接 · ${state.libraries.size} 个图库", style = MaterialTheme.typography.bodySmall)
+                }
             }
         }
-        OutlinedButton(onClick = onDisconnect, modifier = Modifier.fillMaxWidth()) { Text("断开并重新发现") }
+        item {
+            Text("已保存文件", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+        }
+        if (state.savedFiles.isEmpty()) {
+            item {
+                Text(
+                    "暂无已保存的文件",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.secondary,
+                )
+            }
+        } else {
+            items(state.savedFiles.size, key = { "saved-${state.savedFiles[it].uri}-${state.savedFiles[it].savedAtMillis}" }) { index ->
+                val record = state.savedFiles[index]
+                Card(
+                    modifier = Modifier.fillMaxWidth().clickable {
+                        runCatching {
+                            context.startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(Uri.parse(record.uri), "image/*"))
+                        }
+                    },
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                ) {
+                    Column(Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                        Text(record.name, maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.Medium)
+                        Text(formatTime(record.savedAtMillis), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.secondary)
+                    }
+                }
+            }
+        }
+        item {
+            OutlinedButton(onClick = onDisconnect, modifier = Modifier.fillMaxWidth()) { Text("断开并重新发现") }
+        }
     }
 }
 
@@ -697,6 +725,10 @@ private fun OriginalViewer(
     BackHandler(onBack = onClose)
     val initial = state.viewerIndex?.coerceIn(state.results.indices) ?: 0
     val pagerState = rememberPagerState(initialPage = initial, pageCount = { state.results.size })
+    var sheetItem by remember { mutableStateOf<SearchItem?>(null) }
+    var showInfo by remember { mutableStateOf(false) }
+    val rotations = remember { mutableStateMapOf<Int, Float>() }
+
     LaunchedEffect(pagerState) {
         snapshotFlow { pagerState.currentPage }.distinctUntilChanged().collect { page ->
             onIndexChanged(page)
@@ -705,35 +737,21 @@ private fun OriginalViewer(
     }
 
     Surface(color = androidx.compose.ui.graphics.Color.Black, modifier = Modifier.fillMaxSize()) {
-        Box(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding()) {
+        Box(Modifier.fillMaxSize()) {
             HorizontalPager(state = pagerState, modifier = Modifier.fillMaxSize()) { page ->
                 val item = state.results[page]
-                ZoomableOriginalImage(url = mediaUrl(item), contentDescription = item.name)
-            }
-
-            Row(
-                modifier = Modifier.fillMaxWidth().align(Alignment.TopCenter)
-                    .background(androidx.compose.ui.graphics.Color.Black.copy(alpha = 0.65f))
-                    .padding(horizontal = 8.dp, vertical = 6.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                TextButton(onClick = onClose) { Text("返回", color = androidx.compose.ui.graphics.Color.White) }
-                val item = state.viewerIndex?.let(state.results::getOrNull)
-                Column(Modifier.weight(1f)) {
-                    Text(
-                        item?.name.orEmpty(),
-                        color = androidx.compose.ui.graphics.Color.White,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                    Text(
-                        "${(state.viewerIndex ?: 0) + 1} / ${state.totalResults.coerceAtLeast(state.results.size)}",
-                        color = androidx.compose.ui.graphics.Color.LightGray,
-                        style = MaterialTheme.typography.bodySmall,
+                Box(
+                    Modifier.fillMaxSize().pointerInput(Unit) {
+                        detectTapGestures(onLongPress = { sheetItem = item; showInfo = false })
+                    },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    ZoomableOriginalImage(
+                        url = mediaUrl(item),
+                        contentDescription = item.name,
+                        rotation = rotations[page] ?: 0f,
                     )
                 }
-                TextButton(onClick = onSave) { Text("保存", color = androidx.compose.ui.graphics.Color.White) }
-                TextButton(onClick = onShare) { Text("分享", color = androidx.compose.ui.graphics.Color.White) }
             }
 
             AnimatedVisibility(
@@ -752,10 +770,57 @@ private fun OriginalViewer(
             }
         }
     }
+
+    sheetItem?.let { item ->
+        ModalBottomSheet(onDismissRequest = { sheetItem = null }) {
+            Column(
+                Modifier.fillMaxWidth().padding(horizontal = 20.dp).navigationBarsPadding(),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                TextButton(
+                    onClick = { sheetItem = null; onSave() },
+                    modifier = Modifier.fillMaxWidth(),
+                ) { Text("保存", modifier = Modifier.fillMaxWidth(), style = MaterialTheme.typography.bodyLarge) }
+                TextButton(
+                    onClick = { sheetItem = null; onShare() },
+                    modifier = Modifier.fillMaxWidth(),
+                ) { Text("分享", modifier = Modifier.fillMaxWidth(), style = MaterialTheme.typography.bodyLarge) }
+                TextButton(
+                    onClick = {
+                        val page = pagerState.currentPage
+                        rotations[page] = ((rotations[page] ?: 0f) + 90f) % 360f
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                ) { Text("旋转", modifier = Modifier.fillMaxWidth(), style = MaterialTheme.typography.bodyLarge) }
+                TextButton(
+                    onClick = { showInfo = !showInfo },
+                    modifier = Modifier.fillMaxWidth(),
+                ) { Text("详细信息", modifier = Modifier.fillMaxWidth(), style = MaterialTheme.typography.bodyLarge) }
+                if (showInfo) {
+                    Column(
+                        Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        Text("文件名：${item.name.ifBlank { "未命名" }}", style = MaterialTheme.typography.bodyMedium)
+                        if (item.width != null && item.height != null) {
+                            Text("尺寸：${item.width} × ${item.height}", style = MaterialTheme.typography.bodyMedium)
+                        }
+                        item.score?.let { Text("评分：${DecimalFormat("0.000").format(it)}", style = MaterialTheme.typography.bodyMedium) }
+                        item.libraryName?.let { Text("图库：$it", style = MaterialTheme.typography.bodyMedium) }
+                        item.sizeBytes?.let { Text("大小：${formatBytes(it)}", style = MaterialTheme.typography.bodyMedium) }
+                        if (item.tags.isNotEmpty()) {
+                            Text("标签：${item.tags.joinToString("、")}", style = MaterialTheme.typography.bodyMedium)
+                        }
+                    }
+                }
+                Spacer(Modifier.height(16.dp))
+            }
+        }
+    }
 }
 
 @Composable
-private fun ZoomableOriginalImage(url: String, contentDescription: String) {
+private fun ZoomableOriginalImage(url: String, contentDescription: String, rotation: Float = 0f) {
     val context = LocalContext.current
     var scale by remember(url) { mutableFloatStateOf(1f) }
     var offset by remember(url) { mutableStateOf(Offset.Zero) }
@@ -770,7 +835,7 @@ private fun ZoomableOriginalImage(url: String, contentDescription: String) {
     SubcomposeAsyncImage(
         model = ImageRequest.Builder(context).data(url).crossfade(true).build(),
         contentDescription = contentDescription,
-        contentScale = ContentScale.Fit,
+        contentScale = ContentScale.Crop,
         modifier = Modifier
             .fillMaxSize()
             .onSizeChanged { viewport = it }
@@ -779,6 +844,7 @@ private fun ZoomableOriginalImage(url: String, contentDescription: String) {
                 scaleY = scale
                 translationX = offset.x
                 translationY = offset.y
+                rotationZ = rotation
             }
             .pointerInput(url) {
                 detectTapGestures(
@@ -848,3 +914,6 @@ private fun formatBytes(bytes: Long): String {
     } while (value >= 1024.0 && index < units.lastIndex)
     return "${DecimalFormat("0.##").format(value)} ${units[index]}"
 }
+
+private fun formatTime(millis: Long): String =
+    SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.getDefault()).format(java.util.Date(millis))

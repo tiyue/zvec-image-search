@@ -9,6 +9,8 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.zvec.lanviewer.data.local.SavedConnection
+import com.zvec.lanviewer.data.local.SavedFileRecord
+import com.zvec.lanviewer.data.local.SavedFilesStore
 import com.zvec.lanviewer.data.local.ServerAddress
 import com.zvec.lanviewer.data.model.DiscoveredServer
 import com.zvec.lanviewer.data.model.SearchItem
@@ -40,6 +42,7 @@ import java.io.IOException
 class AppViewModel(
     private val appContext: Context,
     private val repository: ZvecRepository,
+    private val savedFilesStore: SavedFilesStore,
 ) : ViewModel() {
     private val _state = MutableStateFlow(AppUiState())
     val state: StateFlow<AppUiState> = _state.asStateFlow()
@@ -56,6 +59,7 @@ class AppViewModel(
     private var actionJob: Job? = null
 
     init {
+        _state.update { it.copy(savedFiles = savedFilesStore.list()) }
         restoreOrDiscover()
     }
 
@@ -386,6 +390,15 @@ class AppViewModel(
             try {
                 repository.copyOriginalTo(item, destination) { updateTransfer(it.fraction) }
                 endTransfer()
+                savedFilesStore.add(
+                    SavedFileRecord(
+                        name = item.name.ifBlank { "zvec-original" },
+                        uri = destination.toString(),
+                        savedAtMillis = System.currentTimeMillis(),
+                        sizeBytes = item.sizeBytes,
+                    ),
+                )
+                _state.update { it.copy(savedFiles = savedFilesStore.list()) }
                 _events.emit(AppEvent.Message("原图已保存"))
             } catch (error: Throwable) {
                 if (error is CancellationException) throw error
@@ -663,11 +676,12 @@ class AppViewModel(
     class Factory(
         private val context: Context,
         private val repository: ZvecRepository,
+        private val savedFilesStore: SavedFilesStore,
     ) : ViewModelProvider.Factory {
         @Suppress("UNCHECKED_CAST")
         override fun <T : ViewModel> create(modelClass: Class<T>): T {
             require(modelClass.isAssignableFrom(AppViewModel::class.java))
-            return AppViewModel(context.applicationContext, repository) as T
+            return AppViewModel(context.applicationContext, repository, savedFilesStore) as T
         }
     }
 

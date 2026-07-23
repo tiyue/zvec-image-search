@@ -59,7 +59,7 @@ object ServerAddress {
             "http://$trimmed"
         }
         val parsed = withScheme.toHttpUrlOrNull() ?: return null
-        if (parsed.scheme != "http" || !isPrivateIpv4(parsed.host)) return null
+        if (parsed.scheme != "http" || !isValidIpv4(parsed.host)) return null
         if (parsed.username.isNotEmpty() || parsed.password.isNotEmpty()) return null
         if (parsed.encodedPath != "/" || parsed.query != null || parsed.fragment != null) return null
         return parsed.newBuilder()
@@ -74,17 +74,23 @@ object ServerAddress {
 
     fun fromDiscovery(server: DiscoveredServer): String? = fromHostPort(server.host, server.port)
 
-    /** This product deliberately accepts only RFC1918 IPv4 literals, never DNS or public hosts. */
-    fun isPrivateIpv4(host: String): Boolean {
+    /** Accepts any well-formed IPv4 literal (private or public) for manual connections. */
+    fun isValidIpv4(host: String): Boolean {
         val octets = host.split('.')
         if (octets.size != 4) return false
-        val values = octets.map { part ->
-            if (part.isEmpty() || part.length > 3 || !part.all(Char::isDigit)) return false
-            if (part.length > 1 && part.startsWith('0')) return false
-            part.toIntOrNull()?.takeIf { it in 0..255 } ?: return false
+        return octets.all { part ->
+            part.isNotEmpty() && part.length <= 3 && part.all(Char::isDigit) &&
+                !(part.length > 1 && part.startsWith('0')) &&
+                (part.toIntOrNull() ?: -1) in 0..255
         }
-        return values[0] == 10 ||
-            (values[0] == 172 && values[1] in 16..31) ||
-            (values[0] == 192 && values[1] == 168)
+    }
+
+    /** RFC1918-only check, used by UDP discovery to stay within the local network. */
+    fun isPrivateIpv4(host: String): Boolean {
+        if (!isValidIpv4(host)) return false
+        val octets = host.split('.').map { it.toInt() }
+        return octets[0] == 10 ||
+            (octets[0] == 172 && octets[1] in 16..31) ||
+            (octets[0] == 192 && octets[1] == 168)
     }
 }

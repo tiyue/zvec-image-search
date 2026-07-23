@@ -15,7 +15,7 @@ class MainActivity : ComponentActivity() {
         setContent {
             ZvecTheme {
                 val appViewModel: AppViewModel = viewModel(
-                    factory = AppViewModel.Factory(applicationContext, container.repository),
+                    factory = AppViewModel.Factory(applicationContext, container.repository, container.savedFilesStore),
                 )
                 ZvecApp(appViewModel)
             }

@@ -4,6 +4,7 @@ import android.content.Context
 import com.zvec.lanviewer.data.discovery.UdpDiscoveryService
 import com.zvec.lanviewer.data.local.ConnectionStore
 import com.zvec.lanviewer.data.local.InstallationStore
+import com.zvec.lanviewer.data.local.SavedFilesStore
 import com.zvec.lanviewer.data.network.LanApiClient
 import com.zvec.lanviewer.data.network.ResumableDownloader
 import com.zvec.lanviewer.data.repository.ZvecRepository
@@ -27,4 +28,5 @@ class AppContainer(context: Context) {
         api = apiClient,
         downloader = ResumableDownloader(apiClient.httpClient),
     )
+    val savedFilesStore = SavedFilesStore(appContext)
 }
