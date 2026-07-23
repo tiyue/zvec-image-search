@@ -12,6 +12,7 @@ import PaginationBar from "../../components/PaginationBar.vue";
 import ActiveLearningPanel from "./ActiveLearningPanel.vue";
 import {
   calculateOrganizeGalleryCapacity,
+  gridSpan,
   type OrganizeGalleryCapacity,
 } from "./galleryCapacity";
 import SimilarityGroupsPanel from "./SimilarityGroupsPanel.vue";
@@ -74,10 +75,7 @@ watch(organize.deletePreview, () => {
   deleteConfirmation.value = "";
 });
 
-const galleryLayoutStyle = computed(() => ({
-  "--organize-gallery-columns": String(galleryCapacity.value.columns),
-  "--organize-gallery-rows": String(galleryCapacity.value.rows),
-}));
+const galleryLayoutStyle = computed(() => ({}));
 
 function changeLibrary(event: Event): void {
   void organize.selectLibrary((event.target as HTMLSelectElement).value);
@@ -161,11 +159,7 @@ function updateGalleryCapacity(reload: boolean): void {
   const element = galleryViewport.value;
   if (!element) return;
   const next = calculateOrganizeGalleryCapacity(element.clientWidth, element.clientHeight);
-  const changed =
-    next.columns !== galleryCapacity.value.columns ||
-    next.rows !== galleryCapacity.value.rows ||
-    next.scrollRequired !== galleryCapacity.value.scrollRequired;
-  if (!changed) return;
+  if (next.pageSize === galleryCapacity.value.pageSize) return;
   galleryCapacity.value = next;
   void organize.setImagePageSize(next.pageSize, reload);
 }
@@ -504,15 +498,16 @@ onBeforeUnmount(() => {
           <div
             v-else
             class="image-grid"
-            :class="{ 'is-scroll-layout': galleryCapacity.scrollRequired }"
-            :style="galleryLayoutStyle"
             aria-label="文件夹图片"
           >
             <article
               v-for="image in organize.images.value"
               :key="image.id"
               class="image-tile"
-              :class="{ selected: organize.isImageSelected(image.id) }"
+              :class="{
+                selected: organize.isImageSelected(image.id),
+                'span-2': gridSpan(image.width, image.height) === 2,
+              }"
               :data-image-id="image.id"
             >
               <button
@@ -933,16 +928,16 @@ textarea { resize: vertical; line-height: 1.5; }
 .selection-actions { flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
 .toolbar-button { border: 1px solid #dde1ec; border-radius: 8px; padding: 6px 9px; color: #515b73; background: #f8f9fc; font: inherit; font-size: 11px; font-weight: 750; cursor: pointer; transition: .12s ease; }
 .toolbar-button.quiet { color: #8a5260; background: #fff6f7; }
-.gallery-viewport { min-height: 0; overflow: hidden; }
-.image-grid { display: grid; height: 100%; min-height: 0; grid-template-columns: repeat(var(--organize-gallery-columns,5),minmax(0,1fr)); grid-template-rows: repeat(var(--organize-gallery-rows,3),minmax(0,1fr)); align-content: stretch; gap: 9px; overflow: hidden; padding: 2px 3px 8px 1px; }
-.image-grid.is-scroll-layout { grid-auto-rows: minmax(210px,auto); grid-template-rows: none; overflow: auto; }
+.gallery-viewport { min-height: 0; overflow: auto; }
+.image-grid { display: grid; min-height: 0; grid-template-columns: repeat(4, 1fr); grid-auto-flow: row dense; grid-auto-rows: 1fr; gap: 9px; overflow: auto; padding: 2px 3px 8px 1px; }
+.image-tile.span-2 { grid-column: span 2; }
 .image-tile { position: relative; display: grid; grid-template-rows: minmax(0,1fr) auto; min-width: 0; min-height: 0; overflow: hidden; border: 1px solid #e1e5ee; border-radius: 12px; background: #fff; content-visibility: auto; contain-intrinsic-size: 210px 168px; }
 .image-tile.selected { border-color: #6d5ee3; box-shadow: 0 0 0 2px rgba(109,94,227,.16); }
 .image-select { display: grid; width: 100%; height: 100%; padding: 0; border: 0; color: inherit; background: transparent; text-align: left; cursor: pointer; grid-template-rows: minmax(0,1fr) auto; }
 .selection-marker { position: absolute; z-index: 2; top: 7px; left: 7px; display: grid; width: 21px; height: 21px; place-items: center; border: 1px solid rgba(255,255,255,.7); border-radius: 7px; color: white; background: rgba(22,27,45,.45); font-size: 12px; font-weight: 900; backdrop-filter: blur(6px); }
 .image-tile.selected .selection-marker { background: #6655df; }
-.thumbnail-stage { display: grid; min-height: 0; height: 100%; place-items: center; overflow: hidden; background: linear-gradient(145deg, #151b2b, #252c3f); }
-.thumbnail-stage img { width: 100%; height: 100%; object-fit: contain; }
+.thumbnail-stage { display: grid; min-height: 0; height: 100%; place-items: stretch; overflow: hidden; background: linear-gradient(145deg, #151b2b, #252c3f); }
+.thumbnail-stage img { width: 100%; height: 100%; object-fit: contain !important; object-position: center center; }
 .thumbnail-placeholder { display: grid; place-items: center; gap: 5px; color: #aab2c2; text-align: center; }
 .thumbnail-placeholder > span { display: grid; width: 34px; height: 34px; place-items: center; border: 1px solid rgba(255,255,255,.1); border-radius: 11px; color: #8f99ab; background: rgba(255,255,255,.04); font-size: 17px; }
 .thumbnail-placeholder small { font-size: 10px; }
@@ -1053,7 +1048,8 @@ textarea { resize: vertical; line-height: 1.5; }
 .folder-library-refresh,.folder-search .icon-button { border-color:#dedede; color:#555; background:#f5f5f5; }
 .selection-toolbar { margin-bottom:10px; padding:8px 10px; border:0; border-radius:10px; background:#f7f7f7; }
 .toolbar-button,.toolbar-button.quiet,.editor-toggle,.folder-load-more { border-color:#dedede; color:#333; background:#f5f5f5; font-weight:500; }
-.image-grid { grid-template-columns:repeat(4,minmax(0,1fr)); gap:8px; }
+.image-grid { grid-template-columns: repeat(4, 1fr); grid-auto-flow: row dense; gap: 8px; }
+.image-tile.span-2 { grid-column: span 2; }
 .image-tile { border:0; border-radius:10px; background:#f2f2f2; box-shadow:none; }
 .image-tile:hover { transform:translateY(-2px); box-shadow:0 4px 12px -2px rgb(0 0 0 / 10%); }
 .image-tile.selected { border-color:#777; outline:2px solid #777; outline-offset:-2px; box-shadow:none; }

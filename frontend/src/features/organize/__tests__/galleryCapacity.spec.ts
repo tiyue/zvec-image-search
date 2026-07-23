@@ -2,55 +2,48 @@ import { describe, expect, it } from "vitest";
 
 import {
   calculateOrganizeGalleryCapacity,
+  gridSpan,
   ORGANIZE_GALLERY_DEFAULT_PAGE_SIZE,
 } from "../galleryCapacity";
 
 describe("calculateOrganizeGalleryCapacity", () => {
-  it.each([
-    { viewport: "2559×1398", width: 1547, height: 1030, columns: 8, rows: 3, pageSize: 24 },
-    { viewport: "1920×1080", width: 908, height: 716, columns: 5, rows: 3, pageSize: 15 },
-    { viewport: "1600×900", width: 980, height: 536, columns: 5, rows: 2, pageSize: 10 },
-    { viewport: "1440×900", width: 860, height: 536, columns: 4, rows: 2, pageSize: 8 },
-  ])("fits the $viewport acceptance viewport", ({ width, height, columns, rows, pageSize }) => {
-    expect(calculateOrganizeGalleryCapacity(width, height)).toEqual({
-      columns,
-      rows,
-      pageSize,
-      scrollRequired: false,
+  it("returns a fixed page size regardless of viewport", () => {
+    expect(calculateOrganizeGalleryCapacity(1547, 1030)).toEqual({
+      pageSize: ORGANIZE_GALLERY_DEFAULT_PAGE_SIZE,
     });
-  });
-
-  it("keeps the maximum page bounded even on an oversized gallery", () => {
-    expect(calculateOrganizeGalleryCapacity(4_000, 2_000)).toEqual({
-      columns: 8,
-      rows: 3,
-      pageSize: 24,
-      scrollRequired: false,
+    expect(calculateOrganizeGalleryCapacity(0, 0)).toEqual({
+      pageSize: ORGANIZE_GALLERY_DEFAULT_PAGE_SIZE,
     });
-  });
-
-  it("uses measured gallery space rather than the outer window dimensions", () => {
-    const measured = calculateOrganizeGalleryCapacity(908, 716);
-    expect(measured).toEqual({
-      columns: 5,
-      rows: 3,
-      pageSize: 15,
-      scrollRequired: false,
-    });
-  });
-
-  it("keeps readable cards and enables scrolling in a short viewport", () => {
     expect(calculateOrganizeGalleryCapacity(470, 300)).toEqual({
-      columns: 2,
-      rows: 2,
-      pageSize: 4,
-      scrollRequired: true,
+      pageSize: ORGANIZE_GALLERY_DEFAULT_PAGE_SIZE,
     });
   });
+});
 
-  it("uses a stable default before the browser can measure the gallery", () => {
-    expect(calculateOrganizeGalleryCapacity(0, 0).pageSize).toBe(
-      ORGANIZE_GALLERY_DEFAULT_PAGE_SIZE,
-    );
+describe("gridSpan", () => {
+  it("returns 2 for landscape images", () => {
+    expect(gridSpan(1920, 1080)).toBe(2);
+    expect(gridSpan(2400, 1200)).toBe(2);
+    expect(gridSpan(800, 500)).toBe(2);
+  });
+
+  it("returns 1 for portrait and square images", () => {
+    expect(gridSpan(1080, 1920)).toBe(1);
+    expect(gridSpan(1000, 1000)).toBe(1);
+    expect(gridSpan(800, 1200)).toBe(1);
+  });
+
+  it("returns 1 when dimensions are missing", () => {
+    expect(gridSpan(0, 0)).toBe(1);
+    expect(gridSpan(100, 0)).toBe(1);
+    expect(gridSpan(0, 100)).toBe(1);
+  });
+
+  it("treats ratio exactly at 1.5 as span 1", () => {
+    expect(gridSpan(1500, 1000)).toBe(1);
+  });
+
+  it("treats ratio just above 1.5 as span 2", () => {
+    expect(gridSpan(1501, 1000)).toBe(2);
   });
 });

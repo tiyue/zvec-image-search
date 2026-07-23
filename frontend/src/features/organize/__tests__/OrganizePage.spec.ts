@@ -168,7 +168,7 @@ describe("OrganizePage batch tags", () => {
       "lib-1",
       "folder-raiden",
       1,
-      15,
+      12,
       false,
       expect.any(AbortSignal),
     );
@@ -189,7 +189,7 @@ describe("OrganizePage batch tags", () => {
       "lib-1",
       "folder-raiden",
       2,
-      15,
+      12,
       false,
       expect.any(AbortSignal),
     );
@@ -307,7 +307,7 @@ describe("OrganizePage batch tags", () => {
       "lib-1",
       "root-folder-key",
       1,
-      15,
+      12,
       false,
       expect.any(AbortSignal),
     );
@@ -322,7 +322,7 @@ describe("OrganizePage batch tags", () => {
       "lib-1",
       "root-folder-key",
       2,
-      15,
+      12,
       false,
       expect.any(AbortSignal),
     );
@@ -334,7 +334,7 @@ describe("OrganizePage batch tags", () => {
       "lib-1",
       "child-folder-key",
       1,
-      15,
+      12,
       false,
       expect.any(AbortSignal),
     );
@@ -345,7 +345,7 @@ describe("OrganizePage batch tags", () => {
       "lib-1",
       "root-folder-key",
       1,
-      15,
+      12,
       false,
       expect.any(AbortSignal),
     );
@@ -484,7 +484,7 @@ describe("OrganizePage batch tags", () => {
       "lib-1",
       "folder-raiden",
       1,
-      24,
+      12,
       false,
       expect.any(AbortSignal),
     );
@@ -493,7 +493,7 @@ describe("OrganizePage batch tags", () => {
     height.mockRestore();
   });
 
-  it("recalculates pagination after a resize while keeping the first visible image in view", async () => {
+  it("does not refetch after resize since the page size is fixed", async () => {
     vi.useFakeTimers();
     let viewportWidth = 1_547;
     let viewportHeight = 1_030;
@@ -523,38 +523,21 @@ describe("OrganizePage batch tags", () => {
       "lib-1",
       "folder-raiden",
       1,
-      24,
+      12,
       false,
       expect.any(AbortSignal),
     );
 
-    await buttonWithText(wrapper, "下一页").trigger("click");
-    await flushPromises();
-    expect(api.listFolderImages).toHaveBeenLastCalledWith(
-      "lib-1",
-      "folder-raiden",
-      2,
-      24,
-      false,
-      expect.any(AbortSignal),
-    );
+    const callCountBeforeResize = vi.mocked(api.listFolderImages).mock.calls.length;
 
-    viewportWidth = 900;
+    viewportWidth = 300;
     viewportHeight = 520;
     resizeCallback?.([], {} as ResizeObserver);
     await vi.advanceTimersByTimeAsync(160);
     await flushPromises();
 
-    // Page 2 at 24 items starts at item 25. With a 10-item page, page 3
-    // starts at item 21, so the former first visible item remains on screen.
-    expect(api.listFolderImages).toHaveBeenLastCalledWith(
-      "lib-1",
-      "folder-raiden",
-      3,
-      10,
-      false,
-      expect.any(AbortSignal),
-    );
+    // Fixed page size means resize does not trigger a refetch.
+    expect(vi.mocked(api.listFolderImages).mock.calls.length).toBe(callCountBeforeResize);
 
     wrapper.unmount();
     width.mockRestore();
