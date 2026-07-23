@@ -70,7 +70,7 @@ class IndexState:
                 deterministic=True,
             )
             self.connection.execute("PRAGMA journal_mode=WAL")
-            self.connection.execute("PRAGMA synchronous=FULL")
+            self.connection.execute("PRAGMA synchronous=NORMAL")
             version = self._existing_schema_version()
             if version == "1":
                 raise ConfigurationError(
@@ -83,6 +83,8 @@ class IndexState:
             # them to Zvec. Interrupted items are made replayable here without
             # scanning entries or calling an embedding model again.
             self.write_outbox = CollectionWriteOutbox(self.connection)
+            self._cache_hit_counter = 0
+            self._roots_light_cache: list[tuple[str, str]] | None = None
             if legacy_path is not None:
                 self._migrate_legacy_json(legacy_path)
         except ConfigurationError:
@@ -714,10 +716,51 @@ class IndexState:
                 f"ON CONFLICT(doc_id) DO UPDATE SET {updates}",
                 values,
             )
+            doc_ids = [str(entry["doc_id"]) for entry in items]
+            for offset in range(0, len(doc_ids), _SQLITE_PARAMETER_CHUNK):
+                chunk = doc_ids[offset : offset + _SQLITE_PARAMETER_CHUNK]
+                ph = ", ".join("?" for _ in chunk)
+                self.connection.execute(
+                    f"DELETE FROM entry_tag_index WHERE doc_id IN ({ph})",
+                    chunk,
+                )
+                self.connection.execute(
+                    f"DELETE FROM entry_folder_index WHERE doc_id IN ({ph})",
+                    chunk,
+                )
+            tag_rows: list[tuple[str, str]] = []
+            folder_rows: list[tuple[str, str, str, int]] = []
+            catalog_rows: list[tuple[str, str, str, str]] = []
             for entry in items:
-                self._replace_indexed_tags(entry)
-                self._replace_folder_index(entry)
-                self._ensure_folder_catalog(entry, observed_at)
+                doc_id = str(entry["doc_id"])
+                root_id = str(entry["root_id"])
+                for tag in self._effective_tags(entry):
+                    tag_rows.append((doc_id, tag))
+                direct = _relative_parent_directory(str(entry["relative_path"]))
+                for folder in _folder_ancestors(direct):
+                    folder_rows.append((doc_id, root_id, folder, int(folder == direct)))
+                catalog_rows.append((root_id, direct, observed_at, observed_at))
+            if tag_rows:
+                self.connection.executemany(
+                    "INSERT INTO entry_tag_index(doc_id, tag) VALUES(?, ?)",
+                    tag_rows,
+                )
+            if folder_rows:
+                self.connection.executemany(
+                    "INSERT INTO entry_folder_index("
+                    "doc_id, root_id, relative_folder, is_direct) "
+                    "VALUES(?, ?, ?, ?)",
+                    folder_rows,
+                )
+            if catalog_rows:
+                self.connection.executemany(
+                    "INSERT INTO folder_catalog("
+                    "root_id, relative_folder, first_indexed_at, "
+                    "last_indexed_at, timestamp_source) "
+                    "VALUES(?, ?, ?, ?, 'observed') "
+                    "ON CONFLICT(root_id, relative_folder) DO NOTHING",
+                    catalog_rows,
+                )
 
     def remove_many(self, doc_ids: Iterable[str]) -> None:
         self._remove_many(doc_ids, mark_source_deleted=False)
@@ -2043,15 +2086,25 @@ class IndexState:
 
     def find_entry_for_path(self, path: Path) -> dict[str, Any] | None:
         resolved = path.expanduser().resolve()
-        for root in self.list_roots():
-            root_path = Path(str(root["current_path"]))
+        for root_id, current_path in self._list_roots_light():
+            root_path = Path(current_path)
             try:
                 relative = resolved.relative_to(root_path)
             except ValueError:
                 continue
-            doc_id = logical_document_id(str(root["root_id"]), relative)
+            doc_id = logical_document_id(root_id, relative)
             return self.get(doc_id)
         return None
+
+    def _list_roots_light(self) -> list[tuple[str, str]]:
+        if self._roots_light_cache is None:
+            rows = self.connection.execute(
+                "SELECT root_id, current_path FROM roots ORDER BY current_path"
+            ).fetchall()
+            self._roots_light_cache = [
+                (str(row["root_id"]), str(row["current_path"])) for row in rows
+            ]
+        return self._roots_light_cache
 
     def get_cached_vector(self, cache_key: str, dimension: int) -> list[float] | None:
         row = self.connection.execute(
@@ -2068,12 +2121,14 @@ class IndexState:
             )
             self.connection.commit()
             return None
-        with self.connection:
-            self.connection.execute(
-                "UPDATE embedding_cache SET hit_count = hit_count + 1, "
-                "last_used_at = CURRENT_TIMESTAMP WHERE cache_key = ?",
-                (cache_key,),
-            )
+        self._cache_hit_counter += 1
+        if self._cache_hit_counter % 32 == 0:
+            with self.connection:
+                self.connection.execute(
+                    "UPDATE embedding_cache SET hit_count = hit_count + 1, "
+                    "last_used_at = CURRENT_TIMESTAMP WHERE cache_key = ?",
+                    (cache_key,),
+                )
         return list(values)
 
     def set_cached_vector(
@@ -2157,6 +2212,7 @@ class IndexState:
                 "current_path=excluded.current_path, recursive=excluded.recursive",
                 (root_id, normalized, int(recursive)),
             )
+        self._roots_light_cache = None
 
     def root_for_path(self, current_path: str) -> dict[str, Any] | None:
         normalized = normalize_path(Path(current_path))
@@ -2219,6 +2275,7 @@ class IndexState:
                 "UPDATE roots SET tags_json = ? WHERE root_id = ?",
                 (json.dumps(values, ensure_ascii=False), root_id),
             )
+        self._roots_light_cache = None
         if cursor.rowcount != 1:
             raise ConfigurationError(f"Unknown root_id: {root_id}")
 
@@ -2490,6 +2547,7 @@ class IndexState:
                 "UPDATE roots SET current_path = ? WHERE root_id = ?",
                 (normalized, root_id),
             )
+        self._roots_light_cache = None
         return {
             "root_id": root_id,
             "previous_path": str(row["current_path"]),

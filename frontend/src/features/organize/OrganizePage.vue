@@ -938,10 +938,10 @@ textarea { resize: vertical; line-height: 1.5; }
 .image-grid.is-scroll-layout { grid-auto-rows: minmax(210px,auto); grid-template-rows: none; overflow: auto; }
 .image-tile { position: relative; min-width: 0; min-height: 0; overflow: hidden; border: 1px solid #e1e5ee; border-radius: 12px; background: #fff; content-visibility: auto; contain-intrinsic-size: 210px 168px; }
 .image-tile.selected { border-color: #6d5ee3; box-shadow: 0 0 0 2px rgba(109,94,227,.16); }
-.image-select { display: grid; width: 100%; padding: 0; border: 0; color: inherit; background: transparent; text-align: left; cursor: pointer; }
+.image-select { display: grid; width: 100%; height: 100%; padding: 0; border: 0; color: inherit; background: transparent; text-align: left; cursor: pointer; grid-template-rows: minmax(0,1fr) auto; }
 .selection-marker { position: absolute; z-index: 2; top: 7px; left: 7px; display: grid; width: 21px; height: 21px; place-items: center; border: 1px solid rgba(255,255,255,.7); border-radius: 7px; color: white; background: rgba(22,27,45,.45); font-size: 12px; font-weight: 900; backdrop-filter: blur(6px); }
 .image-tile.selected .selection-marker { background: #6655df; }
-.thumbnail-stage { display: grid; min-height: 0; height: clamp(118px,65%,168px); place-items: center; overflow: hidden; background: linear-gradient(145deg, #151b2b, #252c3f); }
+.thumbnail-stage { display: grid; min-height: 0; height: 100%; place-items: center; overflow: hidden; background: linear-gradient(145deg, #151b2b, #252c3f); }
 .thumbnail-stage img { width: 100%; height: 100%; object-fit: contain; }
 .thumbnail-placeholder { display: grid; place-items: center; gap: 5px; color: #aab2c2; text-align: center; }
 .thumbnail-placeholder > span { display: grid; width: 34px; height: 34px; place-items: center; border: 1px solid rgba(255,255,255,.1); border-radius: 11px; color: #8f99ab; background: rgba(255,255,255,.04); font-size: 17px; }

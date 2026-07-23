@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import http.client
 import json
 import math
 import random
@@ -10,6 +12,7 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from .config import ServiceConfig
 from .image_data_uri import ImageDataUriError, encode_image_data_uri
@@ -70,6 +73,7 @@ class DashScopeEmbeddingClient:
         self.cancel_event = cancel_event
         self.request_count = 0
         self._request_count_lock = threading.Lock()
+        self._conn_local = threading.local()
 
     def embed_images(self, image_paths: list[Path]) -> EmbeddingResponse:
         if not image_paths:
@@ -175,6 +179,29 @@ class DashScopeEmbeddingClient:
             usage=dict(body.get("usage") or {}),
         )
 
+    def _get_connection(
+        self, scheme: str, host: str, port: int
+    ) -> http.client.HTTPConnection:
+        """Return a thread-local pooled HTTP(S) connection."""
+        conn = getattr(self._conn_local, "conn", None)
+        conn_key = getattr(self._conn_local, "key", None)
+        key = (scheme, host, port)
+        if conn is None or conn_key != key:
+            if conn is not None:
+                with contextlib.suppress(Exception):
+                    conn.close()
+            if scheme == "https":
+                conn = http.client.HTTPSConnection(
+                    host, port, timeout=self.config.timeout_seconds
+                )
+            else:
+                conn = http.client.HTTPConnection(
+                    host, port, timeout=self.config.timeout_seconds
+                )
+            self._conn_local.conn = conn
+            self._conn_local.key = key
+        return conn
+
     def _post_json(
         self,
         payload: dict[str, Any],
@@ -191,67 +218,71 @@ class DashScopeEmbeddingClient:
         for attempt in range(self.config.max_retries + 1):
             api_key = self.config.require_api_key()
             retry_after: str | None = None
-            request = urllib.request.Request(
-                self.config.api_url,
-                data=request_data,
-                method="POST",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                    "User-Agent": "zvec-local-image-service/1.0",
-                },
-            )
+            parsed = urlsplit(self.config.api_url)
+            scheme = parsed.scheme or "https"
+            host = parsed.hostname or "dashscope.aliyuncs.com"
+            port = parsed.port or (443 if scheme == "https" else 80)
+            path = parsed.path or "/"
+            if parsed.query:
+                path = f"{path}?{parsed.query}"
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "User-Agent": "zvec-local-image-service/1.0",
+            }
             permit = self.limiter.acquire(estimated_tokens, self.cancel_event)
             with self._request_count_lock:
                 self.request_count += 1
             try:
-                with urllib.request.urlopen(
-                    request, timeout=self.config.timeout_seconds
-                ) as response:
-                    response_data = response.read()
-            except urllib.error.HTTPError as exc:
+                conn = self._get_connection(scheme, host, port)
+                conn.request("POST", path, body=request_data, headers=headers)
+                response = conn.getresponse()
+                response_data = response.read()
+                status = response.status
+                if status >= 400:
+                    permit.fail()
+                    retry_after = response.getheader("Retry-After")
+                    code, message = self._parse_error_body(response_data)
+                    splittable = self._is_splittable_input_error(status, code, message)
+                    last_error = DashScopeError(
+                        f"DashScope {code or 'HTTPError'}: {message}",
+                        status_code=status,
+                        code=code,
+                        splittable=splittable,
+                    )
+                    if status not in {408, 409, 429, 500, 502, 503, 504}:
+                        raise last_error
+                    if status == 429:
+                        self.limiter.observe_429(retry_after)
+                        retry_after = None
+                else:
+                    try:
+                        decoded = json.loads(response_data.decode("utf-8"))
+                        if not isinstance(decoded, dict):
+                            raise ValueError("API response must be a JSON object.")
+                        body = dict(decoded)
+                    except (
+                        UnicodeDecodeError,
+                        json.JSONDecodeError,
+                        ValueError,
+                    ) as exc:
+                        permit.fail()
+                        raise DashScopeError(
+                            f"DashScope returned an invalid JSON response: {exc}"
+                        ) from exc
+                    permit.succeed(_total_tokens_from_usage(body.get("usage")))
+                    return body
+            except DashScopeError:
+                raise
+            except (http.client.HTTPException, TimeoutError, OSError) as exc:
                 permit.fail()
-                status = exc.code
-                code, message = self._safe_error_details(exc)
-                splittable = self._is_splittable_input_error(status, code, message)
-                last_error = DashScopeError(
-                    f"DashScope {code or 'HTTPError'}: {message}",
-                    status_code=status,
-                    code=code,
-                    splittable=splittable,
-                )
-                retry_after = (
-                    exc.headers.get("Retry-After") if exc.headers is not None else None
-                )
-                exc.close()
-                if status not in {408, 409, 429, 500, 502, 503, 504}:
-                    raise last_error from exc
-                if status == 429:
-                    self.limiter.observe_429(retry_after)
-                    # The shared limiter applies Retry-After before the next
-                    # attempt, so the local exponential sleep must not add it
-                    # a second time.
-                    retry_after = None
-            except (urllib.error.URLError, TimeoutError, OSError) as exc:
-                permit.fail()
+                # Connection may be stale; force reconnect on next attempt.
+                self._conn_local.conn = None
                 last_error = DashScopeError(f"DashScope request failed: {exc}")
                 retry_after = None
             except Exception:
                 permit.fail()
                 raise
-            else:
-                try:
-                    decoded = json.loads(response_data.decode("utf-8"))
-                    if not isinstance(decoded, dict):
-                        raise ValueError("API response must be a JSON object.")
-                    body = dict(decoded)
-                except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
-                    permit.fail()
-                    raise DashScopeError(
-                        f"DashScope returned an invalid JSON response: {exc}"
-                    ) from exc
-                permit.succeed(_total_tokens_from_usage(body.get("usage")))
-                return body
 
             if attempt < self.config.max_retries:
                 delay = self.config.retry_base_seconds * (2**attempt)
@@ -297,6 +328,16 @@ class DashScopeEmbeddingClient:
             return code, message
         except Exception:
             return "", str(error.reason)
+
+    @staticmethod
+    def _parse_error_body(data: bytes) -> tuple[str, str]:
+        try:
+            body = json.loads(data.decode("utf-8"))
+            code = str(body.get("code") or "")
+            message = str(body.get("message") or "")
+            return code, message
+        except Exception:
+            return "", "request failed"
 
     @staticmethod
     def _is_splittable_input_error(status: int, code: str, message: str) -> bool:

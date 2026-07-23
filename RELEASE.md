@@ -246,3 +246,7 @@ python scripts/build_webview_preview.py --makensis build/tools/nsis-3.12-python/
 - Node.js 只属于开发与构建环境，不属于用户运行环境。
 
 最佳实践：每次发布都提高版本号并重新生成 SHA-256，不覆盖已经交付的同版本文件。
+
+## 已废弃产物
+
+- **Pure-Python Desktop（纯 Python 桌面端）**：自 0.5.0-rc.2 起不再构建和发布。后续 Release 只保留 WebView Preview 和 Android LAN Viewer。

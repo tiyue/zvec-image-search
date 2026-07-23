@@ -47,6 +47,7 @@ class FakeClock:
 class FakeHttpResponse:
     def __init__(self, payload: dict[str, object]) -> None:
         self._body = json.dumps(payload).encode("utf-8")
+        self.status = 200
 
     def __enter__(self) -> FakeHttpResponse:
         return self
@@ -56,6 +57,52 @@ class FakeHttpResponse:
 
     def read(self, _size: int = -1) -> bytes:
         return self._body
+
+    def getheader(self, name: str, default: str | None = None) -> str | None:
+        return default
+
+
+class FakeHttpErrorResponse:
+    def __init__(
+        self,
+        status: int,
+        payload: dict[str, object],
+        retry_after: str | None = None,
+    ) -> None:
+        self._body = json.dumps(payload).encode("utf-8")
+        self.status = status
+        self._retry_after = retry_after
+
+    def read(self, _size: int = -1) -> bytes:
+        return self._body
+
+    def getheader(self, name: str, default: str | None = None) -> str | None:
+        if name == "Retry-After":
+            return self._retry_after
+        return default
+
+
+class FakePooledConnection:
+    def __init__(self, responses: list) -> None:
+        self._responses = list(responses)
+        self._call_index = 0
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        body: bytes | None = None,
+        headers: dict | None = None,
+    ) -> None:
+        pass
+
+    def getresponse(self):
+        response = self._responses[self._call_index]
+        self._call_index += 1
+        return response
+
+    def close(self) -> None:
+        pass
 
 
 def _http_error(
@@ -305,11 +352,14 @@ class RateLimitedClientTests(unittest.TestCase):
                 "usage": {"total_tokens": 12},
             }
         )
+        error_response = FakeHttpErrorResponse(
+            429,
+            {"code": "RateLimit", "message": "retry"},
+            retry_after="0",
+        )
+        fake_conn = FakePooledConnection([error_response, success])
 
-        with patch(
-            "image_vector_service.dashscope_client.urllib.request.urlopen",
-            side_effect=[_http_error(429, retry_after="0"), success],
-        ):
+        with patch.object(client, "_get_connection", return_value=fake_conn):
             response = client.embed_text("test")
 
         snapshot = limiter.snapshot()

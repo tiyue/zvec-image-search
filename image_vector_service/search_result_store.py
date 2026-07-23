@@ -139,8 +139,8 @@ def write_result_store(
     result_count = 0
     try:
         connection = sqlite3.connect(str(temporary_path), timeout=30.0)
-        connection.execute("PRAGMA journal_mode = DELETE")
-        connection.execute("PRAGMA synchronous = FULL")
+        connection.execute("PRAGMA journal_mode = WAL")
+        connection.execute("PRAGMA synchronous = NORMAL")
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute(f"PRAGMA application_id = {RESULT_STORE_APPLICATION_ID}")
         connection.execute(f"PRAGMA user_version = {RESULT_STORE_SCHEMA_VERSION}")

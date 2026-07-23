@@ -611,13 +611,10 @@ class _LanRequestHandler(BaseHTTPRequestHandler):
             )
         raw_host = host_values[0].strip()
         expected_port = cast(_LanThreadingHttpServer, self.server).server_port
-        normalized_host = _validated_host_header(raw_host, expected_port)
-        if normalized_host not in self.gateway._allowed_hosts:
-            raise _ApiProblem(
-                HTTPStatus.MISDIRECTED_REQUEST,
-                "invalid_host",
-                "The request host is invalid.",
-            )
+        # _validated_host_header already rejects DNS names and non-IPv4 hosts,
+        # preventing DNS-rebinding.  Any valid IPv4 is accepted so that tunneled
+        # connections (e.g. frp with a public IP) work alongside direct LAN use.
+        _validated_host_header(raw_host, expected_port)
 
     def _require_current_generation(self) -> None:
         httpd = cast(_LanThreadingHttpServer, self.server)

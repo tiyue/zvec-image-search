@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { onMounted, toRef } from "vue";
+import { computed, onMounted, ref, toRef } from "vue";
 
+import PaginationBar from "../../components/PaginationBar.vue";
 import type {
   IntelligenceImage,
   LearningCandidateKind,
@@ -70,6 +71,20 @@ function setSingleDecision(docId: string, decision: LearningDecisionValue): void
     ? learning.editTagInput.value.split(/[\n\r,，、;；]+/u).map((tag) => tag.trim()).filter(Boolean)
     : [];
   learning.setDecision(docId, decision, [...new Set(labels)]);
+}
+
+const LEARNING_PAGE_SIZE = 12;
+const learningPage = ref(1);
+
+const allSamples = computed(() => learning.queue.value?.samples ?? []);
+const learningTotalPages = computed(() => Math.max(1, Math.ceil(allSamples.value.length / LEARNING_PAGE_SIZE)));
+const pagedSamples = computed(() => {
+  const start = (learningPage.value - 1) * LEARNING_PAGE_SIZE;
+  return allSamples.value.slice(start, start + LEARNING_PAGE_SIZE);
+});
+
+function goLearningPage(page: number): void {
+  learningPage.value = Math.max(1, Math.min(page, learningTotalPages.value));
 }
 
 onMounted(() => {
@@ -215,7 +230,7 @@ onMounted(() => {
     </div>
     <div v-else class="learning-grid" aria-label="待学习样本列表">
       <article
-        v-for="sample in learning.queue.value?.samples ?? []"
+        v-for="sample in pagedSamples"
         :key="sample.docId"
         class="learning-card"
         :class="{
@@ -296,6 +311,22 @@ onMounted(() => {
       </article>
     </div>
 
+    <PaginationBar
+      v-if="allSamples.length > LEARNING_PAGE_SIZE"
+      id-prefix="learning-panel"
+      aria-label="待学习样本分页"
+      :page="learningPage"
+      :total-pages="learningTotalPages"
+      :total-items="allSamples.length"
+      :loading="learning.busy.value"
+      :has-previous="learningPage > 1"
+      :has-next="learningPage < learningTotalPages"
+      item-label="张样本"
+      @previous="goLearningPage(learningPage - 1)"
+      @next="goLearningPage(learningPage + 1)"
+      @jump="goLearningPage"
+    />
+
     <footer class="learning-footer">
       <span>
         候选 {{ learning.queue.value?.candidateCount ?? 0 }} 张 · 本轮
@@ -325,7 +356,7 @@ onMounted(() => {
 .learning-status progress{accent-color:#777}.review-summary dl div{background:#fff}
 .selection-buttons button,.batch-decisions button,.single-decisions button{border-color:#dedede;border-radius:8px;color:#4b4b4b;background:#f5f5f5;font-weight:500}
 .edit-tag-input input{border-color:#dedede;color:#242424;background:#fff}
-.learning-grid{grid-template-columns:repeat(4,minmax(0,1fr));grid-template-rows:repeat(3,minmax(0,1fr));gap:9px;padding:2px 3px 8px 1px;align-content:stretch;overflow:hidden}
+.learning-grid{grid-template-columns:repeat(4,minmax(0,1fr));grid-template-rows:repeat(3,minmax(180px,1fr));gap:9px;padding:2px 3px 8px 1px;align-content:stretch;overflow:auto}
 .learning-card{display:grid;grid-template-columns:1fr;grid-template-rows:minmax(0,1fr) auto auto;align-items:stretch;border:1px solid #e5e5e5;border-radius:10px;background:#fff;box-shadow:none;overflow:hidden;padding:0;min-height:0}
 .learning-card.selected{border-color:#999;background:#f8f8f8;box-shadow:none}.learning-card.decided{background:#fafafa}
 .learning-select{position:absolute;z-index:2;top:6px;left:6px;padding:0;color:#555;background:rgba(255,255,255,.85);border-radius:6px;width:22px;height:22px;display:grid;place-items:center;backdrop-filter:none}.learning-select input{accent-color:#777;margin:0}.learning-select span{display:none}
@@ -336,13 +367,13 @@ onMounted(() => {
 .single-decisions{display:grid;grid-template-columns:repeat(4,1fr);gap:3px;padding:4px 6px 6px}.single-decisions button.active{border-color:#555;color:#fff;background:#555;box-shadow:none}
 .decision-state,.review-failure{grid-column:1/-1}.decision-state{color:#555;background:#ededed}
 .learning-footer{border-top-color:#e5e5e5;color:#777}.learning-footer strong{color:#555}
-@media(max-width:1180px){.learning-grid{grid-template-columns:repeat(3,minmax(0,1fr));grid-template-rows:repeat(4,minmax(0,1fr))}}
+@media(max-width:1180px){.learning-grid{grid-template-columns:repeat(3,minmax(0,1fr));grid-template-rows:repeat(4,minmax(180px,1fr));overflow:auto}}
 @media(max-width:760px){.learning-grid{grid-template-columns:repeat(2,minmax(0,1fr));grid-template-rows:repeat(4,minmax(0,1fr));overflow:auto}.learning-notice{flex-wrap:wrap}.learning-notice .learning-controls{width:100%}}
 @media(max-width:500px){.learning-grid{grid-template-columns:1fr;grid-template-rows:none;overflow:auto}}
-.learning-panel{display:grid;height:100%;min-height:0;grid-template-rows:50px auto auto auto minmax(0,1fr) auto;gap:0;overflow:hidden;border:0;border-radius:0;color:#222;background:#fff;box-shadow:none}
+.learning-panel{display:grid;height:100%;min-height:0;grid-template-rows:50px auto auto auto minmax(0,1fr) auto auto;gap:0;overflow:hidden;border:0;border-radius:0;color:#222;background:#fff;box-shadow:none}
 .learning-heading{display:flex;min-height:50px;align-items:center;justify-content:flex-end;padding:0;border:0}.learning-heading>div:first-child{display:none}
 .learning-notice{display:flex;align-items:center;gap:10px;margin:0 0 12px;padding:9px 12px;border:1px solid rgb(36 122 89 / 18%);border-radius:10px;color:#555;background:rgb(36 122 89 / 6%)}.learning-notice>span{color:#47806b;flex-shrink:0}.learning-notice-body{flex:1;min-width:0}.learning-notice-body strong{font-size:12px;font-weight:500}.learning-notice-body small{display:block;margin-top:2px;color:#777;font-size:10px}.learning-notice .learning-controls{display:flex;align-items:flex-end;gap:7px;flex-shrink:0}.learning-notice .learning-controls label{display:grid;gap:3px;color:#777;font-size:10px}.learning-notice .learning-controls input{width:76px;height:34px;padding:0 9px;border:1px solid #dedede;border-radius:8px;background:#fff}.learning-notice .learning-button{min-height:34px;padding:0 10px;border:1px solid #dedede;border-radius:8px;font-weight:400}.learning-notice .learning-button.primary{color:#fff;border-color:#aaa;background:#aaa}.learning-notice .learning-button.secondary{color:#555;background:#f5f5f5}
 .learning-feedback{display:grid;gap:7px}.learning-status,.review-summary{border-color:#e1e1e1!important;border-radius:8px!important;color:#555!important;background:#f6f6f6!important}
 .decision-toolbar{display:grid;min-height:56px;grid-template-columns:auto auto minmax(160px,1fr) auto auto;align-items:center;gap:8px;margin:12px 0;padding:8px 10px;border:0;border-radius:10px;background:#f2f2f2}.selection-summary{display:flex;align-items:center;gap:7px}.selection-summary strong{font-size:12px;font-weight:500}.selection-buttons,.batch-decisions{display:flex;gap:5px}.selection-buttons button,.batch-decisions button{min-height:30px;padding:0 8px;border:1px solid #dedede;border-radius:8px;color:#444;background:#fff}.edit-tag-input input{width:100%;height:34px;border:1px solid #dedede;border-radius:8px;background:#fff}.submit-review{white-space:nowrap}
-.learning-empty{display:grid;min-height:0;place-items:center;align-content:center;color:#777}.learning-empty strong{font-weight:500}.learning-empty span{margin-top:4px;font-size:11px}.learning-grid{grid-template-columns:repeat(4,minmax(0,1fr));grid-template-rows:repeat(3,minmax(0,1fr));gap:9px;padding:2px 3px 8px 1px;align-content:stretch;overflow:hidden}.learning-footer{min-height:36px;border-top:1px solid #e5e5e5;color:#777}
+.learning-empty{display:grid;min-height:0;place-items:center;align-content:center;color:#777}.learning-empty strong{font-weight:500}.learning-empty span{margin-top:4px;font-size:11px}.learning-grid{grid-template-columns:repeat(4,minmax(0,1fr));grid-template-rows:repeat(3,minmax(180px,1fr));gap:9px;padding:2px 3px 8px 1px;align-content:stretch;overflow:auto}.learning-footer{min-height:36px;border-top:1px solid #e5e5e5;color:#777}
 </style>

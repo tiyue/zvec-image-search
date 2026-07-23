@@ -411,6 +411,11 @@ class ImageVectorService:
                     "cluster_operation_store_unavailable error=%s",
                     str(exc) or exc.__class__.__name__,
                 )
+            self._tag_catalog_cache: TagCatalog | None = None
+            self._tag_aliases_cache: TagAliasDictionary | None = None
+            self._search_executor = ThreadPoolExecutor(
+                max_workers=3, thread_name_prefix="zvec-search"
+            )
             self._refresh_tag_catalog()
             self.source_resolver = SourcePathResolver(self.state)
             self.auto_tag_cache = SharedAutoTagCache(
@@ -768,6 +773,8 @@ class ImageVectorService:
             self.logger.info("legacy_root_tags_cleared roots=%d", cleared)
 
     def _refresh_tag_catalog(self) -> None:
+        self._tag_catalog_cache = None
+        self._tag_aliases_cache = None
         configure = getattr(self.repository, "set_tag_catalog", None)
         if configure is not None:
             configure(
@@ -776,16 +783,20 @@ class ImageVectorService:
             )
 
     def _current_tag_aliases(self) -> TagAliasDictionary:
-        return TagAliasDictionary.load(
-            self.config.results_path / "tag-aliases.json",
-            missing_ok=True,
-        )
+        if self._tag_aliases_cache is None:
+            self._tag_aliases_cache = TagAliasDictionary.load(
+                self.config.results_path / "tag-aliases.json",
+                missing_ok=True,
+            )
+        return self._tag_aliases_cache
 
     def _current_tag_catalog(self) -> TagCatalog:
-        return TagCatalog(
-            self.state.list_effective_tags(),
-            aliases=self._current_tag_aliases(),
-        )
+        if self._tag_catalog_cache is None:
+            self._tag_catalog_cache = TagCatalog(
+                self.state.list_effective_tags(),
+                aliases=self._current_tag_aliases(),
+            )
+        return self._tag_catalog_cache
 
     def list_tag_aliases(self) -> dict[str, object]:
         """Return the shared search aliases in the desktop API shape."""
@@ -3423,13 +3434,17 @@ class ImageVectorService:
         if text_vector is None:
             missing.append("text")
         if len(missing) == 2:
-            with ThreadPoolExecutor(max_workers=2) as executor:
+            executor = getattr(self, "_search_executor", None)
+            if executor is not None:
                 image_future = executor.submit(
                     self.embedding_client.embed_images, [path]
                 )
                 text_future = executor.submit(self.embedding_client.embed_text, text)
                 responses["image"] = image_future.result()
                 responses["text"] = text_future.result()
+            else:
+                responses["image"] = self.embedding_client.embed_images([path])
+                responses["text"] = self.embedding_client.embed_text(text)
         elif missing == ["image"]:
             responses["image"] = self.embedding_client.embed_images([path])
         elif missing == ["text"]:
@@ -3892,31 +3907,64 @@ class ImageVectorService:
         catalog = self._current_tag_catalog()
         intent = detect_hybrid_tag_intent(text, catalog)
         candidate_k = hybrid_candidate_count(top_k, self.repository.doc_count)
-        vector_hits = self._query_quality_candidates(
-            vector,
-            candidate_k,
-            tags=tags,
-            tag_mode=tag_mode,
-            quality_mode="text",
-            rank_source="text",
-        )
-        metadata_hits = self._query_metadata_candidates(
-            vector,
-            candidate_k,
-            tags=tags,
-            tag_mode=tag_mode,
-        )
-        tag_hits = (
-            self._tag_search_hits(
-                text,
+        if self.repository.doc_count > 200 and hasattr(self, "_search_executor"):
+            vector_future = self._search_executor.submit(
+                self._query_quality_candidates,
+                vector,
+                candidate_k,
                 tags=tags,
                 tag_mode=tag_mode,
-                query_plan=intent.plan,
-                candidate_limit=candidate_k,
-            )[0]
-            if intent.enabled
-            else []
-        )
+                quality_mode="text",
+                rank_source="text",
+            )
+            metadata_future = self._search_executor.submit(
+                self._query_metadata_candidates,
+                vector,
+                candidate_k,
+                tags=tags,
+                tag_mode=tag_mode,
+            )
+            tag_future = (
+                self._search_executor.submit(
+                    self._tag_search_hits,
+                    text,
+                    tags=tags,
+                    tag_mode=tag_mode,
+                    query_plan=intent.plan,
+                    candidate_limit=candidate_k,
+                )
+                if intent.enabled
+                else None
+            )
+            vector_hits = vector_future.result()
+            metadata_hits = metadata_future.result()
+            tag_hits = tag_future.result()[0] if tag_future is not None else []
+        else:
+            vector_hits = self._query_quality_candidates(
+                vector,
+                candidate_k,
+                tags=tags,
+                tag_mode=tag_mode,
+                quality_mode="text",
+                rank_source="text",
+            )
+            metadata_hits = self._query_metadata_candidates(
+                vector,
+                candidate_k,
+                tags=tags,
+                tag_mode=tag_mode,
+            )
+            tag_hits = (
+                self._tag_search_hits(
+                    text,
+                    tags=tags,
+                    tag_mode=tag_mode,
+                    query_plan=intent.plan,
+                    candidate_limit=candidate_k,
+                )[0]
+                if intent.enabled
+                else []
+            )
         if not tag_hits:
             # Explicit filters can remove every tag candidate. In that case the
             # semantic channel remains useful and must not be penalized.
@@ -4274,7 +4322,8 @@ class ImageVectorService:
         if total == 0:
             return ConfidenceRanking([], "no_reliable_match", 0, 0)
         candidate_k = min(total, confidence_candidate_limit(top_k))
-        with ThreadPoolExecutor(max_workers=2) as executor:
+        executor = getattr(self, "_search_executor", None)
+        if executor is not None:
             image_future = executor.submit(
                 self._query_quality_candidates,
                 image_vector,
@@ -4296,6 +4345,26 @@ class ImageVectorService:
                 rank_source="text",
             )
             candidates = image_future.result() + text_future.result()
+        else:
+            image_hits = self._query_quality_candidates(
+                image_vector,
+                candidate_k,
+                exclude_sha256=exclude_sha256,
+                tags=tags,
+                tag_mode=tag_mode,
+                quality_mode="image",
+                rank_source="image",
+            )
+            text_hits = self._query_quality_candidates(
+                text_vector,
+                candidate_k,
+                exclude_sha256=exclude_sha256,
+                tags=tags,
+                tag_mode=tag_mode,
+                quality_mode="text",
+                rank_source="text",
+            )
+            candidates = image_hits + text_hits
         thresholds = self.search_quality.thresholds_for("combined")
         # Keep combined ranking available to the same lightweight/degraded
         # adapters instead of failing on a missing configuration attribute.
@@ -4398,9 +4467,10 @@ class ImageVectorService:
                 "mode": "weighted_rrf",
             }
         limit = min(total, max(top_k * 3, top_k + 10))
+        executor = getattr(self, "_search_executor", None)
         while True:
             self.cancel_check()
-            with ThreadPoolExecutor(max_workers=3) as executor:
+            if executor is not None:
                 image_future = executor.submit(
                     self.repository.query,
                     image_vector,
@@ -4428,6 +4498,16 @@ class ImageVectorService:
                 image_hits = image_future.result()
                 text_hits = text_future.result()
                 metadata_hits = metadata_future.result()
+            else:
+                image_hits = self.repository.query(
+                    image_vector, limit, tags, tag_mode, "image"
+                )
+                text_hits = self.repository.query(
+                    text_vector, limit, tags, tag_mode, "text"
+                )
+                metadata_hits = self.repository.query_metadata(
+                    text_vector, limit, tags, tag_mode, "metadata"
+                )
             image_hits = _exclude_content_hash(image_hits, exclude_sha256)
             text_hits = _exclude_content_hash(text_hits, exclude_sha256)
             metadata_hits = _exclude_content_hash(metadata_hits, exclude_sha256)
@@ -6625,6 +6705,8 @@ class ImageVectorService:
                 self.run_idle_maintenance()
         if hasattr(self, "state"):
             self.state.close()
+        if hasattr(self, "_search_executor"):
+            self._search_executor.shutdown(wait=False)
         if hasattr(self, "auto_tag_cache"):
             self.auto_tag_cache.close()
         close_repository = getattr(getattr(self, "repository", None), "close", None)

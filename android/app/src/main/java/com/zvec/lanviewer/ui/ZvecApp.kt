@@ -741,15 +741,14 @@ private fun OriginalViewer(
             HorizontalPager(state = pagerState, modifier = Modifier.fillMaxSize()) { page ->
                 val item = state.results[page]
                 Box(
-                    Modifier.fillMaxSize().pointerInput(Unit) {
-                        detectTapGestures(onLongPress = { sheetItem = item; showInfo = false })
-                    },
+                    Modifier.fillMaxSize(),
                     contentAlignment = Alignment.Center,
                 ) {
                     ZoomableOriginalImage(
                         url = mediaUrl(item),
                         contentDescription = item.name,
                         rotation = rotations[page] ?: 0f,
+                        onLongPress = { sheetItem = item; showInfo = false },
                     )
                 }
             }
@@ -820,7 +819,7 @@ private fun OriginalViewer(
 }
 
 @Composable
-private fun ZoomableOriginalImage(url: String, contentDescription: String, rotation: Float = 0f) {
+private fun ZoomableOriginalImage(url: String, contentDescription: String, rotation: Float = 0f, onLongPress: () -> Unit = {}) {
     val context = LocalContext.current
     var scale by remember(url) { mutableFloatStateOf(1f) }
     var offset by remember(url) { mutableStateOf(Offset.Zero) }
@@ -835,7 +834,7 @@ private fun ZoomableOriginalImage(url: String, contentDescription: String, rotat
     SubcomposeAsyncImage(
         model = ImageRequest.Builder(context).data(url).crossfade(true).build(),
         contentDescription = contentDescription,
-        contentScale = ContentScale.Crop,
+        contentScale = ContentScale.Fit,
         modifier = Modifier
             .fillMaxSize()
             .onSizeChanged { viewport = it }
@@ -852,6 +851,7 @@ private fun ZoomableOriginalImage(url: String, contentDescription: String, rotat
                         scale = if (scale > 1f) 1f else 2.5f
                         if (scale == 1f) offset = Offset.Zero
                     },
+                    onLongPress = { onLongPress() },
                 )
             }
             .pointerInput(url) {
