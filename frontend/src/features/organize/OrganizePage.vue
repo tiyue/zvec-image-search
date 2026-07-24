@@ -79,8 +79,6 @@ watch(organize.deletePreview, () => {
   deleteConfirmation.value = "";
 });
 
-const galleryLayoutStyle = computed(() => ({}));
-
 function changeLibrary(event: Event): void {
   void organize.selectLibrary((event.target as HTMLSelectElement).value);
 }

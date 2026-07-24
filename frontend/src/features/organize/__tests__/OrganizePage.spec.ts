@@ -168,7 +168,7 @@ describe("OrganizePage batch tags", () => {
       "lib-1",
       "folder-raiden",
       1,
-      12,
+      6,
       false,
       expect.any(AbortSignal),
     );
@@ -189,7 +189,7 @@ describe("OrganizePage batch tags", () => {
       "lib-1",
       "folder-raiden",
       2,
-      12,
+      6,
       false,
       expect.any(AbortSignal),
     );
@@ -307,7 +307,7 @@ describe("OrganizePage batch tags", () => {
       "lib-1",
       "root-folder-key",
       1,
-      12,
+      6,
       false,
       expect.any(AbortSignal),
     );
@@ -322,7 +322,7 @@ describe("OrganizePage batch tags", () => {
       "lib-1",
       "root-folder-key",
       2,
-      12,
+      6,
       false,
       expect.any(AbortSignal),
     );
@@ -334,7 +334,7 @@ describe("OrganizePage batch tags", () => {
       "lib-1",
       "child-folder-key",
       1,
-      12,
+      6,
       false,
       expect.any(AbortSignal),
     );
@@ -345,7 +345,7 @@ describe("OrganizePage batch tags", () => {
       "lib-1",
       "root-folder-key",
       1,
-      12,
+      6,
       false,
       expect.any(AbortSignal),
     );
@@ -484,7 +484,7 @@ describe("OrganizePage batch tags", () => {
       "lib-1",
       "folder-raiden",
       1,
-      12,
+      6,
       false,
       expect.any(AbortSignal),
     );
@@ -523,7 +523,7 @@ describe("OrganizePage batch tags", () => {
       "lib-1",
       "folder-raiden",
       1,
-      12,
+      6,
       false,
       expect.any(AbortSignal),
     );
