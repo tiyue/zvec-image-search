@@ -61,9 +61,7 @@ class IndexState:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            self.connection = sqlite3.connect(
-                path, timeout=5, check_same_thread=False
-            )
+            self.connection = sqlite3.connect(path, timeout=5, check_same_thread=False)
             self.connection.row_factory = sqlite3.Row
             self.connection.create_function(
                 "zvec_annotation_retryable",

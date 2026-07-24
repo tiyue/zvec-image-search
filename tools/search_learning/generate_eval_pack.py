@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import sys
 from pathlib import Path
 from typing import Any
@@ -58,7 +57,9 @@ def _build_features(
         "action_match": 0.0,
         "expression_match": 0.0,
         "scene_match": 0.0,
-        "image_text_agreement": _clamp01(float(rank_agreement)) if rank_agreement else 0.0,
+        "image_text_agreement": _clamp01(float(rank_agreement))
+        if rank_agreement
+        else 0.0,
         "collection_rank": float(rank),
         "collection_size": float(max(0, collection_size)),
         "duplicate_group_size": 1.0,
@@ -72,9 +73,7 @@ def _is_relevant(result: dict[str, Any]) -> bool:
     confidence = float(result.get("confidence", 0.0))
     if match_state == "high":
         return True
-    if match_state == "possible" and confidence >= 0.65:
-        return True
-    return False
+    return match_state == "possible" and confidence >= 0.65
 
 
 def generate_pack(
@@ -109,7 +108,9 @@ def generate_pack(
             continue
 
         # Use directory name as query_id (must be unique)
-        raw_id = rf.parent.name.replace(" ", "_").replace("\n", "_").replace("\r", "")[:120]
+        raw_id = (
+            rf.parent.name.replace(" ", "_").replace("\n", "_").replace("\r", "")[:120]
+        )
         query_id = raw_id.strip() or f"query-{len(cases)}"
         # Ensure uniqueness
         existing_ids = {c["query_id"] for c in cases}
@@ -129,14 +130,16 @@ def generate_pack(
                 any_relevant = True
             confidence = float(item.get("confidence", 0.0))
             features = _build_features(item, query_type, collection_size)
-            candidates.append({
-                "doc_id": doc_id,
-                "library_id": library_id,
-                "relevant": relevant,
-                "fallback_score": _clamp01(confidence),
-                "fallback_rank": idx + 1,
-                "features": features,
-            })
+            candidates.append(
+                {
+                    "doc_id": doc_id,
+                    "library_id": library_id,
+                    "relevant": relevant,
+                    "fallback_score": _clamp01(confidence),
+                    "fallback_rank": idx + 1,
+                    "features": features,
+                }
+            )
 
         if not candidates:
             continue
@@ -147,13 +150,15 @@ def generate_pack(
         else:
             no_answer_count += 1
 
-        cases.append({
-            "query_id": query_id,
-            "query_type": query_type,
-            "has_answer": has_answer,
-            "latency_ms": 50.0 + len(candidates) * 2.0,
-            "candidates": candidates,
-        })
+        cases.append(
+            {
+                "query_id": query_id,
+                "query_type": query_type,
+                "has_answer": has_answer,
+                "latency_ms": 50.0 + len(candidates) * 2.0,
+                "candidates": candidates,
+            }
+        )
 
     # Ensure we have both has_answer=True and has_answer=False
     if has_answer_count == 0 or no_answer_count == 0:
