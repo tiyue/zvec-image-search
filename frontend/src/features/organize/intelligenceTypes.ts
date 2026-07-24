@@ -20,6 +20,8 @@ export interface IntelligenceImage {
   thumbnailUrl: string;
   imageUrl: string;
   imageAvailable: boolean;
+  width: number;
+  height: number;
 }
 
 export interface IdentityAnchorView {

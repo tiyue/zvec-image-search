@@ -419,6 +419,12 @@ async function markContextFeedback(action: "relevant" | "not_relevant"): Promise
     );
   } else if (searchFeedback.lastError.value) {
     addToast("反馈未保存", searchFeedback.lastError.value, "error");
+  } else {
+    addToast(
+      "反馈未保存",
+      "搜索学习未启用或当前结果不支持反馈记录。",
+      "error",
+    );
   }
 }
 

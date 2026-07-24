@@ -95,6 +95,7 @@ describe("useSearchFeedback", () => {
   it("records explicit feedback with stable candidate identifiers and undoes it", async () => {
     const api = fakeApi();
     const feedback = useSearchFeedback(api);
+    await feedback.initialize();
 
     expect(await feedback.markRelevant(item)).toBe(true);
     expect(api.feedback).toHaveBeenCalledWith({
@@ -125,8 +126,9 @@ describe("useSearchFeedback", () => {
 
   it("fails open when learning is unavailable and keeps UI state reusable", async () => {
     const api = fakeApi();
-    vi.mocked(api.feedback).mockRejectedValueOnce(new Error("disk full"));
     const feedback = useSearchFeedback(api);
+    await feedback.initialize();
+    vi.mocked(api.feedback).mockRejectedValueOnce(new Error("disk full"));
 
     expect(await feedback.markNotRelevant(item)).toBe(false);
     expect(feedback.pending.value).toBe(false);
@@ -139,6 +141,7 @@ describe("useSearchFeedback", () => {
   it("does not attach feedback to the untracked latest-results pseudo session", async () => {
     const api = fakeApi();
     const feedback = useSearchFeedback(api);
+    await feedback.initialize();
     const latestItem = { ...item, searchSessionId: "latest" };
 
     expect(await feedback.markRelevant(latestItem)).toBe(false);
@@ -155,6 +158,7 @@ describe("useSearchFeedback", () => {
   it("keeps explicit menu state when an implicit action is recorded", async () => {
     const api = fakeApi();
     const feedback = useSearchFeedback(api);
+    await feedback.initialize();
     feedback.implicitEnabled.value = true;
 
     expect(await feedback.markRelevant(item)).toBe(true);

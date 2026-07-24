@@ -176,7 +176,7 @@ function tileRowSpan(image: OrganizeImage): number {
     image.height,
     colSpan,
     containerWidth.value,
-    4,
+    3,
     GRID_GAP,
     GALLERY_META_OVERHEAD,
   );
@@ -948,7 +948,7 @@ textarea { resize: vertical; line-height: 1.5; }
 .toolbar-button { border: 1px solid #dde1ec; border-radius: 8px; padding: 6px 9px; color: #515b73; background: #f8f9fc; font: inherit; font-size: 11px; font-weight: 750; cursor: pointer; transition: .12s ease; }
 .toolbar-button.quiet { color: #8a5260; background: #fff6f7; }
 .gallery-viewport { min-height: 0; overflow: auto; }
-.image-grid { display: grid; min-height: 0; grid-template-columns: repeat(4, 1fr); grid-auto-flow: row dense; grid-auto-rows: 10px; gap: 9px; overflow: auto; padding: 2px 3px 8px 1px; }
+.image-grid { display: grid; min-height: 0; grid-template-columns: repeat(3, 1fr); grid-auto-flow: row dense; grid-auto-rows: 10px; gap: 9px; padding: 2px 3px 8px 1px; }
 .image-tile.span-2 { grid-column: span 2; }
 .image-tile { position: relative; display: grid; grid-template-rows: minmax(0,1fr) auto; min-width: 0; min-height: 0; overflow: hidden; border: 1px solid #e1e5ee; border-radius: 12px; background: #fff; content-visibility: auto; contain-intrinsic-size: 210px 168px; }
 .image-tile.selected { border-color: #6d5ee3; box-shadow: 0 0 0 2px rgba(109,94,227,.16); }
@@ -1067,7 +1067,7 @@ textarea { resize: vertical; line-height: 1.5; }
 .folder-library-refresh,.folder-search .icon-button { border-color:#dedede; color:#555; background:#f5f5f5; }
 .selection-toolbar { margin-bottom:10px; padding:8px 10px; border:0; border-radius:10px; background:#f7f7f7; }
 .toolbar-button,.toolbar-button.quiet,.editor-toggle,.folder-load-more { border-color:#dedede; color:#333; background:#f5f5f5; font-weight:500; }
-.image-grid { grid-template-columns: repeat(4, 1fr); grid-auto-flow: row dense; gap: 8px; }
+.image-grid { grid-template-columns: repeat(3, 1fr); grid-auto-flow: row dense; gap: 8px; }
 .image-tile.span-2 { grid-column: span 2; }
 .image-tile { border:0; border-radius:10px; background:#f2f2f2; box-shadow:none; }
 .image-tile:hover { transform:translateY(-2px); box-shadow:0 4px 12px -2px rgb(0 0 0 / 10%); }

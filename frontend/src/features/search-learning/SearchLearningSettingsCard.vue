@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 
 import { searchLearningApi } from "./api";
 import type {
@@ -9,8 +9,9 @@ import type {
   SearchLearningStatus,
 } from "./types";
 
-const props = withDefaults(defineProps<{ api?: SearchLearningApi }>(), {
+const props = withDefaults(defineProps<{ api?: SearchLearningApi; active?: boolean }>(), {
   api: () => searchLearningApi,
+  active: true,
 });
 
 const emit = defineEmits<{
@@ -354,9 +355,21 @@ async function exportData(): Promise<void> {
   }
 }
 
-onMounted(() => void refresh());
+function handleVisibilityChange(): void {
+  if (!document.hidden && props.active) void refresh();
+}
+
+watch(() => props.active, (isActive) => {
+  if (isActive) void refresh();
+});
+
+onMounted(() => {
+  void refresh();
+  document.addEventListener("visibilitychange", handleVisibilityChange);
+});
 onBeforeUnmount(() => {
   if (refreshTimer !== null) window.clearTimeout(refreshTimer);
+  document.removeEventListener("visibilitychange", handleVisibilityChange);
 });
 </script>
 

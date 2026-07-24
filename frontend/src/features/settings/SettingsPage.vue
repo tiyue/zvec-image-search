@@ -375,6 +375,7 @@ function chooseResultsDirectory(): void {
 
     <SearchLearningSettingsCard
       v-show="activeSection === 'learning'"
+      :active="activeSection === 'learning'"
       :api="props.learningApi"
       @toast="(title, message, kind) => emit('toast', title, message, kind)"
     />

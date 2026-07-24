@@ -1,5 +1,5 @@
 export const ORGANIZE_GALLERY_MAX_PAGE_SIZE = 32;
-export const ORGANIZE_GALLERY_DEFAULT_PAGE_SIZE = 12;
+export const ORGANIZE_GALLERY_DEFAULT_PAGE_SIZE = 6;
 
 export interface OrganizeGalleryCapacity {
   pageSize: number;

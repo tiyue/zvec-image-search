@@ -3354,6 +3354,25 @@ class PreviewFacade:
             and len(query_library_ids) == 1
             else ""
         )
+        # History results need their session registered so feedback can be
+        # recorded against them.  The original fresh-search path already
+        # recorded the session under the UUID operation_id, but history
+        # re-opens use a different identifier.
+        if operation_id.startswith("history:"):
+            with suppress(Exception):
+                self._search_learning.store.try_record_search(
+                    SearchSessionRecord(
+                        session_id=operation_id,
+                        query_type=page.query_type or "text",
+                        requested_count=page.page_size,
+                        returned_count=page.total_items,
+                        library_ids=(
+                            (fallback_library_id,) if fallback_library_id else ()
+                        ),
+                        latency_ms=0,
+                        candidates=(),
+                    )
+                )
         for result in page.items:
             try:
                 item = self._search_result_view(result)
@@ -3365,11 +3384,7 @@ class PreviewFacade:
                 item["library_id"] = library_id
                 item["doc_id"] = doc_id
                 items.append(item)
-                if (
-                    operation_id != "latest"
-                    and not operation_id.startswith("history:")
-                    and library_id
-                ):
+                if operation_id != "latest" and library_id:
                     with suppress(Exception):
                         self._search_learning.store.ensure_candidate(
                             session_id=operation_id,

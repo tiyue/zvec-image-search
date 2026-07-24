@@ -15,7 +15,7 @@ export function useSearchFeedback(api: SearchLearningApi = searchLearningApi) {
   const pendingKeys = shallowReactive(new Set<string>());
   const loadedSessions = new Set<string>();
   const loadingSessions = new Map<string, Promise<boolean>>();
-  const enabled = ref(true);
+  const enabled = ref(false);
   const implicitEnabled = ref(false);
   const lastError = ref("");
 
@@ -34,7 +34,14 @@ export function useSearchFeedback(api: SearchLearningApi = searchLearningApi) {
     action: FeedbackAction,
     source = "context_menu",
   ): Promise<boolean> {
-    if (!enabled.value || !canRecordFeedback(item)) return false;
+    if (!enabled.value) {
+      lastError.value = "搜索学习未启用，请在设置中开启。";
+      return false;
+    }
+    if (!canRecordFeedback(item)) {
+      lastError.value = "当前搜索结果不支持反馈记录（缺少会话信息）。";
+      return false;
+    }
     if (!["relevant", "not_relevant"].includes(action) && !implicitEnabled.value) {
       return false;
     }

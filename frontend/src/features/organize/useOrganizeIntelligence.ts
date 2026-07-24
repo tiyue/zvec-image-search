@@ -186,6 +186,8 @@ function normalizeImage(raw: Record<string, unknown>): IntelligenceImage {
     imageUrl,
     imageAvailable:
       raw.image_available === true || Boolean(thumbnailUrl || imageUrl),
+    width: typeof raw.width === "number" && raw.width > 0 ? raw.width : 0,
+    height: typeof raw.height === "number" && raw.height > 0 ? raw.height : 0,
   };
 }
 
