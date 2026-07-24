@@ -56,3 +56,4 @@ logs/
 # Local build, validation, and review artifacts
 /artifacts/
 workspace/
+.venv-build/
