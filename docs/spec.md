@@ -153,6 +153,8 @@ Kotlin + Gradle 构建的安卓应用，通过 LAN API 与桌面端通信。
 | `search-learning/` | 搜索学习产物（聚类快照、主动学习队列） |
 | `model-catalog.default.json` | 默认模型配置 |
 
+集合写入前会对字段做安全校验（`collection_write_outbox`）：拒绝凭据、绝对路径（Windows 盘符 / UNC / Unix `/` 开头）和 NUL 字符。`relative_path` 必须是 POSIX 风格的相对路径，支持 CJK 字符及多级子目录（如 `作品/子目录/1.jpg`）。
+
 ## 发布与构建
 
 - **触发方式**：GitHub Actions `workflow_dispatch` 手动触发 `release.yml`

@@ -66,7 +66,11 @@ _LOCAL_PATHS = (
     re.compile(r"(?i)\bfile:///[^ \t\r\n\"']+"),
     re.compile(r"(?i)\b[a-z]:[\\/][^ \t\r\n\"'<>|]+"),
     re.compile(r"\\\\[^\\\s]+\\[^ \t\r\n\"'<>|]+"),
-    re.compile(r"(?<![A-Za-z0-9_.-])/(?:[^\s/]+/)+[^\s]*"),
+    # Unix absolute paths must start at the beginning of the value.  The
+    # previous lookbehind variant false-positived on CJK relative paths such
+    # as ``作品/子目录/1.jpg`` because the CJK character before a ``/`` is
+    # outside [A-Za-z0-9_.-].
+    re.compile(r"^/(?:[^\s/]+/)+[^\s]*"),
 )
 
 _COLLECTION_FIELDS: Final = frozenset(

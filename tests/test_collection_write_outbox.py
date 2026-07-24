@@ -318,6 +318,51 @@ class CollectionWriteOutboxTest(unittest.TestCase):
                 ],
             )
 
+    def test_cjk_relative_path_with_subdirectories_is_accepted(self) -> None:
+        """CJK folder names followed by subfolders must not be rejected.
+
+        The old ``_LOCAL_PATHS`` lookbehind pattern treated ``/子目录/file``
+        after a CJK character as a Unix absolute path because the character
+        before ``/`` was outside ``[A-Za-z0-9_.-]``.
+        """
+        cjk_path = (
+            "半半子 - Nier：2B 【49P-380MB】_jpg/"
+            "半半子 - Nier：2B 【49P-380MB】/"
+            "映画-40P/1.jpg"
+        )
+        item = CollectionWriteItem(
+            doc_id="doc-cjk",
+            action="upsert",
+            collection_fields=_collection_fields(relative_path=cjk_path),
+            vectors={
+                "embedding": [0.25, 0.5, 0.75],
+                "metadata_embedding": [0.0, 0.0, 0.0],
+            },
+            state_entry=_state_entry("doc-cjk", relative_path=cjk_path),
+        )
+        operation = self.state.write_outbox.enqueue("index:cjk", "index", [item])
+        self.assertEqual(operation.status, "pending")
+
+    def test_unix_absolute_path_is_still_rejected(self) -> None:
+        fields = _collection_fields(relative_path="/home/user/images/1.jpg")
+        with self.assertRaises(CollectionWriteValidationError):
+            self.state.write_outbox.enqueue(
+                "index:abs-unix",
+                "index",
+                [
+                    CollectionWriteItem(
+                        doc_id="doc-abs",
+                        action="upsert",
+                        collection_fields=fields,
+                        vectors={
+                            "embedding": [1.0],
+                            "metadata_embedding": [0.0],
+                        },
+                        state_entry=_state_entry("doc-abs"),
+                    )
+                ],
+            )
+
     def test_collection_rebind_discards_old_collection_writes(self) -> None:
         self.state.ensure_collection_uuid("collection-a")
         self.state.write_outbox.enqueue("index:old", "index", [_upsert()])
