@@ -341,9 +341,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         # Resolve folder to folder_key
         print(f"Resolving folder: {folder}", file=sys.stderr)
-        library_id, folder_key = _resolve_folder_key(
-            client, folder, args.library_id
-        )
+        library_id, folder_key = _resolve_folder_key(client, folder, args.library_id)
         print(f"  Library: {library_id}", file=sys.stderr)
 
         # Submit manual_tag_batch
