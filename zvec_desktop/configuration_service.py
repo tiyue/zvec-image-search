@@ -323,13 +323,8 @@ class DesktopConfigurationService:
             raise DesktopConfigurationError("enabled must be a boolean.")
         if is_default is not None and not isinstance(is_default, bool):
             raise DesktopConfigurationError("is_default must be a boolean.")
-        if (
-            auto_index_enabled is not None
-            and not isinstance(auto_index_enabled, bool)
-        ):
-            raise DesktopConfigurationError(
-                "auto_index_enabled must be a boolean."
-            )
+        if auto_index_enabled is not None and not isinstance(auto_index_enabled, bool):
+            raise DesktopConfigurationError("auto_index_enabled must be a boolean.")
 
         snapshot = self.load()
         assert snapshot is not None

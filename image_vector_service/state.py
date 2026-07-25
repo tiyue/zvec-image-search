@@ -111,9 +111,7 @@ class IndexState:
 
         conn = getattr(self._read_local, "conn", None)
         if conn is None:
-            conn = sqlite3.connect(
-                self.path, timeout=5, check_same_thread=False
-            )
+            conn = sqlite3.connect(self.path, timeout=5, check_same_thread=False)
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA query_only=ON")
             conn.execute("PRAGMA busy_timeout=2000")
@@ -687,15 +685,19 @@ class IndexState:
         return had_entries
 
     def get_metadata(self, key: str) -> str | None:
-        row = self._read_connection().execute(
-            "SELECT value FROM metadata WHERE key = ?", (key,)
-        ).fetchone()
+        row = (
+            self._read_connection()
+            .execute("SELECT value FROM metadata WHERE key = ?", (key,))
+            .fetchone()
+        )
         return str(row["value"]) if row else None
 
     def get(self, doc_id: str) -> dict[str, Any] | None:
-        row = self._read_connection().execute(
-            "SELECT * FROM entries WHERE doc_id = ?", (doc_id,)
-        ).fetchone()
+        row = (
+            self._read_connection()
+            .execute("SELECT * FROM entries WHERE doc_id = ?", (doc_id,))
+            .fetchone()
+        )
         return self._entry_from_row(row) if row else None
 
     def set_many(self, entries: Iterable[dict[str, Any]]) -> None:
@@ -2083,10 +2085,14 @@ class IndexState:
             after_doc_id = str(last["doc_id"])
 
     def find_doc_id_by_sha(self, sha256: str) -> str | None:
-        row = self._read_connection().execute(
-            "SELECT doc_id FROM entries WHERE sha256 = ? ORDER BY doc_id LIMIT 1",
-            (sha256,),
-        ).fetchone()
+        row = (
+            self._read_connection()
+            .execute(
+                "SELECT doc_id FROM entries WHERE sha256 = ? ORDER BY doc_id LIMIT 1",
+                (sha256,),
+            )
+            .fetchone()
+        )
         return str(row["doc_id"]) if row else None
 
     def find_doc_ids_by_sha_many(self, shas: Iterable[str]) -> dict[str, str]:
@@ -2127,19 +2133,27 @@ class IndexState:
 
     def _list_roots_light(self) -> list[tuple[str, str]]:
         if self._roots_light_cache is None:
-            rows = self._read_connection().execute(
-                "SELECT root_id, current_path FROM roots ORDER BY current_path"
-            ).fetchall()
+            rows = (
+                self._read_connection()
+                .execute(
+                    "SELECT root_id, current_path FROM roots ORDER BY current_path"
+                )
+                .fetchall()
+            )
             self._roots_light_cache = [
                 (str(row["root_id"]), str(row["current_path"])) for row in rows
             ]
         return self._roots_light_cache
 
     def get_cached_vector(self, cache_key: str, dimension: int) -> list[float] | None:
-        row = self._read_connection().execute(
-            "SELECT embedding, dimension FROM embedding_cache WHERE cache_key = ?",
-            (cache_key,),
-        ).fetchone()
+        row = (
+            self._read_connection()
+            .execute(
+                "SELECT embedding, dimension FROM embedding_cache WHERE cache_key = ?",
+                (cache_key,),
+            )
+            .fetchone()
+        )
         if not row or int(row["dimension"]) != dimension:
             return None
         values = array("f")
@@ -2210,9 +2224,11 @@ class IndexState:
         self.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
     def count(self) -> int:
-        row = self._read_connection().execute(
-            "SELECT COUNT(*) AS count FROM entries"
-        ).fetchone()
+        row = (
+            self._read_connection()
+            .execute("SELECT COUNT(*) AS count FROM entries")
+            .fetchone()
+        )
         return int(row["count"])
 
     def ensure_root(self, current_path: str, recursive: bool) -> str:
@@ -2615,9 +2631,7 @@ class IndexState:
 
     # ---- File-system change queue (watchdog incremental index) ----
 
-    def enqueue_change(
-        self, root_id: str, relative_path: str, event_type: str
-    ) -> None:
+    def enqueue_change(self, root_id: str, relative_path: str, event_type: str) -> None:
         """Record or refresh a pending file change for *root_id*.
 
         Uses ``ON CONFLICT`` so repeated events for the same file refresh the
@@ -2666,11 +2680,15 @@ class IndexState:
         ]
 
     def count_pending_changes(self, root_id: str) -> int:
-        row = self._read_connection().execute(
-            "SELECT COUNT(*) FROM fs_change_queue "
-            "WHERE root_id = ? AND processed = 0",
-            (root_id,),
-        ).fetchone()
+        row = (
+            self._read_connection()
+            .execute(
+                "SELECT COUNT(*) FROM fs_change_queue "
+                "WHERE root_id = ? AND processed = 0",
+                (root_id,),
+            )
+            .fetchone()
+        )
         return int(row[0]) if row else 0
 
     def clear_processed_changes(self, *, older_than_days: int = 7) -> int:

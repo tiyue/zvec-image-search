@@ -3540,9 +3540,7 @@ class StreamingAutoTagSession:
         self._finish_last_progress = now
         remaining = len(self.active)
         done = max(0, self.candidate_count - remaining)
-        self.coordinator.progress(
-            f"智能标注进行中 {done}/{self.candidate_count}"
-        )
+        self.coordinator.progress(f"智能标注进行中 {done}/{self.candidate_count}")
 
     def _finish_timeout_seconds(self) -> float:
         """Overall safety deadline so auto-tagging never blocks silently.
@@ -3584,14 +3582,8 @@ class StreamingAutoTagSession:
                 )
                 self._report_stream_progress()
                 deadline = getattr(self, "_finish_deadline", 0.0)
-                if (
-                    deadline
-                    and self.active
-                    and monotonic() >= deadline
-                ):
-                    self.coordinator.progress(
-                        "智能标注超时，正在中止剩余请求。"
-                    )
+                if deadline and self.active and monotonic() >= deadline:
+                    self.coordinator.progress("智能标注超时，正在中止剩余请求。")
                     self.abort()
                     return
         else:

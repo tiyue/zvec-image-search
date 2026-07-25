@@ -123,8 +123,7 @@ class FileChangeWatcher:
     def _mark_overflow(self) -> None:
         self._overflowed = True
         _logger.warning(
-            "watcher buffer overflow detected; "
-            "a full scan fallback may be needed"
+            "watcher buffer overflow detected; a full scan fallback may be needed"
         )
 
 

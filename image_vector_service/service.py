@@ -1945,9 +1945,7 @@ class ImageVectorService:
         created_modified = [
             c for c in changes if c["event_type"] in ("created", "modified")
         ]
-        deleted_changes = [
-            c for c in changes if c["event_type"] == "deleted"
-        ]
+        deleted_changes = [c for c in changes if c["event_type"] == "deleted"]
         self.progress(
             f"Incremental: {len(created_modified)} new/modified, "
             f"{len(deleted_changes)} deleted."
@@ -1982,9 +1980,7 @@ class ImageVectorService:
                 report.deleted += len(delete_result.succeeded)
                 report.deferred += delete_result.deferred_count
                 for doc_id, error in delete_result.failures.items():
-                    raw_kind = delete_result.failure_kinds.get(
-                        doc_id, "systemic"
-                    )
+                    raw_kind = delete_result.failure_kinds.get(doc_id, "systemic")
                     failure_kind: FailureKind = (
                         "item" if raw_kind == "item" else "systemic"
                     )
@@ -2119,9 +2115,7 @@ class ImageVectorService:
                     index_run_id,
                     status=(
                         "partial"
-                        if report.failed
-                        or report.deferred
-                        or report.needs_attention
+                        if report.failed or report.deferred or report.needs_attention
                         else "succeeded"
                     ),
                     inserted=report.inserted,
@@ -2938,8 +2932,7 @@ class ImageVectorService:
                     completed_result.extend(result)
                     completed += len(submitted_batch)
                     self.progress(
-                        f"Embedded {completed}/{total_to_embed} "
-                        f"unique images."
+                        f"Embedded {completed}/{total_to_embed} unique images."
                     )
 
                 commit_buffer.extend(completed_result)
