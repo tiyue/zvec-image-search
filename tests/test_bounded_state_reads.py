@@ -194,13 +194,14 @@ class BoundedStateReadScaleTest(unittest.TestCase):
         known_sha = f"{NOISE_COUNT + 10:064x}"
         missing_sha = "e" * 64
         statements: list[str] = []
-        self.state.connection.set_trace_callback(statements.append)
+        read_conn = self.state._read_connection()
+        read_conn.set_trace_callback(statements.append)
         try:
             matches = self.state.find_doc_ids_by_sha_many(
                 [SHARED_SHA, known_sha, missing_sha, SHARED_SHA]
             )
         finally:
-            self.state.connection.set_trace_callback(None)
+            read_conn.set_trace_callback(None)
 
         self.assertEqual(
             matches,

@@ -3502,12 +3502,15 @@ class StreamingAutoTagSession:
 
     def finish(self) -> dict[str, Any]:
         self._assert_owner_open()
+        self._finish_deadline = monotonic() + self._finish_timeout_seconds()
+        self._finish_last_progress = 0.0
         try:
             while self.active:
                 self.coordinator.cancel_check()
                 self._drain(block=True)
-            self.executor.shutdown(wait=True)
-            self.closed = True
+            if not self.closed:
+                self.executor.shutdown(wait=True)
+                self.closed = True
             self._invalidate_changed_sources()
             report = self.coordinator._complete_run(
                 scope="index_run_inserted",
@@ -3523,6 +3526,33 @@ class StreamingAutoTagSession:
         except BaseException:
             self.abort()
             raise
+
+    def _report_stream_progress(self) -> None:
+        """Emit a periodic auto-tagging progress message during _drain waits."""
+
+        deadline = getattr(self, "_finish_deadline", 0.0)
+        if not deadline:
+            return
+        now = monotonic()
+        last = getattr(self, "_finish_last_progress", 0.0)
+        if now - last < 1.0:
+            return
+        self._finish_last_progress = now
+        remaining = len(self.active)
+        done = max(0, self.candidate_count - remaining)
+        self.coordinator.progress(
+            f"智能标注进行中 {done}/{self.candidate_count}"
+        )
+
+    def _finish_timeout_seconds(self) -> float:
+        """Overall safety deadline so auto-tagging never blocks silently.
+
+        Each candidate may retry rate-limiter and HTTP timeouts in the worst
+        case.  The bound keeps the floor proportional to the batch size while
+        never exceeding a hard ceiling, so a stuck session always surfaces.
+        """
+
+        return min(max(self.limit * 120.0, 1800.0), 7200.0)
 
     def abort(self) -> None:
         self._assert_owner()
@@ -3552,6 +3582,18 @@ class StreamingAutoTagSession:
                     timeout=0.1,
                     return_when=FIRST_COMPLETED,
                 )
+                self._report_stream_progress()
+                deadline = getattr(self, "_finish_deadline", 0.0)
+                if (
+                    deadline
+                    and self.active
+                    and monotonic() >= deadline
+                ):
+                    self.coordinator.progress(
+                        "智能标注超时，正在中止剩余请求。"
+                    )
+                    self.abort()
+                    return
         else:
             completed = {future for future in self.active if future.done()}
         if completed:

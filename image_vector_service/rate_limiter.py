@@ -26,6 +26,10 @@ class RateLimitCancelled(RateLimitError):
     """Raised when a caller cancels while waiting for a request permit."""
 
 
+class RateLimitTimeout(RateLimitError):
+    """Raised when acquire exceeds max_wait_seconds without capacity."""
+
+
 class RateLimitCapacityError(RateLimitError):
     """Raised when one request cannot fit inside the configured token window."""
 
@@ -188,8 +192,16 @@ class ModelRateLimiter:
         self,
         estimated_tokens: int,
         cancel_event: threading.Event | None = None,
+        max_wait_seconds: float | None = None,
     ) -> RateLimitPermit:
-        """Wait for RPM, TPM, cooldown and concurrency capacity, then reserve it."""
+        """Wait for RPM, TPM, cooldown and concurrency capacity, then reserve it.
+
+        ``max_wait_seconds`` bounds the total time one call may spend waiting for
+        capacity.  It prevents a request from blocking indefinitely when the
+        provider keeps returning 429 and the AIMD controller has reduced
+        concurrency to its floor.  ``None`` preserves the original unbounded
+        behaviour for callers that still rely on external cancellation.
+        """
 
         if isinstance(estimated_tokens, bool) or not isinstance(estimated_tokens, int):
             raise TypeError("estimated_tokens must be an integer.")
@@ -200,7 +212,11 @@ class ModelRateLimiter:
                 f"One {self.model} request reserves {estimated_tokens} tokens, "
                 f"above the {self.config.tokens_per_minute}-token window."
             )
+        if max_wait_seconds is not None:
+            if not math.isfinite(float(max_wait_seconds)) or float(max_wait_seconds) <= 0:
+                raise ValueError("max_wait_seconds must be a positive finite number.")
 
+        waited = 0.0
         with self._condition:
             while True:
                 self._raise_if_cancelled(cancel_event)
@@ -215,6 +231,12 @@ class ModelRateLimiter:
                     self._total_reserved_tokens += estimated_tokens
                     return RateLimitPermit(self, event)
 
+                if max_wait_seconds is not None and waited >= max_wait_seconds:
+                    raise RateLimitTimeout(
+                        f"Rate limiter for {self.model} waited {waited:.1f}s "
+                        f"without capacity; exceeded max_wait_seconds="
+                        f"{max_wait_seconds}."
+                    )
                 wait_slice = max(wait_seconds, 0.001)
                 if cancel_event is not None:
                     wait_slice = min(
@@ -226,6 +248,7 @@ class ModelRateLimiter:
                 self._waiter(self._condition, wait_slice)
                 elapsed = max(0.0, self._clock() - before)
                 self._total_wait_seconds += elapsed
+                waited += elapsed
 
     def observe_429(self, retry_after: str | float | int | None = None) -> float:
         """Apply provider cooldown and multiplicatively reduce concurrency."""

@@ -1,0 +1,56 @@
+
+=== Quick Tag Run: 2026-07-24 16:32:12 ===
+Task: Batch tag folders by parent folder name
+Image root: D:\图片数据库
+Total folders found: 341
+Already processed (skipped): 0
+---
+[ERROR] 二佐Nisa - 恰巴耶夫礼服 【89P-1.64GB】_jpg/二佐Nisa - 恰巴耶夫礼服 【89P-1.64GB】/自拍 (tag batch failed)
+[ERROR] 半半子 - Nier：2B 【49P-380MB】_jpg/半半子 - Nier：2B 【49P-380MB】/映画-40P (tag batch failed)
+[ERROR] 半半子 - Nier：2B 【49P-380MB】_jpg/半半子 - Nier：2B 【49P-380MB】/自撮-8P (tag batch failed)
+[ERROR] 半半子 - NIKKE 拉毗【54P2V-218MB】_jpg/半半子 - NIKKE 拉毗【54P2V-218MB】/4K映画-32P (tag batch failed)
+[ERROR] 半半子 - NIKKE 拉毗【54P2V-218MB】_jpg/半半子 - NIKKE 拉毗【54P2V-218MB】/自撮-22P (tag batch failed)
+[ERROR] 半半子 - NIKKE布蘭兒【64P6V-370MB】_jpg/半半子 - NIKKE布蘭兒【64P6V-370MB】/4K映画-36P (tag batch failed)
+[ERROR] 半半子 - NIKKE布蘭兒【64P6V-370MB】_jpg/半半子 - NIKKE布蘭兒【64P6V-370MB】/自撮-28P (tag batch failed)
+[ERROR] 半半子 - インプラカブル 修道女 【55P5V-277MB】_jpg/半半子 - インプラカブル 修道女 【55P5V-277MB】/4K映画-40P (tag batch failed)
+[ERROR] 半半子 - インプラカブル 修道女 【55P5V-277MB】_jpg/半半子 - インプラカブル 修道女 【55P5V-277MB】/自撮-15P (tag batch failed)
+[ERROR] 半半子 - ガイド春日ツバキ【86P6V-593MB】_jpg/半半子 - ガイド春日ツバキ【86P6V-593MB】/4K映画-46P (tag batch failed)
+[ERROR] 半半子 - ガイド春日ツバキ【86P6V-593MB】_jpg/半半子 - ガイド春日ツバキ【86P6V-593MB】/自撮-40P (tag batch failed)
+[ERROR] 半半子 - チェシャー廃稿礼装 【66P9V-704MB】_jpg/半半子 - チェシャー廃稿礼装 【66P9V-704MB】/4K映画42P (tag batch failed)
+[ERROR] 半半子 - チェシャー廃稿礼装 【66P9V-704MB】_jpg/半半子 - チェシャー廃稿礼装 【66P9V-704MB】/自撮-24P (tag batch failed)
+[ERROR] 半半子 - 式波・ー ASUKA Christmas【41P-153MB】_jpg/半半子 - 式波・ー ASUKA Christmas【41P-153MB】/自拍 (tag batch failed)
+[ERROR] 半半子 - 柴郡旗袍 【64P-100MB】_jpg/半半子 - 柴郡旗袍 【64P-100MB】/自撮-20P (tag batch failed)
+[ERROR] 半半子 - 碧蓝航线 怨仇OL 【55P1V-177MB】_jpg/半半子 - 碧蓝航线 怨仇OL 【55P1V-177MB】/4K映画-38P (tag batch failed)
+[ERROR] 半半子 - 碧蓝航线 怨仇OL 【55P1V-177MB】_jpg/半半子 - 碧蓝航线 怨仇OL 【55P1V-177MB】/自撮-17P (tag batch failed)
+[ERROR] 半半子 - 飛鳥馬トキBunny 【62P3V-257MB】_jpg/半半子 - 飛鳥馬トキBunny 【62P3V-257MB】/4K映画-40P (tag batch failed)
+[ERROR] 半半子 - 飛鳥馬トキBunny 【62P3V-257MB】_jpg/半半子 - 飛鳥馬トキBunny 【62P3V-257MB】/自撮-22P (tag batch failed)
+[ERROR] 半半子&婉Yue_愛宕x高雄,チャイナ服【35P1V_348MB】_jpg/半半子&婉Yue  - 愛宕x高雄,チャイナ服【35P1V-348MB】/自拍 (tag batch failed)
+[ERROR] 半半子BANBANKO_インプラカブル_修道女【55P5V_277MB】_jpg/半半子BANBANKO インプラカブル 修道女【55P5V-277MB】/自撮 (tag batch failed)
+[ERROR] 半半子_Claudius_Maid_ネロ・クラウディウス_【43P_353MB】_jpg/半半子 - Claudius Maid ネロ・クラウディウス 【43P-353MB】/4K映画-31P (tag batch failed)
+[ERROR] 半半子_Claudius_Maid_ネロ・クラウディウス_【43P_353MB】_jpg/半半子 - Claudius Maid ネロ・クラウディウス 【43P-353MB】/自撮-11P (tag batch failed)
+[ERROR] 半半子_彼女の制服姿が好き_Vol_02_电车+庭院【58P_169MB】_jpg/半半子 - 彼女の制服姿が好き Vol.02 (电车+庭院)【58P-169MB】/4K映画-52P (tag batch failed)
+[ERROR] 半半子_彼女の制服姿が好き_Vol_02_电车+庭院【58P_169MB】_jpg/半半子 - 彼女の制服姿が好き Vol.02 (电车+庭院)【58P-169MB】/自撮-6P (tag batch failed)
+[ERROR] 莉莉丝泳装32p+12s/图包/1 (tag batch failed)
+[ERROR] 莉莉丝泳装32p+12s/图包/2 (tag batch failed)
+[ERROR] 阿半今天很开心 喜多川x小雫【56P-202MB】_jpg/阿半今天很开心 喜多川x小雫【56P-202MB】/GIF (tag batch failed)
+[ERROR] 阿半今天很开心 柴郡【42P-155MB】_jpg/阿半今天很开心 柴郡【42P-155MB】/GIF (tag batch failed)
+---
+Result: tagged=312, untagged=0, errors=29, skipped=0
+Duration: 6m 28s
+
+=== Quick Tag CLEAN: 2026-07-24 16:52:58 ===
+Task: Remove dirty metadata tags
+---
+---
+Result: cleaned=337, no_dirty=4, errors=0
+Duration: 6m 23s
+
+=== Quick Tag Run: 2026-07-24 17:50:22 ===
+Task: Batch tag folders by parent folder name
+Image root: D:\图片数据库
+Total folders found: 341
+Already processed (skipped): 312
+---
+---
+Result: tagged=29, untagged=0, errors=0, skipped=312
+Duration: 0m 33s

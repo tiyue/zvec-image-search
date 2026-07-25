@@ -685,7 +685,11 @@ class DashScopeVisionTaggingClient:
                     "User-Agent": "zvec-visual-auto-tagger/1.0",
                 },
             )
-            permit = self.limiter.acquire(estimated_tokens, self.cancel_event)
+            permit = self.limiter.acquire(
+                estimated_tokens,
+                self.cancel_event,
+                max_wait_seconds=self.config.timeout_seconds,
+            )
             with self._request_count_lock:
                 self.request_count += 1
             try:

@@ -7,8 +7,6 @@ import math
 import random
 import threading
 import time
-import urllib.error
-import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -318,16 +316,6 @@ class DashScopeEmbeddingClient:
                 )
             return
         time.sleep(delay)
-
-    @staticmethod
-    def _safe_error_details(error: urllib.error.HTTPError) -> tuple[str, str]:
-        try:
-            body = json.loads(error.read().decode("utf-8"))
-            code = str(body.get("code") or "")
-            message = str(body.get("message") or error.reason)
-            return code, message
-        except Exception:
-            return "", str(error.reason)
 
     @staticmethod
     def _parse_error_body(data: bytes) -> tuple[str, str]:

@@ -1,0 +1,3 @@
+Error: Cannot get libraries from backend.
+Auto-discovered gateway: 127.0.0.1:1205
+Connecting to 127.0.0.1:1205 (gateway mode)...

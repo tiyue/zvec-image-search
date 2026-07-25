@@ -53,6 +53,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         _report_startup_error(str(exc) or exc.__class__.__name__)
         return 1
 
+    # Write gateway URL to a file so CLI tools can discover it.
+    try:
+        gateway_file = runtime.facade.config_home / "gateway-url.txt"
+        gateway_file.parent.mkdir(parents=True, exist_ok=True)
+        gateway_file.write_text(started.address.url, encoding="utf-8")
+    except OSError:
+        pass  # Non-critical; CLI tools can still use --gateway manually.
+
     window_holder: dict[str, Any] = {}
     allow_close = threading.Event()
     shutdown_started = threading.Event()
