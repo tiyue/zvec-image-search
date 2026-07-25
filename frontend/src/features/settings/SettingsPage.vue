@@ -353,6 +353,12 @@ function chooseResultsDirectory(): void {
               {{ draft.saving ? "保存中…" : "保存图库设置" }}
             </button>
           </footer>
+          <div class="library-auto-index">
+            <label class="toggle-option">
+              <input v-model="draft.autoIndexEnabled" name="auto_index_enabled" type="checkbox" />
+              <span><strong>自动增量索引与标注</strong><small>检测到新图片时自动索引并智能标注，无需手动触发。需重启软件后生效。</small></span>
+            </label>
+          </div>
         </form>
       </div>
       <p class="save-status" aria-live="polite">{{ settings.saveStatus.value }}</p>
@@ -518,6 +524,7 @@ label small { color: #8a91a2; font-weight: 500; }
 .toggle-option input { width: 17px; height: 17px; margin: 0; padding: 0; }
 .toggle-option span { display: grid; gap: 2px; }
 .library-editor footer { margin-top: 11px; padding-top: 10px; border-top: 1px solid #e7eaf1; }
+.library-auto-index { margin-top: 10px; }
 .save-status { min-height: 18px; margin: 10px 2px 0; color: #68718a; font-size: 12px; }
 .settings-grid { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 14px; }
 .model-form { display: grid; gap: 11px; margin-top: 14px; }

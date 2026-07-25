@@ -46,6 +46,7 @@ class NativeLibrary:
     image_root: Path
     workspace_directory: Path
     enabled: bool = True
+    auto_index_enabled: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -54,6 +55,7 @@ class NativeLibrary:
             "image_root": str(self.image_root),
             "workspace_directory": str(self.workspace_directory),
             "enabled": self.enabled,
+            "auto_index_enabled": self.auto_index_enabled,
         }
 
 
@@ -231,6 +233,11 @@ def validate_native_config(payload: Mapping[str, Any]) -> NativeConfig:
                 image_root=image_root,
                 workspace_directory=workspace,
                 enabled=enabled,
+                auto_index_enabled=(
+                    value.get("auto_index_enabled", False)
+                    if isinstance(value.get("auto_index_enabled"), bool)
+                    else False
+                ),
             )
         )
 

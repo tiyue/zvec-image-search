@@ -5,6 +5,7 @@ export interface SettingsLibraryWire {
   workspace_directory?: unknown;
   enabled?: unknown;
   is_default?: unknown;
+  auto_index_enabled?: unknown;
 }
 
 export interface SettingsLibrary {
@@ -14,6 +15,7 @@ export interface SettingsLibrary {
   workspaceDirectory: string;
   enabled: boolean;
   isDefault: boolean;
+  autoIndexEnabled: boolean;
 }
 
 export interface LibraryDraft extends SettingsLibrary {
@@ -81,6 +83,7 @@ export interface LibraryUpdate {
   workspace_directory?: string;
   enabled?: boolean;
   is_default?: boolean;
+  auto_index_enabled?: boolean;
   results_directory?: string;
 }
 

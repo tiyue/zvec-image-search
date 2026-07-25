@@ -13,6 +13,7 @@ const libraries: SettingsLibrary[] = [
     workspaceDirectory: "D:\\Zvec\\workspace",
     enabled: true,
     isDefault: true,
+    autoIndexEnabled: false,
   },
   {
     id: "lib-2",
@@ -21,6 +22,7 @@ const libraries: SettingsLibrary[] = [
     workspaceDirectory: "E:\\Zvec\\workspace",
     enabled: true,
     isDefault: false,
+    autoIndexEnabled: false,
   },
 ];
 

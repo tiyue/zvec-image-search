@@ -1,6 +1,6 @@
 # Zvec Image Search - 项目规格文档
 
-> 版本：0.5.0-rc.2 | 最后更新：2026-07-23
+> 版本：0.5.0-rc.2 | 最后更新：2026-07-25
 
 ## 概述
 
@@ -51,6 +51,7 @@ Python 包，提供所有业务逻辑：
 | `tag_search.py` / `tags.py` | 标签匹配与归一化 |
 | `image_clustering.py` | 图片聚类 |
 | `image_scanner.py` | 文件系统扫描 |
+| `file_watcher.py` | 文件系统监听（watchdog），自动增量索引触发 |
 | `model_catalog.py` | 模型配置目录 |
 | `rate_limiter.py` | API 限流 |
 | `result_exporter.py` | 搜索结果导出 |
@@ -115,6 +116,12 @@ Kotlin + Gradle 构建的安卓应用，通过 LAN API 与桌面端通信。
 | `clean-results` | 清理过期结果目录（`--days`） |
 | `serve` | 启动 HTTP 后端服务（`--host`、`--port`、`--token`） |
 
+### 开发工具
+
+| 工具 | 说明 |
+|------|------|
+| `tools/search_learning/generate_eval_pack.py` | 从 `search_results/` 历史结果生成固定评测包（`fixed-evaluation.json`），用于搜索学习排序模型的离线评估；参数：`--search-results-dir`、`--output`、`--max-cases`、`--max-candidates` |
+
 ## 技术栈
 
 | 层 | 技术 |
@@ -148,12 +155,24 @@ Kotlin + Gradle 构建的安卓应用，通过 LAN API 与桌面端通信。
 |------|------|
 | `image_collection/` | zvec 向量集合（RocksDB） |
 | `image_collection.meta.json` | 集合元数据 |
-| `image_collection.state.sqlite3` | 索引状态数据库 |
+| `image_collection.state.sqlite3` | 索引状态数据库（含 `fs_change_queue` 表：文件变更队列） |
 | `search_results/` | 搜索结果导出目录 |
 | `search-learning/` | 搜索学习产物（聚类快照、主动学习队列） |
+| `fixed-evaluation.json` | 搜索学习固定评测包（离线排序质量评估基准） |
 | `model-catalog.default.json` | 默认模型配置 |
 
 集合写入前会对字段做安全校验（`collection_write_outbox`）：拒绝凭据、绝对路径（Windows 盘符 / UNC / Unix `/` 开头）和 NUL 字符。`relative_path` 必须是 POSIX 风格的相对路径，支持 CJK 字符及多级子目录（如 `作品/子目录/1.jpg`）。
+
+### 自动增量索引与标注
+
+基于 watchdog 文件系统监听实现自动增量索引，避免每次索引时全量扫描目录树：
+
+- **开关位置**：设置 → 图库与路径 → 每个图库编辑器“保存图库设置”按钮下方的 toggle 开关（`auto_index_enabled`）
+- **工作流程**：watchdog 后台监听已索引 root 目录 → 文件变化事件持久化到 `fs_change_queue` 表 → 5 秒防抖等待无新事件 → 自动提交增量索引+智能标注任务（`index_and_auto_tag_incremental`）
+- **增量路径**：只处理变更队列中的文件（created/modified → inspect + embed + auto_tag；deleted → 删除记录），绕过全量 `scan_folder_to_staging`
+- **启动行为**：信任上次索引结果，不做启动时全量扫描；watcher 直接接管新变化
+- **兜底机制**：watchdog buffer 溢出 → 标记需全量扫描；程序关闭期间变化 → 下次启动 watcher 接管，提供手动全量索引兜底
+- **配置项**：`watcher_debounce_seconds`（默认 5 秒）、`watcher_overflow_triggers_full_scan`（默认 True）
 
 ## 发布与构建
 

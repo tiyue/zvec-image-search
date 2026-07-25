@@ -18,6 +18,7 @@ class LibraryDefinition:
     image_root: Path | None
     workspace: Path
     enabled: bool = True
+    auto_index_enabled: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -26,6 +27,7 @@ class LibraryDefinition:
             "image_root": str(self.image_root) if self.image_root else None,
             "workspace_directory": str(self.workspace),
             "enabled": self.enabled,
+            "auto_index_enabled": self.auto_index_enabled,
         }
 
 
@@ -115,6 +117,11 @@ def load_library_catalog(
             raw_library.get(workspace_field),
             f"libraries[{index}].{workspace_field}",
         )
+        auto_index_enabled = raw_library.get("auto_index_enabled", False)
+        if not isinstance(auto_index_enabled, bool):
+            raise ConfigurationError(
+                f"libraries[{index}].auto_index_enabled must be a boolean."
+            )
         libraries.append(
             LibraryDefinition(
                 library_id=library_id,
@@ -122,6 +129,7 @@ def load_library_catalog(
                 image_root=image_root,
                 workspace=workspace,
                 enabled=enabled,
+                auto_index_enabled=auto_index_enabled,
             )
         )
 

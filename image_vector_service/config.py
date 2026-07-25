@@ -103,6 +103,9 @@ class ServiceConfig:
     rate_limit_max_concurrency: int = 6
     embedding_estimated_tokens_per_image: int = 1_000
     embedding_estimated_tokens_per_text: int = 256
+    # File-system watcher (watchdog) for automatic incremental indexing.
+    watcher_debounce_seconds: float = 5.0
+    watcher_overflow_triggers_full_scan: bool = True
     results_directory: Path | None = None
     runtime_credentials: RuntimeCredentials | None = field(
         default=None, repr=False, compare=False

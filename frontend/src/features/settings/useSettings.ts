@@ -41,6 +41,7 @@ function normalizeLibrary(raw: SettingsLibraryWire, index = 0): SettingsLibrary 
     workspaceDirectory: text(raw.workspace_directory),
     enabled: raw.enabled !== false,
     isDefault: raw.is_default === true,
+    autoIndexEnabled: raw.auto_index_enabled === true,
   };
 }
 
@@ -233,6 +234,7 @@ export function useSettings(api: SettingsApi = settingsApi, events: SettingsEven
         workspaceDirectory: fallbackDraft.workspaceDirectory,
         enabled: fallbackDraft.enabled,
         isDefault: fallbackDraft.isDefault,
+        autoIndexEnabled: fallbackDraft.autoIndexEnabled,
       };
       libraries.value = libraries.value.map((item) =>
         item.id === fallbackDraft.id ? updatedLibrary : item,
@@ -266,6 +268,7 @@ export function useSettings(api: SettingsApi = settingsApi, events: SettingsEven
         workspace_directory: draft.workspaceDirectory.trim(),
         enabled: draft.enabled,
         is_default: draft.isDefault,
+        auto_index_enabled: draft.autoIndexEnabled,
         results_directory: resultsDirectory.value.trim(),
       });
       applyUpdateResponse(payload, draft);

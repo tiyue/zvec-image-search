@@ -285,6 +285,7 @@ class DesktopConfigurationService:
         workspace_directory: str | Path | None = None,
         enabled: bool | None = None,
         is_default: bool | None = None,
+        auto_index_enabled: bool | None = None,
         results_directory: str | Path | None = None,
     ) -> ConfigurationSnapshot:
         """Update one library without changing its stable identity.
@@ -302,6 +303,7 @@ class DesktopConfigurationService:
                 workspace_directory=workspace_directory,
                 enabled=enabled,
                 is_default=is_default,
+                auto_index_enabled=auto_index_enabled,
                 results_directory=results_directory,
             )
 
@@ -314,12 +316,20 @@ class DesktopConfigurationService:
         workspace_directory: str | Path | None,
         enabled: bool | None,
         is_default: bool | None,
+        auto_index_enabled: bool | None,
         results_directory: str | Path | None,
     ) -> ConfigurationSnapshot:
         if enabled is not None and not isinstance(enabled, bool):
             raise DesktopConfigurationError("enabled must be a boolean.")
         if is_default is not None and not isinstance(is_default, bool):
             raise DesktopConfigurationError("is_default must be a boolean.")
+        if (
+            auto_index_enabled is not None
+            and not isinstance(auto_index_enabled, bool)
+        ):
+            raise DesktopConfigurationError(
+                "auto_index_enabled must be a boolean."
+            )
 
         snapshot = self.load()
         assert snapshot is not None
@@ -351,6 +361,11 @@ class DesktopConfigurationService:
             image_root=next_image_root,
             workspace_directory=next_workspace,
             enabled=existing.enabled if enabled is None else enabled,
+            auto_index_enabled=(
+                existing.auto_index_enabled
+                if auto_index_enabled is None
+                else auto_index_enabled
+            ),
         )
         libraries = tuple(
             next_library if item.library_id == requested else item

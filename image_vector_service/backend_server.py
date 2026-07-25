@@ -490,6 +490,7 @@ class _LibraryWorker:
         self._cooperative_checkpoints = 0
         self._cooperative_last_yield = monotonic()
         self._cooperative_depth = 0
+        self._watcher: Any = None
         self._thread = threading.Thread(
             target=self._main,
             name=f"zvec-library-{library.library_id}",
@@ -572,11 +573,56 @@ class _LibraryWorker:
 
     def close(self) -> None:
         self._stop.set()
+        if self._watcher is not None:
+            with suppress(Exception):
+                self._watcher.stop()
+            self._watcher = None
         for future in self._queue.close():
             future.cancel()
         if self._thread.ident is None:
             return
         self._thread.join()
+
+    def _start_file_watcher(self, service: Any) -> None:
+        from .file_watcher import FileChangeWatcher
+        from .logical_paths import normalize_path
+
+        image_root = self.library.image_root
+        if image_root is None:
+            return
+        normalized = normalize_path(image_root)
+        root_info = service.state.root_for_path(normalized)
+        if root_info is None:
+            return
+        root_id = str(root_info["root_id"])
+        recursive = bool(root_info["recursive"])
+        self._watcher = FileChangeWatcher(
+            debounce_seconds=service.config.watcher_debounce_seconds,
+            on_changes_settled=self._on_changes_settled,
+            enqueue_change=service.state.enqueue_change,
+        )
+        self._watcher.start([(root_id, Path(normalized), recursive)])
+
+    def _on_changes_settled(self, root_id: str) -> None:
+        if self._stop.is_set() or not self._ready.is_set():
+            return
+        if self._startup_error is not None:
+            return
+        job_id = f"auto-index-{root_id}-{int(monotonic() * 1000)}"
+
+        def callback(service: Any) -> Any:
+            root_path = service.state.root_path(root_id)
+            if root_path is None:
+                return {}
+            return service.index_and_auto_tag_incremental(
+                folder_path=root_path,
+                root_id=root_id,
+            )
+
+        try:
+            self.submit(job_id, callback, priority=_JobPriority.BATCH)
+        except Exception:
+            pass
 
     def _main(self) -> None:
         service: Any = None
@@ -599,6 +645,11 @@ class _LibraryWorker:
                 recovery = recover(library_id=self.library.library_id)
                 if isinstance(recovery, dict):
                     self._recovery_report = _json_safe(recovery)
+            if (
+                getattr(self.library, "auto_index_enabled", False)
+                and self.library.image_root is not None
+            ):
+                self._start_file_watcher(service)
             self._ready.set()
             while True:
                 timeout = self._idle_maintenance_wait_timeout(service)
@@ -621,6 +672,10 @@ class _LibraryWorker:
             self._ready.set()
             self._fail_pending(exc)
         finally:
+            if self._watcher is not None:
+                with suppress(Exception):
+                    self._watcher.stop()
+                self._watcher = None
             if service is not None:
                 with suppress(Exception):
                     service.close()

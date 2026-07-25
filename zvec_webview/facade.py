@@ -158,6 +158,7 @@ _LIBRARY_UPDATE_FIELDS = frozenset(
         "workspace_directory",
         "enabled",
         "is_default",
+        "auto_index_enabled",
         # This is a global setting, but it is edited from the library settings
         # surface and is returned separately in every response.
         "results_directory",
@@ -2138,6 +2139,11 @@ class PreviewFacade:
             if "is_default" in payload
             else None
         )
+        auto_index_enabled = (
+            _boolean(payload.get("auto_index_enabled"), "auto_index_enabled")
+            if "auto_index_enabled" in payload
+            else None
+        )
         try:
             updated = self._configuration.update_library(
                 library_id,
@@ -2146,6 +2152,7 @@ class PreviewFacade:
                 workspace_directory=workspace_directory,
                 enabled=enabled,
                 is_default=is_default,
+                auto_index_enabled=auto_index_enabled,
                 results_directory=results_directory,
             )
         except Exception as exc:
@@ -4262,6 +4269,7 @@ def _libraries_view(
             "workspace_directory": str(library.workspace_directory),
             "enabled": library.enabled,
             "is_default": library.library_id == default_id,
+            "auto_index_enabled": library.auto_index_enabled,
         }
         for library in snapshot.configuration.libraries
     ]

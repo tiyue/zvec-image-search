@@ -78,6 +78,7 @@ from .image_clustering import (
 from .image_scanner import (
     StagedScanResult,
     file_sha256,
+    inspect_image,
     inspect_query_image,
     scan_folder_to_staging,
 )
@@ -87,7 +88,11 @@ from .large_cluster_adapter import (
     should_use_large_cluster_engine,
 )
 from .library_browser import LibraryBrowser
-from .logical_paths import normalize_path, normalize_relative_path
+from .logical_paths import (
+    logical_document_id,
+    normalize_path,
+    normalize_relative_path,
+)
 from .metadata_backfill import (
     MetadataBackfillItem,
     MetadataBackfillReport,
@@ -137,7 +142,12 @@ from .result_exporter import (
     cleanup_search_results,
     export_results,
 )
-from .scan_staging import StagedImageRecord, retire_orphaned_scan_staging
+from .scan_staging import (
+    ScanStaging,
+    SeenScanDocument,
+    StagedImageRecord,
+    retire_orphaned_scan_staging,
+)
 from .search_learning_config import (
     ACTIVE_CONFIG_FILENAME,
     SEARCH_LEARNING_DIRECTORY,
@@ -1902,6 +1912,319 @@ class ImageVectorService:
         )
         return report
 
+    def _index_incremental(
+        self,
+        folder_path: str,
+        root_id: str,
+        *,
+        recursive: bool = True,
+        tags: Iterable[str] | None = None,
+        inserted_commit_callback: (
+            Callable[[str, list[dict[str, Any]]], None] | None
+        ) = None,
+        network_metrics: _PipelineNetworkMetrics | None = None,
+    ) -> IndexReport:
+        """Index only files recorded in the fs_change_queue.
+
+        Bypasses the full directory scan and directly inspects the files
+        flagged by the watchdog watcher.  The existing embedding pipeline
+        and auto-tag session are reused for consistency.
+        """
+        root = Path(folder_path).expanduser().resolve()
+        normalized_root = normalize_path(root)
+
+        changes = self.state.drain_pending_changes(root_id)
+        if not changes:
+            self.progress("No pending changes; incremental index skipped.")
+            return IndexReport(
+                root_path=normalized_root,
+                collection=str(self.config.collection_path),
+                index_run_id="",
+            )
+
+        created_modified = [
+            c for c in changes if c["event_type"] in ("created", "modified")
+        ]
+        deleted_changes = [
+            c for c in changes if c["event_type"] == "deleted"
+        ]
+        self.progress(
+            f"Incremental: {len(created_modified)} new/modified, "
+            f"{len(deleted_changes)} deleted."
+        )
+
+        requested_tags = normalize_tags(tags) if tags is not None else None
+        clear_tags = requested_tags == ()
+        new_document_tags = requested_tags or ()
+        index_run_id = self.state.begin_index_run(root_id, normalized_root)
+        report = IndexReport(
+            root_path=normalized_root,
+            collection=str(self.config.collection_path),
+            index_run_id=index_run_id,
+        )
+        failure_sink = IndexFailureSink(
+            self.config.results_path,
+            index_run_id or uuid.uuid4().hex,
+            root,
+        )
+
+        # ---- Process deletions ----
+        if deleted_changes:
+            doc_ids = [
+                logical_document_id(root_id, c["relative_path"])
+                for c in deleted_changes
+            ]
+            try:
+                delete_result = self.collection_writes.delete(
+                    doc_ids,
+                    operation_kind="incremental_delete",
+                )
+                report.deleted += len(delete_result.succeeded)
+                report.deferred += delete_result.deferred_count
+                for doc_id, error in delete_result.failures.items():
+                    raw_kind = delete_result.failure_kinds.get(
+                        doc_id, "systemic"
+                    )
+                    failure_kind: FailureKind = (
+                        "item" if raw_kind == "item" else "systemic"
+                    )
+                    self._record_index_failure(
+                        report,
+                        failure_sink,
+                        path=doc_id,
+                        error=error,
+                        kind=failure_kind,
+                        stage="incremental_delete",
+                        quarantine=False,
+                    )
+            except Exception as exc:
+                self.logger.exception("incremental_delete_failed")
+                self._record_index_failure(
+                    report,
+                    failure_sink,
+                    path=str(root),
+                    error=f"Incremental delete failed: {exc}",
+                    kind="systemic",
+                    stage="incremental_delete",
+                    quarantine=False,
+                )
+
+        # ---- Process created/modified via staging + embedding pipeline ----
+        if created_modified:
+            staging = ScanStaging.create(
+                self.config.workspace / ".scan-staging",
+                root_id=root_id,
+                run_id=index_run_id,
+            )
+            seen_buffer: list[SeenScanDocument] = []
+            record_buffer: list[StagedImageRecord] = []
+            scan_failures: list[FileFailure] = []
+            sequence = 0
+            supported = 0
+
+            for change in created_modified:
+                self.cancel_check()
+                relative = change["relative_path"]
+                path = root / relative
+                doc_id = logical_document_id(root_id, relative)
+                seen_buffer.append(
+                    SeenScanDocument(
+                        doc_id=doc_id,
+                        root_id=root_id,
+                        relative_path=relative,
+                    )
+                )
+                try:
+                    record = inspect_image(path, root, root_id)
+                    record_buffer.append(
+                        StagedImageRecord.from_image_record(sequence, record)
+                    )
+                    supported += 1
+                except Exception as exc:
+                    scan_failures.append(
+                        FileFailure(
+                            str(path),
+                            str(exc) or exc.__class__.__name__,
+                            stage="inspect_image",
+                        )
+                    )
+                sequence += 1
+
+            staging.append_batch(
+                seen_documents=tuple(seen_buffer),
+                records=tuple(record_buffer),
+                scanned=len(created_modified),
+                supported=supported,
+                skipped=0,
+                peak_in_flight=0,
+                complete=True,
+                failure_count=len(scan_failures),
+            )
+            staging.mark_ready(
+                scanned=len(created_modified),
+                supported=supported,
+                skipped=0,
+                peak_in_flight=0,
+                complete=True,
+                failure_count=len(scan_failures),
+            )
+
+            scan = StagedScanResult(
+                staging=staging,
+                scanned=len(created_modified),
+                supported=supported,
+                skipped=0,
+                peak_in_flight=0,
+                complete=True,
+                failure_count=len(scan_failures),
+                failures=scan_failures,
+                warnings=[],
+            )
+
+            control = _StagedPipelineControl()
+            try:
+                embeddable = self._iter_staged_embedding_work(
+                    scan,
+                    root,
+                    new_document_tags,
+                    clear_tags,
+                    report,
+                    index_run_id,
+                    failure_sink,
+                    control,
+                    inserted_commit_callback=inserted_commit_callback,
+                )
+                self._run_embedding_pipeline(
+                    embeddable,
+                    scan,
+                    new_document_tags,
+                    clear_tags,
+                    report,
+                    root,
+                    index_run_id,
+                    failure_sink,
+                    control,
+                    inserted_commit_callback=inserted_commit_callback,
+                    network_metrics=network_metrics,
+                )
+            finally:
+                with suppress(Exception):
+                    scan.discard()
+
+        # ---- Finalize ----
+        if report.inserted or report.updated or report.deleted:
+            self._refresh_tag_catalog()
+
+        if index_run_id:
+            try:
+                self.state.finish_index_run(
+                    index_run_id,
+                    status=(
+                        "partial"
+                        if report.failed
+                        or report.deferred
+                        or report.needs_attention
+                        else "succeeded"
+                    ),
+                    inserted=report.inserted,
+                    updated=report.updated,
+                    failed=report.failed,
+                    deferred=report.deferred,
+                    needs_attention=report.needs_attention,
+                    failure_manifest=report.failure_manifest,
+                )
+            except Exception:
+                self.logger.exception("incremental_index_run_finish_failed")
+
+        self.logger.info(
+            "incremental_index_complete inserted=%d updated=%d deleted=%d "
+            "failed=%d deferred=%d",
+            report.inserted,
+            report.updated,
+            report.deleted,
+            report.failed,
+            report.deferred,
+        )
+        return report
+
+    def index_and_auto_tag_incremental(
+        self,
+        folder_path: str,
+        root_id: str,
+        *,
+        recursive: bool = True,
+        verify_hash: bool = False,
+        tags: Iterable[str] | None = None,
+        model: str | None = None,
+        max_images: int = 200,
+        max_budget_cny: float | None = None,
+        external_processing_confirmed: bool = False,
+    ) -> dict[str, Any]:
+        """Incremental index+auto-tag, consuming only the fs_change_queue."""
+
+        metrics = _PipelineNetworkMetrics()
+        session: StreamingAutoTagSession = self.auto_tagging.begin_stream(
+            model=model,
+            max_images=max_images,
+            max_budget_cny=max_budget_cny,
+            external_processing_confirmed=external_processing_confirmed,
+            activity_callback=metrics.set_flash_active,
+        )
+        try:
+            index_report = self._index_incremental(
+                folder_path,
+                root_id,
+                recursive=recursive,
+                tags=tags,
+                inserted_commit_callback=session.offer,
+                network_metrics=metrics,
+            )
+            auto_tag_report = session.finish()
+        except BaseException:
+            session.abort()
+            raise
+
+        index_payload = index_report.to_dict()
+        failed = int(index_payload.get("failed") or 0) + int(
+            auto_tag_report.get("failed") or 0
+        )
+        needs_attention = bool(index_payload.get("needs_attention")) or bool(
+            auto_tag_report.get("needs_attention")
+        )
+        failure_manifests = [
+            str(path)
+            for path in (
+                index_payload.get("failure_manifest"),
+                auto_tag_report.get("failure_manifest"),
+            )
+            if path
+        ]
+        pipeline = {
+            **metrics.snapshot(),
+            "primary_model": session.selected_model,
+            "overlap_basis": "model_call",
+            "flash_queue_capacity": session.max_pending,
+            "flash_peak_pending": session.peak_pending,
+            "flash_peak_pending_bytes": session.peak_pending_bytes,
+            "max_inflight_request_bytes": self.config.max_inflight_request_bytes,
+            "inserted_offered": session.candidate_count,
+        }
+        return {
+            "failed": failed,
+            "needs_attention": needs_attention,
+            "failure_manifest": failure_manifests[0] if failure_manifests else "",
+            "failure_manifests": failure_manifests,
+            "quarantined": int(index_payload.get("quarantined") or 0)
+            + int(auto_tag_report.get("quarantined") or 0),
+            "quarantine_copy_failures": int(
+                index_payload.get("quarantine_copy_failures") or 0
+            )
+            + int(auto_tag_report.get("quarantine_copy_failures") or 0),
+            "index": index_payload,
+            "auto_tag": auto_tag_report,
+            "pipeline": pipeline,
+        }
+
     def _iter_staged_group_plans(
         self,
         scan: StagedScanResult,
@@ -2535,7 +2858,9 @@ class ImageVectorService:
         ) = None,
         network_metrics: _PipelineNetworkMetrics | None = None,
     ) -> None:
-        batches = iter(self._embedding_batches(pending))
+        pending_items = list(pending)
+        total_to_embed = len(pending_items)
+        batches = iter(self._embedding_batches(iter(pending_items)))
         next_batch = next(batches, None)
         if next_batch is None:
             return
@@ -2614,7 +2939,10 @@ class ImageVectorService:
                         )
                     completed_result.extend(result)
                     completed += len(submitted_batch)
-                    self.progress(f"Embedded {completed} unique images.")
+                    self.progress(
+                        f"Embedded {completed}/{total_to_embed} "
+                        f"unique images."
+                    )
 
                 commit_buffer.extend(completed_result)
                 buffered_records = sum(
@@ -6703,10 +7031,10 @@ class ImageVectorService:
             # only maintenance that the in-memory policy says is already due.
             with suppress(Exception):
                 self.run_idle_maintenance()
+        if hasattr(self, "_search_executor"):
+            self._search_executor.shutdown(wait=True)
         if hasattr(self, "state"):
             self.state.close()
-        if hasattr(self, "_search_executor"):
-            self._search_executor.shutdown(wait=False)
         if hasattr(self, "auto_tag_cache"):
             self.auto_tag_cache.close()
         close_repository = getattr(getattr(self, "repository", None), "close", None)

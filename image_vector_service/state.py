@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import threading
 import uuid
 from array import array
 from collections.abc import Iterable, Iterator, Mapping, Sequence
@@ -71,6 +72,7 @@ class IndexState:
             )
             self.connection.execute("PRAGMA journal_mode=WAL")
             self.connection.execute("PRAGMA synchronous=NORMAL")
+            self._read_local = threading.local()
             version = self._existing_schema_version()
             if version == "1":
                 raise ConfigurationError(
@@ -88,19 +90,35 @@ class IndexState:
             if legacy_path is not None:
                 self._migrate_legacy_json(legacy_path)
         except ConfigurationError:
-            if hasattr(self, "connection"):
-                self.connection.close()
+            self._close_all_connections()
             raise
         except CollectionWriteOutboxError as exc:
-            if hasattr(self, "connection"):
-                self.connection.close()
+            self._close_all_connections()
             raise ConfigurationError(
                 f"Invalid collection write recovery state: {path}"
             ) from exc
         except sqlite3.DatabaseError as exc:
-            if hasattr(self, "connection"):
-                self.connection.close()
+            self._close_all_connections()
             raise ConfigurationError(f"Invalid SQLite state database: {path}") from exc
+
+    def _read_connection(self) -> sqlite3.Connection:
+        """Return a thread-local read-only connection for concurrent reads.
+
+        WAL mode allows multiple connections to read the same database file
+        simultaneously.  Each thread gets its own Connection object so the
+        per-connection C-level mutex does not serialize reads across threads.
+        """
+
+        conn = getattr(self._read_local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(
+                self.path, timeout=5, check_same_thread=False
+            )
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA query_only=ON")
+            conn.execute("PRAGMA busy_timeout=2000")
+            self._read_local.conn = conn
+        return conn
 
     def _create_schema(self) -> None:
         self.connection.executescript(
@@ -281,6 +299,17 @@ class IndexState:
             );
             CREATE INDEX IF NOT EXISTS idx_manual_tag_batch_entries_status
                 ON manual_tag_batch_entries(batch_id, status, doc_id);
+            CREATE TABLE IF NOT EXISTS fs_change_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                root_id TEXT NOT NULL,
+                relative_path TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                queued_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                processed INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(root_id, relative_path)
+            );
+            CREATE INDEX IF NOT EXISTS idx_fcq_pending
+                ON fs_change_queue(processed, queued_at);
             """
         )
         root_columns = {
@@ -658,13 +687,13 @@ class IndexState:
         return had_entries
 
     def get_metadata(self, key: str) -> str | None:
-        row = self.connection.execute(
+        row = self._read_connection().execute(
             "SELECT value FROM metadata WHERE key = ?", (key,)
         ).fetchone()
         return str(row["value"]) if row else None
 
     def get(self, doc_id: str) -> dict[str, Any] | None:
-        row = self.connection.execute(
+        row = self._read_connection().execute(
             "SELECT * FROM entries WHERE doc_id = ?", (doc_id,)
         ).fetchone()
         return self._entry_from_row(row) if row else None
@@ -878,7 +907,7 @@ class IndexState:
         )
 
     def list_effective_tags(self) -> list[str]:
-        rows = self.connection.execute(
+        rows = self._read_connection().execute(
             "SELECT DISTINCT tag FROM entry_tag_index ORDER BY tag COLLATE NOCASE"
         )
         return [str(row["tag"]) for row in rows]
@@ -1318,7 +1347,7 @@ class IndexState:
             if not chunk:
                 continue
             placeholders = ", ".join("?" for _ in chunk)
-            rows = self.connection.execute(
+            rows = self._read_connection().execute(
                 f"SELECT * FROM entries WHERE doc_id IN ({placeholders})", chunk
             )
             for row in rows:
@@ -2054,7 +2083,7 @@ class IndexState:
             after_doc_id = str(last["doc_id"])
 
     def find_doc_id_by_sha(self, sha256: str) -> str | None:
-        row = self.connection.execute(
+        row = self._read_connection().execute(
             "SELECT doc_id FROM entries WHERE sha256 = ? ORDER BY doc_id LIMIT 1",
             (sha256,),
         ).fetchone()
@@ -2072,7 +2101,7 @@ class IndexState:
         normalized = list(dict.fromkeys(str(sha256) for sha256 in shas))
         if not normalized:
             return {}
-        rows = self.connection.execute(
+        rows = self._read_connection().execute(
             "WITH requested(sha256) AS ("
             "SELECT DISTINCT CAST(value AS TEXT) FROM json_each(?)"
             ") "
@@ -2098,7 +2127,7 @@ class IndexState:
 
     def _list_roots_light(self) -> list[tuple[str, str]]:
         if self._roots_light_cache is None:
-            rows = self.connection.execute(
+            rows = self._read_connection().execute(
                 "SELECT root_id, current_path FROM roots ORDER BY current_path"
             ).fetchall()
             self._roots_light_cache = [
@@ -2107,7 +2136,7 @@ class IndexState:
         return self._roots_light_cache
 
     def get_cached_vector(self, cache_key: str, dimension: int) -> list[float] | None:
-        row = self.connection.execute(
+        row = self._read_connection().execute(
             "SELECT embedding, dimension FROM embedding_cache WHERE cache_key = ?",
             (cache_key,),
         ).fetchone()
@@ -2181,7 +2210,7 @@ class IndexState:
         self.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
     def count(self) -> int:
-        row = self.connection.execute(
+        row = self._read_connection().execute(
             "SELECT COUNT(*) AS count FROM entries"
         ).fetchone()
         return int(row["count"])
@@ -2576,8 +2605,85 @@ class IndexState:
                 }
         return None
 
+    def _close_all_connections(self) -> None:
+        read_conn = getattr(self._read_local, "conn", None)
+        if read_conn is not None:
+            read_conn.close()
+            self._read_local.conn = None
+        if hasattr(self, "connection"):
+            self.connection.close()
+
+    # ---- File-system change queue (watchdog incremental index) ----
+
+    def enqueue_change(
+        self, root_id: str, relative_path: str, event_type: str
+    ) -> None:
+        """Record or refresh a pending file change for *root_id*.
+
+        Uses ``ON CONFLICT`` so repeated events for the same file refresh the
+        timestamp and event type without creating duplicates.
+        """
+        with self.connection:
+            self.connection.execute(
+                "INSERT INTO fs_change_queue(root_id, relative_path, event_type) "
+                "VALUES(?, ?, ?) "
+                "ON CONFLICT(root_id, relative_path) DO UPDATE SET "
+                "event_type=excluded.event_type, "
+                "queued_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'), "
+                "processed=0",
+                (root_id, relative_path, event_type),
+            )
+
+    def drain_pending_changes(self, root_id: str) -> list[dict[str, Any]]:
+        """Return all pending changes for *root_id* and mark them processed."""
+        rows = self.connection.execute(
+            "SELECT id, root_id, relative_path, event_type, queued_at "
+            "FROM fs_change_queue WHERE root_id = ? AND processed = 0 "
+            "ORDER BY queued_at",
+            (root_id,),
+        ).fetchall()
+        if not rows:
+            return []
+        ids = [int(row["id"]) for row in rows]
+        with self.connection:
+            for offset in range(0, len(ids), _SQLITE_PARAMETER_CHUNK):
+                chunk = ids[offset : offset + _SQLITE_PARAMETER_CHUNK]
+                placeholders = ", ".join("?" for _ in chunk)
+                self.connection.execute(
+                    f"UPDATE fs_change_queue SET processed = 1 "
+                    f"WHERE id IN ({placeholders})",
+                    chunk,
+                )
+        return [
+            {
+                "id": int(row["id"]),
+                "root_id": str(row["root_id"]),
+                "relative_path": str(row["relative_path"]),
+                "event_type": str(row["event_type"]),
+                "queued_at": str(row["queued_at"]),
+            }
+            for row in rows
+        ]
+
+    def count_pending_changes(self, root_id: str) -> int:
+        row = self._read_connection().execute(
+            "SELECT COUNT(*) FROM fs_change_queue "
+            "WHERE root_id = ? AND processed = 0",
+            (root_id,),
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+    def clear_processed_changes(self, *, older_than_days: int = 7) -> int:
+        with self.connection:
+            cursor = self.connection.execute(
+                "DELETE FROM fs_change_queue WHERE processed = 1 "
+                "AND queued_at < datetime('now', ?)",
+                (f"-{older_than_days} days",),
+            )
+            return cursor.rowcount
+
     def close(self) -> None:
-        self.connection.close()
+        self._close_all_connections()
 
 
 class IndexStateReader:
