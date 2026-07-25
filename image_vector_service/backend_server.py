@@ -619,10 +619,8 @@ class _LibraryWorker:
                 root_id=root_id,
             )
 
-        try:
+        with suppress(Exception):
             self.submit(job_id, callback, priority=_JobPriority.BATCH)
-        except Exception:
-            pass
 
     def _main(self) -> None:
         service: Any = None

@@ -2019,10 +2019,9 @@ class ImageVectorService:
             seen_buffer: list[SeenScanDocument] = []
             record_buffer: list[StagedImageRecord] = []
             scan_failures: list[FileFailure] = []
-            sequence = 0
             supported = 0
 
-            for change in created_modified:
+            for sequence, change in enumerate(created_modified):
                 self.cancel_check()
                 relative = change["relative_path"]
                 path = root / relative
@@ -2048,7 +2047,6 @@ class ImageVectorService:
                             stage="inspect_image",
                         )
                     )
-                sequence += 1
 
             staging.append_batch(
                 seen_documents=tuple(seen_buffer),

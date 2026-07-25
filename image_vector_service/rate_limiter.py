@@ -212,9 +212,10 @@ class ModelRateLimiter:
                 f"One {self.model} request reserves {estimated_tokens} tokens, "
                 f"above the {self.config.tokens_per_minute}-token window."
             )
-        if max_wait_seconds is not None:
-            if not math.isfinite(float(max_wait_seconds)) or float(max_wait_seconds) <= 0:
-                raise ValueError("max_wait_seconds must be a positive finite number.")
+        if max_wait_seconds is not None and (
+            not math.isfinite(float(max_wait_seconds)) or float(max_wait_seconds) <= 0
+        ):
+            raise ValueError("max_wait_seconds must be a positive finite number.")
 
         waited = 0.0
         with self._condition:

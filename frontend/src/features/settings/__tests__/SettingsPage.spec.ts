@@ -178,6 +178,7 @@ describe("SettingsPage", () => {
       workspace_directory: "E:\\Zvec\\workspace",
       enabled: true,
       is_default: true,
+      auto_index_enabled: false,
       results_directory: "E:\\Zvec\\results",
     });
     expect(wrapper.emitted("libraries-updated")?.at(-1)?.[0]).toEqual([
