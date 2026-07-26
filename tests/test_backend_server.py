@@ -882,6 +882,7 @@ class BackendServerTest(unittest.TestCase):
         )
         self.assertEqual(completed["status"], "partial")
         self.assertEqual(completed["failure_count"], 2)
+        self.assertEqual(completed["progress"]["percent"], 100.0)
         self.assertEqual(completed["result"]["failed"], 2)
         self.assertEqual(completed["result"]["index"], {"inserted": 8, "failed": 1})
         self.assertEqual(completed["result"]["auto_tag"], {"proposed": 7, "failed": 1})

@@ -1651,6 +1651,7 @@ class BackendJobManager:
                     completion_progress["total"] = total
                 job.progress = {
                     **completion_progress,
+                    "percent": 100.0,
                     "message": (
                         "Completed and needs attention."
                         if needs_attention
@@ -2000,6 +2001,7 @@ class BackendJobManager:
         self._check_cancel(job_id)
         with self._jobs_lock:
             job = self._jobs[job_id]
+            previous = job.progress or {}
             item: dict[str, Any] = {
                 "message": str(message),
                 "updated_at": _utc_now(),
@@ -2008,7 +2010,15 @@ class BackendJobManager:
             if match:
                 item["current"] = int(match.group("current"))
                 item["total"] = int(match.group("total"))
-            previous = job.progress or {}
+            if job.command == "index_and_auto_tag":
+                item.update(
+                    _combined_progress_projection(
+                        str(message),
+                        current=item.get("current"),
+                        total=item.get("total"),
+                        previous_percent=previous.get("percent"),
+                    )
+                )
             per_library = dict(previous.get("libraries") or {})
             per_library[library.library_id] = {
                 **item,
@@ -4040,6 +4050,72 @@ def _result_failure_count(value: Any) -> int:
     if isinstance(failures, list):
         return len(failures)
     return 0
+
+
+def _combined_progress_projection(
+    message: str,
+    *,
+    current: Any,
+    total: Any,
+    previous_percent: Any,
+) -> dict[str, Any]:
+    """Map index+auto-tag stage counters onto one monotonic 0-100 timeline."""
+
+    normalized = message.strip().casefold()
+    stage = ""
+    target = 0.0
+    if normalized.startswith("scanning:"):
+        stage = "scanning"
+        target = 1.0
+    elif normalized.startswith("found "):
+        stage = "scanning"
+        target = 5.0
+    elif normalized.startswith("incremental:"):
+        stage = "indexing"
+        target = 5.0
+    elif normalized.startswith("no pending changes"):
+        stage = "indexing"
+        target = 50.0
+    elif normalized.startswith("embedded "):
+        stage = "indexing"
+        target = _stage_percent(5.0, 50.0, current, total)
+    elif (
+        normalized.startswith("resolved ")
+        or normalized.startswith("auto-tagged ")
+        or normalized.startswith("recovered refused image ")
+        or "智能标注" in normalized
+    ):
+        stage = "auto_tagging"
+        target = _stage_percent(50.0, 99.0, current, total)
+    else:
+        return {}
+
+    previous = _finite_percent(previous_percent)
+    return {
+        "stage": stage,
+        "percent": round(max(previous, target), 3),
+    }
+
+
+def _stage_percent(start: float, end: float, current: Any, total: Any) -> float:
+    if (
+        not isinstance(current, int)
+        or isinstance(current, bool)
+        or not isinstance(total, int)
+        or isinstance(total, bool)
+        or total <= 0
+    ):
+        return start
+    fraction = max(0.0, min(1.0, current / total))
+    return start + ((end - start) * fraction)
+
+
+def _finite_percent(value: Any) -> float:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        number = float(value)
+        if number == number and number not in {float("inf"), float("-inf")}:
+            return max(0.0, min(100.0, number))
+    return 0.0
 
 
 def _result_progress_counts(value: Any) -> tuple[int | None, int | None]:

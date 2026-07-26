@@ -71,6 +71,55 @@ class _ScriptedService:
         return
 
 
+class _CombinedProgressService(_ScriptedService):
+    """Pause at each combined stage so live and durable progress can be inspected."""
+
+    def __init__(self, progress: Any, cancel_check: Any) -> None:
+        super().__init__(progress, cancel_check)
+        self.index_complete = threading.Event()
+        self.release_index = threading.Event()
+        self.tag_started = threading.Event()
+        self.release_tag_start = threading.Event()
+        self.tag_complete = threading.Event()
+        self.release_tag_complete = threading.Event()
+
+    def index_and_auto_tag_folder(
+        self,
+        _folder: str,
+        **_kwargs: Any,
+    ) -> dict[str, Any]:
+        self._cancel_check()
+        self._progress("Scanning: synthetic library")
+        self._progress("Found 4 valid images; skipped 0; invalid 0.")
+        self._progress("Embedded 4/4 unique images.")
+        self.index_complete.set()
+        if not self.release_index.wait(timeout=5):
+            raise TimeoutError("test did not release the completed index stage")
+
+        self._cancel_check()
+        self._progress("智能标注进行中 0/3")
+        self.tag_started.set()
+        if not self.release_tag_start.wait(timeout=5):
+            raise TimeoutError("test did not release the started auto-tag stage")
+
+        self._cancel_check()
+        self._progress("Auto-tagged 3/3 unique images.")
+        self.tag_complete.set()
+        if not self.release_tag_complete.wait(timeout=5):
+            raise TimeoutError("test did not release the completed auto-tag stage")
+
+        return {
+            "failed": 0,
+            "needs_attention": False,
+            "index": {"inserted": 4, "failed": 0},
+            "auto_tag": {
+                "processed": 3,
+                "candidate_count": 3,
+                "failed": 0,
+            },
+        }
+
+
 class BackendActivityIntegrationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(
@@ -243,6 +292,85 @@ class BackendActivityIntegrationTests(unittest.TestCase):
             cleanup_service = service_holder.get("service")
             if cleanup_service is not None:
                 cleanup_service.release_index.set()
+            manager.close()
+            store.close()
+
+    def test_combined_progress_is_monotonic_across_index_and_auto_tag_stages(
+        self,
+    ) -> None:
+        store = ActivityStore(self.config_home)
+        service_holder: dict[str, _CombinedProgressService] = {}
+
+        def factory(
+            _library: LibraryDefinition,
+            progress: Any,
+            cancel_check: Any,
+        ) -> _CombinedProgressService:
+            service = _CombinedProgressService(progress, cancel_check)
+            service_holder["service"] = service
+            return service
+
+        manager = BackendJobManager(
+            instance_id="activity-combined-progress",
+            config_fingerprint="c" * 64,
+            config=self.config,
+            query_root=self.query_root,
+            library_catalog=self.catalog,
+            library_service_factory=factory,
+            activity_store=store,
+        )
+        try:
+            manager.start()
+            submitted = manager.submit(
+                {
+                    "command": "index_and_auto_tag",
+                    "params": {"external_processing_confirmed": True},
+                }
+            )
+            job_id = submitted["id"]
+            service = service_holder["service"]
+
+            self.assertTrue(service.index_complete.wait(timeout=3))
+            indexed = manager.get(job_id)["progress"]
+            self.assertEqual(indexed["stage"], "indexing")
+            self.assertEqual(indexed["current"], 4)
+            self.assertEqual(indexed["total"], 4)
+            self.assertEqual(indexed["percent"], 50.0)
+
+            service.release_index.set()
+            self.assertTrue(service.tag_started.wait(timeout=3))
+            tag_started = manager.get(job_id)["progress"]
+            self.assertEqual(tag_started["stage"], "auto_tagging")
+            self.assertEqual(tag_started["current"], 0)
+            self.assertEqual(tag_started["total"], 3)
+            self.assertEqual(tag_started["percent"], 50.0)
+
+            service.release_tag_start.set()
+            self.assertTrue(service.tag_complete.wait(timeout=3))
+            tag_complete = manager.get(job_id)["progress"]
+            self.assertEqual(tag_complete["stage"], "auto_tagging")
+            self.assertEqual(tag_complete["current"], 3)
+            self.assertEqual(tag_complete["total"], 3)
+            self.assertEqual(tag_complete["percent"], 99.0)
+
+            service.release_tag_complete.set()
+            completed = self._wait_for_job(manager, job_id)
+            self.assertEqual(completed["status"], "succeeded")
+            self.assertEqual(completed["progress"]["percent"], 100.0)
+            terminal = self._history_item(
+                store,
+                job_id,
+                expected_status="succeeded",
+            )
+            self.assertEqual(terminal["processed"], 3)
+            self.assertEqual(terminal["total"], 3)
+            self.assertEqual(terminal["progress"], 1.0)
+        finally:
+            service = service_holder.get("service")
+            if service is not None:
+                service.release_index.set()
+                service.release_tag_start.set()
+                service.release_tag_complete.set()
             manager.close()
             store.close()
 

@@ -85,6 +85,29 @@ describe("useActivityCenter", () => {
     expect(page.hasMore).toBe(true);
   });
 
+  it("keeps composite progress when the active stage counters restart", () => {
+    const page = normalizeJobHistoryPage({
+      items: [
+        {
+          job_id: "combined-running",
+          task_type: "index_and_auto_tag",
+          status: "running",
+          processed: 0,
+          total: 3,
+          progress: 0.5,
+          message: "智能标注进行中 0/3",
+        },
+      ],
+    });
+
+    expect(page.items[0]).toMatchObject({
+      id: "combined-running",
+      processed: 0,
+      total: 3,
+      progressPercent: 50,
+    });
+  });
+
   it("sanitizes bounded details and rejects non-local image URLs", () => {
     const item = normalizeActivityLog({
       sequence: 7,

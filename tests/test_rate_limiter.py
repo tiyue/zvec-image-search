@@ -408,7 +408,7 @@ class ProcessingConfigurationTests(unittest.TestCase):
         config = ServiceConfig(workspace=Path(tempfile.gettempdir()))
         config.validate()
         self.assertEqual(config.embedding_concurrency, 2)
-        self.assertEqual(config.auto_tag_concurrency, 2)
+        self.assertEqual(config.auto_tag_concurrency, 4)
         self.assertEqual(config.max_inflight_request_bytes, 96 * 1024 * 1024)
 
         with self.assertRaisesRegex(Exception, "embedding_concurrency"):
