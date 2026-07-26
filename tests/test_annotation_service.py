@@ -686,13 +686,77 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
         self.assertTrue(Path(manifest_entries[0]["blob_path"]).is_file())
         self.assertEqual(len(report["failures"]), 1)
 
+    def test_auto_tag_network_concurrency_supports_two_four_and_six_workers(self):
+        for concurrency in (2, 4, 6):
+            with self.subTest(concurrency=concurrency):
+                case_root = self.temporary / f"concurrency-{concurrency}"
+                library_root = case_root / "library"
+                library_root.mkdir(parents=True)
+                for index in range(6):
+                    Image.new(
+                        "RGB",
+                        (32, 32),
+                        (
+                            (concurrency * 31 + index * 17) % 256,
+                            (index * 47 + 20) % 256,
+                            (index * 71 + 40) % 256,
+                        ),
+                    ).save(library_root / f"parallel-{index}.png")
+
+                service = ImageVectorService(
+                    config=ServiceConfig(
+                        workspace=case_root / "workspace",
+                        results_directory=case_root / "results",
+                        auto_tag_concurrency=concurrency,
+                    ),
+                    embedding_client=FakeEmbeddingClient(),
+                )
+                try:
+                    indexed = service.index_folder(str(library_root))
+                    self.assertEqual(indexed.inserted, 6)
+                    ConcurrentVisionClient.active = 0
+                    ConcurrentVisionClient.max_active = 0
+                    ConcurrentVisionClient.failed_names = set()
+                    ConcurrentVisionClient.calls = 0
+                    ConcurrentVisionClient.contexts = []
+                    ConcurrentVisionClient.models = []
+                    ConcurrentVisionClient.responses = {}
+
+                    with patch(
+                        "image_vector_service.annotation_service."
+                        "DashScopeVisionTaggingClient",
+                        ConcurrentVisionClient,
+                    ):
+                        report = service.auto_tag_images(
+                            scope="latest_index_run",
+                            max_images=6,
+                            max_budget_cny=5.0,
+                            external_processing_confirmed=True,
+                        )
+
+                    self.assertEqual(ConcurrentVisionClient.max_active, concurrency)
+                    self.assertEqual(ConcurrentVisionClient.calls, 6)
+                    self.assertEqual(report["candidate_count"], 6)
+                    self.assertEqual(report["unique_image_count"], 6)
+                    self.assertEqual(report["succeeded"], 6)
+                    self.assertEqual(report["failed"], 0)
+                    self.assertEqual(report["api_request_count"], 6)
+                finally:
+                    service.close()
+
     def test_auto_tag_cancellation_does_not_wait_for_running_network_call(self):
-        # Four unique SHA groups fill two running and two queued worker slots.
+        # Eight unique SHA groups fill four running and four queued worker slots.
         # Cancellation must retire every claim without waiting for running HTTP.
-        for index, color in enumerate(((10, 20, 30), (40, 50, 60), (70, 80, 90))):
-            Image.new("RGB", (24, 24), color).save(
-                self.root / "set-a" / f"cancel-{index}.png"
-            )
+        for index in range(7):
+            Image.new(
+                "RGB",
+                (24, 24),
+                (
+                    (10 + index * 30) % 256,
+                    (20 + index * 40) % 256,
+                    (30 + index * 50) % 256,
+                ),
+            ).save(self.root / "set-a" / f"cancel-{index}.png")
         self.service.index_folder(str(self.root))
         cancel_requested = threading.Event()
 
@@ -745,7 +809,7 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
             cache_keys = {
                 _cache_key(str(entry["sha256"]), FLASH_MODEL) for entry in entries
             }
-            self.assertEqual(len(cache_keys), 4)
+            self.assertEqual(len(cache_keys), 8)
             running_claims = 0
             released_queued_claims = 0
             for cache_key in cache_keys:
