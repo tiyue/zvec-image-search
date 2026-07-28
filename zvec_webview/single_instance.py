@@ -14,7 +14,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Protocol, cast
+from typing import Any, Protocol, cast
 
 _ERROR_FILE_NOT_FOUND = 2
 _ERROR_ALREADY_EXISTS = 183
@@ -29,6 +29,9 @@ _SCOPE_DIGEST_HEX_CHARS = 24
 _INSTANCE_NAMESPACE = r"Local\Zvec.ImageSearch.WebView"
 
 NativeHandle = object
+
+# Non-Windows typeshed stubs intentionally omit these Windows-only attributes.
+_WINDOWS_CTYPES = cast(Any, ctypes)
 
 
 class SingleInstanceError(RuntimeError):
@@ -458,7 +461,7 @@ class _WindowsNativeApi:
             raise SingleInstanceUnsupportedError(
                 "Win32 named objects are unavailable on this platform."
             )
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32 = _WINDOWS_CTYPES.WinDLL("kernel32", use_last_error=True)
         self._kernel32 = kernel32
         self._create_mutex = kernel32.CreateMutexW
         self._create_mutex.argtypes = [
@@ -503,9 +506,9 @@ class _WindowsNativeApi:
     def create_mutex(
         self, name: str, initially_owned: bool
     ) -> tuple[NativeHandle, bool]:
-        ctypes.set_last_error(0)
+        _WINDOWS_CTYPES.set_last_error(0)
         handle = self._create_mutex(None, bool(initially_owned), name)
-        error_code = ctypes.get_last_error()
+        error_code = _WINDOWS_CTYPES.get_last_error()
         if not handle:
             raise SingleInstanceNativeError("CreateMutexW", error_code)
         return handle, error_code != _ERROR_ALREADY_EXISTS
@@ -514,7 +517,7 @@ class _WindowsNativeApi:
         if not self._release_mutex(handle):
             raise SingleInstanceNativeError(
                 "ReleaseMutex",
-                ctypes.get_last_error(),
+                _WINDOWS_CTYPES.get_last_error(),
             )
 
     def create_auto_reset_event(self, name: str) -> NativeHandle:
@@ -522,23 +525,26 @@ class _WindowsNativeApi:
         if not handle:
             raise SingleInstanceNativeError(
                 "CreateEventW",
-                ctypes.get_last_error(),
+                _WINDOWS_CTYPES.get_last_error(),
             )
         return handle
 
     def open_event(self, name: str) -> NativeHandle | None:
-        ctypes.set_last_error(0)
+        _WINDOWS_CTYPES.set_last_error(0)
         handle = self._open_event(_EVENT_MODIFY_STATE, False, name)
         if handle:
             return handle
-        error_code = ctypes.get_last_error()
+        error_code = _WINDOWS_CTYPES.get_last_error()
         if error_code == _ERROR_FILE_NOT_FOUND:
             return None
         raise SingleInstanceNativeError("OpenEventW", error_code)
 
     def signal_event(self, handle: NativeHandle) -> None:
         if not self._set_event(handle):
-            raise SingleInstanceNativeError("SetEvent", ctypes.get_last_error())
+            raise SingleInstanceNativeError(
+                "SetEvent",
+                _WINDOWS_CTYPES.get_last_error(),
+            )
 
     def wait_any(self, handles: Sequence[NativeHandle], timeout_ms: int) -> int | None:
         native_handles = (ctypes.c_void_p * len(handles))(
@@ -557,7 +563,7 @@ class _WindowsNativeApi:
         if result == _WAIT_FAILED:
             raise SingleInstanceNativeError(
                 "WaitForMultipleObjects",
-                ctypes.get_last_error(),
+                _WINDOWS_CTYPES.get_last_error(),
             )
         selected = result - _WAIT_OBJECT_0
         if not 0 <= selected < len(handles):
@@ -570,7 +576,10 @@ class _WindowsNativeApi:
 
     def close_handle(self, handle: NativeHandle) -> None:
         if not self._close_handle(handle):
-            raise SingleInstanceNativeError("CloseHandle", ctypes.get_last_error())
+            raise SingleInstanceNativeError(
+                "CloseHandle",
+                _WINDOWS_CTYPES.get_last_error(),
+            )
 
 
 def _normalize_config_scope(config_scope: str | Path) -> str:

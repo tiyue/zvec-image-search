@@ -104,6 +104,7 @@ Vue 3 + TypeScript + Vite SPA：
 - 用户完全停止应用的唯一产品入口是“设置 → 应用 → 退出 YaoLens”。存在活动任务时必须拒绝退出；任务空闲后才依次安全停止 backend、LAN、Gateway 和宿主。
 - portable 包不得注册或修改计划任务。用户手工启动后仅在当前登录会话内隐藏常驻，关闭窗口和二次启动语义与安装版一致。
 - Windows 下宿主为自己创建的 backend 子进程持有启用 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` 的 unnamed Job Object。Job Object 只负责宿主异常死亡时清理孤儿 backend；正常停止仍必须先走 authenticated `shutdown_if_idle`，不得用 Job Object 绕过 active-job 保护。
+- Windows 专属 `ctypes` 调用必须保持非 Windows 导入安全，并通过 Windows 与 Linux 两侧的 Mypy 检查。
 
 ### zvec_lan（局域网服务）
 
