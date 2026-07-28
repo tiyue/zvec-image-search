@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import unicodedata
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -8,6 +9,7 @@ from typing import Literal
 from .tag_aliases import TagAliasDictionary
 
 DEFAULT_MAX_EXPANSIONS_PER_FRAGMENT = 200
+_TAG_QUERY_SEPARATOR = re.compile(r"[\s,，、;；|/\\]+")
 
 TagMatchMode = Literal["all", "any"]
 
@@ -308,6 +310,21 @@ def normalize_tag_search_text(value: str) -> str:
     if _contains_control_character(normalized):
         raise TagSearchError("Tag search values cannot contain control characters.")
     return normalized.casefold()
+
+
+def split_tag_search_query(value: str) -> tuple[str, ...]:
+    """Split one tag-only query into stable, independently matched fragments."""
+
+    if not isinstance(value, str):
+        raise TagSearchError("Tag search query must be a string.")
+    fragments = tuple(
+        fragment
+        for fragment in _TAG_QUERY_SEPARATOR.split(unicodedata.normalize("NFKC", value))
+        if fragment
+    )
+    if not fragments:
+        raise TagSearchError("Tag search query must contain at least one tag.")
+    return tuple(display for display, _comparison in _normalize_fragments(fragments))
 
 
 def quote_zvec_filter_string(value: str) -> str:

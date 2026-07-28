@@ -41,6 +41,7 @@ from .models import SearchReport
 from .rank_fusion import confidence_candidate_limit
 from .result_exporter import search_report_payload
 from .service import ImageVectorService
+from .tag_search import TagSearchError, split_tag_search_query
 
 ServiceFactory = Callable[[Callable[[str], None], Callable[[], None]], Any]
 LibraryServiceFactory = Callable[
@@ -81,6 +82,7 @@ _DEFAULT_COOPERATIVE_MAX_INTERVAL_SECONDS = 0.25
 _DEFAULT_COOPERATIVE_MAX_CALLS = 4
 _DEFAULT_IDLE_MAINTENANCE_DELAY_SECONDS = 2.0
 _DEFAULT_RESULT_PREVIEW_PAGE_SIZE = 15
+_MAX_SEMANTIC_QUERIES = 8
 _CAPABILITIES = {
     "multi_library": True,
     "federated_search": True,
@@ -97,6 +99,7 @@ _CAPABILITIES = {
     "fuzzy_tag_search": True,
     "tag_only_search": True,
     "hybrid_tag_vector_search": True,
+    "multi_semantic_query": True,
     "metadata_embedding_search": True,
     "result_diversity": True,
     "search_sort_modes": ["confidence", "relevance", "diverse", "legacy"],
@@ -1455,7 +1458,12 @@ class BackendJobManager:
             )
         elif job.command == "search":
             libraries = self._search_libraries(job.params)
-            if len(libraries) > 1:
+            uses_semantic_segments = (
+                job.params["search_mode"] == "semantic"
+                and job.params["text"] is not None
+                and "|" in job.params["text"]
+            )
+            if len(libraries) > 1 or uses_semantic_segments:
                 future = self._control_executor.submit(
                     self._run_federated_job, job.id, libraries
                 )
@@ -1706,21 +1714,29 @@ class BackendJobManager:
         started_at = perf_counter()
         params = job.params
         primary = libraries[0]
-        prepared = self._call_library(
-            job.id,
-            primary,
-            lambda service: (
-                service.prepare_search_query(
+
+        def prepare(service: Any) -> Any:
+            if params["search_mode"] == "tags":
+                return service.prepare_search_query(
                     text=params["text"],
                     image_path=params["image"],
                     search_mode="tags",
                 )
-                if params["search_mode"] == "tags"
-                else service.prepare_search_query(
+            if params["text"] is not None and "|" in params["text"]:
+                return service.prepare_search_query(
                     text=params["text"],
                     image_path=params["image"],
+                    semantic_queries=params["semantic_queries"],
                 )
-            ),
+            return service.prepare_search_query(
+                text=params["text"],
+                image_path=params["image"],
+            )
+
+        prepared = self._call_library(
+            job.id,
+            primary,
+            prepare,
         )
         candidate_k = params["candidate_k"]
         if self._config.max_top_k is not None:
@@ -2649,6 +2665,32 @@ def serve_backend(
         manager.close()
 
 
+def _semantic_queries(text: str | None) -> tuple[str, ...]:
+    if text is None:
+        return ()
+    if "|" not in text:
+        return (text,)
+    queries: list[str] = []
+    seen: set[str] = set()
+    for value in text.split("|"):
+        query = value.strip()
+        if not query or query in seen:
+            continue
+        seen.add(query)
+        queries.append(query)
+    if not queries:
+        raise BackendRequestError(
+            "invalid_params",
+            "semantic text must contain at least one non-empty query.",
+        )
+    if len(queries) > _MAX_SEMANTIC_QUERIES:
+        raise BackendRequestError(
+            "invalid_params",
+            f"semantic text accepts at most {_MAX_SEMANTIC_QUERIES} queries.",
+        )
+    return tuple(queries)
+
+
 def _normalize_job(
     payload: dict[str, Any], query_root: Path
 ) -> tuple[str, dict[str, Any]]:
@@ -3574,6 +3616,12 @@ def _normalize_job(
                 "invalid_params",
                 "tag-only search requires text and does not accept an image.",
             )
+        if search_mode == "tags":
+            try:
+                split_tag_search_query(text or "")
+            except TagSearchError as exc:
+                raise BackendRequestError("invalid_params", str(exc)) from exc
+        semantic_queries = _semantic_queries(text) if search_mode == "semantic" else ()
         tag_mode = params.get("tag_mode", "all")
         if tag_mode not in {"all", "any"}:
             raise BackendRequestError(
@@ -3604,6 +3652,7 @@ def _normalize_job(
             "text": text,
             "image": image,
             "search_mode": search_mode,
+            "semantic_queries": semantic_queries,
             "top_k": top_k,
             "candidate_k": confidence_candidate_limit(
                 top_k,

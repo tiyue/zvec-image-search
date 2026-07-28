@@ -441,6 +441,9 @@ async function undoContextFeedback(): Promise<void> {
 
 function handleWindowPointerDown(event: PointerEvent): void {
   const target = event.target;
+  if (!(target instanceof Element && target.closest(".composer-mode"))) {
+    modeMenuOpen.value = false;
+  }
   if (target instanceof Element && target.closest(".gallery-context-menu")) return;
   closeContextMenu();
 }
@@ -740,7 +743,7 @@ watch(
                 type="search"
                 maxlength="4096"
                 autocomplete="off"
-                :placeholder="search.mode.value === 'tags' ? '输入标签，多个标签用空格分隔' : '搜索人物、场景、动作或作品'"
+                :placeholder="search.mode.value === 'tags' ? '输入多个标签，默认同时包含' : '搜索人物、场景、动作或作品；用 | 分开多组语义'"
                 @keydown.enter="handleSearchInputEnter"
               />
               <div class="composer-mode">
@@ -786,6 +789,13 @@ watch(
                   <label>
                     <span>结果数量</span>
                     <input v-model="search.resultLimit.value" aria-label="本次搜索图片数量" type="number" min="1" step="1" inputmode="numeric" />
+                  </label>
+                  <label v-if="search.mode.value === 'tags'" class="tag-match-setting">
+                    <span>标签匹配</span>
+                    <select v-model="search.tagMode.value" aria-label="标签匹配方式">
+                      <option value="all">同时包含全部</option>
+                      <option value="any">包含任一标签</option>
+                    </select>
                   </label>
                 </div>
               </details>

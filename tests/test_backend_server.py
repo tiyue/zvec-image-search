@@ -202,6 +202,7 @@ class MultiLibraryFakeService:
         self.owner_thread = threading.get_ident()
         self.call_threads: list[int] = []
         self.prepare_count = 0
+        self.prepared_semantic_queries: list[tuple[str, ...]] = []
         self.query_count = 0
         self.candidate_ks: list[int] = []
         self.block_stats = False
@@ -246,6 +247,7 @@ class MultiLibraryFakeService:
         text=None,
         image_path=None,
         search_mode="semantic",
+        semantic_queries=None,
     ):
         self._record()
         self.prepare_count += 1
@@ -262,17 +264,33 @@ class MultiLibraryFakeService:
             if image_path is not None
             else "text"
         )
+        normalized_semantic_queries = tuple(
+            semantic_queries or ((text,) if text is not None else ())
+        )
+        self.prepared_semantic_queries.append(normalized_semantic_queries)
         return PreparedSearch(
             query_type=query_type,
             text=text,
+            semantic_queries=normalized_semantic_queries,
             image_path=image_path,
             text_vector=[1.0] if text is not None else None,
+            text_vectors=[
+                [float(index + 1)]
+                for index, _query in enumerate(normalized_semantic_queries)
+            ],
             image_vector=[1.0] if image_path is not None else None,
             embedding_sources={
                 **({"image": "api"} if image_path is not None else {}),
                 **({"text": "api"} if text is not None else {}),
             },
-            request_ids=["one-embedding-request"],
+            request_ids=(
+                ["one-embedding-request"]
+                if len(normalized_semantic_queries) == 1
+                else [
+                    f"embedding-request-{index + 1}"
+                    for index, _query in enumerate(normalized_semantic_queries)
+                ]
+            ),
         )
 
     def query_prepared_search(self, prepared, **kwargs):
@@ -387,6 +405,16 @@ class MultiLibraryFakeService:
             minimum_confidence=0.25,
             possible_confidence=0.5,
             high_confidence=0.75,
+            semantic_search=(
+                {
+                    "enabled": True,
+                    "fusion": "equal_weight_rrf",
+                    "query_count": len(prepared.semantic_queries),
+                    "queries": list(prepared.semantic_queries),
+                }
+                if len(prepared.semantic_queries) > 1
+                else {}
+            ),
         )
 
     def close(self):
@@ -532,6 +560,7 @@ class BackendServerTest(unittest.TestCase):
         self.assertTrue(version["capabilities"]["tag_only_search"])
         self.assertTrue(version["capabilities"]["low_confidence_override"])
         self.assertTrue(version["capabilities"]["hybrid_tag_vector_search"])
+        self.assertTrue(version["capabilities"]["multi_semantic_query"])
         self.assertTrue(version["capabilities"]["result_diversity"])
         self.assertTrue(version["capabilities"]["source_only_search_results"])
         self.assertEqual(
@@ -1360,6 +1389,7 @@ class BackendServerTest(unittest.TestCase):
                 "search_mode": "tags",
             },
             {"image": str(self.query_image), "search_mode": "tags"},
+            {"text": "|||", "search_mode": "tags"},
         )
         for params in invalid_params:
             with self.subTest(params=params):
@@ -1370,6 +1400,20 @@ class BackendServerTest(unittest.TestCase):
                 )
                 self.assertEqual(status, 400, payload)
                 self.assertEqual(payload["error"]["code"], "invalid_params")
+
+    def test_semantic_search_rejects_more_than_eight_pipe_segments(self):
+        status, payload = self.request(
+            "POST",
+            "/v1/jobs",
+            {
+                "command": "search",
+                "params": {"text": "|".join(f"query-{index}" for index in range(9))},
+            },
+        )
+
+        self.assertEqual(status, 400, payload)
+        self.assertEqual(payload["error"]["code"], "invalid_params")
+        self.assertIn("at most 8", payload["error"]["message"])
 
     def test_running_and_queued_jobs_can_be_cancelled(self):
         running = self.submit("index", {"folder": "slow"})
@@ -1701,6 +1745,62 @@ class MultiLibraryBackendTest(unittest.TestCase):
         service_a.query_release.set()
         service_b.query_release.set()
         self.assertEqual(self.wait_for_job(job["id"])["status"], "succeeded")
+
+    def test_multi_semantic_query_uses_independent_recall_for_one_library(self):
+        completed = self.wait_for_job(
+            self.submit(
+                "search",
+                {
+                    "text": "red | blue",
+                    "library_ids": ["library-a"],
+                    "top_k": 2,
+                },
+            )["id"]
+        )
+
+        self.assertEqual(completed["status"], "succeeded", completed)
+        result = completed["result"]
+        self.assertEqual(result["ranking_mode"], "semantic_rrf")
+        self.assertEqual(
+            result["search_quality"]["semantic_search"]["query_count"],
+            2,
+        )
+        self.assertEqual(
+            result["request_ids"],
+            ["embedding-request-1", "embedding-request-2"],
+        )
+        self.assertEqual(
+            self.services["library-a"].prepared_semantic_queries,
+            [("red", "blue")],
+        )
+        self.assertEqual(self.services["library-a"].query_count, 1)
+        self.assertEqual(self.services["library-b"].prepare_count, 0)
+        manifest = json.loads(
+            (Path(result["output_dir"]) / "results.json").read_text("utf-8")
+        )
+        self.assertEqual(
+            manifest["query"]["semantic_queries"],
+            ["red", "blue"],
+        )
+
+    def test_pipe_semantic_query_uses_normalized_segment_after_deduplication(self):
+        completed = self.wait_for_job(
+            self.submit(
+                "search",
+                {
+                    "text": " red | red | ",
+                    "library_ids": ["library-a"],
+                    "top_k": 2,
+                },
+            )["id"]
+        )
+
+        self.assertEqual(completed["status"], "succeeded", completed)
+        self.assertEqual(
+            self.services["library-a"].prepared_semantic_queries,
+            [("red",)],
+        )
+        self.assertEqual(self.services["library-a"].prepare_count, 1)
 
     def test_cross_library_tag_search_uses_no_embedding_request(self):
         completed = self.wait_for_job(

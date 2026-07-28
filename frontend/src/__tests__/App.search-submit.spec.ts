@@ -142,4 +142,34 @@ describe("App search submission entry points", () => {
     expect(searchBodies).toHaveLength(1);
     expect(searchBodies[0]).toMatchObject({ text: "角色动作", mode: "text" });
   });
+
+  it("keeps the existing search style while submitting the selected tag mode", async () => {
+    wrapper = await mountReadyApp();
+    await wrapper.get(".composer-mode-trigger").trigger("click");
+    await wrapper.findAll(".composer-mode-menu button")[1]?.trigger("click");
+    await wrapper.get("input[type='search']").setValue("人物, 侧脸");
+    await wrapper.get(".search-settings summary").trigger("click");
+    await wrapper.get("select[aria-label='标签匹配方式']").setValue("any");
+
+    await wrapper.get("[data-testid='submit-search']").trigger("click");
+    await flushPromises();
+
+    expect(searchBodies).toHaveLength(1);
+    expect(searchBodies[0]).toMatchObject({
+      text: "人物, 侧脸",
+      mode: "tag",
+      tag_mode: "any",
+    });
+  });
+
+  it("closes the search mode menu when clicking elsewhere", async () => {
+    wrapper = await mountReadyApp();
+    await wrapper.get(".composer-mode-trigger").trigger("click");
+    expect(wrapper.find(".composer-mode-menu").exists()).toBe(true);
+
+    document.body.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+    await flushPromises();
+
+    expect(wrapper.find(".composer-mode-menu").exists()).toBe(false);
+  });
 });

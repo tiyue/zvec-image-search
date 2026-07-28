@@ -252,9 +252,11 @@ class PreparedSearch:
     query_type: str
     search_mode: str = "semantic"
     text: str | None = None
+    semantic_queries: tuple[str, ...] = ()
     image_path: str | None = None
     image_sha256: str | None = None
     text_vector: list[float] | None = None
+    text_vectors: list[list[float]] = field(default_factory=list)
     image_vector: list[float] | None = None
     request_ids: list[str] = field(default_factory=list)
     usage: list[dict[str, Any]] = field(default_factory=list)
@@ -292,6 +294,7 @@ class PreparedSearchCandidates:
     ranking_mode: str = "distance"
     hybrid_search: dict[str, Any] = field(default_factory=dict)
     metadata_search: dict[str, Any] = field(default_factory=dict)
+    semantic_search: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

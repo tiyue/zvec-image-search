@@ -1,5 +1,6 @@
 export type SearchMode = "semantic" | "tags";
 export type SearchRequestMode = "text" | "tag" | "image" | "combined";
+export type TagMatchMode = "all" | "any";
 export type MatchState = "high" | "possible" | "weak" | string;
 
 export interface LibrarySummary {
@@ -134,6 +135,7 @@ export interface SearchSubmission {
   page: 1;
   page_size: 15;
   query_image_id?: string;
+  tag_mode?: TagMatchMode;
 }
 
 export interface BootstrapResponse {

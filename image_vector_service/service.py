@@ -132,6 +132,7 @@ from .rank_fusion import (
     ConfidenceRanking,
     confidence_candidate_limit,
     confidence_rank,
+    fuse_semantic_query_hits,
     normalize_sort_mode,
     sort_confidence_hits,
     sort_mode_uses_diversity,
@@ -169,6 +170,7 @@ from .tag_search import (
     TagMatchMode,
     TagSearchPlan,
     matched_tags_for_result,
+    split_tag_search_query,
 )
 from .tags import folder_tags_for_relative_path, normalize_tags
 from .zvec_repository import ZvecImageRepository
@@ -4178,6 +4180,7 @@ class ImageVectorService:
         text: str | None = None,
         image_path: str | None = None,
         search_mode: str = "semantic",
+        semantic_queries: Iterable[str] | None = None,
     ) -> PreparedSearch:
         """Create reusable query vectors without querying this Collection."""
         self.cancel_check()
@@ -4190,6 +4193,8 @@ class ImageVectorService:
         if text is not None and not normalized_text:
             raise ValueError("Search text cannot be empty.")
         if search_mode == "tags":
+            if semantic_queries is not None:
+                raise ValueError("Tag-only search does not accept semantic queries.")
             if image_path is not None:
                 raise ValueError("Tag-only search does not accept a query image.")
             if normalized_text is None:
@@ -4202,11 +4207,36 @@ class ImageVectorService:
         path = inspect_query_image(image_path) if image_path is not None else None
         if normalized_text is None and path is None:
             raise ValueError("Search requires text, image, or both.")
+        normalized_semantic_queries: tuple[str, ...] = ()
+        if normalized_text is not None:
+            if semantic_queries is None:
+                normalized_semantic_queries = (normalized_text,)
+            else:
+                if isinstance(semantic_queries, str):
+                    raise ValueError("Semantic queries must be an iterable of strings.")
+                values: list[str] = []
+                seen: set[str] = set()
+                for value in semantic_queries:
+                    if not isinstance(value, str) or not value.strip():
+                        raise ValueError("Semantic queries must be non-empty strings.")
+                    normalized = value.strip()
+                    if normalized in seen:
+                        continue
+                    seen.add(normalized)
+                    values.append(normalized)
+                if not values:
+                    raise ValueError("Semantic search requires at least one query.")
+                if len(values) > 8:
+                    raise ValueError("Semantic search accepts at most 8 queries.")
+                normalized_semantic_queries = tuple(values)
+        elif semantic_queries is not None:
+            raise ValueError("Semantic queries require search text.")
 
         request_ids: list[str] = []
         usage: list[dict] = []
         sources: dict[str, str] = {}
         text_vector: list[float] | None = None
+        text_vectors: list[list[float]] = []
         image_vector: list[float] | None = None
         image_sha256: str | None = None
         if path is not None:
@@ -4223,15 +4253,19 @@ class ImageVectorService:
             if image_usage:
                 usage.append(image_usage)
         self.cancel_check()
-        if normalized_text is not None:
-            text_vector, source, request_id, text_usage = self._text_embedding(
-                normalized_text
+        for semantic_query in normalized_semantic_queries:
+            vector, source, request_id, text_usage = self._text_embedding(
+                semantic_query
             )
+            text_vectors.append(vector)
+            if text_vector is None:
+                text_vector = vector
             sources["text"] = source
             if request_id:
                 request_ids.append(request_id)
             if text_usage:
                 usage.append(text_usage)
+            self.cancel_check()
         self.cancel_check()
         query_type = (
             "image_text"
@@ -4244,9 +4278,11 @@ class ImageVectorService:
             query_type=query_type,
             search_mode="semantic",
             text=normalized_text,
+            semantic_queries=normalized_semantic_queries,
             image_path=str(path) if path is not None else None,
             image_sha256=image_sha256,
             text_vector=text_vector,
+            text_vectors=text_vectors,
             image_vector=image_vector,
             request_ids=request_ids,
             usage=usage,
@@ -4302,46 +4338,147 @@ class ImageVectorService:
         if prepared.query_type == "text":
             if prepared.text_vector is None:
                 raise ValueError("Prepared text query has no text vector.")
-            hits = self._query_quality_candidates(
-                prepared.text_vector,
-                candidate_k,
-                tags=normalized_tags,
-                tag_mode=tag_mode,
-                quality_mode="text",
-                rank_source="text",
+            text_vectors = prepared.text_vectors or [prepared.text_vector]
+            semantic_queries = prepared.semantic_queries or (
+                (prepared.text,) if prepared.text is not None else ()
             )
-            hybrid_intent = HybridTagIntent()
-            tag_hits: list[SearchHit] = []
-            metadata_hits: list[SearchHit] = []
-            metadata_search: dict[str, object] = {
-                "enabled": False,
-                "candidate_count": 0,
-                "extra_embedding_requests": 0,
-                "calibrated": False,
-            }
-            if not self.search_quality.configured and prepared.text is not None:
-                metadata_hits = self._query_metadata_candidates(
-                    prepared.text_vector,
-                    candidate_k,
-                    tags=normalized_tags,
-                    tag_mode=tag_mode,
+            if len(text_vectors) != len(semantic_queries):
+                raise ValueError(
+                    "Prepared semantic queries and text vectors do not match."
                 )
-                metadata_search = {
+            multi_semantic = len(semantic_queries) > 1
+            if multi_semantic:
+                vector_queries: list[list[SearchHit]] = []
+                metadata_queries: list[list[SearchHit]] = []
+                tag_queries: list[list[SearchHit]] = []
+                hybrid_queries: list[dict[str, object]] = []
+                catalog = (
+                    None
+                    if self.search_quality.configured
+                    else self._current_tag_catalog()
+                )
+                for semantic_query, vector in zip(
+                    semantic_queries,
+                    text_vectors,
+                    strict=True,
+                ):
+                    vector_queries.append(
+                        self._query_quality_candidates(
+                            vector,
+                            candidate_k,
+                            tags=normalized_tags,
+                            tag_mode=tag_mode,
+                            quality_mode="text",
+                            rank_source="text",
+                        )
+                    )
+                    if self.search_quality.configured:
+                        metadata_queries.append([])
+                        tag_queries.append([])
+                        continue
+                    metadata_queries.append(
+                        self._query_metadata_candidates(
+                            vector,
+                            candidate_k,
+                            tags=normalized_tags,
+                            tag_mode=tag_mode,
+                        )
+                    )
+                    intent = detect_hybrid_tag_intent(
+                        semantic_query,
+                        cast(TagCatalog, catalog),
+                    )
+                    hybrid_queries.append(
+                        {"query": semantic_query, **intent.diagnostics()}
+                    )
+                    if intent.enabled:
+                        query_tag_hits, _tag_match_count = self._tag_search_hits(
+                            semantic_query,
+                            tags=normalized_tags,
+                            tag_mode=tag_mode,
+                            query_plan=intent.plan,
+                            candidate_limit=candidate_k,
+                        )
+                        tag_queries.append(query_tag_hits)
+                    else:
+                        tag_queries.append([])
+                hits = fuse_semantic_query_hits(vector_queries)
+                metadata_hits = fuse_semantic_query_hits(metadata_queries)
+                tag_hits = fuse_semantic_query_hits(tag_queries)
+                hybrid_search: dict[str, object] = {
+                    "enabled": bool(tag_hits),
+                    "queries": hybrid_queries,
+                    "extra_embedding_requests": 0,
+                }
+                metadata_search: dict[str, object] = {
                     "enabled": bool(metadata_hits),
                     "candidate_count": len(metadata_hits),
                     "extra_embedding_requests": 0,
                     "calibrated": False,
                 }
-                catalog = self._current_tag_catalog()
-                hybrid_intent = detect_hybrid_tag_intent(prepared.text, catalog)
-                if hybrid_intent.enabled:
-                    tag_hits, _tag_match_count = self._tag_search_hits(
-                        prepared.text,
+                ranking_mode = "semantic_rrf"
+                semantic_search: dict[str, object] = {
+                    "enabled": True,
+                    "fusion": "equal_weight_rrf",
+                    "query_count": len(semantic_queries),
+                    "queries": list(semantic_queries),
+                    "extra_embedding_requests": len(semantic_queries) - 1,
+                    "vector_candidate_count": len(hits),
+                    "metadata_candidate_count": len(metadata_hits),
+                    "tag_candidate_count": len(tag_hits),
+                }
+            else:
+                hits = self._query_quality_candidates(
+                    prepared.text_vector,
+                    candidate_k,
+                    tags=normalized_tags,
+                    tag_mode=tag_mode,
+                    quality_mode="text",
+                    rank_source="text",
+                )
+                hybrid_intent = HybridTagIntent()
+                tag_hits = []
+                metadata_hits = []
+                metadata_search = {
+                    "enabled": False,
+                    "candidate_count": 0,
+                    "extra_embedding_requests": 0,
+                    "calibrated": False,
+                }
+                if not self.search_quality.configured and prepared.text is not None:
+                    metadata_hits = self._query_metadata_candidates(
+                        prepared.text_vector,
+                        candidate_k,
                         tags=normalized_tags,
                         tag_mode=tag_mode,
-                        query_plan=hybrid_intent.plan,
-                        candidate_limit=candidate_k,
                     )
+                    metadata_search = {
+                        "enabled": bool(metadata_hits),
+                        "candidate_count": len(metadata_hits),
+                        "extra_embedding_requests": 0,
+                        "calibrated": False,
+                    }
+                    catalog = self._current_tag_catalog()
+                    hybrid_intent = detect_hybrid_tag_intent(prepared.text, catalog)
+                    if hybrid_intent.enabled:
+                        tag_hits, _tag_match_count = self._tag_search_hits(
+                            prepared.text,
+                            tags=normalized_tags,
+                            tag_mode=tag_mode,
+                            query_plan=hybrid_intent.plan,
+                            candidate_limit=candidate_k,
+                        )
+                hybrid_search = hybrid_intent.diagnostics()
+                ranking_mode = (
+                    "hybrid_tag_visual_metadata"
+                    if hybrid_intent.enabled and tag_hits and metadata_hits
+                    else "hybrid_tag_vector"
+                    if hybrid_intent.enabled and tag_hits
+                    else "visual_metadata"
+                    if metadata_hits
+                    else "distance"
+                )
+                semantic_search = {}
             return PreparedSearchCandidates(
                 query_type="text",
                 hits=self._resolve_search_hits(hits),
@@ -4365,17 +4502,10 @@ class ImageVectorService:
                 collection_confidence_offsets=(
                     self.search_quality.collection_calibration.offsets_for("text")
                 ),
-                ranking_mode=(
-                    "hybrid_tag_visual_metadata"
-                    if hybrid_intent.enabled and tag_hits and metadata_hits
-                    else "hybrid_tag_vector"
-                    if hybrid_intent.enabled and tag_hits
-                    else "visual_metadata"
-                    if metadata_hits
-                    else "distance"
-                ),
-                hybrid_search=hybrid_intent.diagnostics(),
+                ranking_mode=ranking_mode,
+                hybrid_search=hybrid_search,
                 metadata_search=metadata_search,
+                semantic_search=semantic_search,
             )
         if prepared.query_type == "image":
             if prepared.image_vector is None:
@@ -4415,6 +4545,13 @@ class ImageVectorService:
             raise ValueError(f"Unsupported prepared query type: {prepared.query_type}")
         if prepared.image_vector is None or prepared.text_vector is None:
             raise ValueError("Prepared combined query is missing a vector.")
+        text_vectors = prepared.text_vectors or [prepared.text_vector]
+        semantic_queries = prepared.semantic_queries or (
+            (prepared.text,) if prepared.text is not None else ()
+        )
+        if len(text_vectors) != len(semantic_queries):
+            raise ValueError("Prepared semantic queries and text vectors do not match.")
+        multi_semantic = len(semantic_queries) > 1
         image_hits = self._query_quality_candidates(
             prepared.image_vector,
             candidate_k,
@@ -4424,26 +4561,66 @@ class ImageVectorService:
             quality_mode="image",
             rank_source="image",
         )
-        text_hits = self._query_quality_candidates(
-            prepared.text_vector,
-            candidate_k,
-            exclude_sha256=exclude_sha256,
-            tags=normalized_tags,
-            tag_mode=tag_mode,
-            quality_mode="text",
-            rank_source="text",
-        )
-        metadata_hits = (
-            []
-            if self.search_quality.configured
-            else self._query_metadata_candidates(
+        if multi_semantic:
+            text_queries: list[list[SearchHit]] = []
+            combined_metadata_queries: list[list[SearchHit]] = []
+            for vector in text_vectors:
+                text_queries.append(
+                    self._query_quality_candidates(
+                        vector,
+                        candidate_k,
+                        exclude_sha256=exclude_sha256,
+                        tags=normalized_tags,
+                        tag_mode=tag_mode,
+                        quality_mode="text",
+                        rank_source="text",
+                    )
+                )
+                combined_metadata_queries.append(
+                    []
+                    if self.search_quality.configured
+                    else self._query_metadata_candidates(
+                        vector,
+                        candidate_k,
+                        exclude_sha256=exclude_sha256,
+                        tags=normalized_tags,
+                        tag_mode=tag_mode,
+                    )
+                )
+            text_hits = fuse_semantic_query_hits(text_queries)
+            metadata_hits = fuse_semantic_query_hits(combined_metadata_queries)
+            combined_semantic_search: dict[str, object] = {
+                "enabled": True,
+                "fusion": "equal_weight_rrf",
+                "query_count": len(semantic_queries),
+                "queries": list(semantic_queries),
+                "extra_embedding_requests": len(semantic_queries) - 1,
+                "vector_candidate_count": len(text_hits),
+                "metadata_candidate_count": len(metadata_hits),
+                "tag_candidate_count": 0,
+            }
+        else:
+            text_hits = self._query_quality_candidates(
                 prepared.text_vector,
                 candidate_k,
                 exclude_sha256=exclude_sha256,
                 tags=normalized_tags,
                 tag_mode=tag_mode,
+                quality_mode="text",
+                rank_source="text",
             )
-        )
+            metadata_hits = (
+                []
+                if self.search_quality.configured
+                else self._query_metadata_candidates(
+                    prepared.text_vector,
+                    candidate_k,
+                    exclude_sha256=exclude_sha256,
+                    tags=normalized_tags,
+                    tag_mode=tag_mode,
+                )
+            )
+            combined_semantic_search = {}
         return PreparedSearchCandidates(
             query_type="image_text",
             image_hits=self._resolve_search_hits(image_hits),
@@ -4468,7 +4645,11 @@ class ImageVectorService:
                 self.search_quality.collection_calibration.offsets_for("combined")
             ),
             ranking_mode=(
-                "weighted_rrf_with_metadata" if metadata_hits else "weighted_rrf"
+                "semantic_rrf"
+                if multi_semantic
+                else "weighted_rrf_with_metadata"
+                if metadata_hits
+                else "weighted_rrf"
             ),
             metadata_search={
                 "enabled": bool(metadata_hits),
@@ -4476,6 +4657,7 @@ class ImageVectorService:
                 "extra_embedding_requests": 0,
                 "calibrated": False,
             },
+            semantic_search=combined_semantic_search,
         )
 
     def _resolve_search_hits(self, hits: list[SearchHit]) -> list[ResolvedSearchHit]:
@@ -4606,7 +4788,10 @@ class ImageVectorService:
         """Resolve fuzzy tags and ask SQLite for only the ranked candidate pool."""
 
         catalog = self._current_tag_catalog()
-        query_plan = query_plan or catalog.resolve(text, mode="all")
+        query_plan = query_plan or catalog.resolve(
+            split_tag_search_query(text),
+            mode=cast(TagMatchMode, tag_mode),
+        )
         filter_plan = catalog.resolve(
             tags,
             mode=cast(TagMatchMode, tag_mode),

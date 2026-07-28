@@ -174,6 +174,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .search-settings-panel { position: absolute; z-index: 20; top: 34px; left: 50%; display: grid; width: 320px; grid-template-columns: 1fr 110px; gap: 10px; padding: 14px; transform: translateX(-50%); border: 1px solid var(--border); border-radius: 14px; background: #fff; box-shadow: var(--shadow-float); }
 .search-settings-panel label { display: grid; gap: 5px; color: #666; font-size: 11px; }
 .search-settings-panel input, .search-settings-panel select { width: 100%; height: 38px; padding: 0 10px; border: 1px solid var(--border-strong); border-radius: 9px; background: #fff; }
+.search-settings-panel .tag-match-setting { grid-column: 1 / -1; }
 
 /* Search results */
 .search-page:not(.is-landing) { padding: 0; }

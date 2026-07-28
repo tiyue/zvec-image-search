@@ -142,6 +142,47 @@ describe("useSearch", () => {
     );
   });
 
+  it("uses AND by default for tag search and can submit OR explicitly", async () => {
+    const api = fakeApi();
+    const search = useSearch(api);
+    search.mode.value = "tags";
+    search.query.value = "人物 侧脸";
+
+    expect(search.tagMode.value).toBe("all");
+    expect(await search.submit()).toBe(true);
+    expect(api.submit).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        mode: "tag",
+        tag_mode: "all",
+      }),
+      expect.any(AbortSignal),
+    );
+
+    search.tagMode.value = "any";
+    expect(await search.submit()).toBe(true);
+    expect(api.submit).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        mode: "tag",
+        tag_mode: "any",
+      }),
+      expect.any(AbortSignal),
+    );
+  });
+
+  it("rejects more than eight semantic segments before calling the API", async () => {
+    const api = fakeApi();
+    const onError = vi.fn();
+    const search = useSearch(api, { onError });
+    search.query.value = Array.from({ length: 9 }, (_, index) => `词${index}`).join("|");
+
+    expect(await search.submit()).toBe(false);
+    expect(api.submit).not.toHaveBeenCalled();
+    expect(onError).toHaveBeenCalledWith(
+      "语义词过多",
+      "使用 | 分隔时，最多支持 8 段语义词。",
+    );
+  });
+
   it("prefetches the adjacent page and reuses it without another request", async () => {
     const api = fakeApi();
     const search = useSearch(api);

@@ -5,6 +5,7 @@ import unittest
 from image_vector_service.models import RankSource, SearchHit
 from image_vector_service.rank_fusion import (
     confidence_rank,
+    fuse_semantic_query_hits,
     sort_confidence_hits,
     weighted_rrf,
 )
@@ -40,6 +41,31 @@ def hit(
 
 
 class ConfidenceRankTest(unittest.TestCase):
+    def test_semantic_query_rrf_uses_or_union_and_rewards_multi_query_coverage(self):
+        first = [
+            hit("red", 0.91, source="text", rank=1),
+            hit("shared", 0.82, source="text", rank=2),
+        ]
+        second = [
+            hit("shared", 0.88, source="text", rank=1),
+            hit("blue", None, source="text", rank=2),
+        ]
+
+        fused = fuse_semantic_query_hits([first, second])
+
+        self.assertEqual(
+            [item.doc_id for item in fused],
+            ["shared", "red", "blue"],
+        )
+        self.assertEqual([item.rank for item in fused], [1, 2, 3])
+        self.assertTrue(all(item.rank_source == "fused" for item in fused))
+        self.assertEqual(fused[0].text_confidence, 0.88)
+        self.assertIsNone(fused[2].text_confidence)
+        self.assertGreater(
+            fused[0].normalized_score or 0.0,
+            fused[1].normalized_score or 0.0,
+        )
+
     def test_dual_source_reward_can_promote_a_combined_match(self):
         ranking = confidence_rank(
             [

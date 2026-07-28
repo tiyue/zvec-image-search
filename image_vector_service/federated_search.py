@@ -125,6 +125,37 @@ def rank_federated_hits(
     resolved_sort_mode = normalize_sort_mode(sort_mode)
     query_type = _query_type(collections)
     confidence_candidates = _confidence_candidates(collections, query_type)
+    semantic_rrf = bool(collections) and all(
+        collection.candidates.semantic_search.get("enabled") is True
+        for collection in collections
+    )
+    if semantic_rrf:
+        ranking = _legacy_ranking(
+            collections,
+            confidence_candidates,
+            query_type=query_type,
+            top_k=top_k,
+            image_weight=image_weight,
+            text_weight=text_weight,
+            diversify_results=diversify_results,
+            sort_mode="legacy",
+            requested_sort_mode=resolved_sort_mode,
+            show_low_confidence=show_low_confidence,
+        )
+        diagnostics = dict(ranking.ranking_diagnostics)
+        diagnostics.update(
+            {
+                "fallback": False,
+                "semantic_rrf": True,
+                "search_learning_disabled": True,
+            }
+        )
+        return replace(
+            ranking,
+            status="ok" if ranking.hits else "no_reliable_match",
+            ranking_mode="semantic_rrf",
+            ranking_diagnostics=diagnostics,
+        )
     quality_configured = bool(collections) and all(
         collection.candidates.quality_configured for collection in collections
     )
@@ -462,7 +493,10 @@ def export_federated_search(
     copy_files: bool = True,
     report_result_limit: int | None = None,
 ) -> dict:
-    search_learning = load_search_learning(config.config_home_path)
+    multi_semantic = len(prepared.semantic_queries) > 1
+    search_learning = (
+        None if multi_semantic else load_search_learning(config.config_home_path)
+    )
     ranking = rank_federated_hits(
         collections,
         top_k=top_k,
@@ -471,7 +505,11 @@ def export_federated_search(
         show_low_confidence=show_low_confidence,
         diversify_results=diversify_results,
         sort_mode=sort_mode,
-        search_learning=search_learning if search_learning.configured else None,
+        search_learning=(
+            search_learning
+            if search_learning is not None and search_learning.configured
+            else None
+        ),
     )
     libraries = [collection.library for collection in collections]
     query: dict[str, object] = {
@@ -485,6 +523,8 @@ def export_federated_search(
     }
     if prepared.text is not None:
         query["text"] = prepared.text
+    if multi_semantic:
+        query["semantic_queries"] = list(prepared.semantic_queries)
     if prepared.image_path is not None:
         query["image"] = Path(prepared.image_path).name
     if prepared.query_type == "image_text":
@@ -574,6 +614,39 @@ def _quality_diagnostics(
             ),
             "extra_embedding_requests": 0,
             "calibrated": False,
+        },
+        "semantic_search": {
+            "enabled": any(
+                collection.candidates.semantic_search.get("enabled") is True
+                for collection in collections
+            ),
+            "collections": {
+                collection.library.library_id: dict(
+                    collection.candidates.semantic_search
+                )
+                for collection in collections
+                if collection.candidates.semantic_search
+            },
+            "query_count": max(
+                (
+                    int(
+                        collection.candidates.semantic_search.get(
+                            "query_count",
+                            0,
+                        )
+                    )
+                    for collection in collections
+                ),
+                default=0,
+            ),
+            "fusion": (
+                "equal_weight_rrf"
+                if any(
+                    collection.candidates.semantic_search.get("enabled") is True
+                    for collection in collections
+                )
+                else "none"
+            ),
         },
         "diversity": dict(ranking.diversity),
         "fusion": {"mode": fusion_mode, **fusion_options},

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import cast
 
@@ -156,6 +156,82 @@ def weighted_rrf(
                     if image_rank is not None and text_rank is not None
                     else None
                 ),
+            )
+        )
+    return results
+
+
+def fuse_semantic_query_hits(
+    query_hits: Sequence[Sequence[SearchHit]],
+    *,
+    rank_constant: int = RRF_RANK_CONSTANT,
+) -> list[SearchHit]:
+    """Fuse independent semantic result lists with equal-weight OR semantics."""
+
+    if rank_constant < 0:
+        raise ValueError("rank_constant cannot be negative.")
+    if not query_hits:
+        return []
+
+    weight = 1.0 / len(query_hits)
+    scores: dict[str, float] = {}
+    representatives: dict[str, tuple[int, float, SearchHit]] = {}
+    coverage: dict[str, int] = {}
+    confidences: dict[str, float] = {}
+    matched_tags: dict[str, list[str]] = {}
+    for collection in query_hits:
+        seen: set[str] = set()
+        for rank, hit in enumerate(collection, start=1):
+            if hit.doc_id in seen:
+                continue
+            seen.add(hit.doc_id)
+            scores[hit.doc_id] = scores.get(hit.doc_id, 0.0) + weight / (
+                rank_constant + rank
+            )
+            coverage[hit.doc_id] = coverage.get(hit.doc_id, 0) + 1
+            confidence = _confidence(hit)
+            if confidence is not None:
+                confidences[hit.doc_id] = max(
+                    confidences.get(hit.doc_id, confidence),
+                    confidence,
+                )
+            candidate = (rank, hit.distance, hit)
+            if (
+                hit.doc_id not in representatives
+                or candidate[:2] < representatives[hit.doc_id][:2]
+            ):
+                representatives[hit.doc_id] = candidate
+            values = matched_tags.setdefault(hit.doc_id, [])
+            values.extend(tag for tag in hit.matched_tags if tag not in values)
+
+    ordered = sorted(
+        scores,
+        key=lambda doc_id: (
+            -scores[doc_id],
+            -coverage[doc_id],
+            representatives[doc_id][0],
+            representatives[doc_id][1],
+            doc_id,
+        ),
+    )
+    results: list[SearchHit] = []
+    for rank, doc_id in enumerate(ordered, start=1):
+        raw_score = scores[doc_id]
+        normalized_score = normalize_rrf_score(raw_score, rank_constant)
+        representative = representatives[doc_id][2]
+        results.append(
+            replace(
+                representative,
+                rank=rank,
+                distance=1.0 - normalized_score,
+                fused_score=raw_score,
+                raw_score=raw_score,
+                normalized_score=normalized_score,
+                confidence=normalized_score,
+                match_state=classify_match_state(normalized_score),
+                rank_source="fused",
+                text_confidence=confidences.get(doc_id),
+                matched_tags=tuple(matched_tags[doc_id]),
             )
         )
     return results

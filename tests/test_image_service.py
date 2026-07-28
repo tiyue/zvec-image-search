@@ -373,6 +373,30 @@ class ImageVectorServiceTest(unittest.TestCase):
             all(item.hit.rank_source == "text" for item in expanded_candidates.hits)
         )
 
+        multi_prepared = self.service.prepare_search_query(
+            text="red | blue",
+            semantic_queries=("red", "blue"),
+        )
+        multi_candidates = self.service.query_prepared_search(
+            multi_prepared,
+            candidate_k=1,
+        )
+        self.assertEqual(multi_prepared.semantic_queries, ("red", "blue"))
+        self.assertEqual(len(multi_prepared.text_vectors), 2)
+        self.assertNotEqual(
+            multi_prepared.text_vectors[0],
+            multi_prepared.text_vectors[1],
+        )
+        self.assertEqual(multi_candidates.ranking_mode, "semantic_rrf")
+        self.assertEqual(
+            multi_candidates.semantic_search["query_count"],
+            2,
+        )
+        self.assertEqual(
+            {item.hit.fields.get("relative_path") for item in multi_candidates.hits},
+            {"red.png", "blue.webp"},
+        )
+
         staged_copy = self.temp_dir / "staged-red.png"
         shutil.copy2(query_image, staged_copy)
         staged_report = self.service.search_by_image(str(staged_copy), top_k=3)
@@ -854,6 +878,31 @@ class ImageTagSearchTest(unittest.TestCase):
             )
             self.assertEqual(manifest["query"]["search_mode"], "tags")
             self.assertEqual(manifest["ranking_mode"], "tag_match")
+
+    def test_tag_only_search_defaults_to_and_and_supports_explicit_or(self):
+        self.service.index_folder(
+            str(self.warm_dir),
+            tags=["原神", "刻晴"],
+        )
+        self.service.index_folder(str(self.cool_dir), tags=["崩坏"])
+
+        default_and = self.service.search_by_tags("原，刻", top_k=10)
+        missing_and = self.service.search_by_tags("原 崩", top_k=10)
+        explicit_or = self.service.search_by_tags(
+            "原|崩",
+            top_k=10,
+            tag_mode="any",
+        )
+
+        self.assertEqual(
+            [item.relative_path for item in default_and.results],
+            ["red.png"],
+        )
+        self.assertEqual(missing_and.result_count, 0)
+        self.assertEqual(
+            {item.relative_path for item in explicit_or.results},
+            {"red.png", "blue.png"},
+        )
 
 
 if __name__ == "__main__":

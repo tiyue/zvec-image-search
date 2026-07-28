@@ -11,6 +11,7 @@ from image_vector_service.tag_search import (
     quote_zvec_filter_string,
     resolve_tag_search,
     result_matches_tag_plan,
+    split_tag_search_query,
 )
 
 
@@ -127,6 +128,15 @@ class TagCatalogTest(unittest.TestCase):
 
         self.assertEqual(plan.matched_tags, ("原神",))
         self.assertEqual(plan.zvec_filter, "tags CONTAIN_ANY ('原神')")
+
+    def test_tag_query_splitter_supports_common_separators_and_deduplicates(self):
+        self.assertEqual(
+            split_tag_search_query(" 人物，侧脸 | 夜景/人物； 长发 "),
+            ("人物", "侧脸", "夜景", "长发"),
+        )
+        self.assertEqual(split_tag_search_query("||| 人物 ||"), ("人物",))
+        with self.assertRaises(TagSearchError):
+            split_tag_search_query("|||")
 
     def test_invalid_input_is_rejected(self):
         invalid_calls = (

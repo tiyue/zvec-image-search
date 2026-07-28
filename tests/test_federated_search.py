@@ -1280,6 +1280,60 @@ class FederatedSearchTest(unittest.TestCase):
             )
         )
 
+    def test_multi_semantic_candidates_preserve_rrf_instead_of_quality_reranking(self):
+        semantic_search = {
+            "enabled": True,
+            "fusion": "equal_weight_rrf",
+            "query_count": 2,
+            "queries": ["red", "blue"],
+        }
+        collections = [
+            LibraryCandidateSet(
+                self.library_a,
+                PreparedSearchCandidates(
+                    query_type="text",
+                    hits=[
+                        candidate(
+                            "a",
+                            0.2,
+                            "a" * 64,
+                            self.source_a,
+                            confidence=0.8,
+                            rank_source="fused",
+                        )
+                    ],
+                    quality_configured=True,
+                    semantic_search=semantic_search,
+                ),
+            ),
+            LibraryCandidateSet(
+                self.library_b,
+                PreparedSearchCandidates(
+                    query_type="text",
+                    hits=[
+                        candidate(
+                            "b",
+                            0.1,
+                            "b" * 64,
+                            self.source_b,
+                            confidence=0.9,
+                            rank_source="fused",
+                        )
+                    ],
+                    quality_configured=True,
+                    semantic_search=semantic_search,
+                ),
+            ),
+        ]
+
+        ranking = rank_federated_hits(collections, top_k=2)
+
+        self.assertEqual(ranking.ranking_mode, "semantic_rrf")
+        self.assertEqual(ranking.status, "ok")
+        self.assertEqual([item.doc_id for item in ranking.hits], ["b", "a"])
+        self.assertTrue(ranking.ranking_diagnostics["semantic_rrf"])
+        self.assertTrue(ranking.ranking_diagnostics["search_learning_disabled"])
+
     def test_source_only_export_keeps_a_bounded_preview_without_image_copies(self):
         collections = [
             LibraryCandidateSet(

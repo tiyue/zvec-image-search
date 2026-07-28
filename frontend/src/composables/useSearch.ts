@@ -10,6 +10,7 @@ import type {
   SearchResultItem,
   SearchResultWire,
   SearchSubmission,
+  TagMatchMode,
 } from "../types/contracts";
 
 const PAGE_SIZE = 15 as const;
@@ -246,6 +247,7 @@ export function useSearch(
 ) {
   const query = ref("");
   const mode = ref<SearchMode>("semantic");
+  const tagMode = ref<TagMatchMode>("all");
   const libraryId = ref("");
   const resultLimit = ref<string | number>("15");
   const queryImageId = ref("");
@@ -678,6 +680,17 @@ export function useSearch(
       events.onError?.("请输入标签", "标签搜索需要至少输入一个标签。");
       return false;
     }
+    const semanticQueries = mode.value === "semantic" && hasText
+      ? [...new Set(searchText.split("|").map((value) => value.trim()).filter(Boolean))]
+      : [];
+    if (mode.value === "semantic" && searchText.includes("|") && !semanticQueries.length) {
+      events.onError?.("请输入语义词", "使用 | 分隔时，至少需要一段非空语义词。");
+      return false;
+    }
+    if (semanticQueries.length > 8) {
+      events.onError?.("语义词过多", "使用 | 分隔时，最多支持 8 段语义词。");
+      return false;
+    }
     const topK = positiveInteger(resultLimit.value);
     if (topK === null) {
       events.onError?.("取图数量无效", "请输入大于或等于 1 的整数。");
@@ -713,6 +726,9 @@ export function useSearch(
         page: 1 as const,
         page_size: PAGE_SIZE,
       };
+      if (requestMode === "tag") {
+        body.tag_mode = tagMode.value;
+      }
       if (hasImage && requestMode !== "tag") {
         body.query_image_id = queryImageId.value;
       }
@@ -871,6 +887,7 @@ export function useSearch(
   return {
     query,
     mode,
+    tagMode,
     libraryId,
     resultLimit,
     queryImageId,
