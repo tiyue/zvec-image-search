@@ -82,6 +82,12 @@ class FileChangeWatcher:
         self._observer.start()
         self._running = True
 
+    def schedule_pending(self, root_id: str) -> None:
+        """Debounce a persisted change queue after watcher startup."""
+
+        if self._running:
+            self._schedule_debounce(root_id)
+
     def stop(self) -> None:
         self._running = False
         with self._timers_lock:

@@ -262,7 +262,7 @@ class BackendJob:
 
 @dataclass(frozen=True)
 class _LibraryCall:
-    job_id: str
+    job_id: str | None
     callback: Callable[[Any], Any]
     future: Future[Any]
     priority: _JobPriority
@@ -379,7 +379,7 @@ class _BoundedPriorityCallQueue:
             self._condition.notify_all()
             return pending
 
-    def _position_locked(self, job_id: str) -> int | None:
+    def _position_locked(self, job_id: str | None) -> int | None:
         lanes = {priority: deque(values) for priority, values in self._lanes.items()}
         schedule_index = self._schedule_index
         for position in range(1, self._size + 1):
@@ -542,7 +542,7 @@ class _LibraryWorker:
 
     def submit(
         self,
-        job_id: str,
+        job_id: str | None,
         callback: Callable[[Any], Any],
         *,
         priority: _JobPriority,
@@ -608,13 +608,14 @@ class _LibraryWorker:
             enqueue_change=service.state.enqueue_change,
         )
         self._watcher.start([(root_id, Path(normalized), recursive)])
+        if service.state.count_pending_changes(root_id) > 0:
+            self._watcher.schedule_pending(root_id)
 
     def _on_changes_settled(self, root_id: str) -> None:
         if self._stop.is_set() or not self._ready.is_set():
             return
         if self._startup_error is not None:
             return
-        job_id = f"auto-index-{root_id}-{int(monotonic() * 1000)}"
 
         def callback(service: Any) -> Any:
             root_path = service.state.root_path(root_id)
@@ -623,10 +624,11 @@ class _LibraryWorker:
             return service.index_and_auto_tag_incremental(
                 folder_path=root_path,
                 root_id=root_id,
+                external_processing_confirmed=True,
             )
 
         with suppress(Exception):
-            self.submit(job_id, callback, priority=_JobPriority.BATCH)
+            self.submit(None, callback, priority=_JobPriority.BATCH)
 
     def _main(self) -> None:
         service: Any = None
