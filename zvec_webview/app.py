@@ -13,16 +13,27 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
-from zvec_desktop.backend_host import BackendBusyError
+from zvec_host.backend_host import BackendBusyError
+from zvec_launcher import get_config_home
 
 from .native_bridge import NativeBridge
+from .resident_task import (
+    ResidentTaskError,
+    install_resident_task,
+    remove_resident_task,
+)
 from .runtime import PreviewRuntime
+from .single_instance import (
+    InstanceSignal,
+    SingleInstanceCoordinator,
+    SingleInstanceError,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="zvec-webview-preview",
-        description="Zvec Windows x64 pywebview Preview",
+        prog="YaoLens",
+        description="YaoLens Windows x64 pywebview application",
     )
     parser.add_argument("--config", type=Path, help="使用指定的 config.json。")
     parser.add_argument("--width", type=int, default=1440, help="初始窗口宽度。")
@@ -32,6 +43,27 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="打开 Webview 调试工具，仅用于开发。",
     )
+    maintenance = parser.add_mutually_exclusive_group()
+    maintenance.add_argument(
+        "--install-resident-task",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    maintenance.add_argument(
+        "--remove-resident-task",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    maintenance.add_argument(
+        "--exit-running-instance",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--start-hidden",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     return parser
 
 
@@ -39,42 +71,78 @@ def main(argv: Sequence[str] | None = None) -> int:
     options = build_parser().parse_args(argv)
     try:
         _validate_windows_x64()
-        width = _window_size(options.width, "width", 980, 7680)
-        height = _window_size(options.height, "height", 680, 4320)
-        import webview
-    except (ImportError, RuntimeError, ValueError) as exc:
+    except RuntimeError as exc:
         _report_startup_error(str(exc) or exc.__class__.__name__)
         return 2
 
-    runtime = PreviewRuntime(options.config)
+    if options.install_resident_task or options.remove_resident_task:
+        try:
+            if options.install_resident_task:
+                install_resident_task(Path(sys.executable).resolve().parent)
+            else:
+                remove_resident_task()
+        except (OSError, ResidentTaskError) as exc:
+            _report_startup_error(str(exc) or exc.__class__.__name__)
+            return 1
+        return 0
+
+    coordinator = SingleInstanceCoordinator(_config_scope(options.config))
     try:
+        result = coordinator.start(
+            request_existing_exit=bool(options.exit_running_instance)
+        )
+    except SingleInstanceError as exc:
+        coordinator.close()
+        _report_startup_error(str(exc) or exc.__class__.__name__)
+        return 2
+    if not result.should_run_ui:
+        coordinator.close()
+        if not options.exit_running_instance and result.error is not None:
+            _report_startup_error(str(result.error) or result.error.__class__.__name__)
+        return result.exit_code
+
+    try:
+        width = _window_size(options.width, "width", 980, 7680)
+        height = _window_size(options.height, "height", 680, 4320)
+        import webview
+    except (ImportError, ValueError) as exc:
+        coordinator.close()
+        _report_startup_error(str(exc) or exc.__class__.__name__)
+        return 2
+
+    runtime: PreviewRuntime | None = None
+    try:
+        runtime = PreviewRuntime(options.config)
         started = runtime.start()
     except Exception as exc:
+        if runtime is not None:
+            with suppress(Exception):
+                runtime.close(force=False)
+        coordinator.close()
         _report_startup_error(str(exc) or exc.__class__.__name__)
         return 1
 
-    # Write gateway URL to a file so CLI tools can discover it.
-    try:
-        gateway_file = runtime.facade.config_home / "gateway-url.txt"
-        gateway_file.parent.mkdir(parents=True, exist_ok=True)
-        gateway_file.write_text(started.address.url, encoding="utf-8")
-    except OSError:
-        pass  # Non-critical; CLI tools can still use --gateway manually.
+    gateway_file = runtime.facade.config_home / "gateway-url.txt"
+    _publish_gateway_url(gateway_file, started.address.url)
 
     window_holder: dict[str, Any] = {}
     allow_close = threading.Event()
     shutdown_started = threading.Event()
+    shutdown_lock = threading.Lock()
+    signal_pump_stop = threading.Event()
+    signal_pump_done = threading.Event()
 
     def begin_shutdown() -> dict[str, Any]:
-        if shutdown_started.is_set():
-            return {"ok": True, "closing": True}
-        if runtime.facade.has_active_jobs():
-            return {
-                "ok": False,
-                "error": "仍有任务运行，请先等待完成或取消任务。",
-                "busy": True,
-            }
-        shutdown_started.set()
+        with shutdown_lock:
+            if shutdown_started.is_set():
+                return {"ok": True, "closing": True}
+            if runtime.facade.has_active_jobs():
+                return {
+                    "ok": False,
+                    "error": "仍有任务运行，请先等待完成或取消任务。",
+                    "busy": True,
+                }
+            shutdown_started.set()
 
         def shutdown_worker() -> None:
             try:
@@ -106,10 +174,40 @@ def main(argv: Sequence[str] | None = None) -> int:
     def request_exit() -> dict[str, Any]:
         return begin_shutdown()
 
+    def activate_window() -> None:
+        if shutdown_started.is_set():
+            return
+        window = window_holder.get("window")
+        if window is None:
+            return
+        try:
+            window.show()
+            window.restore()
+        except Exception:
+            return
+
+    def signal_pump() -> None:
+        try:
+            while not signal_pump_stop.is_set():
+                notifications = coordinator.drain_notifications()
+                for notification in notifications:
+                    if notification is InstanceSignal.ACTIVATE:
+                        activate_window()
+                    elif notification is InstanceSignal.EXIT:
+                        result = begin_shutdown()
+                        if result.get("busy") is True:
+                            activate_window()
+                            window = window_holder.get("window")
+                            if window is not None:
+                                _notify_close_blocked(window)
+                signal_pump_stop.wait(0.1)
+        finally:
+            signal_pump_done.set()
+
     bridge = NativeBridge(runtime.facade.image_registry, request_exit=request_exit)
     try:
         window = webview.create_window(
-            "Zvec 图片库 Preview",
+            "YaoLens",
             started.address.url,
             js_api=bridge,
             width=width,
@@ -117,6 +215,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             min_size=(980, 680),
             background_color="#F8FAFC",
             text_select=True,
+            hidden=bool(options.start_hidden),
         )
         window_holder["window"] = window
         bridge.attach_window(window)
@@ -124,13 +223,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         def on_closing(*_args: Any) -> bool | None:
             if allow_close.is_set():
                 return None
-            result = begin_shutdown()
-            if result.get("busy") is True:
-                _notify_close_blocked(window)
+            window.hide()
             return False
 
         window.events.closing += on_closing
         webview.start(
+            signal_pump,
             gui="edgechromium",
             debug=bool(options.debug_webview),
             private_mode=False,
@@ -138,27 +236,54 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     except Exception as exc:
         _report_startup_error(_enrich_webview_error(f"WebView2 窗口启动失败：{exc}"))
-        with suppress(BackendBusyError):
-            runtime.close(force=False)
         return 1
     finally:
         # The close guard normally proves idleness. Never force-kill an accepted
         # indexing or annotation task merely because the Preview window failed.
         with suppress(BackendBusyError):
             runtime.close(force=False)
+        _remove_gateway_url(gateway_file, started.address.url)
+        signal_pump_stop.set()
+        signal_pump_done.wait(timeout=2.0)
+        coordinator.close()
     return 0
+
+
+def _config_scope(config_path: Path | None) -> Path:
+    if config_path is not None:
+        return config_path.expanduser().absolute().parent.resolve()
+    return get_config_home()
+
+
+def _publish_gateway_url(path: Path, url: str) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary.write_text(url, encoding="utf-8")
+        os.replace(temporary, path)
+    except OSError:
+        with suppress(OSError):
+            temporary.unlink(missing_ok=True)
+
+
+def _remove_gateway_url(path: Path, expected_url: str) -> None:
+    try:
+        if path.read_text(encoding="utf-8") == expected_url:
+            path.unlink(missing_ok=True)
+    except OSError:
+        return
 
 
 def _validate_windows_x64() -> None:
     if os.name != "nt" or sys.platform != "win32":
-        raise RuntimeError("此 Preview 仅提供 Windows x64 版本。")
+        raise RuntimeError("YaoLens 仅提供 Windows x64 版本。")
     if platform.python_implementation() != "CPython":
-        raise RuntimeError("此 Preview 需要 CPython。")
+        raise RuntimeError("YaoLens 需要 CPython。")
     if struct.calcsize("P") != 8 or platform.machine().casefold() not in {
         "amd64",
         "x86_64",
     }:
-        raise RuntimeError("此 Preview 仅支持 64 位 Windows（x64）。")
+        raise RuntimeError("YaoLens 仅支持 64 位 Windows（x64）。")
 
 
 def _window_size(value: Any, name: str, minimum: int, maximum: int) -> int:
@@ -172,7 +297,7 @@ def _window_size(value: Any, name: str, minimum: int, maximum: int) -> int:
 def _notify_close_blocked(window: Any) -> None:
     try:
         window.evaluate_js(
-            "window.dispatchEvent(new CustomEvent('zvec-close-blocked'))"
+            "window.dispatchEvent(new CustomEvent('yaolens-close-blocked'))"
         )
     except Exception:
         return
@@ -180,7 +305,9 @@ def _notify_close_blocked(window: Any) -> None:
 
 def _notify_close_failed(window: Any) -> None:
     try:
-        window.evaluate_js("window.dispatchEvent(new CustomEvent('zvec-close-failed'))")
+        window.evaluate_js(
+            "window.dispatchEvent(new CustomEvent('yaolens-close-failed'))"
+        )
     except Exception:
         return
 
@@ -209,11 +336,11 @@ def _report_startup_error(message: str) -> None:
         loader.user32.MessageBoxW(
             None,
             message,
-            "Zvec Preview",
+            "YaoLens",
             0x10,
         )
     except Exception:
-        print(f"Zvec Preview: {message}", file=sys.stderr)
+        print(f"YaoLens: {message}", file=sys.stderr)
 
 
 if __name__ == "__main__":

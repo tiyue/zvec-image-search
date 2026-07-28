@@ -16,8 +16,8 @@ from image_vector_service.search_learning_store import (
     SearchCandidateRecord,
     SearchSessionRecord,
 )
-from zvec_desktop.configuration_service import DesktopConfigurationService
-from zvec_desktop.credentials import SessionCredentialStore
+from zvec_host.configuration_service import DesktopConfigurationService
+from zvec_host.credentials import SessionCredentialStore
 from zvec_webview.facade import FacadeError, PreviewFacade
 from zvec_webview.image_registry import ImageRegistry
 from zvec_webview.server import GatewayError, GatewayServer
@@ -37,6 +37,7 @@ class _Facade:
         self.folder_query: dict[str, Any] | None = None
         self.folder_image_query: dict[str, Any] | None = None
         self.folder_delete_query: dict[str, Any] | None = None
+        self.folder_name_tag_query: dict[str, Any] | None = None
         self.job_history_query: dict[str, Any] | None = None
         self.activity_log_query: dict[str, Any] | None = None
         self.frontend_activities: list[dict[str, Any]] = []
@@ -365,6 +366,23 @@ class _Facade:
             "confirmation_token": "preview-token",
             "folder_key": folder_key,
             "blocked": False,
+            "api_requests": 0,
+        }
+
+    def preview_folder_name_tags(
+        self,
+        library_id: str,
+        *,
+        selection: dict[str, Any],
+    ) -> dict[str, Any]:
+        self.folder_name_tag_query = {
+            "library_id": library_id,
+            "selection": dict(selection),
+        }
+        return {
+            "selected": 10,
+            "changed": 8,
+            "samples": [],
             "api_requests": 0,
         }
 
@@ -912,6 +930,32 @@ class GatewayTests(unittest.TestCase):
                 "operation_id": "a" * 32,
                 "confirmation_token": "preview-token",
                 "confirm": True,
+            },
+        )
+
+    def test_folder_name_tag_preview_route_keeps_the_scope_object(self) -> None:
+        status, _headers, preview = _json(
+            self.server.url + "api/libraries/lib-test/folder-name-tags/preview",
+            method="POST",
+            body={
+                "selection": {
+                    "mode": "folder",
+                    "folder_key": "zvec-folder-v1.preview",
+                    "include_subfolders": True,
+                }
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(preview["changed"], 8)
+        self.assertEqual(
+            self.facade.folder_name_tag_query,
+            {
+                "library_id": "lib-test",
+                "selection": {
+                    "mode": "folder",
+                    "folder_key": "zvec-folder-v1.preview",
+                    "include_subfolders": True,
+                },
             },
         )
 

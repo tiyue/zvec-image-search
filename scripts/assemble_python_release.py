@@ -1,4 +1,4 @@
-"""Assemble verified desktop, WebView, wheel, and Android preview artifacts."""
+"""Assemble verified YaoLens Windows and Android release artifacts."""
 
 from __future__ import annotations
 
@@ -11,6 +11,11 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
+
+if __package__:
+    from scripts.webview_preview_packaging import public_version
+else:
+    from webview_preview_packaging import public_version
 
 
 class ReleaseAssemblyError(RuntimeError):
@@ -102,8 +107,29 @@ def _verify_checksum_directory(source: Path) -> None:
         )
 
 
+def _validate_webview_directory(source: Path, version: str) -> tuple[str, str]:
+    display_version = public_version(version)
+    portable_name = f"YaoLens-{display_version}-win-x64-portable.zip"
+    installer_name = f"YaoLens-{display_version}-win-x64-setup.exe"
+    expected = {
+        portable_name,
+        installer_name,
+        "WINDOWS-RELEASE-VERIFICATION.json",
+    }
+    artifacts = {
+        path.name
+        for path in source.iterdir()
+        if path.is_file() and path.name != "SHA256SUMS.txt"
+    }
+    if artifacts != expected:
+        raise ReleaseAssemblyError(
+            "Windows artifact directory does not match the approved release set"
+        )
+    return portable_name, installer_name
+
+
 def _validate_android_directory(source: Path, version: str) -> str:
-    expected_name = f"Zvec-LAN-Viewer-{version}-android-debug-preview.apk"
+    expected_name = f"YaoLens-{public_version(version)}-android.apk"
     artifacts = {
         path.name
         for path in source.iterdir()
@@ -111,107 +137,70 @@ def _validate_android_directory(source: Path, version: str) -> str:
     }
     if artifacts != {expected_name}:
         raise ReleaseAssemblyError(
-            "Android artifact directory must contain only the expected debug-preview "
-            f"APK: {expected_name}"
+            f"Android artifact directory must contain only {expected_name}"
         )
     return expected_name
 
 
 def assemble_release(
     *,
-    desktop_directory: Path,
     webview_directory: Path,
-    native_directory: Path,
     android_directory: Path,
     output_directory: Path,
     version: str,
     revision: str,
-    signing_status: str,
     version_prerelease: bool,
     exact_tag_ref: bool,
     license_present: bool,
     search_quality_certified: bool,
 ) -> dict[str, str]:
-    if signing_status not in {"unsigned", "authenticode"}:
-        raise ReleaseAssemblyError("signing_status must be unsigned or authenticode")
     output = output_directory.resolve()
     assets = output / "release-assets"
     if output.exists():
         raise ReleaseAssemblyError(f"Output directory already exists: {output}")
-    _verify_checksum_directory(desktop_directory)
     _verify_checksum_directory(webview_directory)
-    _verify_checksum_directory(native_directory)
     _verify_checksum_directory(android_directory)
+    portable_name, installer_name = _validate_webview_directory(
+        webview_directory,
+        version,
+    )
     android_apk_name = _validate_android_directory(android_directory, version)
     assets.mkdir(parents=True)
 
-    reasons: list[str] = []
     if version_prerelease:
-        reasons.append("the version has a SemVer prerelease suffix")
-    if signing_status != "authenticode":
-        reasons.append("desktop artifacts are explicitly unsigned")
-    if not license_present:
-        reasons.append("the repository has no LICENSE file")
-    if not exact_tag_ref:
-        reasons.append("the workflow ref is not the exact v<version> tag")
-    if not search_quality_certified:
-        reasons.append("search quality is explicitly uncertified")
-    reasons.append("the Android client is a debug-signed preview")
-    effective_prerelease = bool(reasons)
-    if signing_status != "authenticode" and not effective_prerelease:
-        raise ReleaseAssemblyError("Unsigned artifacts cannot enter the stable channel")
+        raise ReleaseAssemblyError("Stable release assets require a stable SemVer")
+    display_version = public_version(version)
+    title = f"YaoLens {display_version}"
 
-    qualifier = (
-        "UNSIGNED PREVIEW"
-        if signing_status == "unsigned"
-        else "PRERELEASE"
-        if effective_prerelease
-        else "SIGNED STABLE CANDIDATE"
-    )
-    title = f"Zvec {version} - {qualifier}"
-
-    _copy_checksum(desktop_directory, assets / "DESKTOP-SHA256SUMS.txt")
     _copy_checksum(webview_directory, assets / "WEBVIEW-SHA256SUMS.txt")
-    _copy_checksum(native_directory, assets / "NATIVE-SHA256SUMS.txt")
     _copy_checksum(android_directory, assets / "ANDROID-SHA256SUMS.txt")
-    _copy_unique_files(desktop_directory, assets)
     _copy_unique_files(webview_directory, assets)
-    _copy_unique_files(native_directory, assets)
     _copy_unique_files(android_directory, assets)
 
     policy = {
-        "schema_version": 2,
+        "schema_version": 4,
         "version": version,
+        "public_version": display_version,
         "git_revision": revision,
-        "draft": True,
-        "prerelease": effective_prerelease,
-        "signing_status": signing_status,
+        "draft": False,
+        "prerelease": False,
         "exact_tag_ref": exact_tag_ref,
         "license_present": license_present,
         "search_quality_certified": search_quality_certified,
-        "stable_channel_eligible": not effective_prerelease,
-        "preview_reasons": reasons,
-        "desktop_runtime": {
-            "implementation": "CPython 3.12 / PyInstaller",
-            "target": "win-x64",
-            "powershell_required": False,
-            "dotnet_required": False,
-            "docker_required": False,
-        },
-        "webview_preview": {
+        "release_channel": "stable",
+        "publication_ready": exact_tag_ref,
+        "windows": {
             "implementation": "CPython 3.12 / PyInstaller / pywebview / Vue 3",
             "target": "win-x64",
-            "channel": "independent unsigned preview",
             "powershell_required": False,
             "dotnet_required": False,
             "docker_required": False,
+            "artifacts": [portable_name, installer_name],
+            "verification_report": "WINDOWS-RELEASE-VERIFICATION.json",
         },
         "android_client": {
             "implementation": "Kotlin / Jetpack Compose",
             "target": "Android 8.0 (API 26) or later",
-            "channel": "debug preview",
-            "signing_status": "android-debug",
-            "production_signed": False,
             "artifact": android_apk_name,
         },
     }
@@ -226,33 +215,23 @@ def assemble_release(
         "".join(checksum_lines), encoding="utf-8"
     )
 
-    warning = (
-        "This is a draft prerelease/preview and must not be represented as a "
-        "stable signed release."
-        if effective_prerelease
-        else "This is a signed stable candidate; the GitHub Release remains draft."
-    )
     notes = [
         f"# {title}",
         "",
-        warning,
-        "",
         f"Git revision: `{revision}`",
-        f"Desktop signing status: `{signing_status}`",
+        f"Machine version: `{version}`",
         f"Search quality certified: `{str(search_quality_certified).lower()}`",
-        "Desktop: pure Python win-x64 payload and installer verification passed",
-        "WebView Preview: frozen payload, ZIP, and NSIS inventory verification passed",
-        "Native CLI: isolated Python 3.12 wheel install and command smoke passed",
-        (
-            "Android LAN Viewer: unit tests, lint, and debug APK assembly passed; "
-            "the APK is preview-only and is not production signed"
-        ),
+        "Windows x64: frozen payload, portable ZIP, and NSIS inventory checks passed",
+        "Android: unit tests, lint, APK assembly, and checksum generation passed",
+        "",
+        "Release assets:",
+        "",
+        f"- `{portable_name}`",
+        f"- `{installer_name}`",
+        f"- `{android_apk_name}`",
     ]
-    if reasons:
-        notes.extend(["", "Preview reasons:", "", *(f"- {item}" for item in reasons)])
     (output / "RELEASE-NOTES.md").write_text("\n".join(notes) + "\n", encoding="utf-8")
     return {
-        "effective_prerelease": str(effective_prerelease).lower(),
         "release_title": title,
     }
 
@@ -267,18 +246,11 @@ def _append_outputs(path: Path, values: dict[str, str]) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--desktop-directory", type=Path, required=True)
     parser.add_argument("--webview-directory", type=Path, required=True)
-    parser.add_argument("--native-directory", type=Path, required=True)
     parser.add_argument("--android-directory", type=Path, required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
     parser.add_argument("--version", required=True)
     parser.add_argument("--revision", required=True)
-    parser.add_argument(
-        "--signing-status",
-        choices=("unsigned", "authenticode"),
-        required=True,
-    )
     parser.add_argument("--version-prerelease", required=True)
     parser.add_argument("--exact-tag-ref", required=True)
     parser.add_argument("--license-present", required=True)
@@ -291,14 +263,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         outputs = assemble_release(
-            desktop_directory=args.desktop_directory.resolve(),
             webview_directory=args.webview_directory.resolve(),
-            native_directory=args.native_directory.resolve(),
             android_directory=args.android_directory.resolve(),
             output_directory=args.output_directory,
             version=args.version,
             revision=args.revision,
-            signing_status=args.signing_status,
             version_prerelease=_boolean(args.version_prerelease, "version_prerelease"),
             exact_tag_ref=_boolean(args.exact_tag_ref, "exact_tag_ref"),
             license_present=_boolean(args.license_present, "license_present"),

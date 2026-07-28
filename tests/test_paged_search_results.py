@@ -8,7 +8,7 @@ from contextlib import closing
 from pathlib import Path
 from unittest import mock
 
-import zvec_desktop.result_catalog as result_catalog_module
+import zvec_host.result_catalog as result_catalog_module
 from image_vector_service.config import ServiceConfig
 from image_vector_service.models import SearchHit
 from image_vector_service.result_exporter import (
@@ -29,7 +29,7 @@ from image_vector_service.search_result_store import (
     result_count,
     write_result_store,
 )
-from zvec_desktop.result_catalog import ResultCatalog, ResultCatalogError
+from zvec_host.result_catalog import ResultCatalog, ResultCatalogError
 
 
 class PagedSearchResultTests(unittest.TestCase):
@@ -68,7 +68,7 @@ class PagedSearchResultTests(unittest.TestCase):
 
         with (
             mock.patch(
-                "zvec_desktop.result_catalog.read_result_range",
+                "zvec_host.result_catalog.read_result_range",
                 wraps=result_catalog_module.read_result_range,
             ) as range_read,
             mock.patch.object(
@@ -330,7 +330,7 @@ class PagedSearchResultTests(unittest.TestCase):
         catalog = ResultCatalog.from_config(self.config_path)
 
         with mock.patch(
-            "zvec_desktop.result_catalog._root_paths_from_state",
+            "zvec_host.result_catalog._root_paths_from_state",
             wraps=result_catalog_module._root_paths_from_state,
         ) as lookup:
             page = catalog.load_manifest(manifest, page_size=15)

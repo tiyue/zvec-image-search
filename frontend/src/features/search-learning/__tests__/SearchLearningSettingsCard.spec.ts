@@ -162,6 +162,38 @@ describe("SearchLearningSettingsCard", () => {
     ]);
   });
 
+  it("uses the YaoLens product name for anonymous export downloads", async () => {
+    const api = fakeApi();
+    const downloads: string[] = [];
+    const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(
+      function captureDownload(this: HTMLAnchorElement) {
+        downloads.push(this.download);
+      },
+    );
+    const createObjectUrl = vi.spyOn(URL, "createObjectURL").mockReturnValue(
+      "blob:yaolens-search-learning",
+    );
+    const revokeObjectUrl = vi.spyOn(URL, "revokeObjectURL").mockImplementation(
+      () => undefined,
+    );
+    const wrapper = mount(SearchLearningSettingsCard, { props: { api } });
+    await flushPromises();
+
+    const exportButton = wrapper.findAll("button").find((button) =>
+      button.text().includes("导出匿名数据"),
+    );
+    expect(exportButton).toBeDefined();
+    await exportButton?.trigger("click");
+    await flushPromises();
+
+    expect(api.exportData).toHaveBeenCalledOnce();
+    expect(downloads).toEqual(["yaolens-search-learning-anonymous.json"]);
+    wrapper.unmount();
+    click.mockRestore();
+    createObjectUrl.mockRestore();
+    revokeObjectUrl.mockRestore();
+  });
+
   it("starts gated training and reports failures without leaving controls busy", async () => {
     const api = fakeApi();
     const wrapper = mount(SearchLearningSettingsCard, { props: { api } });

@@ -1,5 +1,5 @@
 import { flushPromises, mount } from "@vue/test-utils";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type {
   SearchLearningApi,
@@ -121,7 +121,7 @@ function fakeLanApi(): LanAccessApi {
     running: false,
     bind_host: "192.168.1.20",
     port: 38522,
-    display_name: "Zvec 图片库",
+    display_name: "YaoLens",
     discovery_port: 38521,
     available_hosts: [{ address: "192.168.1.20", label: "以太网" }],
     pending_pairings: [],
@@ -146,6 +146,7 @@ function buttonWithText(wrapper: ReturnType<typeof mount>, label: string) {
 
 describe("SettingsPage", () => {
   beforeEach(() => vi.clearAllMocks());
+  afterEach(() => Reflect.deleteProperty(window, "pywebview"));
 
   it("loads editable library fields while never displaying the stored API key", async () => {
     const wrapper = mount(SettingsPage, { props: { api: fakeApi(), lanApi: fakeLanApi() } });
@@ -154,6 +155,11 @@ describe("SettingsPage", () => {
     expect(wrapper.get('.library-editor input[name="name"]').element).toHaveProperty("value", "人物图库");
     expect(wrapper.get('.library-editor input[name="image_root"]').element).toHaveProperty("value", "D:\\Pictures");
     expect(wrapper.get('.library-editor input[name="workspace_directory"]').element).toHaveProperty("value", "D:\\Zvec\\workspace");
+    expect(wrapper.get('.results-form input[name="results_directory"]').attributes("placeholder"))
+      .toBe("D:\\YaoLens\\results");
+    await buttonWithText(wrapper, "新增图库").trigger("click");
+    expect(wrapper.get('input[name="new_workspace_directory"]').attributes("placeholder"))
+      .toBe("D:\\YaoLens\\workspace");
     expect(wrapper.get('input[name="api_key"]').attributes("type")).toBe("password");
     expect((wrapper.get('input[name="api_key"]').element as HTMLInputElement).value).toBe("");
     expect(wrapper.text()).not.toContain("sk-");
@@ -199,6 +205,7 @@ describe("SettingsPage", () => {
     expect(api.updateLibrary).not.toHaveBeenCalled();
     expect(wrapper.emitted("toast")?.at(-1)?.[0]).toBe("图库设置无效");
     expect(String(wrapper.emitted("toast")?.at(-1)?.[1])).toContain("Windows 绝对路径");
+    expect(String(wrapper.emitted("toast")?.at(-1)?.[1])).toContain("D:\\YaoLens\\data");
   });
 
   it("saves the global result directory through the default library endpoint", async () => {
@@ -262,6 +269,36 @@ describe("SettingsPage", () => {
       "设置已保存",
       "隐式反馈已开启。",
       "success",
+    ]);
+  });
+
+  it("requires confirmation and reports a busy refusal from explicit exit", async () => {
+    const exitApplication = vi.fn().mockResolvedValue({
+      ok: false,
+      error: "仍有任务运行，请先等待完成或取消任务。",
+    });
+    Object.defineProperty(window, "pywebview", {
+      configurable: true,
+      value: { api: { exit_application: exitApplication } },
+    });
+    const wrapper = mount(SettingsPage, {
+      props: { api: fakeApi(), lanApi: fakeLanApi() },
+    });
+    await flushPromises();
+
+    await buttonWithText(wrapper, "应用").trigger("click");
+    expect(wrapper.text()).toContain("关闭主窗口后，YaoLens 会继续在后台运行");
+    await buttonWithText(wrapper, "退出 YaoLens").trigger("click");
+    expect(exitApplication).not.toHaveBeenCalled();
+
+    await buttonWithText(wrapper, "确认退出").trigger("click");
+    await flushPromises();
+
+    expect(exitApplication).toHaveBeenCalledOnce();
+    expect(wrapper.emitted("toast")?.at(-1)).toEqual([
+      "无法退出 YaoLens",
+      "仍有任务运行，请先等待完成或取消任务。",
+      "error",
     ]);
   });
 });

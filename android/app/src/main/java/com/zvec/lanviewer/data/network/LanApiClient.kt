@@ -206,7 +206,7 @@ class LanApiClient(
 
     private fun currentEndpoint(vararg segments: String): HttpUrl {
         val baseUrl = connectionReader.read()?.baseUrl
-            ?: throw IllegalStateException("尚未选择 Zvec 电脑")
+            ?: throw IllegalStateException("尚未选择 YaoLens 电脑")
         return endpoint(baseUrl, *segments)
     }
 

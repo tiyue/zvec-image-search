@@ -1,5 +1,5 @@
 # Windows x64 / CPython 3.12 only.  The build script rejects every other host.
-# Reuse the locked core runtime and PyInstaller toolchain used by Zvec Desktop.
+# Reuse the locked core runtime and PyInstaller toolchain.
 -r requirements-packaging.txt
 
 # pywebview 6.2.1 Windows dependency closure.  Keep every version exact so a

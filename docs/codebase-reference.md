@@ -1,12 +1,12 @@
-# Zvec 项目文件与核心方法参考
+# YaoLens 项目文件与核心方法参考
 
-> 版本：0.5.0-rc.3 | 生成时间：2026-07-25
+> 版本：0.1（机器 SemVer：0.1.0）| 更新日期：2026-07-28
 
 ## 目录
 
 1. [顶层入口文件](#顶层入口文件)
 2. [image_vector_service（核心服务层）](#image_vector_service核心服务层)
-3. [zvec_desktop（桌面端）](#zvec_desktop桌面端)
+3. [zvec_host（无界面应用服务）](#zvec_host无界面应用服务)
 4. [zvec_webview（WebView 宿主）](#zvec_webviewwebview-宿主)
 5. [zvec_lan（局域网服务）](#zvec_lan局域网服务)
 6. [frontend（Vue 3 前端）](#frontendvue-3-前端)
@@ -622,17 +622,9 @@ Python 包，提供所有业务逻辑。
 
 ---
 
-## zvec_desktop（桌面端）
+## zvec_host（无界面应用服务）
 
-Python GUI 应用（pystray 系统托盘 + Tkinter），命令 `zvec-desktop`。
-
-### `app.py`（178 行）
-
-| 核心方法/类 | 作用 |
-|------------|------|
-| `main()` | 桌面端入口 |
-| `DesktopLaunchOptions` | 启动选项（config_path、page_size） |
-| `build_parser()` | 命令行参数解析 |
+WebView 与 LAN 宿主共用的 Python 服务层，不包含 Tkinter、系统托盘或窗口入口。
 
 ### `backend_host.py`（894 行）
 
@@ -648,47 +640,17 @@ Python GUI 应用（pystray 系统托盘 + Tkinter），命令 `zvec-desktop`。
 | `BackendApiClient` | 后端 HTTP API 客户端（同步） |
 | `BackendApiError / BackendHttpError` | API 错误 |
 
-### `runtime_controller.py`（830 行）
-
-| 核心类 | 作用 |
-|--------|------|
-| `RuntimeController` | 线程安全运行时控制器（工作池 + 事件队列，桥接后端与 UI） |
-
-### `single_instance.py`
-
-| 核心类 | 作用 |
-|--------|------|
-| `SingleInstanceCoordinator` | 单实例协调器（防止多开） |
-
-### `tray.py`
-
-| 核心功能 | 作用 |
-|---------|------|
-| 系统托盘图标 | pystray 常驻托盘，右键菜单 |
-
-### `gallery_layout.py`
-
-| 核心功能 | 作用 |
-|---------|------|
-| 图库布局 | 图片网格布局计算 |
-
 ### `search_service.py`
 
 | 核心功能 | 作用 |
 |---------|------|
-| 搜索服务 | 桌面端搜索逻辑封装 |
+| 搜索服务 | WebView/LAN 搜索逻辑封装 |
 
-### `organize_panel.py` / `organize_runtime.py` / `organize_state.py`
-
-| 核心功能 | 作用 |
-|---------|------|
-| 图片整理 | 聚类面板、整理运行时、整理状态管理 |
-
-### `library_tasks.py` / `library_task_ui_state.py`
+### `library_tasks.py`
 
 | 核心功能 | 作用 |
 |---------|------|
-| 多库任务 | 库任务管理、任务 UI 状态 |
+| 多库任务 | 库任务提交、轮询、取消和结果校验 |
 
 ### `model_settings.py` / `credentials.py`
 
@@ -700,31 +662,13 @@ Python GUI 应用（pystray 系统托盘 + Tkinter），命令 `zvec-desktop`。
 
 | 核心功能 | 作用 |
 |---------|------|
-| 配置服务 | 桌面端配置读写 |
-
-### `image_loader.py` / `image_geometry.py`
-
-| 核心功能 | 作用 |
-|---------|------|
-| 图片加载 | 异步图片加载、几何计算 |
+| 配置服务 | WebView/LAN 宿主配置读写 |
 
 ### `result_catalog.py`
 
 | 核心功能 | 作用 |
 |---------|------|
 | 结果目录 | 搜索结果目录管理 |
-
-### `settings_panel.py`
-
-| 核心功能 | 作用 |
-|---------|------|
-| 设置面板 | 桌面端设置 UI |
-
-### `ui.py` / `widgets.py` / `theme.py` / `resources.py`
-
-| 核心功能 | 作用 |
-|---------|------|
-| UI 基础 | 主窗口、控件、主题、资源 |
 
 ---
 
@@ -760,7 +704,7 @@ Python GUI 应用（pystray 系统托盘 + Tkinter），命令 `zvec-desktop`。
 
 | 核心类 | 作用 |
 |--------|------|
-| `PreviewFacade` | 预览外观层（封装后端启动、LAN、配置） |
+| `PreviewFacade` | WebView 外观层（封装后端启动、LAN、配置） |
 
 ### `server.py`
 
@@ -933,19 +877,14 @@ Vue 3.5 + TypeScript 5.9 + Vite 8 SPA。
 
 | 文件 | 作用 |
 |------|------|
-| `build_python_desktop.py` | 构建 Python 桌面端（PyInstaller） |
-| `build_python_preview.py` | 构建 Python 预览版 |
-| `build_webview_preview.py` | 构建 WebView 预览版 |
-| `assemble_python_release.py` | 组装 Python 发布包 |
+| `build_webview_preview.py` | 构建 YaoLens Windows 包 |
+| `assemble_python_release.py` | 组装 Windows + Android 发布资产 |
 | `prepare_python_release.py` | 准备发布材料 |
-| `generate_python_release_materials.py` | 生成发布材料 |
 | `provision_nsis.py` | 配置 NSIS 安装包 |
-| `python_preview_packaging.py` | Python 预览打包 |
-| `webview_preview_packaging.py` | WebView 预览打包 |
+| `webview_preview_packaging.py` | Windows 打包契约 |
 | `verify_search_quality_gate.py` | 搜索质量门禁验证 |
-| `verify_webview_preview_release.py` | WebView 预览发布验证 |
+| `verify_webview_preview_release.py` | Windows 发布资产验证 |
 | `run_large_library_gates.py` | 大库门禁测试 |
-| `smoke_python_desktop_installer.py` | 桌面安装包冒烟测试 |
 
 ### `tools/`
 

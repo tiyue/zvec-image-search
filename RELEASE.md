@@ -1,8 +1,8 @@
-# Zvec 0.5.0-rc.4 Android 局域网预览版
+# YaoLens 0.1
 
 本版提供 Windows x64 原生 Python 后端和 Vue 3 桌面界面。发布包冻结 Python、WebView2 桥接和前端静态资源；用户运行时不需要 Node.js、PowerShell、.NET、Docker、WSL 或单独安装 Python。
 
-当前状态：Windows x64、未签名候选。尚未达到已签名稳定版发布门槛。
+本次使用机器版本 `0.1.0`、公开展示版本 `0.1` 和稳定标签 `v0.1.0`。
 
 ## 本版更新
 
@@ -20,6 +20,14 @@
 - 自动发现不可用时可通过私网 IP 直接连接，连接前会明确校验目标地址与端口。
 - 配对诊断进一步区分待批准、已批准、已拒绝、已过期和凭据恢复失败，便于定位“电脑已批准但手机无反应”。
 
+### Windows 登录后常驻
+
+- 安装版为当前用户注册 `AtLogon` 计划任务，使用 `InteractiveToken`、`LeastPrivilege`、`IgnoreNew`、无限执行时间和固定有限次数的失败重启，不要求管理员权限或保存用户密码。
+- 用户登录后 YaoLens 隐藏常驻；关闭窗口只隐藏界面，后台任务、Android LAN 服务和自动增量索引 watcher 继续运行。再次启动会唤醒已有窗口。
+- 完全停止必须使用“设置 → 应用 → 退出 YaoLens”；存在活动任务时退出请求会被拒绝，不会中断已接受的索引或标注任务。
+- 便携包不注册计划任务；用户手工启动后只在当前登录会话内常驻，二次启动同样唤醒已有窗口。
+- backend 子进程加入仅由宿主持有的 Windows Job Object。它只在宿主异常死亡时兜底清理孤儿进程；正常退出仍先执行现有的 idle-only 安全关闭协议。
+
 ### Vue 3 桌面界面
 
 - 前端迁移至 Vue 3、TypeScript 和 Vite。
@@ -28,15 +36,15 @@
 - 发布包仅包含编译后的 HTML、CSS 和 JavaScript，不包含 Node.js、源码或 `node_modules`。
 - 所有页面资源随包提供，不加载 CDN、远程字体或示例图片。
 
-### Android 局域网查看（Debug Preview）
+### Android 局域网查看
 
-- 新增 Android 8.0 及以上局域网客户端。Windows 继续保存图库、运行 Zvec 和调用模型。
+- 新增 Android 8.0 及以上局域网客户端。Windows 继续保存图库、运行本地向量引擎和调用模型。
 - 支持 UDP 自动发现和手工私网 IP；配对无需二维码，两端核对相同 6 位验证码后由 Windows 批准。
 - 支持选择图库、文字/标签/图片/图文搜索、分页查看、原图预览、保存和分享。
 - 查询图片不设固定文件大小上限，按流上传；原图支持 Range、断点续传和多路并发流式传输。
 - 对外 LAN 网关与本机控制接口隔离，只开放配对、搜索和原图读取，不开放设置、索引、迁移或图库删除。
 - 撤销或重新配对会先持久化旧 Token 的哈希拒绝记录；即使凭据文件写入失败并重启，旧 Token 也不会恢复有效。
-- 本次 APK 使用 Android debug 签名，仅作 Preview。工作流不创建、保存或冒充正式发布私钥。
+- APK 由固定 JDK、Android SDK 和 Gradle Wrapper 完成测试、lint、装配及 SHA-256 校验。
 
 ### 搜索与图片操作
 
@@ -152,22 +160,22 @@
 以下是完成最终构建和校验后采用的文件名。本说明不代表这些文件已经由当前源码重新生成；实际交付必须同时提供 SHA-256 和验证报告。
 
 ```text
-Zvec-Desktop-0.5.0-rc.4-win-x64-unsigned-setup.exe
-Zvec-Desktop-0.5.0-rc.4-win-x64-portable.zip
-Zvec-Webview-Preview-0.5.0-rc.4-win-x64-portable.zip
-Zvec-Webview-Preview-0.5.0-rc.4-win-x64-unsigned-setup.exe
-Zvec-LAN-Viewer-0.5.0-rc.4-android-debug-preview.apk
+YaoLens-0.1-win-x64-portable.zip
+YaoLens-0.1-win-x64-setup.exe
+YaoLens-0.1-android.apk
 ```
 
-候选包只要包含该 debug APK，发布装配策略就会将 `effective_prerelease` 设为 `true`。触发 GitHub Release 时必须使用带预发布后缀的 SemVer；本次使用 `0.5.0-rc.4`，不能把 debug APK 挂在稳定版标签下。
+登录常驻没有新增独立发布资产；GitHub Release 资产矩阵仍为上述 Windows 安装包、便携包、Android APK 及对应校验和、验证报告和策略元数据。
 
-Vue Preview 使用独立入口：
+GitHub Release 标题固定为 `YaoLens 0.1`，并从精确指向工作流提交的稳定标签 `v0.1.0` 发布。
+
+Windows 应用入口：
 
 ```text
-Zvec.WebviewPreview.exe
+YaoLens.exe
 ```
 
-Preview 不安装或覆盖旧桌面版。冻结包包含 `zvec-backend.exe`、`zvec.exe`、Python 运行库、WebView2 桥接和 `zvec_webview/frontend_dist`。
+WebView 使用独立安装身份，不安装或覆盖已废弃的旧 Desktop 产品。冻结包包含内部组件 `zvec-backend.exe`、`zvec.exe`、Python 运行库、WebView2 桥接和 `zvec_webview/frontend_dist`。
 
 包内不得出现：
 
@@ -182,10 +190,11 @@ Preview 不安装或覆盖旧桌面版。冻结包包含 `zvec-backend.exe`、`z
 1. 将 ZIP 完整解压到普通可写目录。
 2. 不要直接在 ZIP 内运行。
 3. 不要移动单个 EXE，也不要删除 `_internal`。
-4. 运行 `Zvec.WebviewPreview.exe`。
-5. 升级前等待任务结束，并从程序内明确退出。
+4. 运行 `YaoLens.exe`。
+5. 关闭窗口只会隐藏界面；再次运行会唤醒当前会话内的已有窗口。
+6. 升级前等待任务结束，并使用“设置 → 应用 → 退出 YaoLens”明确退出。
 
-便携版与安装版复用 `%LOCALAPPDATA%\zvec-image-search` 下的配置和缓存。删除便携目录不会删除原图、Workspace 或 Collection。
+便携版不会注册登录计划任务，只在用户手工启动后的当前登录会话内常驻。它与安装版复用 `%LOCALAPPDATA%\zvec-image-search` 下的配置和缓存；删除便携目录不会删除原图、Workspace 或 Collection。
 
 ## 升级与兼容
 
@@ -207,7 +216,7 @@ python -m venv .venv
 .venv\Scripts\python.exe -m pip install --constraint requirements-lock.txt --editable . --requirement requirements-dev.txt
 .venv\Scripts\python.exe -m ruff check .
 .venv\Scripts\python.exe -m ruff format --check .
-.venv\Scripts\python.exe -m mypy image_vector_service zvec_desktop zvec_lan zvec_webview image_service.py zvec_launcher.py zvec_logging.py scripts
+.venv\Scripts\python.exe -m mypy image_vector_service zvec_host zvec_lan zvec_webview image_service.py zvec_launcher.py zvec_logging.py scripts
 .venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
@@ -228,25 +237,22 @@ cd android
 gradlew.bat testDebugUnitTest assembleDebug lintDebug
 ```
 
-Android 构建使用 JDK 17、SDK Platform 34 和 Build Tools 34.0.0。CI 与候选发布只生成明确标记为 `debug-preview` 的 APK 和 SHA-256，不接触正式签名密钥。
+Android 构建使用 JDK 17、SDK Platform 34 和 Build Tools 34.0.0。CI 生成 APK 和 SHA-256，并在发布装配时复核固定公开文件名。
 
-完整 Windows x64 Preview 构建：
+完整 Windows x64 构建由 `.github/workflows/release.yml` 使用固定 Python、NSIS 和前端依赖执行。本地发布契约检查：
 
 ```text
-python -m pip install --requirement requirements-webview-preview-lock.txt
-python scripts/provision_nsis.py --output-directory build/tools/nsis-3.12-python
-python scripts/build_webview_preview.py --dry-run --makensis build/tools/nsis-3.12-python/payload/nsis-3.12/makensis.exe
-python scripts/build_webview_preview.py --makensis build/tools/nsis-3.12-python/payload/nsis-3.12/makensis.exe
+python -m unittest tests.test_release_pipeline -v
 ```
 
 构建脚本必须验证 Vite manifest、资源闭包、冻结入口、x64 WebView2、payload 清单、便携 ZIP 和 NSIS 安装器；冻结自检还会导入搜索学习、主动学习、聚类持久层、活动记录、安全删除和图库目录模块，并实际验证 SQLite WAL 及本地学习状态库可写。
 
 ## 已知限制
 
-- 当前产物未签名，SmartScreen 可能提示风险。
-- 桌面端只发布 Windows x64；不提供 macOS、Linux、ARM64 或 x86 版本。
-- Android 客户端目前只有 debug-signed Preview，没有应用商店正式签名、自动更新或 iOS 版本。
-- Android 局域网 Preview 当前使用未加密 HTTP，不提供端到端传输加密；只应在用户自己控制的家庭专用网络使用。
+- Windows 可能显示 SmartScreen 提示；安装前应核对发布页提供的 SHA-256。
+- YaoLens 只发布 Windows x64；不提供 macOS、Linux、ARM64 或 x86 版本。
+- Android 客户端不提供应用商店分发、自动更新或 iOS 版本。
+- Android 局域网连接当前使用未加密 HTTP，不提供端到端传输加密；只应在用户自己控制的家庭专用网络使用。
 - Android 与电脑必须位于可互访的私网；访客 Wi-Fi、AP 隔离、VPN 或防火墙可能阻止自动发现，手工 IP 可作为备用。
 - 尚无自动更新。
 - 阿里云模型需要网络、有效 API Key 和可用额度。
@@ -256,4 +262,4 @@ python scripts/build_webview_preview.py --makensis build/tools/nsis-3.12-python/
 
 ## 已废弃产物
 
-- **Pure-Python Desktop（纯 Python 桌面端）**：自 0.5.0-rc.2 起不再构建和发布。后续 Release 只保留 WebView Preview 和 Android LAN Viewer。
+- **Pure-Python Desktop（纯 Python 桌面端）**：源码入口、Tkinter/pystray 依赖和发布打包链均已移除。后续 Release 只保留 YaoLens Windows、Android 及校验元数据；Python wheel 仅用于 CI 安装验证。

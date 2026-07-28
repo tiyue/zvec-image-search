@@ -217,7 +217,7 @@ export function useDataMigration(
     workspaceDirectory: "",
     imageRoot: "",
     rootId: "",
-    dockerImage: "zvec-image-search:local",
+    dockerImage: "",
     backupDirectory: "",
   });
   const preview = shallowRef<MigrationPreview | null>(null);

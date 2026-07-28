@@ -102,7 +102,7 @@ function applyTypeDefaults(type: DataMigrationType): void {
   migration.form.workspaceDirectory = "";
   migration.form.imageRoot = library?.imageRoot ?? "";
   migration.form.rootId = "";
-  migration.form.dockerImage = "zvec-image-search:local";
+  migration.form.dockerImage = "";
   if (library) migration.form.libraryName = library.name;
   if (type === "schema" && library) {
     migration.form.source = library.workspaceDirectory;
@@ -290,7 +290,7 @@ watch(
               name="migration_source"
               autocomplete="off"
               spellcheck="false"
-              :placeholder="migration.form.migrationType === 'docker_workspace' ? 'zvec_workspace' : 'C:\\Zvec\\workspace'"
+              :placeholder="migration.form.migrationType === 'docker_workspace' ? 'docker_workspace' : 'C:\\YaoLens\\workspace'"
               @input="migration.invalidatePreview"
             />
             <button
@@ -313,7 +313,7 @@ watch(
               name="migration_target"
               autocomplete="off"
               spellcheck="false"
-              placeholder="D:\Zvec\workspace"
+              placeholder="D:\YaoLens\workspace"
               :readonly="migration.form.migrationType === 'legacy_config'"
               @input="migration.invalidatePreview"
             />

@@ -152,7 +152,7 @@ def _run_frozen_self_test(plan: BuildPlan) -> dict[str, object]:
     output_path = plan.work_directory / "frozen-self-test.json"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.unlink(missing_ok=True)
-    executable = plan.payload_directory / "Zvec.WebviewPreview.exe"
+    executable = plan.payload_directory / "YaoLens.exe"
     try:
         completed = subprocess.run(
             [
@@ -313,7 +313,7 @@ def build(
         }
     return {
         "status": "ok",
-        "product": "Zvec Webview Preview",
+        "product": "YaoLens",
         "payload_directory": str(plan.payload_directory),
         "manifest": str(manifest_path),
         "file_count": manifest["file_count"],
@@ -334,7 +334,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 json.dumps(
                     {
                         "status": "ok",
-                        "product": "Zvec Webview Preview",
+                        "product": "YaoLens",
                         "payload_directory": str(args.verify_only.resolve()),
                         "file_count": manifest["file_count"],
                         "total_size": manifest["total_size"],

@@ -6,8 +6,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from image_vector_service.activity_store import ActivityStore
-from zvec_desktop.configuration_service import DesktopConfigurationService
-from zvec_desktop.credentials import SessionCredentialStore
+from zvec_host.configuration_service import DesktopConfigurationService
+from zvec_host.credentials import SessionCredentialStore
 from zvec_webview.facade import FacadeError, PreviewFacade
 
 

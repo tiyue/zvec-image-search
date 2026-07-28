@@ -3,14 +3,32 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="description" content="Zvec 是面向 Windows 的本地优先智能图片库，支持多模态搜索、跨图库检索、AI 标注、批量整理与 Android 局域网查看。">
-  <title>Zvec 智能图片库 — 本地优先，搜索、标注与整理</title>
+  <meta name="description" content="曜镜（YaoLens）是面向 Windows 的本地优先智能图片库，支持多模态搜索、跨图库检索、AI 标注、批量整理与 Android 局域网查看。">
+  <meta name="theme-color" content="#f7f7f5" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#14181b" media="(prefers-color-scheme: dark)">
+  <link rel="icon" type="image/png" href="assets/images/yaolens-logo.png">
+  <title>曜镜 YaoLens — 本地优先，搜索、标注与整理</title>
   <style>
     :root{
+      color-scheme:light;
       --bg:#f7f7f5;--panel:#fff;--soft:#f1f1ee;--soft-2:#ecece8;
-      --line:#e4e4df;--line-2:#d5d5cf;--text:#1d1e20;--muted:#777872;
-      --accent:#0f8a72;--accent-2:#0b725f;--accent-soft:#e8f5f1;
+      --line:#e4e4df;--line-2:#d5d5cf;--text:#292f34;--muted:#6f7478;--subtle:#8c8e89;
+      --accent:#c94b00;--accent-2:#983900;--accent-soft:#fff0e5;
+      --brand-orange:#ff6a00;--brand-graphite:#292f34;
+      --strong:#292f34;--strong-hover:#363d42;--on-strong:#fff;
+      --nav-bg:rgba(247,247,245,.88);
       --shadow:0 18px 48px rgba(21,22,22,.12);--radius:14px;
+    }
+    @media(prefers-color-scheme:dark){
+      :root{
+        color-scheme:dark;
+        --bg:#14181b;--panel:#1c2125;--soft:#252b30;--soft-2:#30373c;
+        --line:#31383d;--line-2:#454d52;--text:#f4f5f6;--muted:#b3b8bc;--subtle:#8f969b;
+        --accent:#ff9852;--accent-2:#ffc092;--accent-soft:#3a2417;
+        --strong:#f4f5f6;--strong-hover:#fff;--on-strong:#1c2125;
+        --nav-bg:rgba(20,24,27,.9);
+        --shadow:0 18px 48px rgba(0,0,0,.32);
+      }
     }
     *{box-sizing:border-box;margin:0}
     html{scroll-behavior:smooth}
@@ -19,14 +37,15 @@
     img{max-width:100%;display:block}
 
     /* Nav */
-    .nav{position:fixed;top:0;left:0;right:0;z-index:50;height:60px;border-bottom:1px solid var(--line);background:rgba(247,247,245,.88);backdrop-filter:blur(16px)}
+    .nav{position:fixed;top:0;left:0;right:0;z-index:50;height:60px;border-bottom:1px solid var(--line);background:var(--nav-bg);backdrop-filter:blur(16px)}
     .nav-inner{max-width:1100px;margin:0 auto;padding:0 24px;height:100%;display:flex;align-items:center;justify-content:space-between}
     .brand{display:flex;align-items:center;gap:10px;font-weight:750;font-size:17px;letter-spacing:-.02em}
-    .brand-icon{width:32px;height:32px;border-radius:9px;background:linear-gradient(135deg,#725fff,#25b89e);display:grid;place-items:center;color:#fff;font-size:14px;font-weight:850;box-shadow:0 6px 18px rgba(100,80,255,.25)}
+    .brand-icon{width:32px;height:32px;border-radius:9px;background:#fff;border:1px solid var(--line);display:grid;place-items:center;overflow:hidden;box-shadow:0 6px 18px rgba(255,106,0,.2)}
+    .brand-icon img,.showcase-dot img{width:100%;height:100%;object-fit:cover;transform:scale(1.32)}
     .nav-links{display:none;gap:28px;font-size:14px;color:var(--muted)}
     .nav-links a:hover{color:var(--text)}
-    .nav-cta{display:none;height:36px;padding:0 16px;border-radius:10px;background:var(--accent);color:#fff;font-size:13px;font-weight:650;align-items:center;gap:6px}
-    .nav-cta:hover{background:var(--accent-2)}
+    .nav-cta{display:none;height:36px;padding:0 16px;border-radius:10px;background:var(--brand-orange);color:var(--brand-graphite);font-size:13px;font-weight:750;align-items:center;gap:6px}
+    .nav-cta:hover{background:#e85f00}
     @media(min-width:768px){.nav-links{display:flex}.nav-cta{display:inline-flex}}
 
     /* Hero */
@@ -36,14 +55,14 @@
     .hero p{color:var(--muted);font-size:16px;max-width:560px;margin:0 auto 28px;line-height:1.65}
     .hero-btns{display:flex;flex-direction:column;gap:10px;align-items:center;justify-content:center}
     .btn{height:46px;padding:0 22px;border-radius:12px;font-size:14px;font-weight:650;display:inline-flex;align-items:center;gap:8px;transition:.15s}
-    .btn-primary{background:var(--text);color:#fff;border:0}
-    .btn-primary:hover{background:#2a2a2a}
-    .btn-secondary{background:#fff;border:1px solid var(--line-2);color:var(--text)}
+    .btn-primary{background:var(--strong);color:var(--on-strong);border:0}
+    .btn-primary:hover{background:var(--strong-hover)}
+    .btn-secondary{background:var(--panel);border:1px solid var(--line-2);color:var(--text)}
     .btn-secondary:hover{background:var(--soft)}
     @media(min-width:640px){.hero h1{font-size:44px}.hero-btns{flex-direction:row}}
 
     /* Stats */
-    .stats{border-top:1px solid var(--line);border-bottom:1px solid var(--line);background:#fff}
+    .stats{border-top:1px solid var(--line);border-bottom:1px solid var(--line);background:var(--panel)}
     .stats-inner{max-width:1100px;margin:0 auto;padding:28px 24px;display:grid;grid-template-columns:repeat(2,1fr);gap:24px;text-align:center}
     .stat-num{font-size:26px;font-weight:750;letter-spacing:-.03em;margin-bottom:2px}
     .stat-label{font-size:13px;color:var(--muted)}
@@ -59,8 +78,8 @@
 
     /* Cards */
     .cards{display:grid;gap:14px}
-    .card{background:#fff;border:1px solid var(--line);border-radius:var(--radius);padding:22px;transition:.17s}
-    .card:hover{transform:translateY(-2px);box-shadow:0 10px 25px rgba(0,0,0,.06);border-color:#d0d0ca}
+    .card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:22px;transition:.17s}
+    .card:hover{transform:translateY(-2px);box-shadow:0 10px 25px rgba(0,0,0,.12);border-color:var(--line-2)}
     .card-icon{width:40px;height:40px;border-radius:10px;display:grid;place-items:center;margin-bottom:14px;font-size:18px;background:var(--soft)}
     .card h3{font-size:16px;font-weight:700;margin-bottom:6px}
     .card p{font-size:13.5px;color:var(--muted);line-height:1.6}
@@ -68,31 +87,152 @@
     @media(min-width:1024px){.cards{grid-template-columns:repeat(3,1fr)}}
 
     /* Showcase */
-    .showcase{background:#fff;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+    .showcase{background:var(--panel);border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
     .showcase-tabs{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;margin-bottom:28px}
-    .showcase-tab{height:38px;padding:0 16px;border-radius:10px;border:1px solid var(--line);background:#fff;color:var(--muted);font-size:13px;font-weight:650;cursor:pointer;transition:.15s}
+    .showcase-tab{height:38px;padding:0 16px;border-radius:10px;border:1px solid var(--line);background:var(--panel);color:var(--muted);font-size:13px;font-weight:650;cursor:pointer;transition:.15s}
     .showcase-tab:hover{color:var(--text)}
-    .showcase-tab.active{background:var(--text);color:#fff;border-color:var(--text)}
-    .showcase-frame{position:relative;border-radius:16px;overflow:hidden;border:1px solid var(--line);background:var(--bg);box-shadow:var(--shadow)}
+    .showcase-tab.active{background:var(--strong);color:var(--on-strong);border-color:var(--strong)}
+    .showcase-tab:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+    .showcase-frame{
+      --demo-canvas:var(--panel);--demo-sidebar:var(--bg);--demo-soft:var(--soft);
+      --demo-soft-2:var(--soft-2);--demo-line:var(--line);--demo-text:var(--text);
+      --demo-muted:var(--muted);--demo-accent:var(--brand-orange);
+      position:relative;border-radius:16px;overflow:hidden;border:1px solid var(--line);
+      background:var(--demo-canvas);box-shadow:var(--shadow)
+    }
     .showcase-body{padding:22px 24px 28px}
     .showcase-body h3{font-size:18px;font-weight:700;margin-bottom:6px}
     .showcase-body p{color:var(--muted);font-size:14px;line-height:1.6;max-width:600px}
-    .showcase-window{aspect-ratio:16/9;position:relative;background:var(--bg);border-bottom:1px solid var(--line);display:flex;overflow:hidden}
-    .showcase-sidebar{width:56px;background:#171717;flex-shrink:0;display:flex;flex-direction:column;align-items:center;padding:14px 0;gap:14px}
-    .showcase-dot{width:28px;height:28px;border-radius:8px;background:linear-gradient(135deg,#725fff,#25b89e);display:grid;place-items:center;color:#fff;font-size:11px;font-weight:850}
-    .showcase-navdot{width:22px;height:22px;border-radius:6px;background:#2a2a2a}
-    .showcase-navdot.active{background:#3a3a3a}
-    .showcase-main{flex:1;display:flex;flex-direction:column;min-width:0}
-    .showcase-topbar{height:40px;border-bottom:1px solid var(--line);display:flex;align-items:center;padding:0 14px;gap:8px;background:rgba(247,247,245,.9)}
-    .showcase-tag{height:22px;padding:0 8px;border-radius:6px;background:#fff;border:1px solid var(--line);font-size:11px;color:var(--muted);display:flex;align-items:center}
-    .showcase-content{flex:1;padding:14px;display:grid;grid-template-columns:repeat(5,1fr);gap:10px;align-content:start}
-    .showcase-thumb{aspect-ratio:4/3;background:#ddd;border-radius:8px;position:relative;overflow:hidden}
-    .showcase-thumb svg{width:100%;height:100%;display:block}
-    .showcase-score{position:absolute;right:6px;top:6px;border-radius:999px;padding:2px 6px;background:rgba(20,20,20,.68);color:#fff;font-size:10px;font-weight:650}
-    @media(max-width:640px){.showcase-content{grid-template-columns:repeat(3,1fr)}.showcase-sidebar{display:none}}
+    .showcase-window{height:560px;display:grid;grid-template-columns:200px minmax(0,1fr);overflow:hidden;border-bottom:1px solid var(--demo-line);color:var(--demo-text);background:var(--demo-canvas);font-size:11px;text-align:left}
+    .showcase-window button,.showcase-window input,.showcase-window select{font:inherit}
+    .showcase-window button:disabled,.showcase-window input:disabled,.showcase-window select:disabled{cursor:default;opacity:1}
+    .mini-sidebar{display:flex;min-width:0;flex-direction:column;overflow:hidden;border-right:1px solid var(--demo-line);background:var(--demo-sidebar)}
+    .mini-brand{display:flex;min-height:58px;align-items:center;gap:9px;padding:10px 11px}
+    .mini-logo{width:30px;height:30px;flex:0 0 auto;overflow:hidden;border:1px solid var(--demo-line);border-radius:8px;background:#fff}
+    .mini-logo img{width:100%;height:100%;object-fit:cover;transform:scale(1.32)}
+    .mini-brand-copy{display:grid;min-width:0;line-height:1.3}
+    .mini-brand-copy strong{font-size:13px;font-weight:650}
+    .mini-brand-copy small{color:var(--demo-muted);font-size:10px}
+    .mini-collapse{margin-left:auto;color:var(--demo-muted);font-size:14px}
+    .mini-new-search,.mini-nav-item,.mini-settings-link{display:flex;min-height:38px;align-items:center;gap:9px;margin:0 7px;padding:7px 10px;border-radius:8px}
+    .mini-new-search{margin-bottom:3px;border:1px solid var(--demo-line);background:var(--demo-canvas);font-weight:650}
+    .mini-nav{display:grid;gap:1px}
+    .mini-nav-item,.mini-settings-link{color:var(--demo-muted)}
+    .mini-nav-item.is-active,.mini-settings-link.is-active{color:var(--demo-text);background:var(--demo-soft-2)}
+    .mini-nav-icon{display:grid;width:20px;height:20px;flex:0 0 auto;place-items:center;color:inherit;font-size:13px}
+    .mini-nav-copy{display:grid;min-width:0}
+    .mini-nav-copy strong{overflow:hidden;color:inherit;font-size:11px;font-weight:600;text-overflow:ellipsis;white-space:nowrap}
+    .mini-nav-copy small{overflow:hidden;color:var(--demo-muted);font-size:9px;text-overflow:ellipsis;white-space:nowrap}
+    .mini-recents{display:grid;gap:2px;margin:auto 8px 8px;padding-top:10px;border-top:1px solid var(--demo-line)}
+    .mini-recents>span{margin:0 5px 3px;color:var(--demo-muted);font-size:9px}
+    .mini-recent{display:grid;padding:5px 6px;border-radius:7px}
+    .mini-recent strong{font-size:10px;font-weight:550}
+    .mini-recent small{color:var(--demo-muted);font-size:8px}
+    .mini-settings-link{margin-top:0;margin-bottom:8px}
+    .mini-main{display:grid;min-width:0;min-height:0;grid-template-rows:46px minmax(0,1fr);overflow:hidden;background:var(--demo-canvas)}
+    .mini-topbar{position:relative;display:flex;align-items:center;justify-content:center;padding:0 12px;border-bottom:1px solid var(--demo-line);background:var(--demo-canvas)}
+    .mini-view-switch{display:grid;width:170px;height:31px;grid-template-columns:1fr 1fr;gap:2px;padding:2px;border-radius:18px;background:var(--demo-soft)}
+    .mini-view-switch[hidden]{display:none}
+    .mini-view-switch span{display:grid;place-items:center;border-radius:15px;color:var(--demo-muted);font-size:10px}
+    .mini-view-switch span.active{color:var(--demo-text);background:var(--demo-canvas);box-shadow:0 1px 4px rgba(0,0,0,.12)}
+    .mini-service-state{position:absolute;right:18px;padding:4px 8px;border:1px solid var(--demo-line);border-radius:999px;color:var(--demo-muted);font-size:9px}
+    .mini-page{min-width:0;min-height:0;overflow:hidden;background:var(--demo-canvas)}
+    .mini-page[hidden]{display:none}
+    .mini-page-heading{display:flex;min-height:54px;align-items:center;justify-content:space-between;gap:12px;padding:8px 13px;border-bottom:1px solid var(--demo-line)}
+    .mini-page-heading strong,.mini-panel-heading strong{display:block;font-size:11px;font-weight:650}
+    .mini-page-heading small,.mini-panel-heading small{display:block;margin-top:1px;color:var(--demo-muted);font-size:9px}
+    .mini-actions{display:flex;align-items:center;gap:5px}
+    .mini-control{min-height:27px;padding:0 9px;border:1px solid var(--demo-line);border-radius:8px;color:var(--demo-text);background:var(--demo-canvas)}
+    .mini-control.is-primary{border-color:var(--demo-text);color:var(--demo-canvas);background:var(--demo-text)}
+    .mini-control.is-accent{border-color:var(--demo-accent);color:#211b17;background:var(--demo-accent);font-weight:700}
+    .mini-search-strip{display:grid;grid-template-columns:25px minmax(0,1fr) auto 29px;align-items:center;gap:3px;margin:9px 13px;padding:4px 5px;border:1px solid var(--demo-line);border-radius:22px;background:var(--demo-canvas);box-shadow:0 7px 22px rgba(0,0,0,.07)}
+    .mini-search-strip>span{display:grid;min-height:29px;place-items:center}
+    .mini-search-query{justify-content:start!important;padding:0 4px;color:var(--demo-text)}
+    .mini-search-mode{padding:0 7px!important;border-radius:7px;color:var(--demo-muted)}
+    .mini-search-submit{width:29px;border-radius:50%;color:var(--demo-canvas);background:var(--demo-text)}
+    .mini-search-tools{display:flex;align-items:center;justify-content:space-between;padding:0 13px 8px;color:var(--demo-muted);font-size:9px}
+    .mini-search-grid{display:grid;min-height:0;grid-template-columns:repeat(4,minmax(0,1fr));gap:7px;padding:0 13px 9px}
+    .mini-image-card{position:relative;min-width:0;overflow:hidden;border-radius:8px;background:var(--demo-soft)}
+    .mini-image-card img{width:100%;height:100%;min-height:98px;object-fit:cover}
+    .mini-image-copy{position:absolute;right:0;bottom:0;left:0;padding:18px 7px 6px;color:#fff;background:linear-gradient(transparent,rgba(0,0,0,.78))}
+    .mini-image-copy strong,.mini-image-copy small{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .mini-image-copy strong{font-size:9px}.mini-image-copy small{font-size:8px;opacity:.8}
+    .mini-score{position:absolute;top:5px;right:5px;padding:2px 5px;border-radius:999px;color:#fff;background:rgba(22,24,26,.72);font-size:8px}
+    .mini-pager{display:flex;align-items:center;justify-content:center;gap:9px;padding:8px;border-top:1px solid var(--demo-line);color:var(--demo-muted);font-size:9px}
+    .mini-tasks-page,.mini-organize-page,.mini-settings-page{padding:10px;background:var(--demo-canvas)}
+    .mini-toolbar{display:flex;min-height:37px;align-items:center;justify-content:space-between;margin-bottom:8px}
+    .mini-toolbar h3{font-size:12px;font-weight:650}.mini-toolbar p{color:var(--demo-muted);font-size:9px}
+    .mini-subtabs{display:flex;gap:4px;margin-bottom:8px;border-bottom:1px solid var(--demo-line)}
+    .mini-subtabs span{padding:6px 8px;color:var(--demo-muted);font-size:9px}
+    .mini-subtabs span.active{margin-bottom:-1px;border-bottom:2px solid var(--demo-accent);color:var(--demo-text);font-weight:650}
+    .mini-task-layout{display:grid;height:calc(100% - 82px);min-height:0;grid-template-columns:minmax(0,1.45fr) minmax(180px,.75fr);gap:8px}
+    .mini-panel{min-width:0;overflow:hidden;border:1px solid var(--demo-line);border-radius:10px;background:var(--demo-canvas)}
+    .mini-panel-heading{display:flex;min-height:42px;align-items:center;justify-content:space-between;padding:7px 9px;border-bottom:1px solid var(--demo-line)}
+    .mini-filter-row{display:flex;gap:5px;padding:7px 9px;border-bottom:1px solid var(--demo-line);background:var(--demo-sidebar)}
+    .mini-filter{min-width:0;height:26px;padding:0 7px;border:1px solid var(--demo-line);border-radius:7px;color:var(--demo-muted);background:var(--demo-canvas)}
+    .mini-table{display:grid}
+    .mini-table-row{display:grid;grid-template-columns:minmax(110px,1.5fr) .8fr .8fr .7fr;align-items:center;gap:7px;min-height:43px;padding:6px 9px;border-bottom:1px solid var(--demo-line);font-size:9px}
+    .mini-table-row.is-head{min-height:29px;color:var(--demo-muted);background:var(--demo-sidebar)}
+    .mini-table-row strong{display:block;font-size:9px}.mini-table-row small{display:block;color:var(--demo-muted);font-size:8px}
+    .mini-task-status{justify-self:start;padding:3px 6px;border:1px solid var(--demo-line);border-radius:999px;color:var(--demo-muted)}
+    .mini-task-status.is-running{border-color:var(--demo-accent);color:var(--accent)}
+    .mini-progress{height:4px;overflow:hidden;border-radius:999px;background:var(--demo-soft-2)}
+    .mini-progress span{display:block;height:100%;border-radius:inherit;background:var(--demo-accent)}
+    .mini-log-list{display:grid}
+    .mini-log-item{display:grid;grid-template-columns:38px 1fr;gap:6px;padding:8px 9px;border-bottom:1px solid var(--demo-line)}
+    .mini-log-item time{color:var(--demo-muted);font-size:8px}.mini-log-item span{font-size:9px;line-height:1.45}
+    .mini-organize-layout{display:grid;height:calc(100% - 45px);min-height:0;grid-template-columns:150px minmax(0,1fr) 170px;gap:8px}
+    .mini-folder-list{display:grid;gap:2px;padding:6px}
+    .mini-folder{display:flex;align-items:center;justify-content:space-between;padding:6px;border-radius:7px;color:var(--demo-muted);font-size:9px}
+    .mini-folder.active{color:var(--demo-text);background:var(--demo-soft-2)}
+    .mini-organize-gallery{display:grid;min-height:0;grid-template-rows:auto auto minmax(0,1fr)}
+    .mini-selection{display:flex;align-items:center;justify-content:space-between;padding:6px 8px;border-bottom:1px solid var(--demo-line);color:var(--demo-muted);font-size:9px;background:var(--demo-sidebar)}
+    .mini-organize-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px;padding:7px}
+    .mini-organize-grid img{width:100%;height:94px;object-fit:cover;border-radius:7px}
+    .mini-tag-editor{padding:9px}
+    .mini-tag-editor h4{margin-bottom:3px;font-size:11px}.mini-tag-editor>p{margin-bottom:9px;color:var(--demo-muted);font-size:8px}
+    .mini-tags{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:9px}
+    .mini-tag{padding:3px 6px;border:1px solid var(--demo-line);border-radius:999px;color:var(--demo-muted);font-size:8px;background:var(--demo-sidebar)}
+    .mini-field{display:grid;gap:3px;margin-bottom:7px;color:var(--demo-muted);font-size:8px}
+    .mini-field input,.mini-field select{width:100%;height:27px;padding:0 7px;border:1px solid var(--demo-line);border-radius:7px;color:var(--demo-text);background:var(--demo-canvas)}
+    .mini-settings-layout{display:grid;height:calc(100% - 45px);min-height:0;grid-template-columns:145px minmax(0,1fr);gap:8px}
+    .mini-settings-nav{padding:6px}
+    .mini-settings-nav span{display:block;padding:7px;border-radius:7px;color:var(--demo-muted);font-size:9px}
+    .mini-settings-nav span.active{color:var(--demo-text);background:var(--demo-soft-2);font-weight:650}
+    .mini-settings-content{display:grid;min-height:0;grid-template-columns:1fr 1fr;gap:8px;overflow:hidden}
+    .mini-settings-section{padding:9px}
+    .mini-settings-section h4{font-size:11px}.mini-settings-section>p{margin:2px 0 9px;color:var(--demo-muted);font-size:8px}
+    .mini-library-row{display:grid;grid-template-columns:1fr auto;gap:6px;padding:7px 0;border-top:1px solid var(--demo-line)}
+    .mini-library-row strong,.mini-library-row small{display:block}.mini-library-row small{color:var(--demo-muted);font-size:8px}
+    .mini-switch{width:28px;height:16px;padding:2px;border-radius:999px;background:var(--demo-accent)}
+    .mini-switch::after{display:block;width:12px;height:12px;margin-left:auto;border-radius:50%;background:#fff;content:""}
+    .mini-migration-note{padding:7px;border-left:3px solid var(--demo-accent);color:var(--demo-muted);font-size:8px;background:var(--demo-sidebar)}
+    @media(max-width:760px){
+      .showcase-window{height:520px;grid-template-columns:48px minmax(0,1fr)}
+      .mini-brand{justify-content:center;padding-inline:8px}.mini-logo{width:28px;height:28px}
+      .mini-brand-copy,.mini-collapse,.mini-nav-copy,.mini-recents{display:none}
+      .mini-new-search,.mini-nav-item,.mini-settings-link{justify-content:center;margin-inline:6px;padding-inline:0}
+      .mini-new-search{border:0;background:transparent}.mini-service-state{display:none}
+      .mini-search-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+      .mini-image-card img{min-height:112px}
+      .mini-image-card:nth-child(n+5){display:none}
+      .mini-task-layout{grid-template-columns:1fr}.mini-log-panel{display:none}
+      .mini-organize-layout{grid-template-columns:92px minmax(0,1fr)}.mini-tag-panel{display:none}
+      .mini-organize-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+      .mini-settings-layout{grid-template-columns:82px minmax(0,1fr)}
+      .mini-settings-content{grid-template-columns:1fr}.mini-settings-content .mini-panel:nth-child(2){display:none}
+    }
+    @media(max-width:520px){
+      .showcase-tabs{display:grid;grid-template-columns:1fr 1fr}
+      .showcase-tab{width:100%;padding:0 8px}
+      .showcase-window{height:480px}
+      .mini-view-switch{width:142px}
+      .mini-table-row{grid-template-columns:minmax(90px,1.3fr) .7fr .7fr}.mini-table-row>*:nth-child(4){display:none}
+      .mini-organize-grid img{height:80px}
+    }
 
     /* Phone highlight */
-    .phone-block{background:#fff;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+    .phone-block{background:var(--panel);border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
     .phone-inner{max-width:1100px;margin:0 auto;padding:64px 24px;display:grid;gap:36px;align-items:center}
     .phone-visual{position:relative;border-radius:var(--radius);overflow:hidden;border:1px solid var(--line);background:var(--bg);aspect-ratio:16/10;display:grid;place-items:center}
     .phone-visual .phone-svg{max-width:70%;max-height:70%}
@@ -114,29 +254,29 @@
     @media(min-width:768px){.steps{grid-template-columns:repeat(3,1fr);gap:28px}.step-num{font-size:64px}}
 
     /* Privacy */
-    .privacy-block{background:#fff;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+    .privacy-block{background:var(--panel);border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
     .privacy-inner{max-width:1100px;margin:0 auto;padding:80px 24px}
     .privacy-grid{display:grid;gap:36px;align-items:center}
     .privacy-list{display:grid;gap:16px}
     .privacy-item{display:flex;gap:14px;align-items:flex-start;font-size:14.5px;line-height:1.6}
     .privacy-check{width:24px;height:24px;border-radius:50%;background:var(--accent-soft);color:var(--accent-2);display:grid;place-items:center;font-size:12px;flex-shrink:0}
     .privacy-cards{display:grid;grid-template-columns:1fr 1fr;gap:14px}
-    .privacy-card{border:1px solid var(--line);border-radius:13px;padding:20px;background:#fff}
+    .privacy-card{border:1px solid var(--line);border-radius:13px;padding:20px;background:var(--panel)}
     .privacy-card b{font-size:15px;display:block;margin-bottom:4px}
     .privacy-card span{font-size:12.5px;color:var(--muted);line-height:1.5}
     @media(min-width:768px){.privacy-grid{grid-template-columns:1fr 1fr;gap:56px}.privacy-inner{padding:100px 24px}}
 
     /* CTA */
-    .cta{text-align:center;background:linear-gradient(180deg,#fff 0%,var(--bg) 100%);border-top:1px solid var(--line)}
+    .cta{text-align:center;background:linear-gradient(180deg,var(--panel) 0%,var(--bg) 100%);border-top:1px solid var(--line)}
     .cta h2{font-size:28px;font-weight:750;letter-spacing:-.025em;margin-bottom:10px}
     .cta p{color:var(--muted);font-size:15px;max-width:520px;margin:0 auto 28px}
 
     /* Footer */
-    footer{border-top:1px solid var(--line);padding:32px 24px;background:#fff}
+    footer{border-top:1px solid var(--line);padding:32px 24px;background:var(--panel)}
     .footer-inner{max-width:1100px;margin:0 auto;display:flex;flex-direction:column;gap:18px;align-items:center;text-align:center}
     .footer-links{display:flex;flex-wrap:wrap;gap:20px;font-size:13px;color:var(--muted)}
     .footer-links a:hover{color:var(--text)}
-    .footer-copy{font-size:12px;color:#aaa}
+    .footer-copy{font-size:12px;color:var(--subtle)}
     @media(min-width:640px){.footer-inner{flex-direction:row;justify-content:space-between;text-align:left}}
 
     /* Reveal */
@@ -149,8 +289,8 @@
 <nav class="nav">
   <div class="nav-inner">
     <a href="#" class="brand">
-      <div class="brand-icon">Z</div>
-      Zvec
+      <div class="brand-icon"><img src="assets/images/yaolens-logo.png" alt=""></div>
+      曜镜 YaoLens
     </a>
     <div class="nav-links">
       <a href="#features">核心能力</a>
@@ -200,32 +340,32 @@
     </div>
     <div class="cards">
       <div class="card reveal">
-        <div class="card-icon" style="background:#e8f5f1;color:#0b725f">⌕</div>
+        <div class="card-icon" style="background:var(--accent-soft);color:var(--accent)">⌕</div>
         <h3>多模态与跨图库搜索</h3>
         <p>支持文字、图片、图文联合和模糊标签检索。多个图库可以统一召回、去重和排序；置信度低于阈值的结果不会为了凑数而返回。</p>
       </div>
       <div class="card reveal">
-        <div class="card-icon" style="background:#fff3e4;color:#a56700">✎</div>
+        <div class="card-icon" style="background:var(--accent-soft);color:var(--accent)">✎</div>
         <h3>可估算的智能标注</h3>
         <p>使用 qwen3-vl-flash 生成真人、Cosplayer、角色、作品、服装和场景等结构化标签。运行前可估算候选数、缓存命中与费用；已有标注自动跳过。</p>
       </div>
       <div class="card reveal">
-        <div class="card-icon" style="background:#e8f5f1;color:#0b725f">◫</div>
+        <div class="card-icon" style="background:var(--accent-soft);color:var(--accent)">◫</div>
         <h3>文件夹驱动的批量标签</h3>
         <p>按图库、根目录和文件夹筛选，多选图片后批量添加、移除或替换多个标签。人工、文件夹、模型和继承标签都有来源标识，并支持撤销。</p>
       </div>
       <div class="card reveal">
-        <div class="card-icon" style="background:#f1f1ee;color:#60615d">◎</div>
+        <div class="card-icon" style="background:var(--soft);color:var(--muted)">◎</div>
         <h3>相似分组与别名治理</h3>
         <p>利用 SHA-256、感知哈希和已有向量整理重复图、近似图与内容相似图。可维护别名关系，并只在安全身份类别中进行整组传播。</p>
       </div>
       <div class="card reveal">
-        <div class="card-icon" style="background:#e8f5f1;color:#0b725f">☷</div>
+        <div class="card-icon" style="background:var(--accent-soft);color:var(--accent)">☷</div>
         <h3>面向大图库的后台任务</h3>
         <p>分页读取、有界队列、磁盘结果集和批量写入避免一次装入全部数据。搜索优先于长任务；单图失败会跳过并记录，不会中断整批。</p>
       </div>
       <div class="card reveal">
-        <div class="card-icon" style="background:#eef0f4;color:#4f504c">⌂</div>
+        <div class="card-icon" style="background:var(--soft);color:var(--muted)">⌂</div>
         <h3>可恢复迁移与安全清理</h3>
         <p>设置页集中处理路径重绑、Schema 迁移和旧工作区兼容，已有向量无需重新生成。文件夹删除采用预览、暂存、提交、清理的两阶段流程。</p>
       </div>
@@ -242,39 +382,236 @@
     </div>
 
     <div class="reveal">
-      <div class="showcase-tabs">
-        <button class="showcase-tab active" onclick="showTab('search')" id="tab-search">图片搜索</button>
-        <button class="showcase-tab" onclick="showTab('tasks')" id="tab-tasks">任务与日志</button>
-        <button class="showcase-tab" onclick="showTab('organize')" id="tab-organize">批量整理</button>
-        <button class="showcase-tab" onclick="showTab('settings')" id="tab-settings">设置与迁移</button>
+      <div class="showcase-tabs" role="tablist" aria-label="曜镜界面展示">
+        <button class="showcase-tab active" type="button" role="tab" aria-selected="true" aria-controls="showcase-search" onclick="showTab('search')" id="tab-search">图片搜索</button>
+        <button class="showcase-tab" type="button" role="tab" aria-selected="false" aria-controls="showcase-tasks" onclick="showTab('tasks')" id="tab-tasks">任务与日志</button>
+        <button class="showcase-tab" type="button" role="tab" aria-selected="false" aria-controls="showcase-organize" onclick="showTab('organize')" id="tab-organize">批量整理</button>
+        <button class="showcase-tab" type="button" role="tab" aria-selected="false" aria-controls="showcase-settings" onclick="showTab('settings')" id="tab-settings">设置与迁移</button>
       </div>
 
       <div class="showcase-frame">
         <div class="showcase-window" id="showcase-window">
-          <div class="showcase-sidebar">
-            <div class="showcase-dot">Z</div>
-            <div class="showcase-navdot active"></div>
-            <div class="showcase-navdot"></div>
-            <div class="showcase-navdot"></div>
-            <div class="showcase-navdot"></div>
-            <div style="margin-top:auto"><div class="showcase-navdot"></div></div>
-          </div>
-          <div class="showcase-main">
-            <div class="showcase-topbar">
-              <span style="font-size:12px;font-weight:650;color:var(--text)">图片搜索</span>
-              <div style="margin-left:auto;display:flex;gap:6px">
-                <span class="showcase-tag">语义搜索</span>
-                <span class="showcase-tag">100 个结果</span>
+          <aside class="mini-sidebar" aria-label="微缩界面主导航">
+            <div class="mini-brand">
+              <div class="mini-logo"><img src="assets/images/yaolens-logo.png" alt=""></div>
+              <span class="mini-brand-copy"><strong>曜镜</strong><small>智能图片库</small></span>
+              <span class="mini-collapse" aria-hidden="true">‹</span>
+            </div>
+            <div class="mini-new-search"><span class="mini-nav-icon" aria-hidden="true">＋</span><span class="mini-nav-copy"><strong>新建搜索</strong></span></div>
+            <nav class="mini-nav" aria-label="微缩功能导航">
+              <div class="mini-nav-item is-active" data-mini-nav="search">
+                <span class="mini-nav-icon" aria-hidden="true">⌕</span>
+                <span class="mini-nav-copy"><strong>图片搜索</strong><small>文字、图片与标签</small></span>
               </div>
+              <div class="mini-nav-item" data-mini-nav="tasks">
+                <span class="mini-nav-icon" aria-hidden="true">☷</span>
+                <span class="mini-nav-copy"><strong>图库任务</strong><small>索引、同步与日志</small></span>
+              </div>
+              <div class="mini-nav-item" data-mini-nav="groups">
+                <span class="mini-nav-icon" aria-hidden="true">✎</span>
+                <span class="mini-nav-copy"><strong>批量标签</strong><small>按文件夹整理</small></span>
+              </div>
+              <div class="mini-nav-item" data-mini-nav="learning">
+                <span class="mini-nav-icon" aria-hidden="true">◎</span>
+                <span class="mini-nav-copy"><strong>相似分组</strong><small>重复与近似图片</small></span>
+              </div>
+              <div class="mini-nav-item" data-mini-nav="organize">
+                <span class="mini-nav-icon" aria-hidden="true">◉</span>
+                <span class="mini-nav-copy"><strong>待学习样本</strong><small>反馈与质量门禁</small></span>
+              </div>
+            </nav>
+            <div class="mini-recents">
+              <span>搜索记录</span>
+              <div class="mini-recent"><strong>红色服装 人像</strong><small>刚刚 · 128 张</small></div>
+              <div class="mini-recent"><strong>室内数据看板</strong><small>昨天 · 42 张</small></div>
             </div>
-            <div class="showcase-content">
-              <div class="showcase-thumb"><div class="showcase-score">96%</div><svg viewBox="0 0 400 300"><rect width="400" height="300" fill="#171f34"/><circle cx="200" cy="120" r="50" fill="#8d2636"/><path d="M100 280 Q200 160 300 280Z" fill="#e4a96f"/></svg></div>
-              <div class="showcase-thumb"><div class="showcase-score">94%</div><svg viewBox="0 0 400 300"><rect width="400" height="300" fill="#142840"/><circle cx="210" cy="110" r="48" fill="#b73545"/><path d="M110 275 Q200 170 290 275Z" fill="#d99f73"/></svg></div>
-              <div class="showcase-thumb"><div class="showcase-score">92%</div><svg viewBox="0 0 400 300"><rect width="400" height="300" fill="#202431"/><circle cx="190" cy="130" r="46" fill="#a1192b"/><path d="M120 270 Q200 180 280 270Z" fill="#d3b181"/></svg></div>
-              <div class="showcase-thumb"><div class="showcase-score">90%</div><svg viewBox="0 0 400 300"><rect width="400" height="300" fill="#1d2430"/><circle cx="205" cy="115" r="52" fill="#963243"/><path d="M105 278 Q200 165 295 278Z" fill="#d8b483"/></svg></div>
-              <div class="showcase-thumb"><div class="showcase-score">88%</div><svg viewBox="0 0 400 300"><rect width="400" height="300" fill="#19273b"/><circle cx="195" cy="125" r="49" fill="#af2d3b"/><path d="M115 272 Q200 175 285 272Z" fill="#d29d6e"/></svg></div>
+            <div class="mini-settings-link" data-mini-nav="settings">
+              <span class="mini-nav-icon" aria-hidden="true">⚙</span>
+              <span class="mini-nav-copy"><strong>设置</strong><small>图库、模型与访问</small></span>
             </div>
-          </div>
+          </aside>
+
+          <main class="mini-main">
+            <header class="mini-topbar">
+              <div class="mini-view-switch" aria-hidden="true">
+                <span class="active" data-mini-switch="search">搜索</span>
+                <span data-mini-switch="tasks">图库任务</span>
+              </div>
+              <span class="mini-service-state">本地服务就绪</span>
+            </header>
+
+            <section class="mini-page mini-search-page" data-showcase-page="search" id="showcase-search" role="tabpanel" aria-labelledby="tab-search">
+              <header class="mini-page-heading">
+                <div><strong>图文组合 · 128 张 · 全部图库</strong><small>红色服装的人像照片</small></div>
+                <div class="mini-actions">
+                  <button class="mini-control" type="button" disabled>筛选</button>
+                  <button class="mini-control" type="button" disabled>导出</button>
+                </div>
+              </header>
+              <div class="mini-search-strip" aria-label="搜索输入示意">
+                <span aria-hidden="true">＋</span>
+                <span class="mini-search-query">红色服装的人像照片</span>
+                <span class="mini-search-mode">语义⌄</span>
+                <span class="mini-search-submit" aria-hidden="true">↑</span>
+              </div>
+              <div class="mini-search-tools"><span>搜索设置 · 全部图库 · 128 个结果</span><span>全选当前页</span></div>
+              <div class="mini-search-grid">
+                <article class="mini-image-card">
+                  <img src="assets/images/showcase-search.webp" alt="人物肖像搜索结果" loading="lazy">
+                  <span class="mini-score">96%</span>
+                  <span class="mini-image-copy"><strong>portrait_042.webp</strong><small>人物 · 黑发 · 耳环</small></span>
+                </article>
+                <article class="mini-image-card">
+                  <img src="assets/images/showcase-organize.webp" alt="红色服装搜索结果" loading="lazy">
+                  <span class="mini-score">94%</span>
+                  <span class="mini-image-copy"><strong>fashion_red_018.webp</strong><small>红色服装 · 户外</small></span>
+                </article>
+                <article class="mini-image-card">
+                  <img src="assets/images/showcase-tasks.webp" alt="数据看板搜索结果" loading="lazy">
+                  <span class="mini-score">91%</span>
+                  <span class="mini-image-copy"><strong>dashboard_007.webp</strong><small>屏幕 · 图表 · 深色</small></span>
+                </article>
+                <article class="mini-image-card">
+                  <img src="assets/images/showcase-settings.webp" alt="代码画面搜索结果" loading="lazy">
+                  <span class="mini-score">88%</span>
+                  <span class="mini-image-copy"><strong>code_113.webp</strong><small>代码 · 屏幕 · 暖色</small></span>
+                </article>
+                <article class="mini-image-card">
+                  <img src="assets/images/showcase-organize.webp" alt="服装图片搜索结果" loading="lazy">
+                  <span class="mini-score">86%</span>
+                  <span class="mini-image-copy"><strong>collection_205.webp</strong><small>服装 · 人像</small></span>
+                </article>
+                <article class="mini-image-card">
+                  <img src="assets/images/showcase-search.webp" alt="肖像图片搜索结果" loading="lazy">
+                  <span class="mini-score">84%</span>
+                  <span class="mini-image-copy"><strong>portrait_108.webp</strong><small>面部特写 · 粉色</small></span>
+                </article>
+                <article class="mini-image-card">
+                  <img src="assets/images/showcase-settings.webp" alt="开发场景搜索结果" loading="lazy">
+                  <span class="mini-score">81%</span>
+                  <span class="mini-image-copy"><strong>workspace_031.webp</strong><small>开发 · 暗色场景</small></span>
+                </article>
+                <article class="mini-image-card">
+                  <img src="assets/images/showcase-tasks.webp" alt="图表图片搜索结果" loading="lazy">
+                  <span class="mini-score">79%</span>
+                  <span class="mini-image-copy"><strong>metrics_024.webp</strong><small>图表 · 数据分析</small></span>
+                </article>
+              </div>
+              <div class="mini-pager"><span>‹ 上一页</span><strong>1 / 9</strong><span>下一页 ›</span></div>
+            </section>
+
+            <section class="mini-page mini-tasks-page" data-showcase-page="tasks" id="showcase-tasks" role="tabpanel" aria-labelledby="tab-tasks" hidden>
+              <div class="mini-toolbar">
+                <div><h3>图库任务</h3><p>索引、同步、智能标注与持久化日志</p></div>
+                <button class="mini-control is-primary" type="button" disabled>＋ 新建任务</button>
+              </div>
+              <nav class="mini-subtabs" aria-label="任务视图示意"><span class="active">任务历史</span><span>操作日志</span></nav>
+              <div class="mini-task-layout">
+                <section class="mini-panel">
+                  <header class="mini-panel-heading"><div><strong>任务历史</strong><small>跨重启保留，失败项可单独查看</small></div><span>24 条</span></header>
+                  <div class="mini-filter-row">
+                    <select class="mini-filter" disabled aria-label="图库筛选"><option>全部图库</option></select>
+                    <select class="mini-filter" disabled aria-label="状态筛选"><option>全部状态</option></select>
+                    <input class="mini-filter" value="搜索任务" readonly aria-label="任务搜索示意">
+                  </div>
+                  <div class="mini-table">
+                    <div class="mini-table-row is-head"><span>任务</span><span>图库</span><span>状态</span><span>进度</span></div>
+                    <div class="mini-table-row">
+                      <span><strong>增量索引</strong><small>index_incremental · 10:42</small></span><span>人物摄影</span><span class="mini-task-status is-running">运行中</span><span><small>68%</small><span class="mini-progress"><span style="width:68%"></span></span></span>
+                    </div>
+                    <div class="mini-table-row">
+                      <span><strong>智能标注</strong><small>auto_tag · 09:18</small></span><span>角色收藏</span><span class="mini-task-status">已完成</span><span><small>1,248 / 1,248</small></span>
+                    </div>
+                    <div class="mini-table-row">
+                      <span><strong>同步图库</strong><small>sync · 昨天</small></span><span>全部图库</span><span class="mini-task-status">已完成</span><span><small>无变化</small></span>
+                    </div>
+                    <div class="mini-table-row">
+                      <span><strong>文件夹名称标签</strong><small>folder_name_tags · 昨天</small></span><span>人物摄影</span><span class="mini-task-status">需注意</span><span><small>跳过 3 项</small></span>
+                    </div>
+                  </div>
+                </section>
+                <section class="mini-panel mini-log-panel">
+                  <header class="mini-panel-heading"><div><strong>最近操作</strong><small>凭据与路径已脱敏</small></div><span>实时</span></header>
+                  <div class="mini-log-list">
+                    <div class="mini-log-item"><time>10:44</time><span>增量索引已处理 3,412 张图片</span></div>
+                    <div class="mini-log-item"><time>10:43</time><span>检测到 28 个新增文件，已进入写入队列</span></div>
+                    <div class="mini-log-item"><time>10:42</time><span>图库任务开始：人物摄影</span></div>
+                    <div class="mini-log-item"><time>09:36</time><span>智能标注完成，缓存命中 317 项</span></div>
+                    <div class="mini-log-item"><time>09:18</time><span>费用估算通过，任务进入后台队列</span></div>
+                  </div>
+                </section>
+              </div>
+            </section>
+
+            <section class="mini-page mini-organize-page" data-showcase-page="organize" id="showcase-organize" role="tabpanel" aria-labelledby="tab-organize" hidden>
+              <div class="mini-toolbar">
+                <div><h3>批量标签</h3><p>按图库与文件夹选择图片，统一维护人工标签</p></div>
+                <div class="mini-actions"><button class="mini-control" type="button" disabled>相似分组</button><button class="mini-control" type="button" disabled>待学习样本</button></div>
+              </div>
+              <div class="mini-organize-layout">
+                <aside class="mini-panel">
+                  <header class="mini-panel-heading"><div><strong>图库与文件夹</strong><small>人物摄影 · 86 个</small></div></header>
+                  <div class="mini-filter-row"><input class="mini-filter" value="搜索文件夹" readonly aria-label="文件夹搜索示意"></div>
+                  <div class="mini-folder-list">
+                    <div class="mini-folder"><span>◆ 根目录</span><small>8,420</small></div>
+                    <div class="mini-folder active"><span>◆ 红色服装</span><small>128</small></div>
+                    <div class="mini-folder"><span>◆ 室内人像</span><small>364</small></div>
+                    <div class="mini-folder"><span>◆ Cosplay</span><small>1,028</small></div>
+                    <div class="mini-folder"><span>◆ 待整理</span><small>73</small></div>
+                  </div>
+                </aside>
+                <section class="mini-panel mini-organize-gallery">
+                  <header class="mini-panel-heading"><div><strong>红色服装</strong><small>128 张图片 · 已选择 3 张</small></div><button class="mini-control" type="button" disabled>全选当前页</button></header>
+                  <div class="mini-selection"><span>已选择 3 张；支持连续选择</span><span>复制文件　导出所选　清除</span></div>
+                  <div class="mini-organize-grid">
+                    <img src="assets/images/showcase-organize.webp" alt="待整理的红色服装图片" loading="lazy">
+                    <img src="assets/images/showcase-search.webp" alt="待整理的人物肖像图片" loading="lazy">
+                    <img src="assets/images/showcase-tasks.webp" alt="待整理的数据看板图片" loading="lazy">
+                    <img src="assets/images/showcase-search.webp" alt="待整理的肖像图片" loading="lazy">
+                    <img src="assets/images/showcase-organize.webp" alt="待整理的服装图片" loading="lazy">
+                    <img src="assets/images/showcase-settings.webp" alt="待整理的代码场景图片" loading="lazy">
+                  </div>
+                </section>
+                <aside class="mini-panel mini-tag-panel">
+                  <div class="mini-tag-editor">
+                    <h4>标签编辑</h4><p>作用于当前选择，来源清晰可追踪</p>
+                    <div class="mini-tags"><span class="mini-tag">人物</span><span class="mini-tag">红色服装</span><span class="mini-tag">户外</span><span class="mini-tag">＋ 添加</span></div>
+                    <label class="mini-field"><span>操作</span><select disabled><option>添加标签</option></select></label>
+                    <label class="mini-field"><span>标签</span><input value="时尚 人像" readonly></label>
+                    <button class="mini-control is-accent" type="button" disabled>应用到 3 张图片</button>
+                  </div>
+                </aside>
+              </div>
+            </section>
+
+            <section class="mini-page mini-settings-page" data-showcase-page="settings" id="showcase-settings" role="tabpanel" aria-labelledby="tab-settings" hidden>
+              <div class="mini-toolbar">
+                <div><h3>设置</h3><p>图库、模型、凭据、局域网访问与迁移</p></div>
+                <span class="mini-task-status">配置已保存</span>
+              </div>
+              <div class="mini-settings-layout">
+                <nav class="mini-panel mini-settings-nav" aria-label="设置分类示意">
+                  <span class="active">图库与路径</span><span>模型角色</span><span>API 凭据</span><span>局域网访问</span><span>数据迁移</span><span>应用</span>
+                </nav>
+                <div class="mini-settings-content">
+                  <section class="mini-panel mini-settings-section">
+                    <h4>图库与路径</h4><p>原图、Workspace 与结果目录相互独立</p>
+                    <div class="mini-library-row"><span><strong>人物摄影</strong><small>D:\Pictures\Portrait</small></span><span class="mini-switch" aria-hidden="true"></span></div>
+                    <label class="mini-field"><span>Workspace</span><input value="D:\YaoLens\portrait" readonly></label>
+                    <label class="mini-field"><span>结果目录</span><input value="D:\YaoLens\exports" readonly></label>
+                    <div class="mini-actions"><button class="mini-control is-primary" type="button" disabled>保存图库设置</button><button class="mini-control" type="button" disabled>新增图库</button></div>
+                  </section>
+                  <section class="mini-panel mini-settings-section">
+                    <h4>模型与访问</h4><p>配置只影响后续任务，不重算已有向量</p>
+                    <label class="mini-field"><span>图片向量模型</span><select disabled><option>qwen3-vl-embedding</option></select></label>
+                    <label class="mini-field"><span>智能标注模型</span><select disabled><option>qwen3-vl-flash</option></select></label>
+                    <div class="mini-library-row"><span><strong>Android 局域网访问</strong><small>192.168.1.18 · 已启用</small></span><span class="mini-switch" aria-hidden="true"></span></div>
+                    <div class="mini-migration-note">迁移流程会先检查、再备份、最后验证文档数与搜索可用性。</div>
+                  </section>
+                </div>
+              </div>
+            </section>
+          </main>
         </div>
         <div class="showcase-body">
           <h3 id="showcase-title">搜索结果只加载当前页</h3>
@@ -301,7 +638,7 @@
         <rect x="104" y="164" width="66" height="66" rx="12" fill="#ddd"/>
         <rect x="30" y="238" width="66" height="66" rx="12" fill="#ddd"/>
         <rect x="104" y="238" width="66" height="66" rx="12" fill="#ccc"/>
-        <rect x="30" y="310" width="140" height="20" rx="10" fill="#0f8a72" opacity=".12"/>
+        <rect x="30" y="310" width="140" height="20" rx="10" fill="#ff6a00" opacity=".18"/>
         <rect x="65" y="350" width="70" height="4" rx="2" fill="#1d1e20" opacity=".9"/>
       </svg>
     </div>
@@ -311,7 +648,7 @@
       <div class="phone-steps">
         <div class="phone-step">
           <div class="phone-step-num">1</div>
-          <div><b>启用局域网服务</b><span>在 Windows Zvec 设置中选择私网 IP，保存并启用服务。</span></div>
+          <div><b>启用局域网服务</b><span>在 Windows 曜镜设置中选择私网 IP，保存并启用服务。</span></div>
         </div>
         <div class="phone-step">
           <div class="phone-step-num">2</div>
@@ -322,7 +659,7 @@
           <div><b>配对并开始搜索</b><span>核对 6 位验证码，在 Windows 上批准配对。选择图库并搜索，原图流式并发传输。</span></div>
         </div>
       </div>
-      <p style="margin-top:16px;font-size:12px;color:#aaa">当前 Preview 使用未加密 HTTP，只适合你自己控制的家庭专用网络，不要在公共 Wi-Fi 使用。</p>
+      <p style="margin-top:16px;font-size:12px;color:var(--subtle)">局域网连接使用未加密 HTTP，只适合你自己控制的家庭专用网络，不要在公共 Wi-Fi 使用。</p>
     </div>
   </div>
 </div>
@@ -391,7 +728,7 @@
         </div>
         <div class="privacy-card">
           <b>凭据隔离</b>
-          <span>API Key 保存在 Windows 凭据管理器，不进入配置和日志</span>
+          <span>密钥、Token 与 Cookie 采用独立存储和脱敏边界，界面不会回显旧凭据</span>
         </div>
         <div class="privacy-card">
           <b>按需联网</b>
@@ -427,8 +764,8 @@
 <footer>
   <div class="footer-inner">
     <div class="brand" style="font-size:15px">
-      <div class="brand-icon" style="width:26px;height:26px;font-size:12px">Z</div>
-      Zvec 智能图片库
+      <div class="brand-icon" style="width:26px;height:26px"><img src="assets/images/yaolens-logo.png" alt=""></div>
+      曜镜 YaoLens
     </div>
     <div class="footer-links">
       <a href="https://github.com/tiyue/zvec-image-search#readme" target="_blank" rel="noopener noreferrer">README</a>
@@ -436,7 +773,7 @@
       <a href="https://github.com/tiyue/zvec-image-search/issues" target="_blank" rel="noopener noreferrer">问题反馈</a>
       <a href="https://github.com/tiyue/zvec-image-search" target="_blank" rel="noopener noreferrer">GitHub</a>
     </div>
-    <div class="footer-copy">© 2026 Zvec. 本地优先，边界透明。</div>
+    <div class="footer-copy">© 2026 YaoLens. 本地优先，边界透明。</div>
   </div>
 </footer>
 
@@ -451,27 +788,19 @@ document.querySelectorAll('.reveal').forEach((el) => observer.observe(el));
 const showcaseData = {
   search: {
     title: '搜索结果只加载当前页',
-    desc: '输入任意正整数决定本次搜索数量。结果按置信度为主、原始分数为辅排序，默认每页显示 15 张；双击打开原图，也可以定位文件夹、复制、多选和导出。',
-    top: '图片搜索',
-    tags: ['语义搜索', '100 个结果']
+    desc: '输入任意正整数决定本次搜索数量。结果按置信度为主、原始分数为辅排序，默认每页显示 15 张；双击打开原图，也可以定位文件夹、复制、多选和导出。'
   },
   tasks: {
     title: '后台任务持续运行，失败项单独处理',
-    desc: '索引、同步、智能标注进入有界任务队列。任务历史与操作日志跨重启保留，单图失败不会中断整批，取消或网络失败后按钮会恢复。',
-    top: '任务与日志',
-    tags: ['索引', '运行中']
+    desc: '索引、同步、智能标注进入有界任务队列。任务历史与操作日志跨重启保留，单图失败不会中断整批，取消或网络失败后按钮会恢复。'
   },
   organize: {
     title: '按文件夹批量设置多标签',
-    desc: '以文件夹为筛选依据，对当前页、选中图片或整文件夹执行人工标签操作。模型标签自动批准，来源清晰可见；相似分组、别名词典和撤销能力降低重复劳动。',
-    top: '批量整理',
-    tags: ['文件夹整理', '标签管理']
+    desc: '以文件夹为筛选依据，对当前页、选中图片或整文件夹执行人工标签操作。模型标签自动批准，来源清晰可见；相似分组、别名词典和撤销能力降低重复劳动。'
   },
   settings: {
     title: '模型、路径和迁移集中管理',
-    desc: '在设置页维护阿里云模型、预算、并发、结果目录和图库路径。迁移先检查、再执行、最后验证文档数与搜索可用性，已有向量不会被无意义地重新计算。',
-    top: '设置与迁移',
-    tags: ['常规', '图库']
+    desc: '在设置页维护阿里云模型、预算、并发、结果目录和图库路径。迁移先检查、再执行、最后验证文档数与搜索可用性，已有向量不会被无意义地重新计算。'
   }
 };
 
@@ -482,13 +811,22 @@ function showTab(key) {
   document.getElementById('showcase-title').textContent = data.title;
   document.getElementById('showcase-desc').textContent = data.desc;
 
-  const topbar = document.querySelector('.showcase-topbar');
-  topbar.querySelector('span').textContent = data.top;
-  const tagContainer = topbar.querySelector('div');
-  tagContainer.innerHTML = data.tags.map(t => `<span class="showcase-tag">${t}</span>`).join('');
-
-  document.querySelectorAll('.showcase-tab').forEach(b => b.classList.remove('active'));
-  document.getElementById('tab-' + key).classList.add('active');
+  document.querySelectorAll('[data-showcase-page]').forEach((panel) => {
+    const active = panel.dataset.showcasePage === key;
+    panel.hidden = !active;
+  });
+  document.querySelectorAll('.showcase-tab').forEach((button) => {
+    const active = button.id === 'tab-' + key;
+    button.classList.toggle('active', active);
+    button.setAttribute('aria-selected', String(active));
+  });
+  document.querySelectorAll('[data-mini-nav]').forEach((item) => {
+    item.classList.toggle('is-active', item.dataset.miniNav === key);
+  });
+  document.querySelectorAll('[data-mini-switch]').forEach((item) => {
+    item.classList.toggle('active', item.dataset.miniSwitch === key);
+  });
+  document.querySelector('.mini-view-switch').hidden = !['search', 'tasks'].includes(key);
 }
 </script>
 </body>

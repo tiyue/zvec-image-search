@@ -255,7 +255,7 @@ def main(
         return launcher_main(module_arguments)
 
     entry_name = _entry_name(executable)
-    if entry_name == "zvec.webviewpreview":
+    if entry_name in {"yaolens", "zvec.webviewpreview"}:
         from zvec_webview.app import main as webview_main
 
         return webview_main(arguments)
@@ -267,9 +267,7 @@ def main(
         from image_service import main as backend_main
 
         return backend_main(arguments or ["serve"])
-    raise FrozenWebviewEntryError(
-        f"Unknown frozen Zvec Webview Preview entry point: {entry_name}"
-    )
+    raise FrozenWebviewEntryError(f"Unknown frozen YaoLens entry point: {entry_name}")
 
 
 if __name__ == "__main__":

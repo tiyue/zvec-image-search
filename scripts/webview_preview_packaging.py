@@ -23,16 +23,16 @@ from zvec_webview.frontend_assets import (
     validate_frontend_build,
 )
 
-PRODUCT_NAME: Final = "Zvec Webview Preview"
-PRODUCT_DIRECTORY: Final = "Zvec-Webview-Preview"
-MANIFEST_FILE: Final = "webview-preview-payload-manifest.json"
+PRODUCT_NAME: Final = "YaoLens"
+PRODUCT_DIRECTORY: Final = "YaoLens"
+MANIFEST_FILE: Final = "yaolens-payload-manifest.json"
 MANIFEST_SCHEMA_VERSION: Final = 1
 TARGET_RUNTIME: Final = "win-x64"
 TARGET_PYTHON: Final = "CPython 3.12"
 PYINSTALLER_VERSION: Final = "6.16.0"
 
 ENTRY_POINTS: Final = (
-    "Zvec.WebviewPreview.exe",
+    "YaoLens.exe",
     "zvec.exe",
     "zvec-backend.exe",
 )
@@ -65,6 +65,10 @@ EXCLUDED_PACKAGES: Final = frozenset(
 _PROJECT_VERSION = re.compile(
     r"(?m)^\s*version\s*=\s*[\"'](?P<version>[^\"']+)[\"']\s*$"
 )
+_SEMVER = re.compile(
+    r"^(?P<major>0|[1-9]\d*)\.(?P<minor>0|[1-9]\d*)\."
+    r"(?P<patch>0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$"
+)
 _WINDOWS_FILE_VERSION_PART = re.compile(r"\d+")
 _FORBIDDEN_SOURCE_SUFFIXES = frozenset(
     {".cs", ".csproj", ".ps1", ".psd1", ".psm1", ".sln", ".xaml"}
@@ -78,6 +82,7 @@ _FORBIDDEN_RUNTIME_NAMES = frozenset(
         "pwsh.exe",
         "webbrowserinterop.x86.dll",
         "zvec.desktop.exe",
+        "zvec.webviewpreview.exe",
     }
 )
 _FORBIDDEN_CONTAINER_PREFIXES = ("compose.", "docker-compose.", "dockerfile.")
@@ -120,6 +125,7 @@ class BuildPlan:
 
     repository_root: Path
     version: str
+    display_version: str
     spec_path: Path
     icon_path: Path
     nsis_path: Path
@@ -140,6 +146,7 @@ class BuildPlan:
             "schema_version": 1,
             "product": PRODUCT_NAME,
             "version": self.version,
+            "display_version": self.display_version,
             "target_runtime": TARGET_RUNTIME,
             "target_python": TARGET_PYTHON,
             "repository_root": str(self.repository_root),
@@ -226,6 +233,19 @@ def windows_file_version(version: str) -> str:
     return ".".join(str(value) for value in selected)
 
 
+def public_version(version: str) -> str:
+    """Return the compact user-visible version for a machine SemVer."""
+
+    match = _SEMVER.fullmatch(version)
+    if match is None:
+        raise WebviewPreviewPackagingError(
+            f"Project version must be a valid three-part SemVer: {version}"
+        )
+    if match.group("patch") == "0" and "-" not in version and "+" not in version:
+        return f"{match.group('major')}.{match.group('minor')}"
+    return version
+
+
 def create_build_plan(
     *,
     root: Path | None = None,
@@ -235,6 +255,7 @@ def create_build_plan(
 ) -> BuildPlan:
     resolved_root = (root or repository_root()).resolve()
     version = read_project_version(resolved_root)
+    display_version = public_version(version)
     resolved_output = (
         output_root.resolve()
         if output_root is not None
@@ -248,10 +269,10 @@ def create_build_plan(
     resolved_work = work_parent / TARGET_RUNTIME
     payload_directory = resolved_output / PRODUCT_DIRECTORY
     portable_output = resolved_output / (
-        f"Zvec-Webview-Preview-{version}-{TARGET_RUNTIME}-portable.zip"
+        f"YaoLens-{display_version}-{TARGET_RUNTIME}-portable.zip"
     )
     installer_output = resolved_output / (
-        f"Zvec-Webview-Preview-{version}-{TARGET_RUNTIME}-unsigned-setup.exe"
+        f"YaoLens-{display_version}-{TARGET_RUNTIME}-setup.exe"
     )
     spec_path = (
         resolved_root / "release" / "webview_preview" / "zvec_webview_preview.spec"
@@ -274,16 +295,17 @@ def create_build_plan(
         makensis_command = (
             str(makensis.resolve()),
             f"/DVERSION={version}",
+            f"/DDISPLAY_VERSION={display_version}",
             f"/DFILE_VERSION={windows_file_version(version)}",
             f"/DSOURCE_DIR={payload_directory}",
             f"/DOUTPUT_FILE={installer_output}",
             f"/DRID={TARGET_RUNTIME}",
-            "/DSIGNING_STATUS=unsigned",
             str(nsis_path),
         )
     return BuildPlan(
         repository_root=resolved_root,
         version=version,
+        display_version=display_version,
         spec_path=spec_path,
         icon_path=resolved_root / "assets" / "Zvec.AppIcon.ico",
         nsis_path=nsis_path,
@@ -339,8 +361,10 @@ def validate_static_inputs(plan: BuildPlan) -> None:
         plan.repository_root / "zvec_webview" / "lan_access.py",
         plan.repository_root / "zvec_webview" / "lan_settings.py",
         plan.repository_root / "zvec_webview" / "native_bridge.py",
+        plan.repository_root / "zvec_webview" / "resident_task.py",
         plan.repository_root / "zvec_webview" / "runtime.py",
         plan.repository_root / "zvec_webview" / "server.py",
+        plan.repository_root / "zvec_webview" / "single_instance.py",
         plan.repository_root / "zvec_webview" / "frontend_assets.py",
         plan.frontend_directory / "package.json",
         plan.frontend_directory / "package-lock.json",
@@ -375,10 +399,14 @@ def validate_static_inputs(plan: BuildPlan) -> None:
         plan.repository_root
         / "release"
         / "webview_preview"
+        / "yaolens_version_info.txt",
+        plan.repository_root
+        / "release"
+        / "webview_preview"
         / "hooks"
         / "hook-webview.py",
         plan.repository_root / "release" / "webview_preview" / "hooks" / "hook-clr.py",
-        plan.repository_root / "release" / "python_preview" / "hooks" / "hook-zvec.py",
+        plan.repository_root / "release" / "webview_preview" / "hooks" / "hook-zvec.py",
         plan.spec_path,
         plan.icon_path,
         plan.nsis_path,

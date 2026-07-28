@@ -14,6 +14,9 @@ import {
 import type {
   FolderDeletePreview,
   FolderDeletePreviewWire,
+  FolderNameTagPreview,
+  FolderNameTagPreviewWire,
+  FolderNameTagSelection,
   ManualTagOperation,
   OrganizeAlias,
   OrganizeAliasWire,
@@ -366,6 +369,36 @@ function normalizeDeletePreview(payload: FolderDeletePreviewWire): FolderDeleteP
   };
 }
 
+function normalizeFolderNameTagPreview(
+  payload: FolderNameTagPreviewWire,
+): FolderNameTagPreview {
+  const raw = payload.result ?? payload;
+  const samples = Array.isArray(raw.samples)
+    ? raw.samples
+        .filter((item): item is Record<string, unknown> =>
+          typeof item === "object" && item !== null,
+        )
+        .map((item) => ({
+          rootId: text(item.root_id),
+          relativeFolder: text(item.relative_folder),
+          currentTags: strings(item.current_tags),
+          proposedTags: strings(item.proposed_tags),
+          affectedImages: Math.max(0, integer(item.affected_images)),
+        }))
+    : [];
+  return {
+    selected: Math.max(0, integer(raw.selected)),
+    processed: Math.max(0, integer(raw.processed)),
+    changed: Math.max(0, integer(raw.changed)),
+    unchanged: Math.max(0, integer(raw.unchanged)),
+    untagged: Math.max(0, integer(raw.untagged)),
+    foldersScanned: Math.max(0, integer(raw.folders_scanned)),
+    changedFolders: Math.max(0, integer(raw.changed_folders)),
+    samples,
+    samplesTruncated: raw.samples_truncated === true,
+  };
+}
+
 function jobWire(payload: OrganizeJobResponse): OrganizeJobWire | null {
   if (payload.job) return payload.job;
   if (payload.jobs?.length) return payload.jobs[0] ?? null;
@@ -530,10 +563,16 @@ export function useOrganize(api: OrganizeApi = organizeApi, events: OrganizeEven
   const finalizingJob = ref(false);
   const undoAvailable = ref(false);
   const activeJob = shallowRef<OrganizeJob | null>(null);
-  const activeJobKind = ref<"" | "mutation" | "undo" | "alias" | "delete">("");
+  const activeJobKind = ref<
+    "" | "mutation" | "undo" | "alias" | "delete" | "folder-tags"
+  >("");
   const deletePreview = shallowRef<FolderDeletePreview | null>(null);
   const deletePreviewLoading = ref(false);
   const deleteCommitLoading = ref(false);
+  const folderNameTagPreview = shallowRef<FolderNameTagPreview | null>(null);
+  const folderNameTagPreviewSelection =
+    shallowRef<FolderNameTagSelection | null>(null);
+  const folderNameTagPreviewLoading = ref(false);
   const lastError = ref("");
   const legacy = shallowRef<OrganizeImage[]>([]);
 
@@ -542,6 +581,7 @@ export function useOrganize(api: OrganizeApi = organizeApi, events: OrganizeEven
   let imageController: AbortController | null = null;
   let jobController: AbortController | null = null;
   let deleteController: AbortController | null = null;
+  let folderNameTagController: AbortController | null = null;
   let folderRequestSequence = 0;
   let imageRequestSequence = 0;
   let pollTimer: number | null = null;
@@ -733,6 +773,7 @@ export function useOrganize(api: OrganizeApi = organizeApi, events: OrganizeEven
   }
 
   async function selectLibrary(libraryId: string): Promise<boolean> {
+    cancelFolderNameTags();
     selectedLibraryId.value = libraryId;
     selectedRootId.value = "";
     selectedFolderKey.value = "";
@@ -1086,6 +1127,15 @@ export function useOrganize(api: OrganizeApi = organizeApi, events: OrganizeEven
             job.failed ? "info" : "success",
           );
           await refreshAfterMutation();
+        } else if (kind === "folder-tags") {
+          folderNameTagPreview.value = null;
+          notify(
+            "文件夹名称标签已更新",
+            job.message ||
+              `已更新 ${job.updated || job.processed} 张图片，失败 ${job.failed} 张。`,
+            job.failed ? "info" : "success",
+          );
+          await refreshAfterMutation();
         } else {
           undoAvailable.value = kind === "undo" ? job.undoAvailable : true;
           notify(
@@ -1101,6 +1151,8 @@ export function useOrganize(api: OrganizeApi = organizeApi, events: OrganizeEven
             ? "别名词典未保存"
             : kind === "delete"
               ? "文件夹清理未完成"
+              : kind === "folder-tags"
+                ? "文件夹名称标签任务未完成"
               : "批量标签任务未完成",
           job.message || "请查看任务页中的错误详情。",
           "error",
@@ -1142,8 +1194,9 @@ export function useOrganize(api: OrganizeApi = organizeApi, events: OrganizeEven
   }
 
   async function submitTrackedJob(
-    kind: "mutation" | "undo" | "alias",
+    kind: "mutation" | "undo" | "alias" | "folder-tags",
     body: Record<string, unknown>,
+    fallbackTotal = selectedCount.value,
   ): Promise<boolean> {
     if (busyAction.value || jobRunning.value) {
       notify("已有后台任务", "请等待当前批量任务结束后再提交下一项操作。", "info");
@@ -1152,24 +1205,109 @@ export function useOrganize(api: OrganizeApi = organizeApi, events: OrganizeEven
     busyAction.value = kind;
     try {
       const payload = await api.submitJob(body);
-      const job = normalizeOrganizeJob(payload, selectedCount.value);
+      const job = normalizeOrganizeJob(payload, fallbackTotal);
       activeJob.value = job;
       activeJobKind.value = kind;
       jobPollFailures = 0;
       lastError.value = "";
       if (!job.id || TERMINAL_JOB_STATUSES.has(job.status)) await finishJob(job);
       else {
-        notify("批量标签任务已提交", "任务会在后台执行，可继续浏览图片。", "success");
+        notify(
+          kind === "folder-tags" ? "文件夹名称标签任务已提交" : "批量标签任务已提交",
+          "任务会在后台执行，可继续浏览图片。",
+          "success",
+        );
         scheduleJobPoll();
       }
       return true;
     } catch (error) {
       lastError.value = errorMessage(error);
-      notify("无法提交批量标签任务", lastError.value, "error");
+      notify(
+        kind === "folder-tags"
+          ? "无法提交文件夹名称标签任务"
+          : "无法提交批量标签任务",
+        lastError.value,
+        "error",
+      );
       return false;
     } finally {
       busyAction.value = "";
     }
+  }
+
+  async function previewFolderNameTags(
+    selection: FolderNameTagSelection,
+  ): Promise<boolean> {
+    const libraryId = selectedLibraryId.value;
+    if (!libraryId) return false;
+    if (!api.previewFolderNameTags) {
+      notify(
+        "暂时无法生成文件夹名称标签",
+        "当前后端版本尚未提供文件夹名称标签预览。",
+        "error",
+      );
+      return false;
+    }
+    if (busyAction.value || jobRunning.value) {
+      notify(
+        "已有后台任务",
+        "请等待当前任务结束后再生成预览。",
+        "info",
+      );
+      return false;
+    }
+    folderNameTagController?.abort();
+    const controller = new AbortController();
+    folderNameTagController = controller;
+    folderNameTagPreviewLoading.value = true;
+    try {
+      const payload = await api.previewFolderNameTags(
+        libraryId,
+        selection,
+        controller.signal,
+      );
+      folderNameTagPreview.value = normalizeFolderNameTagPreview(payload);
+      folderNameTagPreviewSelection.value = selection;
+      lastError.value = "";
+      return true;
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") return false;
+      lastError.value = errorMessage(error);
+      notify("无法生成文件夹名称标签预览", lastError.value, "error");
+      return false;
+    } finally {
+      if (folderNameTagController === controller) {
+        folderNameTagPreviewLoading.value = false;
+      }
+    }
+  }
+
+  function cancelFolderNameTags(): void {
+    folderNameTagController?.abort();
+    folderNameTagPreview.value = null;
+    folderNameTagPreviewSelection.value = null;
+    folderNameTagPreviewLoading.value = false;
+  }
+
+  async function applyFolderNameTags(): Promise<boolean> {
+    const libraryId = selectedLibraryId.value;
+    const preview = folderNameTagPreview.value;
+    const selection = folderNameTagPreviewSelection.value;
+    if (!libraryId || !preview || !selection || preview.changed < 1) return false;
+    const submitted = await submitTrackedJob(
+      "folder-tags",
+      {
+        task_type: "folder_name_tag_apply",
+        library_id: libraryId,
+        selection,
+      },
+      preview.selected,
+    );
+    if (submitted) {
+      folderNameTagPreview.value = null;
+      folderNameTagPreviewSelection.value = null;
+    }
+    return submitted;
   }
 
   async function previewFolderDeletion(folderKey: string): Promise<boolean> {
@@ -1324,6 +1462,7 @@ export function useOrganize(api: OrganizeApi = organizeApi, events: OrganizeEven
     imageController?.abort();
     jobController?.abort();
     deleteController?.abort();
+    folderNameTagController?.abort();
   });
 
   return {
@@ -1366,6 +1505,8 @@ export function useOrganize(api: OrganizeApi = organizeApi, events: OrganizeEven
     deletePreview,
     deletePreviewLoading,
     deleteCommitLoading,
+    folderNameTagPreview,
+    folderNameTagPreviewLoading,
     lastError,
     load,
     selectLibrary,
@@ -1387,6 +1528,9 @@ export function useOrganize(api: OrganizeApi = organizeApi, events: OrganizeEven
     applyManualTags,
     undoLastBatch,
     upsertAlias,
+    previewFolderNameTags,
+    cancelFolderNameTags,
+    applyFolderNameTags,
     previewFolderDeletion,
     cancelFolderDeletion,
     confirmFolderDeletion,

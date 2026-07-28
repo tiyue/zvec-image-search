@@ -520,7 +520,7 @@ def mutate(self):
         calls: list[_CallSite] = []
         roots = (
             PROJECT_ROOT / "image_vector_service",
-            PROJECT_ROOT / "zvec_desktop",
+            PROJECT_ROOT / "zvec_host",
             PROJECT_ROOT / "zvec_webview",
         )
         for root in roots:

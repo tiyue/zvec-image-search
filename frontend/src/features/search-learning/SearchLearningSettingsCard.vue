@@ -340,7 +340,7 @@ async function exportData(): Promise<void> {
     url = URL.createObjectURL(blob);
     const anchor = document.createElement("a");
     anchor.href = url;
-    anchor.download = "zvec-search-learning-anonymous.json";
+    anchor.download = "yaolens-search-learning-anonymous.json";
     anchor.style.display = "none";
     document.body.append(anchor);
     anchor.click();

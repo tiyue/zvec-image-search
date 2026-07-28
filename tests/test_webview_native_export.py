@@ -169,7 +169,7 @@ class NativeExportTests(unittest.TestCase):
             self.assertEqual(completed["exported"], 1)
             self.assertEqual(completed["skipped"], 1)
             self.assertTrue((destination / good_path.name).is_file())
-            manifests = list(destination.glob("zvec-export-errors-*.json"))
+            manifests = list(destination.glob("yaolens-export-errors-*.json"))
             self.assertEqual(len(manifests), 1)
             manifest = json.loads(manifests[0].read_text(encoding="utf-8"))
             self.assertEqual(manifest["schema_version"], 1)

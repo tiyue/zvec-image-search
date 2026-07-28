@@ -191,6 +191,7 @@ export interface PywebviewApi {
   select_directory(): Promise<NativeDirectorySelection>;
   select_json_file(): Promise<NativeDirectorySelection>;
   select_query_image(): Promise<NativeImageSelection>;
+  exit_application?(): Promise<NativeResult>;
   open_image(imageId: string): Promise<NativeResult>;
   reveal_image(imageId: string): Promise<NativeResult>;
   copy_image(imageId: string): Promise<NativeResult>;

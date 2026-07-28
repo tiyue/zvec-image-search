@@ -1,24 +1,24 @@
-# Zvec Android LAN API v1
+# YaoLens Android LAN API v1
 
-This contract defines the private-network boundary between the Windows Zvec
-desktop process and the Android viewer. The existing backend remains bound to
-loopback and is never exposed to the LAN.
+This contract defines the private-network boundary between YaoLens Windows and
+YaoLens Android. The existing backend remains bound to loopback and is never
+exposed to the LAN.
 
 Version 1 uses plain HTTP and does not provide end-to-end transport encryption.
-It is a trusted-home-LAN preview, not a public or shared-network protocol.
+It is intended only for trusted home LANs, not public or shared networks.
 
 ## Discovery
 
 - UDP port: `38521`
-- Android request: UTF-8 `ZVEC_LAN_DISCOVER/1 <nonce>`
-- Windows response: one compact JSON datagram:
+- YaoLens Android request: UTF-8 `ZVEC_LAN_DISCOVER/1 <nonce>`
+- YaoLens Windows response: one compact JSON datagram:
 
 ```json
 {
   "protocol": 1,
   "nonce": "client nonce",
   "instance_id": "stable random id",
-  "name": "Zvec on DESKTOP",
+  "name": "YaoLens on DESKTOP",
   "host": "192.168.1.20",
   "port": 38522
 }
@@ -35,8 +35,9 @@ to prevent a web page or DNS rebinding from reaching the pairing surface.
 
 ## Pairing
 
-Pairing is required once per Android installation. The desktop user must approve
-the request. A six-digit comparison code is displayed on both devices.
+Pairing is required once per YaoLens Android installation. The YaoLens Windows
+user must approve the request. A six-digit comparison code is displayed on both
+devices.
 
 ```text
 POST /api/v1/pair-requests
@@ -47,7 +48,7 @@ Create request:
 
 ```json
 {
-  "device_id": "stable random Android installation id",
+  "device_id": "stable random YaoLens Android installation id",
   "device_name": "Galaxy Tab",
   "client_secret": "base64url encoded 256-bit random value"
 }
@@ -81,8 +82,8 @@ stored plaintext token.
 The request contains a random `device_id`, a display `device_name`, and a
 256-bit `client_secret`. Polling repeats the secret in the JSON body, never in a
 URL. Once approved, the response returns a 256-bit bearer token exactly once.
-Windows stores only token and client-secret hashes. Android stores the bearer
-token in Android Keystore-backed encrypted storage.
+YaoLens Windows stores only token and client-secret hashes. YaoLens Android
+stores the bearer token in Android Keystore-backed encrypted storage.
 
 All following API calls require:
 
@@ -91,8 +92,8 @@ Authorization: Bearer <device token>
 ```
 
 Missing, invalid and revoked credentials return `401 Unauthorized`. Pairing
-approval remains a loopback-only desktop action and is never exposed by this
-LAN route table.
+approval remains a loopback-only YaoLens Windows action and is never exposed by
+this LAN route table.
 
 ## Read-only/search API
 
@@ -141,9 +142,9 @@ Successful upload response (`201 Created`):
 }
 ```
 
-`top_k` has no Android-specific product cap; it remains a positive finite
+`top_k` has no YaoLens Android-specific product cap; it remains a positive finite
 integer accepted by the existing search contract. Result metadata is paged and
-the Android client may browse every returned result.
+the YaoLens Android client may browse every returned result.
 
 Search creation returns `202 Accepted`:
 
@@ -202,8 +203,8 @@ memory and supports one HTTP byte range per request:
 - `416 Range Not Satisfiable`
 - `Accept-Ranges: bytes`
 
-Opaque `media_id` values never reveal an absolute Windows path. Android may run
-multiple transfers concurrently; the app prioritizes visible items and
+Opaque `media_id` values never reveal an absolute Windows path. YaoLens Android
+may run multiple transfers concurrently; the app prioritizes visible items and
 prefetches the next viewport while preserving all results.
 
 `ETag` is the quoted lowercase SHA-256 recorded for the indexed source. `HEAD`
@@ -218,9 +219,9 @@ temporary searches, media capabilities and uploaded query images. Cleanup is
 internally idempotent. A later request with the revoked bearer receives `401`.
 Revocation is attempted even if one temporary-resource cleanup step fails, so
 a cleanup error never leaves an old token authorized.
-The Windows credential store persists a hash-only deny journal before rewriting
-its primary credential file. A failed rewrite therefore cannot resurrect the
-revoked bearer after a process restart.
+The YaoLens Windows credential store persists a hash-only deny journal before
+rewriting its primary credential file. A failed rewrite therefore cannot
+resurrect the revoked bearer after a process restart.
 
 ## Error envelope
 

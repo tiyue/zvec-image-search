@@ -17,6 +17,7 @@ from scripts.webview_preview_packaging import (
     WebviewPreviewPackagingError,
     create_build_plan,
     inspect_payload,
+    public_version,
     repository_root,
     target_host_errors,
     validate_frontend_output,
@@ -25,6 +26,12 @@ from scripts.webview_preview_packaging import (
     windows_file_version,
     write_payload_manifest,
     write_portable_archive,
+)
+from zvec_webview.resident_task import (
+    MAIN_EXECUTABLE as RESIDENT_MAIN_EXECUTABLE,
+)
+from zvec_webview.resident_task import (
+    PRODUCT_DIRECTORY as RESIDENT_PRODUCT_DIRECTORY,
 )
 
 
@@ -131,7 +138,11 @@ class WebviewPreviewSourceContractTest(unittest.TestCase):
         self.assertIsNone(plan.makensis_command)
         self.assertEqual(
             plan.installer_output.name,
-            f"Zvec-Webview-Preview-{plan.version}-win-x64-unsigned-setup.exe",
+            f"YaoLens-{plan.display_version}-win-x64-setup.exe",
+        )
+        self.assertEqual(
+            plan.portable_output.name,
+            f"YaoLens-{plan.display_version}-win-x64-portable.zip",
         )
         self.assertEqual(plan.to_dict()["target_runtime"], "win-x64")
         self.assertEqual(plan.frontend_directory.name, "frontend")
@@ -152,7 +163,9 @@ class WebviewPreviewSourceContractTest(unittest.TestCase):
             "image_clustering.py",
             "large_cluster_adapter.py",
             "large_image_clustering.py",
+            "resident_task.py",
             "search_learning_runtime.py",
+            "single_instance.py",
         ):
             self.assertIn(required_source, packaging_source)
         frontend = validate_frontend_output(plan)
@@ -173,12 +186,25 @@ class WebviewPreviewSourceContractTest(unittest.TestCase):
         installer = (
             repository_root() / "installer" / "Zvec.WebviewPreview.nsi"
         ).read_text(encoding="utf-8")
-        self.assertIn('!define PRODUCT_NAME "Zvec Webview Preview"', installer)
+        self.assertIn('!define PRODUCT_NAME "YaoLens"', installer)
         self.assertIn(
-            '!define INSTALL_DIR "$LOCALAPPDATA\\Programs\\Zvec Webview Preview"',
+            '!define INSTALL_DIR "$LOCALAPPDATA\\Programs\\YaoLens"',
             installer,
         )
-        self.assertIn('!define MAIN_EXE "Zvec.WebviewPreview.exe"', installer)
+        self.assertIn('!define MAIN_EXE "YaoLens.exe"', installer)
+        self.assertIn('!define PRODUCT_REG_KEY "Software\\YaoLens"', installer)
+        self.assertIn(
+            '"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\YaoLens"',
+            installer,
+        )
+        self.assertIn(
+            '!define LEGACY_MAIN_EXE "Zvec.WebviewPreview.exe"',
+            installer,
+        )
+        self.assertIn(
+            'DeleteRegKey /ifempty HKCU "${PRODUCT_REG_KEY}"',
+            installer,
+        )
         self.assertIn("RequestExecutionLevel user", installer)
         self.assertIn("SetShellVarContext current", installer)
         self.assertIn("WriteRegStr HKCU", installer)
@@ -189,8 +215,133 @@ class WebviewPreviewSourceContractTest(unittest.TestCase):
         self.assertIn('File /r "${SOURCE_DIR}\\*.*"', installer)
         self.assertIn("ReadINIStr", installer)
         self.assertIn("RMDir /r", installer)
+        self.assertIn("--exit-running-instance", installer)
+        self.assertIn("--install-resident-task", installer)
+        self.assertIn("--remove-resident-task", installer)
         self.assertNotIn("Zvec.Desktop.exe", installer)
         self.assertNotIn("$LOCALAPPDATA\\Programs\\Zvec Desktop", installer)
+        self.assertNotIn("powershell", installer.casefold())
+
+        self.assertEqual(PRODUCT_DIRECTORY, RESIDENT_PRODUCT_DIRECTORY)
+        self.assertEqual(ENTRY_POINTS[0], RESIDENT_MAIN_EXECUTABLE)
+        self.assertIn(
+            f'!define INSTALL_DIR "$LOCALAPPDATA\\Programs\\{PRODUCT_DIRECTORY}"',
+            installer,
+        )
+        self.assertIn(f'!define MAIN_EXE "{RESIDENT_MAIN_EXECUTABLE}"', installer)
+
+        install_section = installer.split(
+            'Section "YaoLens" SEC_APP',
+            1,
+        )[1].split("SectionEnd", 1)[0]
+        self.assertLess(
+            install_section.index("ReadINIStr"),
+            install_section.index("Call RequestZvecExit"),
+        )
+        self.assertLess(
+            install_section.index("Call RequestZvecExit"),
+            install_section.index('RMDir /r "$INSTDIR"'),
+        )
+        self.assertLess(
+            install_section.index('File /r "${SOURCE_DIR}\\*.*"'),
+            install_section.index("Call InstallResidentTask"),
+        )
+
+        uninstall_section = installer.split('Section "Uninstall"', 1)[1].split(
+            "SectionEnd",
+            1,
+        )[0]
+        self.assertLess(
+            uninstall_section.index("ReadINIStr"),
+            uninstall_section.index("Call un.RequestZvecExit"),
+        )
+        self.assertLess(
+            uninstall_section.index("Call un.RequestZvecExit"),
+            uninstall_section.index("Call un.EnsureZvecStopped"),
+        )
+        self.assertLess(
+            uninstall_section.index("Call un.EnsureZvecStopped"),
+            uninstall_section.index("Call un.RemoveResidentTask"),
+        )
+        legacy_marker_check = uninstall_section.index(
+            'ReadINIStr $0 "${LEGACY_INSTALL_DIR}\\${PRODUCT_MARKER}"'
+        )
+        self.assertLess(
+            legacy_marker_check,
+            uninstall_section.index(
+                'DeleteRegKey HKCU "${LEGACY_PRODUCT_UNINSTALL_KEY}"'
+            ),
+        )
+        self.assertLess(
+            uninstall_section.index("Call un.RemoveResidentTask"),
+            uninstall_section.index('RMDir /r "$INSTDIR"'),
+        )
+
+    def test_installer_boundedly_waits_for_cooperative_resident_exit(self) -> None:
+        installer = (
+            repository_root() / "installer" / "Zvec.WebviewPreview.nsi"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("Sleep 500", installer)
+        self.assertNotIn("taskkill.exe", installer.casefold())
+        self.assertNotIn("Stop-Process", installer)
+
+        wait_macro = installer.split(
+            "!macro WaitForProcessExit IMAGE_NAME",
+            1,
+        )[1].split("!macroend", 1)[0]
+        uninstall_wait_macro = installer.split(
+            "!macro un.WaitForProcessExit IMAGE_NAME",
+            1,
+        )[1].split("!macroend", 1)[0]
+        for wait in (wait_macro, uninstall_wait_macro):
+            with self.subTest(wait=wait.splitlines()[0:2]):
+                self.assertIn("$SYSDIR\\tasklist.exe", wait)
+                self.assertIn("StrCpy $3 0", wait)
+                self.assertIn("IntOp $3 $3 + 1", wait)
+                self.assertIn('${If} $0 != "0"\n      ${ExitDo}', wait)
+                self.assertIn('${If} $2 == ""\n      ${ExitDo}', wait)
+                attempts = int(wait.split("${If} $3 >= ", 1)[1].splitlines()[0].strip())
+                interval_ms = int(wait.split("Sleep ", 1)[1].splitlines()[0].strip())
+                self.assertEqual(attempts, 40)
+                self.assertEqual(interval_ms, 250)
+                self.assertLessEqual(attempts * interval_ms, 10_000)
+
+        request_exit = installer.split("Function RequestZvecExit", 1)[1].split(
+            "FunctionEnd",
+            1,
+        )[0]
+        self.assertLess(
+            request_exit.index("--exit-running-instance"),
+            request_exit.index('!insertmacro WaitForProcessExit "${MAIN_EXE}"'),
+        )
+        uninstall_request_exit = installer.split(
+            "Function un.RequestZvecExit",
+            1,
+        )[1].split("FunctionEnd", 1)[0]
+        self.assertLess(
+            uninstall_request_exit.index("--exit-running-instance"),
+            uninstall_request_exit.index(
+                '!insertmacro un.WaitForProcessExit "${MAIN_EXE}"'
+            ),
+        )
+
+        install_section = installer.split(
+            'Section "YaoLens" SEC_APP',
+            1,
+        )[1].split("SectionEnd", 1)[0]
+        request_index = install_section.index("Call RequestZvecExit")
+        self.assertLess(
+            request_index,
+            install_section.index("Call EnsureZvecStopped", request_index),
+        )
+        uninstall_section = installer.split('Section "Uninstall"', 1)[1].split(
+            "SectionEnd",
+            1,
+        )[0]
+        self.assertLess(
+            uninstall_section.index("Call un.RequestZvecExit"),
+            uninstall_section.index("Call un.EnsureZvecStopped"),
+        )
 
     def test_first_run_state_uses_current_user_writable_directories(self) -> None:
         root = repository_root()
@@ -220,11 +371,11 @@ class WebviewPreviewSourceContractTest(unittest.TestCase):
             (
                 str(compiler.resolve()),
                 f"/DVERSION={plan.version}",
+                f"/DDISPLAY_VERSION={plan.display_version}",
                 f"/DFILE_VERSION={windows_file_version(plan.version)}",
                 f"/DSOURCE_DIR={plan.payload_directory}",
                 f"/DOUTPUT_FILE={plan.installer_output}",
                 "/DRID=win-x64",
-                "/DSIGNING_STATUS=unsigned",
                 str(plan.nsis_path),
             ),
         )
@@ -240,6 +391,16 @@ class WebviewPreviewSourceContractTest(unittest.TestCase):
         ):
             windows_file_version("1.2")
 
+    def test_public_version_compacts_zero_patch_stable_semver(self) -> None:
+        self.assertEqual(public_version("0.1.0"), "0.1")
+        self.assertEqual(public_version("1.2.3"), "1.2.3")
+        self.assertEqual(public_version("1.2.0-rc.1"), "1.2.0-rc.1")
+        with self.assertRaisesRegex(
+            WebviewPreviewPackagingError,
+            "three-part SemVer",
+        ):
+            public_version("0.1")
+
     def test_spec_has_one_graph_three_executables_and_required_assets(self) -> None:
         spec = (
             repository_root()
@@ -249,7 +410,8 @@ class WebviewPreviewSourceContractTest(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertEqual(spec.count("Analysis("), 1)
         self.assertEqual(spec.count("COLLECT("), 1)
-        for executable in ("Zvec.WebviewPreview", "zvec", "zvec-backend"):
+        self.assertEqual(spec.count("version=str(VERSION_INFO)"), 3)
+        for executable in ("YaoLens", "zvec", "zvec-backend"):
             self.assertIn(f'name="{executable}"', spec)
         self.assertIn("zvec_webview/frontend_dist", spec)
         self.assertNotIn("zvec_webview/assets", spec)
@@ -267,13 +429,26 @@ class WebviewPreviewSourceContractTest(unittest.TestCase):
         self.assertIn('"image_vector_service.large_image_clustering"', spec)
         self.assertIn('"image_vector_service.library_browser"', spec)
         self.assertIn('"image_vector_service.search_learning_service"', spec)
+
+        version_info = (
+            repository_root()
+            / "release"
+            / "webview_preview"
+            / "yaolens_version_info.txt"
+        ).read_text(encoding="utf-8")
+        self.assertIn("filevers=(0, 1, 0, 0)", version_info)
+        self.assertIn('StringStruct("ProductName", "YaoLens")', version_info)
+        self.assertIn('StringStruct("FileVersion", "0.1")', version_info)
+        self.assertIn('StringStruct("ProductVersion", "0.1")', version_info)
         self.assertIn('"image_vector_service.search_learning_evaluator"', spec)
         self.assertIn('"image_vector_service.search_learning_store"', spec)
         self.assertIn('"image_vector_service.search_learning_runtime"', spec)
         self.assertIn('"zvec_lan.http_server"', spec)
         self.assertIn('"zvec_lan.service"', spec)
         self.assertIn('"zvec_webview.lan_access"', spec)
-        self.assertIn('name="Zvec-Webview-Preview"', spec)
+        self.assertIn('"zvec_webview.resident_task"', spec)
+        self.assertIn('"zvec_webview.single_instance"', spec)
+        self.assertIn('name="YaoLens"', spec)
         self.assertIn('"tkinter"', spec)
         self.assertIn('"pystray"', spec)
         for unsupported_platform in ("android", "cocoa", "gtk", "qt"):
@@ -559,7 +734,7 @@ class WebviewPreviewPayloadContractTest(unittest.TestCase):
             manifest = verify_payload_manifest(payload)
             self.assertEqual(
                 manifest_path.name,
-                "webview-preview-payload-manifest.json",
+                "yaolens-payload-manifest.json",
             )
             self.assertEqual(manifest["entry_points"], list(ENTRY_POINTS))
             self.assertEqual(manifest["target_runtime"], "win-x64")
@@ -569,7 +744,7 @@ class WebviewPreviewPayloadContractTest(unittest.TestCase):
             self.assertGreater(result["size"], 0)
             self.assertEqual(len(result["sha256"]), 64)
             with zipfile.ZipFile(archive_path) as archive:
-                self.assertIn("Zvec.WebviewPreview.exe", archive.namelist())
+                self.assertIn("YaoLens.exe", archive.namelist())
                 self.assertIsNone(archive.testzip())
 
     def test_manifest_detects_tampering(self) -> None:
@@ -597,6 +772,7 @@ class WebviewPreviewPayloadContractTest(unittest.TestCase):
             ("_internal/_tkinter.pyd", "Legacy Tk"),
             ("_internal/tcl86t.dll", "Legacy Tk"),
             ("Zvec.Desktop.exe", "Forbidden"),
+            ("Zvec.WebviewPreview.exe", "Forbidden"),
             (
                 "_internal/zvec_webview/frontend_dist/node_modules/vue/index.js",
                 "node_modules",
@@ -632,7 +808,7 @@ class WebviewPreviewFrozenEntryTest(unittest.TestCase):
 
     def test_three_executable_names_dispatch_to_expected_entry_points(self) -> None:
         cases = (
-            ("Zvec.WebviewPreview.exe", "zvec_webview.app", ["--debug"], 10),
+            ("YaoLens.exe", "zvec_webview.app", ["--debug"], 10),
             ("zvec.exe", "zvec_launcher", ["stats"], 20),
             ("zvec-backend.exe", "image_service", ["serve", "--port", "1"], 30),
         )
@@ -666,7 +842,7 @@ class WebviewPreviewFrozenEntryTest(unittest.TestCase):
         ) as self_test:
             result = frozen_entry.main(
                 ["--zvec-packaging-self-test", str(output)],
-                executable="Zvec.WebviewPreview.exe",
+                executable="YaoLens.exe",
             )
         self.assertEqual(result, 17)
         self_test.assert_called_once_with(output)
@@ -677,7 +853,7 @@ class WebviewPreviewFrozenEntryTest(unittest.TestCase):
         with patch.dict(sys.modules, {"image_service": module}):
             result = frozen_entry.main(
                 ["-m", "image_service", "serve", "--port", "1234"],
-                executable="Zvec.WebviewPreview.exe",
+                executable="YaoLens.exe",
             )
         self.assertEqual(result, 7)
         self.assertEqual(calls, [["serve", "--port", "1234"]])

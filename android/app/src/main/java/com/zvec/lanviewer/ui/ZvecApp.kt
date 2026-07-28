@@ -136,7 +136,7 @@ fun ZvecApp(viewModel: AppViewModel) {
                     val intent = Intent(Intent.ACTION_SEND).apply {
                         type = event.mimeType
                         putExtra(Intent.EXTRA_STREAM, event.uri)
-                        clipData = ClipData.newUri(context.contentResolver, "Zvec original", event.uri)
+                        clipData = ClipData.newUri(context.contentResolver, "YaoLens original", event.uri)
                         addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                     }
                     context.startActivity(Intent.createChooser(intent, "分享原图"))
@@ -152,7 +152,7 @@ fun ZvecApp(viewModel: AppViewModel) {
             onIndexChanged = viewModel::setViewerIndex,
             onLoadMore = viewModel::loadNextPage,
             onClose = viewModel::closeViewer,
-            onSave = { saveLauncher.launch(currentItem?.name?.ifBlank { "zvec-original" } ?: "zvec-original") },
+            onSave = { saveLauncher.launch(currentItem?.name?.ifBlank { "yaolens-original" } ?: "yaolens-original") },
             onShare = viewModel::shareCurrent,
         )
         return
@@ -172,7 +172,7 @@ fun ZvecApp(viewModel: AppViewModel) {
             )
             ConnectionPhase.CONNECTING -> CenterStatus(
                 title = "正在连接",
-                detail = state.connectionDetail ?: state.serverName ?: "Zvec 电脑",
+                detail = state.connectionDetail ?: state.serverName ?: "YaoLens 电脑",
                 modifier = Modifier.padding(padding),
             )
             ConnectionPhase.PAIRING -> PairingScreen(
@@ -218,9 +218,9 @@ private fun DiscoveryScreen(
         verticalArrangement = Arrangement.spacedBy(14.dp),
     ) {
         item {
-            Text("Zvec LAN Viewer", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
+            Text("YaoLens", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
             Spacer(Modifier.height(6.dp))
-            Text("在同一局域网内发现 Windows 上的 Zvec。首次连接需要在电脑端确认六位码。")
+            Text("在同一局域网内发现 Windows 上的 YaoLens。首次连接需要在电脑端确认六位码。")
         }
         item {
             Surface(
@@ -431,7 +431,7 @@ private fun DevicePanel(state: AppUiState, onDisconnect: () -> Unit) {
         item {
             Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) {
                 Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Text(state.serverName ?: "Zvec 电脑", fontWeight = FontWeight.SemiBold)
+                    Text(state.serverName ?: "YaoLens 电脑", fontWeight = FontWeight.SemiBold)
                     Text("已连接 · ${state.libraries.size} 个图库", style = MaterialTheme.typography.bodySmall)
                 }
             }

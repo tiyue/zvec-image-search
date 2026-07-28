@@ -179,6 +179,13 @@ describe("App page shell", () => {
     expect(wrapper.find(".sidebar-overview").exists()).toBe(false);
     expect(wrapper.find(".gallery-pagination").exists()).toBe(false);
     expect(wrapper.get(".settings-button").text()).toContain("设置");
+    const brandMark = wrapper.get(".brand-mark");
+    expect(brandMark.attributes("aria-label")).toBe("YaoLens");
+    expect(brandMark.attributes("title")).toBe("YaoLens");
+    expect(brandMark.find("img").attributes("src")).toContain("yaolens-logo");
+    expect(brandMark.text()).toBe("");
+    expect(wrapper.get(".brand-name").text()).toBe("YaoLens");
+    expect(wrapper.get(".brand-copy small").text()).toBe("本地智能图片检索");
   });
 
   it("collapses the navigation to the icon rail without removing destinations", async () => {
@@ -353,6 +360,19 @@ describe("App page shell", () => {
 
     await wrapper.get(".nav-item[data-page='search']").trigger("click");
     expect(wrapper.get("[data-testid='tasks-page']").attributes("data-visible")).toBe("false");
+  });
+
+  it("shows resident shutdown failures reported by the host", async () => {
+    wrapper = mountApp();
+    await flushPromises();
+
+    window.dispatchEvent(new CustomEvent("yaolens-close-blocked"));
+    await wrapper.vm.$nextTick();
+    expect(wrapper.text()).toContain("暂时无法退出");
+
+    window.dispatchEvent(new CustomEvent("yaolens-close-failed"));
+    await wrapper.vm.$nextTick();
+    expect(wrapper.text()).toContain("退出失败");
   });
 
   it("connects gallery double click and context-menu detail actions to the native bridge", async () => {

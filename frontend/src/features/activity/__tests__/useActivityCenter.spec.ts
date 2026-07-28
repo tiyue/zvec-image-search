@@ -260,8 +260,14 @@ describe("useActivityCenter", () => {
     expect(await state.copySelectedLogs()).toBe(true);
     expect(copyText).toHaveBeenCalledWith(expect.stringContaining("=FORMULA"));
     expect(await state.exportLogs("csv")).toBe(true);
+    expect(downloadText.mock.calls[0]?.[0]).toMatch(
+      /^yaolens-activity-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z\.csv$/,
+    );
     expect(downloadText.mock.calls[0]?.[1]).toContain("' =FORMULA".replace(" ", ""));
     expect(await state.exportLogs("jsonl")).toBe(true);
+    expect(downloadText.mock.calls[1]?.[0]).toMatch(
+      /^yaolens-activity-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z\.jsonl$/,
+    );
     expect(downloadText.mock.calls[1]?.[1]).toContain('"sequence":1');
     wrapper.unmount();
   });

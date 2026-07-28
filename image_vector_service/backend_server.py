@@ -63,6 +63,9 @@ _ACTIVITY_JOB_HISTORY_EXCLUDED_COMMANDS = frozenset(
         "folder_list",
         "folder_images",
         "folder_delete_preview",
+        "folder_name_tag_estimate",
+        "cluster_list",
+        "cluster_detail",
         "auto_tag_estimate",
         "auto_tag_pending",
         "tag_alias_list",
@@ -88,6 +91,8 @@ _CAPABILITIES = {
     "folder_delete_two_phase": True,
     "manual_tag_batch": True,
     "manual_tag_undo": True,
+    "folder_name_tagging": True,
+    "folder_name_tag_preview": True,
     "search_results_cleanup": True,
     "fuzzy_tag_search": True,
     "tag_only_search": True,
@@ -201,6 +206,7 @@ _BATCH_PRIORITY_COMMANDS = frozenset(
         "auto_tag",
         "auto_tag_policy_migrate",
         "folder_tag_backfill",
+        "folder_name_tag_apply",
         "metadata_backfill",
         "cluster_images",
         "active_learning_queue",
@@ -1847,6 +1853,16 @@ class BackendJobManager:
             )
         if command == "manual_tag_undo":
             return service.undo_latest_manual_tag_batch()
+        if command == "folder_name_tag_estimate":
+            return service.estimate_folder_name_tags(
+                library_id=library.library_id,
+                selection=params["selection"],
+            )
+        if command == "folder_name_tag_apply":
+            return service.apply_folder_name_tags(
+                library_id=library.library_id,
+                selection=params["selection"],
+            )
         if command == "search_results_cleanup":
             return service.cleanup_search_results(
                 keep_latest=params["keep_latest"],
@@ -2662,6 +2678,8 @@ def _normalize_job(
         "folder_delete_commit",
         "manual_tag_batch",
         "manual_tag_undo",
+        "folder_name_tag_estimate",
+        "folder_name_tag_apply",
         "search_results_cleanup",
         "folder_tag_backfill",
         "index_and_auto_tag",
@@ -2833,6 +2851,13 @@ def _normalize_job(
         _reject_unknown(params, {"library_id"})
         return command, {
             "library_id": _optional_string(params, "library_id"),
+        }
+
+    if command in {"folder_name_tag_estimate", "folder_name_tag_apply"}:
+        _reject_unknown(params, {"library_id", "selection"})
+        return command, {
+            "library_id": _optional_string(params, "library_id"),
+            "selection": _folder_name_tag_selection(params.get("selection")),
         }
 
     if command == "search_results_cleanup":
@@ -3853,6 +3878,48 @@ def _manual_tags(value: Any) -> list[str]:
             seen.add(cleaned)
             normalized.append(cleaned)
     return normalized
+
+
+def _folder_name_tag_selection(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise BackendRequestError("invalid_params", "selection must be an object.")
+    mode = value.get("mode")
+    if not isinstance(mode, str):
+        raise BackendRequestError(
+            "invalid_params", "selection.mode must be library or folder."
+        )
+    normalized_mode = mode.strip().lower()
+    if normalized_mode == "library":
+        _reject_unknown(value, {"mode"})
+        return {"mode": "library"}
+    if normalized_mode == "folder":
+        _reject_unknown(
+            value,
+            {"mode", "folder_key", "include_subfolders"},
+        )
+        folder_key = value.get("folder_key")
+        if (
+            not isinstance(folder_key, str)
+            or not folder_key.strip()
+            or len(folder_key.strip()) > 8_192
+        ):
+            raise BackendRequestError(
+                "invalid_params",
+                "folder selection requires a valid folder_key.",
+            )
+        include_subfolders = value.get("include_subfolders", True)
+        if not isinstance(include_subfolders, bool):
+            raise BackendRequestError(
+                "invalid_params", "include_subfolders must be a boolean."
+            )
+        return {
+            "mode": "folder",
+            "folder_key": folder_key.strip(),
+            "include_subfolders": include_subfolders,
+        }
+    raise BackendRequestError(
+        "invalid_params", "selection.mode must be library or folder."
+    )
 
 
 def _manual_tag_selection(value: Any) -> dict[str, Any]:

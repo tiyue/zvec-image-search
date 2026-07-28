@@ -9,9 +9,9 @@ from PIL import Image
 from image_vector_service.activity_store import ActivityStore, JobHistoryRecord
 from image_vector_service.backend_server import BackendHTTPServer, BackendJobManager
 from image_vector_service.config import RuntimeCredentials
-from zvec_desktop.configuration_service import DesktopConfigurationService
-from zvec_desktop.credentials import SessionCredentialStore
-from zvec_desktop.library_tasks import SubmittedLibraryTask
+from zvec_host.configuration_service import DesktopConfigurationService
+from zvec_host.credentials import SessionCredentialStore
+from zvec_host.library_tasks import SubmittedLibraryTask
 from zvec_webview.facade import PreviewFacade, _TaskOperation
 from zvec_webview.server import GatewayServer
 

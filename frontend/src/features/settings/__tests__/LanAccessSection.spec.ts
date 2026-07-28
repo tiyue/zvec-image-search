@@ -10,7 +10,7 @@ function payload(overrides: Partial<LanAccessStatusWire> = {}): LanAccessStatusW
     running: true,
     bind_host: "192.168.1.20",
     port: 38522,
-    display_name: "Zvec on DESKTOP",
+    display_name: "YaoLens on DESKTOP",
     discovery_port: 38521,
     address: "http://192.168.1.20:38522",
     available_hosts: [{ address: "192.168.1.20", label: "以太网" }],
@@ -65,6 +65,16 @@ describe("LanAccessSection", () => {
     expect(wrapper.text()).toContain("手机没有显示验证码时不要批准");
     expect(wrapper.text()).not.toContain("Bearer");
     expect(wrapper.text()).not.toContain("token");
+  });
+
+  it("uses the YaoLens product name when the service omits its display name", async () => {
+    const api = fakeApi();
+    vi.mocked(api.status).mockResolvedValue(payload({ display_name: "" }));
+    const wrapper = mount(LanAccessSection, { props: { api } });
+    await flushPromises();
+
+    expect((wrapper.get('input[name="lan_display_name"]').element as HTMLInputElement).value)
+      .toBe("YaoLens");
   });
 
   it("saves validated settings before starting the service", async () => {

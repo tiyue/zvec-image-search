@@ -206,6 +206,36 @@ class ActivityStoreTests(unittest.TestCase):
         with self.assertRaises(InvalidActivityCursor):
             store.list_job_history(cursor="not-a-cursor")
 
+    def test_read_only_cluster_queries_are_hidden_from_job_history(self) -> None:
+        store = self.create_store()
+        records = (
+            JobHistoryRecord("cluster-list-old", "cluster_list", "succeeded"),
+            JobHistoryRecord("cluster-detail-old", "cluster_detail", "succeeded"),
+            JobHistoryRecord("index-visible", "index", "succeeded"),
+        )
+        for record in records:
+            self.assertTrue(store.record_job(record))
+        self.assertTrue(store.flush())
+
+        connection = sqlite3.connect(store.path)
+        try:
+            stored_count = connection.execute(
+                "SELECT COUNT(*) FROM job_history"
+            ).fetchone()[0]
+        finally:
+            connection.close()
+        self.assertEqual(stored_count, 3)
+
+        page = store.list_job_history()
+        self.assertEqual(page["total_count"], 1)
+        self.assertEqual(
+            [item["job_id"] for item in page["items"]],
+            ["index-visible"],
+        )
+        filtered = store.list_job_history(task_type="cluster_list")
+        self.assertEqual(filtered["total_count"], 0)
+        self.assertEqual(filtered["items"], [])
+
     def test_backend_job_progress_and_result_aliases_map_to_table_counts(self) -> None:
         store = self.create_store(auto_start=False)
         self.assertTrue(

@@ -17,7 +17,7 @@ from image_vector_service.dashscope_client import EmbeddingResponse
 from image_vector_service.model_catalog import load_active_model_configuration
 from image_vector_service.service import ImageVectorService
 from image_vector_service.vision_tagging_client import DashScopeVisionTaggingClient
-from zvec_desktop.credentials import default_credential_store
+from zvec_host.credentials import default_credential_store
 
 
 class _OfflineEmbeddingClient:

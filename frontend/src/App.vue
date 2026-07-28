@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 
+import yaolensLogoUrl from "./assets/yaolens-logo.png";
 import GalleryContextMenu from "./components/GalleryContextMenu.vue";
 import GalleryGrid from "./components/GalleryGrid.vue";
 import ImagePreview from "./components/ImagePreview.vue";
@@ -448,6 +449,14 @@ function handleWindowResize(): void {
   closeContextMenu();
 }
 
+function handleCloseBlocked(): void {
+  addToast("暂时无法退出", "仍有任务在运行，请完成或取消任务后重试。", "error");
+}
+
+function handleCloseFailed(): void {
+  addToast("退出失败", "后台服务未能安全停止，请稍后重试。", "error");
+}
+
 function setPage(page: PageName): void {
   activePage.value = page;
   if (!visitedPages.value.includes(page)) {
@@ -588,6 +597,8 @@ onMounted(() => {
   window.addEventListener("keydown", handleGlobalKeydown);
   window.addEventListener("pointerdown", handleWindowPointerDown);
   window.addEventListener("resize", handleWindowResize);
+  window.addEventListener("yaolens-close-blocked", handleCloseBlocked);
+  window.addEventListener("yaolens-close-failed", handleCloseFailed);
   void search.initialize();
   void searchFeedback.initialize();
 });
@@ -598,6 +609,8 @@ onBeforeUnmount(() => {
   window.removeEventListener("keydown", handleGlobalKeydown);
   window.removeEventListener("pointerdown", handleWindowPointerDown);
   window.removeEventListener("resize", handleWindowResize);
+  window.removeEventListener("yaolens-close-blocked", handleCloseBlocked);
+  window.removeEventListener("yaolens-close-failed", handleCloseFailed);
   search.dispose();
 });
 
@@ -636,13 +649,13 @@ watch(
         <button
           class="brand-mark"
           type="button"
-          :aria-label="sidebarCollapsed ? '展开侧边栏' : 'Zvec'"
-          :title="sidebarCollapsed ? '展开侧边栏' : 'Zvec'"
+          :aria-label="sidebarCollapsed ? '展开侧边栏' : 'YaoLens'"
+          :title="sidebarCollapsed ? '展开侧边栏' : 'YaoLens'"
           @click="sidebarCollapsed = false"
         >
-          <span aria-hidden="true">Z</span>
+          <img :src="yaolensLogoUrl" alt="" aria-hidden="true" />
         </button>
-        <span class="brand-copy"><strong class="brand-name">Zvec</strong><small>智能图片库</small></span>
+        <span class="brand-copy"><strong class="brand-name">YaoLens</strong><small>本地智能图片检索</small></span>
         <button class="icon-button sidebar-toggle" type="button" :aria-label="sidebarCollapsed ? '展开侧边栏' : '收起侧边栏'" @click="sidebarCollapsed = !sidebarCollapsed">
           <AppIcon name="panel" />
         </button>

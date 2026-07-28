@@ -151,6 +151,10 @@ describe("DataMigrationSection", () => {
       "legacy_config",
       "docker_workspace",
     ]);
+    expect(wrapper.get('input[name="migration_source"]').attributes("placeholder"))
+      .toBe("C:\\YaoLens\\workspace");
+    expect(wrapper.get('input[name="migration_target"]').attributes("placeholder"))
+      .toBe("D:\\YaoLens\\workspace");
     await wrapper.get('select[name="migration_library"]').setValue("lib-1");
     expect((wrapper.get('input[name="migration_source"]').element as HTMLInputElement).value)
       .toBe("D:\\Zvec\\workspace");
@@ -165,9 +169,13 @@ describe("DataMigrationSection", () => {
     await wrapper.get('select[name="migration_library"]').setValue("lib-1");
     await wrapper.get('select[name="migration_type"]').setValue("docker_workspace");
 
+    expect(wrapper.get('input[name="migration_source"]').attributes("placeholder"))
+      .toBe("docker_workspace");
     expect((wrapper.get('input[name="migration_source"]').element as HTMLInputElement).value)
       .toBe("");
     expect((wrapper.get('input[name="migration_target"]').element as HTMLInputElement).value)
+      .toBe("");
+    expect((wrapper.get('input[name="migration_docker_image"]').element as HTMLInputElement).value)
       .toBe("");
     await wrapper.get('input[name="migration_source"]').setValue("old-volume");
     await wrapper.get('select[name="migration_library"]').setValue("lib-2");

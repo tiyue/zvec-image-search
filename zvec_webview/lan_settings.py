@@ -147,7 +147,7 @@ class LanSettingsStore:
 def default_display_name() -> str:
     computer = platform.node().strip() or socket.gethostname().strip() or "Windows"
     safe = "".join(character for character in computer if character not in "\r\n\0")
-    return f"Zvec on {safe[:64]}"
+    return f"YaoLens on {safe[:64]}"
 
 
 def available_private_ipv4_hosts() -> tuple[LanHostOption, ...]:

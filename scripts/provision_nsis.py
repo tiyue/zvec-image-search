@@ -216,7 +216,7 @@ def _download_archive(destination: Path, *, attempts: int = 5) -> None:
         request = urllib.request.Request(
             NSIS_ARCHIVE_URL,
             headers={
-                "User-Agent": "Zvec-Python-Desktop-Build/0.4",
+                "User-Agent": "YaoLens-Build/0.1",
                 "Accept": "application/octet-stream",
             },
         )

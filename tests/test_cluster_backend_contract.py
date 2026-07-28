@@ -293,7 +293,7 @@ class ClusterBackendContractTests(unittest.TestCase):
         self.assertEqual(command, "cluster_images")
         self.assertEqual(params["cluster_types"], ["exact", "perceptual"])
 
-    def test_all_intelligence_tasks_submit_poll_and_persist_history(self) -> None:
+    def test_intelligence_tasks_persist_only_actionable_history(self) -> None:
         requests = (
             {
                 "command": "cluster_images",
@@ -386,15 +386,17 @@ class ClusterBackendContractTests(unittest.TestCase):
         self.assertTrue(self.activity.flush(timeout=2.0))
         history = self.activity.list_job_history(limit=50)
         by_id = {item["job_id"]: item for item in history["items"]}
+        read_only_commands = {"cluster_list", "cluster_detail"}
         for job in completed:
-            self.assertIn(job["id"], by_id)
-            self.assertEqual(by_id[job["id"]]["status"], "succeeded")
+            if job["command"] in read_only_commands:
+                self.assertNotIn(job["id"], by_id)
+            else:
+                self.assertIn(job["id"], by_id)
+                self.assertEqual(by_id[job["id"]]["status"], "succeeded")
         self.assertEqual(
-            {by_id[job["id"]]["task_type"] for job in completed},
+            {item["task_type"] for item in by_id.values()},
             {
                 "cluster_images",
-                "cluster_list",
-                "cluster_detail",
                 "cluster_merge",
                 "cluster_split",
                 "cluster_apply_identity",

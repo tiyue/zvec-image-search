@@ -67,6 +67,26 @@ class _ScriptedService:
         self._cancel_check()
         return []
 
+    def list_image_clusters(self, **params: Any) -> dict[str, Any]:
+        self._cancel_check()
+        return {
+            "total": 1,
+            "offset": params["offset"],
+            "limit": params["limit"],
+            "items": [],
+        }
+
+    def image_cluster_detail(
+        self, cluster_id: str, *, offset: int, limit: int
+    ) -> dict[str, Any]:
+        self._cancel_check()
+        return {
+            "cluster": {"cluster_id": cluster_id, "member_count": 0},
+            "members": [],
+            "offset": offset,
+            "limit": limit,
+        }
+
     def close(self) -> None:
         return
 
@@ -403,6 +423,28 @@ class BackendActivityIntegrationTests(unittest.TestCase):
                 manager.submit({"command": "stats", "params": {}}),
                 manager.submit({"command": "roots", "params": {}}),
                 manager.submit({"command": "search", "params": {"text": "portrait"}}),
+                manager.submit(
+                    {
+                        "command": "cluster_list",
+                        "params": {
+                            "library_id": "library-a",
+                            "offset": 0,
+                            "limit": 10,
+                            "cluster_type": "all",
+                        },
+                    }
+                ),
+                manager.submit(
+                    {
+                        "command": "cluster_detail",
+                        "params": {
+                            "library_id": "library-a",
+                            "cluster_id": "cluster-1",
+                            "offset": 0,
+                            "limit": 10,
+                        },
+                    }
+                ),
             ]
             for job in jobs:
                 completed = self._wait_for_job(manager, job["id"])

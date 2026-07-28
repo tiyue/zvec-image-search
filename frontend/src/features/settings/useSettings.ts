@@ -199,7 +199,7 @@ export function useSettings(api: SettingsApi = settingsApi, events: SettingsEven
     }
     for (const [label, value] of paths) {
       if (!isAbsoluteWindowsPath(value)) {
-        return `${label}必须是 Windows 绝对路径，例如 D:\\Zvec\\data。`;
+        return `${label}必须是 Windows 绝对路径，例如 D:\\YaoLens\\data。`;
       }
     }
     if (isDefault && !enabled) return "默认图库必须保持启用。";
@@ -336,7 +336,7 @@ export function useSettings(api: SettingsApi = settingsApi, events: SettingsEven
       return false;
     }
     if (!isAbsoluteWindowsPath(resultsDirectory.value)) {
-      notify("搜索结果目录无效", "请输入 Windows 绝对路径，例如 D:\\Zvec\\results。", "error");
+      notify("搜索结果目录无效", "请输入 Windows 绝对路径，例如 D:\\YaoLens\\results。", "error");
       return false;
     }
     if (savingResults.value) return false;

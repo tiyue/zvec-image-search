@@ -182,9 +182,9 @@ def verify_extracted_installer(
 
     payload = payload_directory.resolve(strict=True)
     extracted = extraction_root.resolve(strict=True)
-    if not (extracted / "Zvec.WebviewPreview.exe").is_file():
-        nested = extracted / "Zvec-Webview-Preview"
-        if not (nested / "Zvec.WebviewPreview.exe").is_file():
+    if not (extracted / "YaoLens.exe").is_file():
+        nested = extracted / "YaoLens"
+        if not (nested / "YaoLens.exe").is_file():
             raise WebviewReleaseVerificationError(
                 "Extracted installer has no documented WebView payload root"
             )

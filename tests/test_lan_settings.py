@@ -23,16 +23,19 @@ class LanSettingsStoreTests(unittest.TestCase):
         self.store = LanSettingsStore(self.root)
 
     def test_missing_file_defaults_off_and_never_selects_loopback(self) -> None:
-        with patch(
-            "zvec_webview.lan_settings.available_private_ipv4_hosts",
-            return_value=(),
+        with (
+            patch(
+                "zvec_webview.lan_settings.available_private_ipv4_hosts",
+                return_value=(),
+            ),
+            patch("zvec_webview.lan_settings.platform.node", return_value="TEST-PC"),
         ):
             settings = self.store.load()
 
         self.assertFalse(settings.enabled)
         self.assertEqual(settings.bind_host, "")
         self.assertEqual(settings.port, DEFAULT_LAN_PORT)
-        self.assertTrue(settings.display_name.startswith("Zvec on "))
+        self.assertEqual(settings.display_name, "YaoLens on TEST-PC")
 
     def test_round_trip_keeps_only_non_secret_listener_preferences(self) -> None:
         written = self.store.save(

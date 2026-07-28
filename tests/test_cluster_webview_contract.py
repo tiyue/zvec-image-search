@@ -6,9 +6,9 @@ from pathlib import Path
 
 from PIL import Image
 
-from zvec_desktop.configuration_service import DesktopConfigurationService
-from zvec_desktop.credentials import SessionCredentialStore
-from zvec_desktop.library_tasks import (
+from zvec_host.configuration_service import DesktopConfigurationService
+from zvec_host.credentials import SessionCredentialStore
+from zvec_host.library_tasks import (
     ActiveLearningReviewRequest,
     ActiveLearningReviewUndoRequest,
     ClusterApplyIdentityRequest,

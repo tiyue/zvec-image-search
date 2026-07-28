@@ -392,7 +392,7 @@ class AppViewModel(
                 endTransfer()
                 savedFilesStore.add(
                     SavedFileRecord(
-                        name = item.name.ifBlank { "zvec-original" },
+                        name = item.name.ifBlank { "yaolens-original" },
                         uri = destination.toString(),
                         savedAtMillis = System.currentTimeMillis(),
                         sizeBytes = item.sizeBytes,

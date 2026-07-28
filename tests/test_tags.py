@@ -45,7 +45,7 @@ class GeneratedTagTest(unittest.TestCase):
             image = folder / "001.jpg"
             image.touch()
 
-            self.assertEqual(folder_tags_for_image(image, root), ("原神-刻晴",))
+            self.assertEqual(folder_tags_for_image(image, root), ("原神刻晴",))
 
     def test_lookup_does_not_escape_root(self):
         with tempfile.TemporaryDirectory() as temporary:

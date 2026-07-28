@@ -601,8 +601,7 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
         self.assertEqual(
             report["proposals"][0]["proposal_id"], report["proposals"][0]["doc_id"]
         )
-        self.assertIn("set-a", FakeVisionClient.contexts[0].folder_name)
-        self.assertIn("set-b", FakeVisionClient.contexts[0].folder_name)
+        self.assertEqual(FakeVisionClient.contexts[0].folder_name, "")
 
         proposal = report["proposals"][0]
         source_path = Path(proposal["source_path"])
@@ -614,7 +613,7 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
             entry["accepted_auto_tags"],
             ["Cosplay", "刻晴", "原神"],
         )
-        self.assertIn(entry["folder_tags"][0], {"set-a", "set-b"})
+        self.assertEqual(entry["folder_tags"], [])
         stored = self.service.state.get_document_annotation(proposal["doc_id"])
         assert stored is not None
         self.assertEqual(stored["policy"]["resolved_model"], FLASH_MODEL)
@@ -1790,6 +1789,8 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
         self.assertFalse(pending["has_more"])
 
     def test_proposal_exposes_existing_sources_risk_and_identity_boundaries(self):
+        (self.root / "set-a").rename(self.root / "角色-set-a")
+        (self.root / "set-b").rename(self.root / "角色-set-b")
         self.service.index_folder(str(self.root), tags=["人工标签"])
         with patch(
             "image_vector_service.annotation_service.DashScopeVisionTaggingClient",
@@ -2450,7 +2451,7 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
         shared_results = self.temporary / "context-results"
         first_root = self.temporary / "context-library-a"
         second_root = self.temporary / "context-library-b"
-        first_folder = first_root / "CoserA-CharacterA-WorkA"
+        first_folder = first_root / "CoserA角色CharacterA作品WorkA"
         second_folder = second_root / "Other"
         first_folder.mkdir(parents=True)
         second_folder.mkdir(parents=True)

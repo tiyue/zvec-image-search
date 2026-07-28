@@ -31,7 +31,7 @@ class NativePackageTest(unittest.TestCase):
                 "zvec_logging.py",
             ):
                 shutil.copy2(repository / name, source / name)
-            for name in ("image_vector_service", "zvec_desktop", "zvec_webview"):
+            for name in ("image_vector_service", "zvec_host", "zvec_webview"):
                 shutil.copytree(
                     repository / name,
                     source / name,
@@ -131,20 +131,7 @@ class NativePackageTest(unittest.TestCase):
             desktop_command = environment / (
                 "Scripts/zvec-desktop.exe" if os.name == "nt" else "bin/zvec-desktop"
             )
-            desktop_help = subprocess.run(
-                [str(desktop_command), "--help"],
-                check=False,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-            )
-            self.assertEqual(
-                desktop_help.returncode,
-                0,
-                desktop_help.stderr or desktop_help.stdout,
-            )
-            self.assertIn("pure-Python image library desktop", desktop_help.stdout)
+            self.assertFalse(desktop_command.exists())
         finally:
             shutil.rmtree(root, ignore_errors=True)
 

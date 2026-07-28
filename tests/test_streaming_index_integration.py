@@ -485,9 +485,8 @@ def _synthetic_entry(index: int, root_id: str) -> dict[str, object]:
         "width": record.width,
         "height": record.height,
         "tags": [],
-        # Files directly under the selected root inherit that folder's cleaned
-        # name under the current folder-tag contract.
-        "folder_tags": ["images"],
+        # Pure ASCII roots do not produce folder-name tags.
+        "folder_tags": [],
         "accepted_auto_tags": [],
         "inherited_tags": [],
     }

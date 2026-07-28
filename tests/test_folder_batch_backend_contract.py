@@ -10,12 +10,15 @@ from image_vector_service.backend_server import BackendJobManager, _normalize_jo
 from image_vector_service.config import ServiceConfig
 from image_vector_service.library_config import LibraryCatalog, LibraryDefinition
 from image_vector_service.state import IndexState
-from zvec_desktop.library_tasks import (
+from zvec_host.library_tasks import (
     AutoTagPolicyMigrateRequest,
     FolderDeleteCommitRequest,
     FolderDeletePreviewRequest,
     FolderImagesRequest,
     FolderListRequest,
+    FolderNameTagApplyRequest,
+    FolderNameTagEstimateRequest,
+    FolderNameTagSelection,
     ManualTagBatchRequest,
     ManualTagSelection,
     ManualTagUndoRequest,
@@ -44,6 +47,27 @@ class _Service:
     def undo_latest_manual_tag_batch(self):
         self.calls.append(("manual_tag_undo", None))
         return {"undone": True, "restored": 1, "failed": 0}
+
+    def estimate_folder_name_tags(self, **kwargs):
+        self.calls.append(("folder_name_tag_estimate", kwargs))
+        return {
+            "selected": 1,
+            "processed": 1,
+            "changed": 1,
+            "failed": 0,
+            "api_requests": 0,
+        }
+
+    def apply_folder_name_tags(self, **kwargs):
+        self.calls.append(("folder_name_tag_apply", kwargs))
+        self.progress("Updated folder-name tags 1/1 images.")
+        return {
+            "selected": 1,
+            "processed": 1,
+            "updated": 1,
+            "failed": 0,
+            "api_requests": 0,
+        }
 
     def cleanup_search_results(self, **kwargs):
         self.calls.append(("search_results_cleanup", kwargs))
@@ -208,6 +232,18 @@ class FolderBatchBackendContractTest(unittest.TestCase):
             FolderDeleteCommitRequest(
                 "library-a", "a" * 32, "preview-token", confirm=True
             ),
+            FolderNameTagEstimateRequest(
+                "library-a",
+                FolderNameTagSelection("library"),
+            ),
+            FolderNameTagApplyRequest(
+                "library-a",
+                FolderNameTagSelection(
+                    "folder",
+                    folder_key="zvec-folder-v1.fake",
+                    include_subfolders=True,
+                ),
+            ),
         )
         for request in requests:
             with self.subTest(command=request.command):
@@ -247,6 +283,8 @@ class FolderBatchBackendContractTest(unittest.TestCase):
         self.assertTrue(capabilities["search_results_cleanup"])
         self.assertTrue(capabilities["auto_tag_policy_migrate"])
         self.assertTrue(capabilities["folder_delete_two_phase"])
+        self.assertTrue(capabilities["folder_name_tagging"])
+        self.assertTrue(capabilities["folder_name_tag_preview"])
 
         preview = self.manager.submit(
             {
@@ -266,6 +304,25 @@ class FolderBatchBackendContractTest(unittest.TestCase):
         commit_job = self._wait(commit["id"])
         self.assertEqual(commit_job["status"], "succeeded")
         self.assertEqual(commit_job["result"]["api_requests"], 0)
+
+        estimate = self.manager.submit(
+            {
+                "command": "folder_name_tag_estimate",
+                "params": requests[8].to_params(),
+            }
+        )
+        estimate_job = self._wait(estimate["id"])
+        self.assertEqual(estimate_job["status"], "succeeded")
+        self.assertEqual(estimate_job["result"]["changed"], 1)
+        apply = self.manager.submit(
+            {
+                "command": "folder_name_tag_apply",
+                "params": requests[9].to_params(),
+            }
+        )
+        apply_job = self._wait(apply["id"])
+        self.assertEqual(apply_job["status"], "succeeded")
+        self.assertEqual(apply_job["result"]["updated"], 1)
         self.assertIn(
             ("folder_delete_recovery", {"library_id": "library-a"}),
             self.service.calls,

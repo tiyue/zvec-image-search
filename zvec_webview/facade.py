@@ -57,15 +57,15 @@ from image_vector_service.search_learning_store import (
     SearchLearningValidationError,
     SearchSessionRecord,
 )
-from zvec_desktop.backend_api import BackendApiError, JsonObject
-from zvec_desktop.backend_host import BackendBusyError, BackendHost, BackendRuntime
-from zvec_desktop.configuration_service import (
+from zvec_host.backend_api import BackendApiError, JsonObject
+from zvec_host.backend_host import BackendBusyError, BackendHost, BackendRuntime
+from zvec_host.configuration_service import (
     ConfigurationSnapshot,
     DesktopConfigurationError,
     DesktopConfigurationService,
 )
-from zvec_desktop.credentials import CredentialStore, default_credential_store
-from zvec_desktop.library_tasks import (
+from zvec_host.credentials import CredentialStore, default_credential_store
+from zvec_host.library_tasks import (
     ActiveLearningDecision,
     ActiveLearningQueueRequest,
     ActiveLearningReviewRequest,
@@ -91,6 +91,9 @@ from zvec_desktop.library_tasks import (
     ClusterUndoRequest,
     FolderDeleteCommitRequest,
     FolderDeletePreviewRequest,
+    FolderNameTagApplyRequest,
+    FolderNameTagEstimateRequest,
+    FolderNameTagSelection,
     FolderTagBackfillRequest,
     IdentityConfirmationRequest,
     IndexAndAutoTagRequest,
@@ -111,14 +114,14 @@ from zvec_desktop.library_tasks import (
     TagAliasListRequest,
     TagAliasUpsertRequest,
 )
-from zvec_desktop.model_settings import ModelSettingsService, ModelSettingsSnapshot
-from zvec_desktop.result_catalog import (
+from zvec_host.model_settings import ModelSettingsService, ModelSettingsSnapshot
+from zvec_host.result_catalog import (
     ResultCatalog,
     ResultCatalogError,
     SearchResult,
     SearchResultPage,
 )
-from zvec_desktop.search_service import (
+from zvec_host.search_service import (
     SearchMode,
     SearchOutcome,
     SearchRequest,
@@ -211,6 +214,7 @@ _ACTIVITY_HISTORY_EXCLUDED_COMMANDS = frozenset(
         "folder_list",
         "folder_images",
         "folder_delete_preview",
+        "folder_name_tag_estimate",
         "auto_tag_estimate",
         "auto_tag_pending",
         "tag_alias_list",
@@ -425,6 +429,7 @@ class PreviewFacade:
         self._result_catalog_version: tuple[int, int] | None = None
         self._activity_job_statuses: dict[str, str] = {}
         self._activity_search_statuses: dict[str, str] = {}
+        self._closing = False
         self._closed = False
         self._lan_access = lan_access_controller or LanAccessController(
             self,
@@ -1232,7 +1237,7 @@ class PreviewFacade:
         libraries = _libraries_view(snapshot)
         return {
             "product": {
-                "name": "Zvec 图片库 Preview",
+                "name": "YaoLens",
                 "version": _package_version(),
                 "platform": "Windows x64",
                 "preview": True,
@@ -2281,6 +2286,52 @@ class PreviewFacade:
             "has_more": offset + len(items) < total,
         }
 
+    def preview_folder_name_tags(
+        self,
+        library_id: str,
+        *,
+        selection: Mapping[str, Any],
+    ) -> JsonObject:
+        """Return a model-free preview before folder-source tags are replaced."""
+
+        _task_type, request, _request_library_id = _library_request(
+            {
+                "task_type": "folder_name_tag_estimate",
+                "library_id": library_id,
+                "selection": dict(selection),
+            }
+        )
+        if not isinstance(request, FolderNameTagEstimateRequest):
+            raise FacadeError(
+                "folder_name_tag_preview_failed",
+                "无法创建文件夹名称标签预览请求。",
+                status=400,
+            )
+        service = self._ready_task_service()
+        try:
+            submission = service.estimate_folder_name_tags(request)
+            outcome = service.wait(
+                submission,
+                timeout=5 * 60,
+                poll_interval=0.1,
+            )
+        except Exception as exc:
+            raise _facade_error(exc, code="folder_name_tag_preview_failed") from exc
+        self._record_job_snapshot(outcome.job)
+        if not outcome.successful or outcome.result is None:
+            error = outcome.error or {}
+            raise FacadeError(
+                str(error.get("code") or "folder_name_tag_preview_failed"),
+                str(error.get("message") or "无法生成文件夹名称标签预览。"),
+                status=409,
+                details=(
+                    error.get("details")
+                    if isinstance(error.get("details"), Mapping)
+                    else None
+                ),
+            )
+        return cast(JsonObject, dict(outcome.result))
+
     def preview_folder_delete(
         self,
         library_id: str,
@@ -3005,8 +3056,9 @@ class PreviewFacade:
 
     def close(self, *, force: bool = False) -> None:
         with self._lock:
-            if self._closed:
+            if self._closed or self._closing:
                 return
+            self._closing = True
         self._activity_log(
             level="warning" if force else "info",
             category="backend",
@@ -3038,7 +3090,10 @@ class PreviewFacade:
                 if force or not self._host.is_running:
                     self._closed = True
                     self._backend_state = "stopped"
-            if self._closed:
+                else:
+                    self._closing = False
+                closed = self._closed
+            if closed:
                 self._activity_log(
                     level="info",
                     category="backend",
@@ -3064,6 +3119,11 @@ class PreviewFacade:
     def _start_backend_worker(self) -> None:
         try:
             runtime = self._host.start()
+            with self._lock:
+                stop_after_start = self._closing or self._closed
+            if stop_after_start:
+                self._host.stop(force=True)
+                return
             secret = self._credentials.read_secret()
             if secret:
                 self._host.client.configure_credentials(secret)
@@ -3076,6 +3136,10 @@ class PreviewFacade:
             task_service = LibraryTaskService(self._host.client)
         except Exception as exc:
             with self._lock:
+                if self._closing or self._closed:
+                    self._backend_state = "stopped"
+                    self._backend_error = None
+                    return
                 self._backend_state = "degraded"
                 self._backend_error = _error_payload(exc, "backend_start_failed")
                 self._backend_runtime = None
@@ -3094,12 +3158,17 @@ class PreviewFacade:
             )
             return
         with self._lock:
-            self._backend_runtime = runtime
-            self._search_service = search_service
-            self._lan_search_service = lan_search_service
-            self._task_service = task_service
-            self._backend_state = "ready"
-            self._backend_error = None
+            stop_after_start = self._closing or self._closed
+            if not stop_after_start:
+                self._backend_runtime = runtime
+                self._search_service = search_service
+                self._lan_search_service = lan_search_service
+                self._task_service = task_service
+                self._backend_state = "ready"
+                self._backend_error = None
+        if stop_after_start:
+            self._host.stop(force=True)
+            return
         self._activity_log(
             level="info",
             category="backend",
@@ -3732,8 +3801,8 @@ class PreviewFacade:
         return previous
 
     def _ensure_open_locked(self) -> None:
-        if self._closed:
-            raise FacadeError("preview_closed", "Preview 已关闭。", status=503)
+        if self._closing or self._closed:
+            raise FacadeError("preview_closed", "YaoLens 已关闭。", status=503)
 
 
 def _search_request(
@@ -3932,7 +4001,7 @@ def _library_request(
                 raw_selection.get("folder_key"), maximum=16_384
             ),
             include_subfolders=_boolean(
-                raw_selection.get("include_subfolders", False),
+                raw_selection.get("include_subfolders", True),
                 "selection.include_subfolders",
             ),
             excluded_doc_ids=_string_tuple(
@@ -3953,6 +4022,29 @@ def _library_request(
         )
     elif task_type == "manual_tag_undo":
         request = ManualTagUndoRequest(library_id)
+    elif task_type in {"folder_name_tag_estimate", "folder_name_tag_apply"}:
+        raw_selection = payload.get("selection")
+        if not isinstance(raw_selection, Mapping):
+            raise FacadeError("invalid_request", "selection must be an object.")
+        selection_mode = _choice(
+            raw_selection.get("mode"),
+            "selection.mode",
+            supported=("library", "folder"),
+            default="library",
+        )
+        folder_selection = FolderNameTagSelection(
+            mode=cast(Literal["library", "folder"], selection_mode),
+            folder_key=_optional_string(raw_selection.get("folder_key"), maximum=8_192),
+            include_subfolders=_boolean(
+                raw_selection.get("include_subfolders", False),
+                "selection.include_subfolders",
+            ),
+        )
+        request = (
+            FolderNameTagEstimateRequest(library_id, folder_selection)
+            if task_type == "folder_name_tag_estimate"
+            else FolderNameTagApplyRequest(library_id, folder_selection)
+        )
     elif task_type == "folder_delete_preview":
         request = FolderDeletePreviewRequest(
             library_id=library_id,
@@ -4234,7 +4326,7 @@ def _library_request(
     else:
         raise FacadeError(
             "unsupported_task",
-            f"Preview 暂不支持任务类型：{task_type}",
+            f"当前不支持任务类型：{task_type}",
         )
     return task_type, request, library_id
 
@@ -5007,7 +5099,7 @@ def _safe_relative_path(value: Any) -> str:
 def _activity_task_category(command: str) -> str:
     if command.startswith("auto_tag") or command == "index_and_auto_tag":
         return "auto_tag"
-    if command.startswith(("manual_tag", "tag_alias", "organize_")):
+    if command.startswith(("manual_tag", "folder_name_tag", "tag_alias", "organize_")):
         return "manual_tag"
     if command.startswith("folder_delete"):
         return "folder_cleanup"
@@ -5025,6 +5117,8 @@ def _activity_task_label(command: str) -> str:
         "auto_tag_estimate": "智能标注估算",
         "manual_tag_batch": "批量标签",
         "manual_tag_undo": "撤销批量标签",
+        "folder_name_tag_estimate": "文件夹名称标签预览",
+        "folder_name_tag_apply": "文件夹名称标签",
         "folder_delete_preview": "文件夹清理预览",
         "folder_delete_commit": "文件夹清理",
         "search_results_cleanup": "清理搜索结果",

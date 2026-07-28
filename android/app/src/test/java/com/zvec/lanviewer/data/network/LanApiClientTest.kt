@@ -77,6 +77,22 @@ class LanApiClientTest {
     }
 
     @Test
+    fun missingConnectionUsesYaoLensProductName() = runBlocking {
+        val disconnectedClient = LanApiClient(
+            connectionReader = ConnectionReader { null },
+            tokenStore = InMemoryTokenStore(),
+            maxConcurrentRequests = 10,
+        )
+
+        try {
+            disconnectedClient.status()
+            fail("expected IllegalStateException")
+        } catch (error: IllegalStateException) {
+            assertEquals("尚未选择 YaoLens 电脑", error.message)
+        }
+    }
+
+    @Test
     fun interruptedPairingResponseRetriesOnceWithIdenticalWireBody() = runBlocking {
         val retryingClient = LanApiClient(
             connectionReader = ConnectionReader { SavedConnection(baseUrl, "instance", "test") },

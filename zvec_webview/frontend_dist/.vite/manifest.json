@@ -1,11 +1,18 @@
 {
   "index.html": {
-    "file": "assets/index-B2qkc47M.js",
+    "file": "assets/index-DYHt_9yZ.js",
     "name": "index",
     "src": "index.html",
     "isEntry": true,
     "css": [
-      "assets/index-DYXBTFfp.css"
+      "assets/index-BU85uKy6.css"
+    ],
+    "assets": [
+      "assets/yaolens-logo-CkRF8Imw.png"
     ]
+  },
+  "src/assets/yaolens-logo.png": {
+    "file": "assets/yaolens-logo-CkRF8Imw.png",
+    "src": "src/assets/yaolens-logo.png"
   }
 }

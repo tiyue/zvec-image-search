@@ -126,13 +126,18 @@ describe("JobHistoryTable", () => {
       items: [
         job(1, { taskType: "folder_delete_commit" }),
         job(2, { taskType: "folder_delete_preview" }),
+        job(3, { taskType: "folder_name_tag_apply" }),
       ],
     });
     expect(
       wrapper
         .findAll(".job-history-table tbody tr.activity-row td:nth-child(2) strong")
         .map((item) => item.text()),
-    ).toEqual(["文件夹清理", "文件夹清理"]);
+    ).toEqual(["文件夹清理", "文件夹清理", "文件夹名称标签"]);
+
+    expect(
+      wrapper.get('option[value="folder_name_tag_apply"]').text(),
+    ).toBe("文件夹名称标签");
 
     await wrapper.get('select[name="job_task_type"]').setValue("folder_delete_commit");
     await wrapper.get("form").trigger("submit");

@@ -9,9 +9,9 @@ from pathlib import Path
 
 from PIL import Image
 
-from zvec_desktop.configuration_service import DesktopConfigurationService
-from zvec_desktop.credentials import SessionCredentialStore
-from zvec_desktop.search_service import SearchOutcome, SubmittedSearch
+from zvec_host.configuration_service import DesktopConfigurationService
+from zvec_host.credentials import SessionCredentialStore
+from zvec_host.search_service import SearchOutcome, SubmittedSearch
 from zvec_webview.facade import PreviewFacade, _SearchOperation
 
 

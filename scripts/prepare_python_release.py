@@ -10,11 +10,11 @@ from collections.abc import Sequence
 from pathlib import Path
 
 if __package__:
-    from scripts.python_preview_packaging import read_project_version
     from scripts.verify_search_quality_gate import verify_release_gate
+    from scripts.webview_preview_packaging import public_version, read_project_version
 else:
-    from python_preview_packaging import read_project_version
     from verify_search_quality_gate import verify_release_gate
+    from webview_preview_packaging import public_version, read_project_version
 
 _SEMVER = re.compile(
     r"^(?P<major>0|[1-9][0-9]*)\.(?P<minor>0|[1-9][0-9]*)\."
@@ -72,8 +72,7 @@ def validate_release_request(
     version: str,
     requested_prerelease: bool,
     search_quality_gate_path: str,
-    allow_uncertified_preview: bool,
-    require_authenticode: bool,
+    allow_uncertified_search_quality: bool,
     github_ref: str,
     github_sha: str,
 ) -> dict[str, str]:
@@ -92,6 +91,8 @@ def validate_release_request(
         raise ReleaseRequestError(
             "prerelease must exactly match the SemVer prerelease suffix"
         )
+    if version_prerelease:
+        raise ReleaseRequestError("Stable releases require a SemVer without a suffix")
     if read_project_version(root) != version:
         raise ReleaseRequestError("version must exactly match pyproject.toml")
 
@@ -101,19 +102,16 @@ def validate_release_request(
         raise ReleaseRequestError(
             "The release tag does not resolve to the workflow commit"
         )
-    if require_authenticode and not exact_tag_ref:
-        raise ReleaseRequestError(
-            "Authenticode can only be required from the exact version tag"
-        )
-
     quality_text = search_quality_gate_path.strip()
-    if quality_text and allow_uncertified_preview:
+    if quality_text and allow_uncertified_search_quality:
         raise ReleaseRequestError(
-            "Use either a search-quality gate or the uncertified Preview flag, not both"
+            "Use either a search-quality gate or the explicit uncertified option, "
+            "not both"
         )
-    if not quality_text and not allow_uncertified_preview:
+    if not quality_text and not allow_uncertified_search_quality:
         raise ReleaseRequestError(
-            "A formal search-quality gate is required unless Preview is explicit"
+            "A formal search-quality gate is required unless the uncertified "
+            "option is explicit"
         )
     normalized_quality_path = ""
     quality_certified = False
@@ -137,6 +135,7 @@ def validate_release_request(
         "license_present": str(_license_present(root)).lower(),
         "search_quality_certified": str(quality_certified).lower(),
         "search_quality_gate_path": normalized_quality_path,
+        "public_version": public_version(version),
         "version_prerelease": str(version_prerelease).lower(),
     }
 
@@ -155,8 +154,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", required=True)
     parser.add_argument("--prerelease", required=True)
     parser.add_argument("--search-quality-gate-path", default="")
-    parser.add_argument("--allow-uncertified-preview", required=True)
-    parser.add_argument("--require-authenticode", required=True)
+    parser.add_argument("--allow-uncertified-search-quality", required=True)
     parser.add_argument("--github-ref", required=True)
     parser.add_argument("--github-sha", required=True)
     parser.add_argument("--github-output", type=Path, required=True)
@@ -172,13 +170,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             version=args.version,
             requested_prerelease=_boolean(args.prerelease, "prerelease"),
             search_quality_gate_path=args.search_quality_gate_path,
-            allow_uncertified_preview=_boolean(
-                args.allow_uncertified_preview,
-                "allow_uncertified_preview",
-            ),
-            require_authenticode=_boolean(
-                args.require_authenticode,
-                "require_authenticode",
+            allow_uncertified_search_quality=_boolean(
+                args.allow_uncertified_search_quality,
+                "allow_uncertified_search_quality",
             ),
             github_ref=args.github_ref,
             github_sha=args.github_sha,
@@ -186,13 +180,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         _append_outputs(args.github_output, values)
         if args.summary is not None:
             summary = [
-                "### Release request",
+                "### YaoLens release request",
                 "",
-                f"- Version: `{args.version}`",
+                f"- Machine version: `{args.version}`",
+                f"- Public version: `{values['public_version']}`",
                 f"- Exact version tag: `{values['exact_tag_ref']}`",
                 f"- Repository license present: `{values['license_present']}`",
                 f"- Search quality certified: `{values['search_quality_certified']}`",
-                "- Desktop runtime: `pure Python / PyInstaller / win-x64`",
+                "- WebView runtime: `CPython / PyInstaller / pywebview / win-x64`",
                 "- PowerShell, .NET, WPF, Docker required: `false`",
             ]
             args.summary.write_text("\n".join(summary) + "\n", encoding="utf-8")

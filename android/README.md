@@ -1,4 +1,4 @@
-# Zvec LAN Viewer for Android
+# YaoLens for Android
 
 Native Android client for the private LAN API in `../docs/android-lan-api-v1.md`.
 

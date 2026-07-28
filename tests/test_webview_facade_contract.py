@@ -19,10 +19,11 @@ from image_vector_service.data_migration import (
 )
 from image_vector_service.search_learning_service import SearchLearningServiceError
 from image_vector_service.state import IndexState
-from zvec_desktop.configuration_service import DesktopConfigurationService
-from zvec_desktop.credentials import SessionCredentialStore
-from zvec_desktop.library_tasks import LibraryTaskService
-from zvec_desktop.result_catalog import ResultCatalog, SearchResult
+from zvec_host.backend_host import BackendRuntime
+from zvec_host.configuration_service import DesktopConfigurationService
+from zvec_host.credentials import SessionCredentialStore
+from zvec_host.library_tasks import LibraryTaskService
+from zvec_host.result_catalog import ResultCatalog, SearchResult
 from zvec_webview import app
 from zvec_webview.facade import (
     FacadeError,
@@ -37,6 +38,37 @@ class _IdleHost:
 
     def stop(self, *, force: bool = False) -> None:
         del force
+
+
+class _BlockingStartHost:
+    def __init__(self, root: Path) -> None:
+        self.client = object()
+        self.is_running = False
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.stop_calls: list[bool] = []
+        self._root = root
+
+    def start(self) -> BackendRuntime:
+        self.started.set()
+        if not self.release.wait(timeout=5):
+            raise RuntimeError("test backend start release timed out")
+        self.is_running = True
+        return BackendRuntime(
+            base_url="http://127.0.0.1:32123",
+            host="127.0.0.1",
+            port=32123,
+            pid=1234,
+            instance_id="instance",
+            config_fingerprint="fingerprint",
+            runtime_directory=self._root,
+            libraries_manifest=self._root / "libraries.json",
+            query_root=self._root / "query",
+        )
+
+    def stop(self, *, force: bool = False) -> None:
+        self.stop_calls.append(force)
+        self.is_running = False
 
 
 class _CompletedFolderDeleteClient:
@@ -233,6 +265,7 @@ class FacadeContractTests(unittest.TestCase):
         try:
             self.assertIsNone(facade.start_backend_async())
             payload = facade.bootstrap()
+            self.assertEqual(payload["product"]["name"], "YaoLens")
             self.assertEqual(payload["product"]["platform"], "Windows x64")
             self.assertEqual(payload["service"]["status"], "needs_setup")
             self.assertFalse(payload["service"]["backend_ready"])
@@ -265,6 +298,30 @@ class FacadeContractTests(unittest.TestCase):
             facade.close()
             control.shutdown(wait=True, cancel_futures=True)
             background.shutdown(wait=True, cancel_futures=True)
+
+    def test_close_during_backend_start_cannot_restart_after_shutdown(self) -> None:
+        images = self.root / "images"
+        images.mkdir()
+        config_path = self.root / "config.json"
+        DesktopConfigurationService(config_path).create_initial(images)
+        host = _BlockingStartHost(self.root / "runtime")
+        facade = PreviewFacade(
+            config_path,
+            backend_host=host,  # type: ignore[arg-type]
+            credential_store=SessionCredentialStore(),
+        )
+
+        future = facade.start_backend_async()
+        self.assertIsNotNone(future)
+        self.assertTrue(host.started.wait(timeout=1))
+        facade.close()
+        host.release.set()
+        assert future is not None
+        future.result(timeout=2)
+
+        self.assertFalse(host.is_running)
+        self.assertIn(True, host.stop_calls)
+        self.assertEqual(facade._backend_state, "stopped")
 
     def test_invalid_config_keeps_preview_available_in_degraded_state(self) -> None:
         config_path = self.root / "config.json"

@@ -760,6 +760,71 @@ describe("OrganizePage batch tags", () => {
     );
   });
 
+  it("previews folder-name tags before submitting the model-free batch", async () => {
+    const previewFolderNameTags = vi.fn(async () => ({
+      selected: 65,
+      processed: 65,
+      changed: 60,
+      unchanged: 5,
+      untagged: 0,
+      folders_scanned: 3,
+      changed_folders: 2,
+      samples: [
+        {
+          root_id: "root-people",
+          relative_folder: "原神/Raiden雷电将军 写真",
+          current_tags: ["旧文件夹"],
+          proposed_tags: ["Raiden雷电将军", "雷电将军", "写真"],
+          affected_images: 40,
+        },
+      ],
+      samples_truncated: false,
+    }));
+    const submitJob = vi.fn(async () => ({
+      job: {
+        id: "folder-name-tag-job",
+        status: "succeeded",
+        processed: 65,
+        total: 65,
+        result: { updated: 60, failed: 0 },
+      },
+    }));
+    const wrapper = await mountPage(
+      fakeApi({ previewFolderNameTags, submitJob }),
+    );
+
+    await buttonWithText(wrapper, "从文件夹名生成").trigger("click");
+    const dialog = wrapper.get(".folder-tag-modal");
+    expect(dialog.text()).toContain("不修改人工标签、模型标签和继承标签");
+
+    await buttonWithText(wrapper, "生成预览").trigger("click");
+    await flushPromises();
+
+    expect(previewFolderNameTags).toHaveBeenCalledWith(
+      "lib-1",
+      {
+        mode: "folder",
+        folder_key: "folder-raiden",
+        include_subfolders: true,
+      },
+      expect.any(AbortSignal),
+    );
+    expect(dialog.text()).toContain("Raiden雷电将军、雷电将军、写真");
+    expect(dialog.text()).toContain("60");
+
+    await buttonWithText(wrapper, "确认应用").trigger("click");
+    await flushPromises();
+    expect(submitJob).toHaveBeenCalledWith({
+      task_type: "folder_name_tag_apply",
+      library_id: "lib-1",
+      selection: {
+        mode: "folder",
+        folder_key: "folder-raiden",
+        include_subfolders: true,
+      },
+    });
+  });
+
   it("shows and updates the compact alias dictionary without identity confirmation controls", async () => {
     const api = fakeApi();
     const wrapper = await mountPage(api);

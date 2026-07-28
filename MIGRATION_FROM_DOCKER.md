@@ -1,10 +1,10 @@
-# 从 Docker 迁移到原生 Python
+# 从 Docker 迁移到 YaoLens
 
-默认运行路径已经改为宿主机原生 Python。迁移目标是复用已有 Collection、SQLite 状态和图片向量，不重新调用模型。只有旧配置使用 Docker named volume 时，导出该 volume 的一次性操作仍需要能访问原 volume 的 Docker Engine。
+YaoLens Windows 版默认使用宿主机上的原生后端，不再依赖 Docker 进行日常运行。迁移目标是复用已有 Collection、SQLite 状态和图片向量，不重新调用模型。只有旧配置使用 Docker named volume 时，导出该 volume 的一次性操作仍需要能访问原 volume 的 Docker Engine。
 
 ## 迁移前准备
 
-1. 停止 Zvec Desktop、旧常驻后端和正在运行的索引任务。
+1. 停止 YaoLens Windows 应用、旧常驻后端和正在运行的索引任务。
 2. 备份当前配置目录、bind Workspace 或 named volume。
 3. 确认图片根目录仍可在宿主机访问。
 4. 安装 Python 3.10 或更高版本，并验证原生命令：
@@ -27,7 +27,7 @@ zvec doctor
     {
       "image_root": "D:/Pictures",
       "workspace_type": "bind",
-      "workspace_source": "D:/ZvecData/workspace"
+      "workspace_source": "D:/YaoLensData/workspace"
     }
   ]
 }
@@ -38,11 +38,11 @@ zvec doctor
 ```json
 {
   "schema_version": 3,
-  "results_directory": "D:/ZvecData/results",
+  "results_directory": "D:/YaoLensData/results",
   "libraries": [
     {
       "image_root": "D:/Pictures",
-      "workspace_directory": "D:/ZvecData/workspace",
+      "workspace_directory": "D:/YaoLensData/workspace",
       "enabled": true
     }
   ]
@@ -57,12 +57,12 @@ zvec doctor
 
 ```powershell
 zvec migrate-docker-workspace `
-  --backup-directory "D:\ZvecBackups\full-before-migration" `
+  --backup-directory "D:\YaoLensBackups\full-before-migration" `
   --full-backup `
   --library "默认图库"
 ```
 
-独立备份入口是 `zvec workspace-backup`；桌面端的备份/迁移服务也调用这一稳定 JSON 接口。`--dry-run` 只返回目录权限、可用空间、预计大小、阻断项和警告，不创建目录或修改 Workspace。
+独立备份入口是 `zvec workspace-backup`；YaoLens Windows 的备份/迁移服务也调用这一稳定 JSON 接口。`--dry-run` 只返回目录权限、可用空间、预计大小、阻断项和警告，不创建目录或修改 Workspace。
 
 ## Collection schema v4
 
@@ -83,7 +83,7 @@ zvec migrate-schema --library "默认图库"
 
 升级会保留已有图片向量，建立旧 Collection 备份，校验文档数，并为描述字段写入空值和零向量占位。整个迁移不请求模型，报告中的 `api_requests` 必须为 `0`。
 
-描述向量不是迁移的一部分，也不会在程序启动时自动生成。迁移完成后，用户可在桌面端“智能整理”点击“生成描述向量”，或显式运行：
+描述向量不是迁移的一部分，也不会在程序启动时自动生成。迁移完成后，用户可在 YaoLens Windows 的“智能整理”中点击“生成描述向量”，或显式运行：
 
 ```powershell
 zvec raw metadata-backfill --max-images 200 --library "默认图库"
@@ -100,7 +100,7 @@ bind Workspace 本来就是宿主机目录，不需要复制数据，也不需�
 ```powershell
 zvec migrate-docker-workspace --dry-run --library "默认图库"
 zvec migrate-docker-workspace `
-  --backup-directory "D:\ZvecBackups\bind-migration" `
+  --backup-directory "D:\YaoLensBackups\bind-migration" `
   --library "默认图库"
 zvec verify-native --library "默认图库"
 ```
@@ -121,16 +121,16 @@ named volume 不能由原生进程直接读取。先预演，再明确指定宿�
 ```powershell
 zvec migrate-docker-workspace `
   --dry-run `
-  --destination "D:\ZvecData\workspace" `
+  --destination "D:\YaoLensData\workspace" `
   --library "默认图库"
 
 zvec migrate-docker-workspace `
-  --destination "D:\ZvecData\workspace" `
-  --backup-directory "D:\ZvecBackups\volume-migration" `
+  --destination "D:\YaoLensData\workspace" `
+  --backup-directory "D:\YaoLensBackups\volume-migration" `
   --library "默认图库"
 ```
 
-目标目录必须为空。桌面配置服务只报告 named volume 阻断，不会在启动时自动调用 Docker；只有用户显式执行上述迁移命令时才进行一次性导出。迁移器先复制到同磁盘临时目录，确认 Collection、元数据和 SQLite 状态完整后写入包含源 volume 名称的完成收据，最后一次性落到目标目录。只有收据完整且源 volume 完全匹配时才会复用已有导出；无收据的目录、半成品和其他 volume 的导出一律拒绝。导出流程以只读方式挂载源 volume，完成后删除临时容器，不删除源 volume。
+目标目录必须为空。YaoLens Windows 配置服务只报告 named volume 阻断，不会在启动时自动调用 Docker；只有用户显式执行上述迁移命令时才进行一次性导出。迁移器先复制到同磁盘临时目录，确认 Collection、元数据和 SQLite 状态完整后写入包含源 volume 名称的完成收据，最后一次性落到目标目录。只有收据完整且源 volume 完全匹配时才会复用已有导出；无收据的目录、半成品和其他 volume 的导出一律拒绝。导出流程以只读方式挂载源 volume，完成后删除临时容器，不删除源 volume。
 
 如果当前电脑已经无法运行 Docker：
 
@@ -196,14 +196,14 @@ zvec verify-native --library "默认图库"
 
 - 新配置和备份配置都已另行保存。
 - 每个图库的数量、SQLite、根目录和搜索探针通过。
-- WPF 与 CLI 都能打开历史结果和原图。
+- YaoLens Windows 应用与 CLI 都能打开历史结果和原图。
 - Workspace 已进入你的常规备份流程。
 
 ## 回滚
 
 迁移不会删除旧 bind 目录或 named volume。需要回滚时：
 
-1. 停止桌面端和原生后端。
+1. 停止 YaoLens Windows 应用和原生后端。
 2. 保存新 schema v3 配置作为审计材料。
 3. 打开备份目录的 `migration-backup-manifest.json`，先核对所需文件的 SHA-256。
 4. metadata 备份只恢复配置、元数据和 SQLite；它必须与仍然完整的原 `image_collection` 配套，不能单独当作完整 Workspace。full 备份才包含可独立恢复的向量 Collection。
@@ -212,6 +212,6 @@ zvec verify-native --library "默认图库"
 
 迁移后新增的索引记录不会自动出现在旧备份中；不要在新旧版本之间并发写同一个 Workspace。
 
-若只需回滚 Collection v4 升级，先停止桌面端和后端，再将当前 v4 Collection 移出 Workspace，并把同一次迁移生成的 `image_collection.v<旧版本>.backup_*` 与对应元数据备份成对恢复；从 v1 升级时还要恢复同批 SQLite 状态备份。不要混用不同批次或不同 schema 的文件。
+若只需回滚 Collection v4 升级，先停止 YaoLens Windows 应用和后端，再将当前 v4 Collection 移出 Workspace，并把同一次迁移生成的 `image_collection.v<旧版本>.backup_*` 与对应元数据备份成对恢复；从 v1 升级时还要恢复同批 SQLite 状态备份。不要混用不同批次或不同 schema 的文件。
 
 最佳实践：完成迁移后仍保留一次不可变的旧 Workspace 快照，直到至少做过一次完整备份恢复演练。

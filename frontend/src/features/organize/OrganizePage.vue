@@ -21,6 +21,7 @@ import {
 import SimilarityGroupsPanel from "./SimilarityGroupsPanel.vue";
 
 import type {
+  FolderNameTagSelection,
   ManualTagOperation,
   OrganizeAlias,
   OrganizeApi,
@@ -63,6 +64,8 @@ const galleryCapacity = ref<OrganizeGalleryCapacity>(
 const editorOpen = ref(false);
 const deleteConfirmation = ref("");
 const deleteTargetKey = ref("");
+const folderNameTagModalOpen = ref(false);
+const folderNameTagScope = ref<"folder" | "library">("folder");
 const folderPanelCollapsed = ref(false);
 const activeWorkspaceTab = ref<WorkspaceTab>(props.activeTab);
 const visitedWorkspaceTabs = ref<Set<WorkspaceTab>>(
@@ -207,6 +210,38 @@ async function requestFolderDeletion(folderKey: string): Promise<void> {
 
 async function confirmFolderDeletion(): Promise<void> {
   await organize.confirmFolderDeletion(deleteConfirmation.value);
+}
+
+function openFolderNameTagModal(): void {
+  organize.cancelFolderNameTags();
+  folderNameTagScope.value = organize.selectedFolderKey.value ? "folder" : "library";
+  folderNameTagModalOpen.value = true;
+}
+
+function closeFolderNameTagModal(): void {
+  organize.cancelFolderNameTags();
+  folderNameTagModalOpen.value = false;
+}
+
+function folderNameTagSelection(): FolderNameTagSelection | null {
+  if (folderNameTagScope.value === "library") return { mode: "library" };
+  if (!organize.selectedFolderKey.value) return null;
+  return {
+    mode: "folder",
+    folder_key: organize.selectedFolderKey.value,
+    include_subfolders: true,
+  };
+}
+
+function requestFolderNameTagPreview(): void {
+  const selection = folderNameTagSelection();
+  if (selection) void organize.previewFolderNameTags(selection);
+}
+
+async function applyFolderNameTags(): Promise<void> {
+  if (await organize.applyFolderNameTags()) {
+    folderNameTagModalOpen.value = false;
+  }
 }
 
 function editAlias(alias: OrganizeAlias): void {
@@ -496,6 +531,14 @@ onBeforeUnmount(() => {
             <button class="toolbar-button" type="button" @click="organize.selectWholeFolder">选择整文件夹</button>
             <button class="toolbar-button" type="button" @click="organize.invertCurrentPage">反选当前页</button>
             <button class="toolbar-button quiet" type="button" @click="organize.clearSelection">清空</button>
+            <button
+              class="toolbar-button"
+              type="button"
+              :disabled="!organize.selectedLibraryId.value || taskSubmissionLocked"
+              @click="openFolderNameTagModal"
+            >
+              从文件夹名生成
+            </button>
             <button class="toolbar-button editor-toggle" type="button" @click="editorOpen = true">
               标签设置
             </button>
@@ -753,7 +796,11 @@ onBeforeUnmount(() => {
           <div class="progress-heading">
             <strong>
               {{ organize.jobRunning.value
-                ? (organize.activeJobKind.value === "alias" ? "正在保存别名" : "后台处理中")
+                ? (organize.activeJobKind.value === "alias"
+                  ? "正在保存别名"
+                  : organize.activeJobKind.value === "folder-tags"
+                    ? "正在更新文件夹名称标签"
+                    : "后台处理中")
                 : "最近任务" }}
             </strong>
             <span>{{ organize.activeJob.value.percent }}%</span>
@@ -809,6 +856,147 @@ onBeforeUnmount(() => {
       aria-label="关闭标签设置"
       @click="editorOpen = false"
     />
+
+    <div
+      v-if="folderNameTagModalOpen"
+      class="folder-tag-modal-backdrop"
+      role="presentation"
+      @click.self="closeFolderNameTagModal"
+    >
+      <section
+        class="folder-tag-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="folder-name-tag-title"
+      >
+        <header>
+          <div>
+            <p class="eyebrow">本地规则</p>
+            <h2 id="folder-name-tag-title">从文件夹名称生成标签</h2>
+          </div>
+          <button type="button" aria-label="关闭" @click="closeFolderNameTagModal">×</button>
+        </header>
+        <p>
+          仅替换文件夹来源标签，不修改人工标签、模型标签和继承标签；不调用模型，也不会重新生成图片向量。
+        </p>
+        <fieldset class="folder-tag-scope">
+          <legend>作用范围</legend>
+          <label>
+            <input
+              v-model="folderNameTagScope"
+              type="radio"
+              value="folder"
+              :disabled="!organize.selectedFolderKey.value"
+              @change="organize.cancelFolderNameTags"
+            />
+            <span>
+              <strong>当前文件夹及子文件夹</strong>
+              <small>{{ organize.selectedFolder.value?.relativeFolder || "尚未选择文件夹" }}</small>
+            </span>
+          </label>
+          <label>
+            <input
+              v-model="folderNameTagScope"
+              type="radio"
+              value="library"
+              @change="organize.cancelFolderNameTags"
+            />
+            <span>
+              <strong>整个当前图库</strong>
+              <small>检查当前图库中全部已索引图片</small>
+            </span>
+          </label>
+        </fieldset>
+        <div class="folder-tag-preview-action">
+          <button
+            class="button secondary"
+            type="button"
+            :disabled="organize.folderNameTagPreviewLoading.value || taskSubmissionLocked"
+            @click="requestFolderNameTagPreview"
+          >
+            {{ organize.folderNameTagPreviewLoading.value ? "正在分析…" : "生成预览" }}
+          </button>
+          <span>会过滤数量、容量、扩展名和黑名单目录，并在需要时向上查找父目录。</span>
+        </div>
+        <div
+          v-if="organize.folderNameTagPreviewLoading.value"
+          class="folder-tag-preview-status"
+          aria-live="polite"
+        >
+          正在读取索引元数据并计算标签…
+        </div>
+        <template v-else-if="organize.folderNameTagPreview.value">
+          <dl class="folder-tag-summary">
+            <div>
+              <dt>检查图片</dt>
+              <dd>{{ organize.folderNameTagPreview.value.selected }}</dd>
+            </div>
+            <div>
+              <dt>将更新</dt>
+              <dd>{{ organize.folderNameTagPreview.value.changed }}</dd>
+            </div>
+            <div>
+              <dt>保持不变</dt>
+              <dd>{{ organize.folderNameTagPreview.value.unchanged }}</dd>
+            </div>
+            <div>
+              <dt>涉及文件夹</dt>
+              <dd>{{ organize.folderNameTagPreview.value.changedFolders }}</dd>
+            </div>
+          </dl>
+          <div
+            v-if="organize.folderNameTagPreview.value.samples.length"
+            class="folder-tag-sample-table"
+          >
+            <table>
+              <thead>
+                <tr>
+                  <th>文件夹</th>
+                  <th>当前</th>
+                  <th>生成后</th>
+                  <th>图片</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr
+                  v-for="sample in organize.folderNameTagPreview.value.samples"
+                  :key="`${sample.rootId}:${sample.relativeFolder}`"
+                >
+                  <td :title="sample.relativeFolder">{{ sample.relativeFolder || "根目录" }}</td>
+                  <td>{{ sample.currentTags.join("、") || "无" }}</td>
+                  <td>{{ sample.proposedTags.join("、") || "不生成标签" }}</td>
+                  <td>{{ sample.affectedImages }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p v-else class="folder-tag-no-changes">当前范围不需要更新文件夹来源标签。</p>
+          <p
+            v-if="organize.folderNameTagPreview.value.samplesTruncated"
+            class="folder-tag-preview-note"
+          >
+            预览仅显示前 100 个变化文件夹，确认后仍会处理完整范围。
+          </p>
+        </template>
+        <footer>
+          <button class="button secondary" type="button" @click="closeFolderNameTagModal">
+            取消
+          </button>
+          <button
+            class="button primary"
+            type="button"
+            :disabled="
+              !organize.folderNameTagPreview.value?.changed ||
+              organize.folderNameTagPreviewLoading.value ||
+              taskSubmissionLocked
+            "
+            @click="applyFolderNameTags"
+          >
+            确认应用
+          </button>
+        </footer>
+      </section>
+    </div>
 
     <div
       v-if="organize.deletePreview.value"
@@ -1021,6 +1209,36 @@ textarea { resize: vertical; line-height: 1.5; }
 .gallery-empty { min-height: 390px; }
 .muted { color: #999fae; font-size: 10px; }
 .editor-backdrop { display: none; }
+.folder-tag-modal-backdrop { position: fixed; z-index: 45; inset: 0; display: grid; place-items: center; padding: 24px; background: rgba(16,22,38,.48); backdrop-filter: blur(4px); }
+.folder-tag-modal { display: grid; width: min(760px,100%); max-height: min(780px,calc(100vh - 48px)); gap: 14px; overflow: auto; padding: 20px; border: 1px solid #dedede; border-radius: 14px; color: #242424; background: #fff; box-shadow: 0 24px 70px rgb(0 0 0 / 18%); }
+.folder-tag-modal > header,.folder-tag-modal > footer,.folder-tag-preview-action { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.folder-tag-modal > header h2 { margin: 2px 0 0; font-size: 18px; }
+.folder-tag-modal > header button { width: 32px; height: 32px; border: 0; border-radius: 8px; color: #555; background: #f2f2f2; font-size: 18px; cursor: pointer; }
+.folder-tag-modal > p { margin: 0; color: #646464; font-size: 12px; line-height: 1.6; }
+.folder-tag-scope { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 0 18px; margin: 0; padding: 0; border: 0; }
+.folder-tag-scope legend { margin-bottom: 6px; color: #666; font-size: 11px; font-weight: 700; }
+.folder-tag-scope label { display: flex; align-items: flex-start; gap: 9px; padding: 10px 0; border-top: 1px solid #e8e8e8; cursor: pointer; }
+.folder-tag-scope input { flex: 0 0 auto; margin-top: 2px; accent-color: #666; }
+.folder-tag-scope label > span { display: grid; min-width: 0; gap: 2px; }
+.folder-tag-scope strong { font-size: 12px; }
+.folder-tag-scope small { overflow: hidden; color: #777; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.folder-tag-preview-action { align-items: flex-start; }
+.folder-tag-preview-action > span { max-width: 470px; color: #777; font-size: 10px; line-height: 1.5; }
+.folder-tag-preview-status,.folder-tag-no-changes { margin: 0; padding: 12px 0; border-top: 1px solid #e8e8e8; color: #666; font-size: 11px; text-align: center; }
+.folder-tag-summary { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); margin: 0; border-block: 1px solid #e8e8e8; }
+.folder-tag-summary > div { padding: 10px 12px; border-right: 1px solid #e8e8e8; }
+.folder-tag-summary > div:last-child { border-right: 0; }
+.folder-tag-summary dt { color: #777; font-size: 10px; }
+.folder-tag-summary dd { margin: 2px 0 0; font-size: 15px; font-weight: 700; }
+.folder-tag-sample-table { max-height: 280px; overflow: auto; border-bottom: 1px solid #e8e8e8; }
+.folder-tag-sample-table table { width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 11px; }
+.folder-tag-sample-table th,.folder-tag-sample-table td { padding: 8px; border-bottom: 1px solid #ededed; overflow: hidden; text-align: left; text-overflow: ellipsis; white-space: nowrap; }
+.folder-tag-sample-table th { position: sticky; top: 0; color: #666; background: #f5f5f5; }
+.folder-tag-sample-table th:first-child { width: 34%; }
+.folder-tag-sample-table th:last-child { width: 58px; text-align: right; }
+.folder-tag-sample-table td:last-child { text-align: right; font-variant-numeric: tabular-nums; }
+.folder-tag-preview-note { margin: -4px 0 0 !important; color: #76521f !important; font-size: 10px !important; }
+.folder-tag-modal > footer { justify-content: flex-end; padding-top: 2px; }
 .delete-modal-backdrop { position: fixed; z-index: 45; inset: 0; display: grid; place-items: center; padding: 24px; background: rgba(16,22,38,.52); backdrop-filter: blur(4px); }
 .delete-modal { width: min(620px,100%); max-height: min(760px,calc(100vh - 48px)); overflow: auto; padding: 18px; border: 1px solid #e2d7dc; border-radius: 17px; background: #fff; box-shadow: 0 24px 80px rgba(20,24,39,.28); }
 .delete-modal > header,.delete-modal > footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
@@ -1101,7 +1319,20 @@ textarea { resize: vertical; line-height: 1.5; }
   .gallery-panel { min-height: 680px; }
   .selection-actions { justify-content: flex-start; }
   .delete-modal dl { grid-template-columns: repeat(2,minmax(0,1fr)); }
+  .folder-tag-modal-backdrop { padding: 12px; }
+  .folder-tag-modal { max-height: calc(100vh - 24px); padding: 16px; }
+  .folder-tag-scope,.folder-tag-summary { grid-template-columns: repeat(2,minmax(0,1fr)); }
+  .folder-tag-summary > div:nth-child(2) { border-right: 0; }
+  .folder-tag-summary > div:nth-child(-n+2) { border-bottom: 1px solid #e8e8e8; }
+  .folder-tag-preview-action { align-items: stretch; flex-direction: column; }
   .workspace-tabs { display: grid; width: 100%; grid-template-columns: repeat(3,minmax(0,1fr)); }
   .workspace-tabs button { min-width: 0; padding-inline: 8px; }
+}
+
+@media (prefers-color-scheme: dark) {
+  .folder-tag-modal { border-color: #444; color: #f2f2f2; background: #202020; }
+  .folder-tag-modal > header button,.folder-tag-sample-table th { color: #ddd; background: #333; }
+  .folder-tag-modal > p,.folder-tag-scope legend,.folder-tag-scope small,.folder-tag-preview-action > span,.folder-tag-preview-status,.folder-tag-no-changes,.folder-tag-summary dt { color: #bbb; }
+  .folder-tag-scope label,.folder-tag-summary,.folder-tag-summary > div,.folder-tag-sample-table,.folder-tag-sample-table th,.folder-tag-sample-table td { border-color: #3d3d3d; }
 }
 </style>

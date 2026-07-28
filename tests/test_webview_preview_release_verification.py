@@ -71,9 +71,9 @@ class WebviewPreviewReleaseVerificationTest(unittest.TestCase):
     def test_release_checksums_cover_verified_artifacts_only(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            portable = root / "Zvec-Webview-Preview-portable.zip"
-            installer = root / "Zvec-Webview-Preview-setup.exe"
-            report = root / "webview-preview-release-verification.json"
+            portable = root / "YaoLens-0.1-win-x64-portable.zip"
+            installer = root / "YaoLens-0.1-win-x64-setup.exe"
+            report = root / "yaolens-release-verification.json"
             portable.write_bytes(b"portable")
             installer.write_bytes(b"installer")
             report.write_bytes(b"report")
@@ -159,7 +159,7 @@ class WebviewPreviewReleaseVerificationTest(unittest.TestCase):
             payload = _payload(root)
             extracted = root / "extracted"
             shutil.copytree(payload, extracted)
-            (extracted / "Zvec.WebviewPreview.exe").write_bytes(b"tampered")
+            (extracted / "YaoLens.exe").write_bytes(b"tampered")
 
             with self.assertRaisesRegex(
                 WebviewReleaseVerificationError,

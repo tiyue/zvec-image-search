@@ -226,6 +226,13 @@ class _ManualTagPlan:
     after_tags: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class _FolderNameTagPlan:
+    entry: dict[str, Any]
+    before_tags: tuple[str, ...]
+    after_tags: tuple[str, ...]
+
+
 @dataclass
 class _PipelineNetworkMetrics:
     embedding_active: int = 0
@@ -1151,6 +1158,159 @@ class ImageVectorService:
         )
         return result
 
+    def estimate_folder_name_tags(
+        self,
+        *,
+        library_id: str,
+        selection: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Preview deterministic folder-source changes without writing data."""
+
+        selection_view, total, chunks = self._folder_name_tag_selection(
+            library_id=library_id,
+            selection=selection,
+        )
+        root_names = self._folder_name_tag_root_names()
+        processed = 0
+        changed = 0
+        unchanged = 0
+        untagged = 0
+        scanned_folder_keys: set[tuple[str, str]] = set()
+        changed_folder_keys: set[tuple[str, str]] = set()
+        sample_indexes: dict[tuple[str, str], int] = {}
+        samples: list[dict[str, Any]] = []
+
+        for entries in chunks:
+            self.cancel_check()
+            for entry in entries:
+                folder_key = (
+                    str(entry.get("root_id") or ""),
+                    str(entry.get("parent_directory") or ""),
+                )
+                scanned_folder_keys.add(folder_key)
+                before = normalize_tags(entry.get("folder_tags", ()))
+                after = self._folder_name_tags_for_entry(entry, root_names)
+                if not after:
+                    untagged += 1
+                if before == after:
+                    unchanged += 1
+                    continue
+                changed += 1
+                changed_folder_keys.add(folder_key)
+                sample_index = sample_indexes.get(folder_key)
+                if sample_index is None and len(samples) < 100:
+                    sample_index = len(samples)
+                    sample_indexes[folder_key] = sample_index
+                    samples.append(
+                        {
+                            "root_id": folder_key[0],
+                            "relative_folder": folder_key[1],
+                            "current_tags": list(before),
+                            "proposed_tags": list(after),
+                            "affected_images": 0,
+                        }
+                    )
+                if sample_index is not None:
+                    samples[sample_index]["affected_images"] += 1
+
+            processed += len(entries)
+            self.progress(f"Previewed folder-name tags {processed}/{total} images.")
+
+        return {
+            "selection": selection_view,
+            "selected": total,
+            "processed": processed,
+            "changed": changed,
+            "unchanged": unchanged,
+            "untagged": untagged,
+            "folders_scanned": len(scanned_folder_keys),
+            "changed_folders": len(changed_folder_keys),
+            "samples": samples,
+            "samples_truncated": len(changed_folder_keys) > len(samples),
+            "api_requests": 0,
+        }
+
+    def apply_folder_name_tags(
+        self,
+        *,
+        library_id: str,
+        selection: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Replace only folder-source tags using existing indexed vectors."""
+
+        selection_view, total, chunks = self._folder_name_tag_selection(
+            library_id=library_id,
+            selection=selection,
+        )
+        root_names = self._folder_name_tag_root_names()
+        processed = 0
+        updated = 0
+        unchanged = 0
+        untagged = 0
+        failed = 0
+        scanned_folder_keys: set[tuple[str, str]] = set()
+        failures: list[dict[str, str]] = []
+        needs_attention = False
+
+        for entries in chunks:
+            self.cancel_check()
+            plans: list[_FolderNameTagPlan] = []
+            for entry in entries:
+                folder_key = (
+                    str(entry.get("root_id") or ""),
+                    str(entry.get("parent_directory") or ""),
+                )
+                scanned_folder_keys.add(folder_key)
+                before = normalize_tags(entry.get("folder_tags", ()))
+                after = self._folder_name_tags_for_entry(entry, root_names)
+                if not after:
+                    untagged += 1
+                if before == after:
+                    unchanged += 1
+                    continue
+                plans.append(_FolderNameTagPlan(entry, before, after))
+
+            if plans:
+                succeeded, plan_failures, inconsistent = (
+                    self._apply_folder_name_tag_plans(plans)
+                )
+                needs_attention = needs_attention or inconsistent
+                succeeded_set = set(succeeded)
+                updated += len(succeeded_set)
+                for plan in plans:
+                    doc_id = str(plan.entry["doc_id"])
+                    if doc_id in succeeded_set:
+                        continue
+                    failed += 1
+                    _append_manual_failure(
+                        failures,
+                        doc_id=doc_id,
+                        relative_path=str(plan.entry.get("relative_path") or ""),
+                        error=plan_failures.get(
+                            doc_id, "The folder-name tag update failed."
+                        ),
+                    )
+
+            processed += len(entries)
+            self.progress(f"Updated folder-name tags {processed}/{total} images.")
+
+        if updated:
+            self._refresh_tag_catalog()
+        return {
+            "selection": selection_view,
+            "selected": total,
+            "processed": processed,
+            "updated": updated,
+            "unchanged": unchanged,
+            "untagged": untagged,
+            "failed": failed,
+            "folders_scanned": len(scanned_folder_keys),
+            "failures": failures,
+            "failures_truncated": failed > len(failures),
+            "needs_attention": needs_attention,
+            "api_requests": 0,
+        }
+
     def undo_latest_manual_tag_batch(self) -> dict[str, Any]:
         """Restore both SQLite and Zvec for the most recent manual batch."""
 
@@ -1417,6 +1577,77 @@ class ImageVectorService:
             folder_chunks(),
         )
 
+    def _folder_name_tag_selection(
+        self,
+        *,
+        library_id: str,
+        selection: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], int, Iterator[list[dict[str, Any]]]]:
+        if not isinstance(selection, Mapping):
+            raise ValueError("selection must be an object.")
+        mode = str(selection.get("mode") or "").strip().lower()
+        if mode == "library":
+            return (
+                {"mode": "library"},
+                self.state.count(),
+                self.state.iter_entries(chunk_size=128),
+            )
+        if mode != "folder":
+            raise ValueError("selection.mode must be library or folder.")
+        folder_key = selection.get("folder_key")
+        if not isinstance(folder_key, str) or not folder_key.strip():
+            raise ValueError("folder selection requires folder_key.")
+        include_subfolders = selection.get("include_subfolders", True)
+        if not isinstance(include_subfolders, bool):
+            raise ValueError("include_subfolders must be a boolean.")
+        with LibraryBrowser(
+            library_id=library_id,
+            state_path=self.config.state_path,
+        ) as browser:
+            root_id, relative_folder = browser.decode_folder_key(folder_key)
+        total = self.state.count_folder_entries(
+            root_id,
+            relative_folder,
+            include_subfolders=include_subfolders,
+        )
+        return (
+            {
+                "mode": "folder",
+                "folder_key": folder_key,
+                "root_id": root_id,
+                "relative_folder": relative_folder,
+                "include_subfolders": include_subfolders,
+            },
+            total,
+            self.state.iter_folder_entries(
+                root_id,
+                relative_folder,
+                include_subfolders=include_subfolders,
+                chunk_size=128,
+            ),
+        )
+
+    def _folder_name_tag_root_names(self) -> dict[str, str]:
+        names: dict[str, str] = {}
+        for root in self.state.list_roots():
+            current_path = str(root.get("current_path") or "")
+            path = Path(current_path)
+            names[str(root["root_id"])] = (
+                path.name or path.drive.rstrip("\\/") or current_path
+            )
+        return names
+
+    @staticmethod
+    def _folder_name_tags_for_entry(
+        entry: Mapping[str, Any],
+        root_names: Mapping[str, str],
+    ) -> tuple[str, ...]:
+        root_id = str(entry.get("root_id") or "")
+        return folder_tags_for_relative_path(
+            str(entry.get("relative_path") or ""),
+            str(root_names.get(root_id) or ""),
+        )
+
     def _apply_manual_tag_plans(
         self,
         plans: Sequence[_ManualTagPlan],
@@ -1453,6 +1684,53 @@ class ImageVectorService:
         write_result = self.collection_writes.upsert(
             prepared,
             operation_kind="manual_tag",
+        )
+        failures.update(write_result.failures)
+        return (
+            write_result.succeeded,
+            failures,
+            write_result.systemic_failure,
+        )
+
+    def _apply_folder_name_tag_plans(
+        self,
+        plans: Sequence[_FolderNameTagPlan],
+    ) -> tuple[list[str], dict[str, str], bool]:
+        vectors, failures = self.repository.fetch_vectors(
+            str(plan.entry["doc_id"]) for plan in plans
+        )
+        prepared: list[PreparedCollectionUpsert] = []
+        for plan in plans:
+            doc_id = str(plan.entry["doc_id"])
+            vector = vectors.get(doc_id)
+            if vector is None:
+                failures.setdefault(
+                    doc_id,
+                    "The indexed image vector is missing.",
+                )
+                continue
+            state_entry = {
+                **plan.entry,
+                "folder_tags": list(plan.after_tags),
+            }
+            prepared.append(
+                PreparedCollectionUpsert(
+                    record=_record_from_state_entry(plan.entry),
+                    image_vector=vector,
+                    effective_tags=normalize_tags(
+                        [
+                            *plan.entry.get("tags", ()),
+                            *plan.after_tags,
+                            *plan.entry.get("accepted_auto_tags", ()),
+                            *plan.entry.get("inherited_tags", ()),
+                        ]
+                    ),
+                    state_entry=state_entry,
+                )
+            )
+        write_result = self.collection_writes.upsert(
+            prepared,
+            operation_kind="folder_name_tag",
         )
         failures.update(write_result.failures)
         return (

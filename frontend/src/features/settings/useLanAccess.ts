@@ -73,7 +73,7 @@ export function normalizeLanAccessStatus(raw: LanAccessStatusWire): LanAccessSta
     running: raw.running === true,
     bindHost: text(raw.bind_host),
     port: integer(raw.port, 38_522),
-    displayName: text(raw.display_name) || "Zvec 图片库",
+    displayName: text(raw.display_name) || "YaoLens",
     discoveryPort: integer(raw.discovery_port, 38_521),
     address: text(raw.address),
     availableHosts: hostOptions(raw.available_hosts),
@@ -98,7 +98,7 @@ export function useLanAccess(
     enabled: false,
     bindHost: "",
     port: 38_522,
-    displayName: "Zvec 图片库",
+    displayName: "YaoLens",
   });
   let controller: AbortController | null = null;
   let pollHandle: number | null = null;

@@ -40,7 +40,11 @@ const settings = useSettings(props.api, {
 });
 const apiKey = ref("");
 const choosingDirectory = ref("");
-const activeSection = ref<"libraries" | "models" | "credentials" | "learning" | "lan" | "migration">("libraries");
+const confirmingExit = ref(false);
+const exiting = ref(false);
+const activeSection = ref<
+  "libraries" | "models" | "credentials" | "learning" | "lan" | "migration" | "application"
+>("libraries");
 
 function selectDefault(libraryId: string): void {
   settings.libraryDrafts.value.forEach((draft) => {
@@ -109,6 +113,33 @@ function chooseResultsDirectory(): void {
     settings.resultsDirectory.value = path;
   });
 }
+
+async function exitApplication(): Promise<void> {
+  const bridge = window.pywebview?.api;
+  if (!bridge || typeof bridge.exit_application !== "function") {
+    confirmingExit.value = false;
+    emit("toast", "无法退出 YaoLens", "桌面桥接尚未就绪，请稍后重试。", "error");
+    return;
+  }
+  if (exiting.value) return;
+  exiting.value = true;
+  try {
+    const result = await bridge.exit_application();
+    if (!result || result.ok !== true) {
+      throw new Error(result?.error || result?.message || "后台服务暂时无法安全退出。");
+    }
+  } catch (error) {
+    confirmingExit.value = false;
+    emit(
+      "toast",
+      "无法退出 YaoLens",
+      error instanceof Error ? error.message : String(error),
+      "error",
+    );
+  } finally {
+    exiting.value = false;
+  }
+}
 </script>
 
 <template>
@@ -144,6 +175,9 @@ function chooseResultsDirectory(): void {
         <button type="button" :class="{ active: activeSection === 'migration' }" @click="activeSection = 'migration'">
           <span>数据迁移</span>
         </button>
+        <button type="button" :class="{ active: activeSection === 'application' }" @click="activeSection = 'application'">
+          <span>应用</span>
+        </button>
       </nav>
 
       <div class="settings-content">
@@ -173,7 +207,7 @@ function chooseResultsDirectory(): void {
           required
           autocomplete="off"
           spellcheck="false"
-          placeholder="D:\Zvec\results"
+          placeholder="D:\YaoLens\results"
         />
         <button
           class="path-picker"
@@ -244,7 +278,7 @@ function chooseResultsDirectory(): void {
                 required
                 autocomplete="off"
                 spellcheck="false"
-                placeholder="D:\Zvec\workspace"
+                placeholder="D:\YaoLens\workspace"
               />
               <button
                 class="path-picker"
@@ -476,7 +510,53 @@ function chooseResultsDirectory(): void {
         </div>
       </section>
     </div>
-      </div>
+      <section
+        v-show="activeSection === 'application'"
+        class="settings-card panel application-card"
+        aria-labelledby="application-title"
+      >
+        <header class="section-heading">
+          <div><p class="eyebrow">运行方式</p><h2 id="application-title">应用</h2></div>
+        </header>
+        <p class="section-copy">
+          关闭主窗口后，YaoLens 会继续在后台运行，正在处理的任务和局域网访问不会中断。
+        </p>
+        <div class="application-action">
+          <div>
+            <strong>退出 YaoLens</strong>
+            <small>后台空闲时会关闭本地服务；存在活动任务时将拒绝退出。</small>
+          </div>
+          <div class="application-action-buttons">
+            <template v-if="confirmingExit">
+              <button
+                class="button danger"
+                type="button"
+                :disabled="exiting"
+                @click="exitApplication"
+              >
+                {{ exiting ? "退出中…" : "确认退出" }}
+              </button>
+              <button
+                class="button secondary"
+                type="button"
+                :disabled="exiting"
+                @click="confirmingExit = false"
+              >
+                取消
+              </button>
+            </template>
+            <button
+              v-else
+              class="button danger"
+              type="button"
+              @click="confirmingExit = true"
+            >
+              退出 YaoLens
+            </button>
+          </div>
+        </div>
+      </section>
+    </div>
     </div>
   </section>
 </template>
@@ -531,6 +611,10 @@ label small { color: #8a91a2; font-weight: 500; }
 .model-form .button { justify-self: start; }
 .credential-form { display: grid; grid-template-columns: minmax(220px,1fr) auto; gap: 10px; align-items: end; margin-top: 14px; }
 .credential-note { margin-top: 14px; padding: 11px; border-radius: 10px; background: #f7f8fc; color: #6f788e; font-size: 12px; }
+.application-action { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-top: 16px; padding: 12px 0; border-top: 1px solid #e7e7e7; }
+.application-action > div:first-child { display: grid; gap: 4px; }
+.application-action small { color: #777; }
+.application-action-buttons { display: flex; align-items: center; gap: 8px; }
 .empty-state { display: grid; place-items: center; gap: 5px; min-height: 150px; color: #7d8598; text-align: center; }
 .empty-state span { font-size: 12px; }
 
@@ -553,6 +637,7 @@ label small { color: #8a91a2; font-weight: 500; }
 .button { min-height:36px; border:1px solid #dedede; border-radius:9px; color:#333; background:#f3f3f3; font-weight:500; transform:none !important; }
 .button.primary { color:#fff; border-color:#606060; background:#606060; }
 .button.secondary { color:#333; border-color:#dedede; background:#f3f3f3; }
+.button.danger { color:#992f3d; border-color:#e6c6ca; background:#fff2f3; }
 .path-picker { border-color:#dedede; color:#444; background:#f5f5f5; font-weight:500; }
 .results-form { grid-template-columns: 1fr auto auto; }
 .results-form,.library-editor,.new-library-editor,.toggle-option,.credential-note { border-color:#e5e5e5; background:#fff; box-shadow:none; }
@@ -569,11 +654,16 @@ label small { color: #8a91a2; font-weight: 500; }
   .library-fields { grid-template-columns: 1fr; }
 }
 @media (max-width: 720px) {
-  .settings-layout { grid-template-columns:1fr; }
-  .settings-nav { grid-template-columns:repeat(5,minmax(0,1fr)); padding:0 0 8px; overflow:auto; border-right:0; border-bottom:1px solid #e5e5e5; }
-  .settings-nav button { justify-content:center; white-space:nowrap; }
-  .page-heading, .library-editor footer, .credential-note { align-items: stretch; flex-direction: column; }
+  .settings-layout { grid-template-columns:1fr; grid-template-rows:auto minmax(0,1fr); }
+  .settings-nav { display:flex; padding:0 0 8px; overflow:auto; border-right:0; border-bottom:1px solid #e5e5e5; }
+  .settings-nav button { flex:0 0 auto; justify-content:center; white-space:nowrap; }
+  .page-heading, .library-editor footer, .credential-note, .application-action { align-items: stretch; flex-direction: column; }
   .results-form, .credential-form, .library-options, .library-options.single-option { grid-template-columns: 1fr; }
   .section-actions { align-items: flex-end; flex-direction: column; }
+}
+@media (prefers-color-scheme: dark) {
+  .application-action { border-color: #3f3f3f; }
+  .application-action small { color: #b8b8b8; }
+  .button.danger { color: #ffd8dd; border-color: #713f47; background: #492b30; }
 }
 </style>

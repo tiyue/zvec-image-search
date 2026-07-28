@@ -673,7 +673,7 @@ export function useActivityCenter(
       if (!items.length) return false;
       const content = serializeActivityLogs(items, format);
       const mimeType = format === "jsonl" ? "application/x-ndjson;charset=utf-8" : "text/csv;charset=utf-8";
-      const filename = `zvec-activity-${timestampForFilename()}.${format}`;
+      const filename = `yaolens-activity-${timestampForFilename()}.${format}`;
       (events.downloadText ?? downloadText)(filename, content, mimeType);
       const scope = selected.length ? "选中日志" : "当前筛选结果";
       events.onInfo?.("日志已导出", `已导出 ${items.length} 条${scope}。`);

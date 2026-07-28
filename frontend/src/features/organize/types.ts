@@ -154,6 +154,37 @@ export interface FolderDeleteCommitRequest {
   confirm: true;
 }
 
+export type FolderNameTagSelection =
+  | { mode: "library" }
+  | {
+      mode: "folder";
+      folder_key: string;
+      include_subfolders: boolean;
+    };
+
+export interface FolderNameTagSampleWire {
+  root_id?: unknown;
+  relative_folder?: unknown;
+  current_tags?: unknown;
+  proposed_tags?: unknown;
+  affected_images?: unknown;
+  [key: string]: unknown;
+}
+
+export interface FolderNameTagPreviewWire {
+  selected?: unknown;
+  processed?: unknown;
+  changed?: unknown;
+  unchanged?: unknown;
+  untagged?: unknown;
+  folders_scanned?: unknown;
+  changed_folders?: unknown;
+  samples?: unknown;
+  samples_truncated?: unknown;
+  result?: FolderNameTagPreviewWire;
+  [key: string]: unknown;
+}
+
 export interface OrganizeFolderImagesResponse {
   items?: OrganizeImageWire[];
   images?: OrganizeImageWire[];
@@ -245,6 +276,11 @@ export interface OrganizeApi {
     request: FolderDeleteCommitRequest,
     signal?: AbortSignal,
   ): Promise<OrganizeJobResponse>;
+  previewFolderNameTags?(
+    libraryId: string,
+    selection: FolderNameTagSelection,
+    signal?: AbortSignal,
+  ): Promise<FolderNameTagPreviewWire>;
 }
 
 export interface OrganizeFolder {
@@ -312,6 +348,26 @@ export interface FolderDeletePreview {
   expiresAt: string;
   warnings: string[];
   blocked: boolean;
+}
+
+export interface FolderNameTagSample {
+  rootId: string;
+  relativeFolder: string;
+  currentTags: string[];
+  proposedTags: string[];
+  affectedImages: number;
+}
+
+export interface FolderNameTagPreview {
+  selected: number;
+  processed: number;
+  changed: number;
+  unchanged: number;
+  untagged: number;
+  foldersScanned: number;
+  changedFolders: number;
+  samples: FolderNameTagSample[];
+  samplesTruncated: boolean;
 }
 
 export interface OrganizeAlias {

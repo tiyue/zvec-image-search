@@ -6,6 +6,7 @@ const TASK_LABELS: Record<string, string> = {
   auto_tag: "智能标注",
   index_and_auto_tag: "索引并智能标注",
   manual_tag_batch: "批量标签",
+  folder_name_tag_apply: "文件夹名称标签",
   folder_delete: "文件夹清理",
   folder_delete_preview: "文件夹清理",
   folder_delete_commit: "文件夹清理",
@@ -74,7 +75,9 @@ export function formatDuration(start: string, finish: string): string {
   if (!Number.isFinite(startTime) || !Number.isFinite(finishTime) || finishTime < startTime) {
     return "—";
   }
-  const seconds = Math.max(0, Math.round((finishTime - startTime) / 1_000));
+  const elapsedMilliseconds = finishTime - startTime;
+  if (elapsedMilliseconds < 1_000) return "< 1 秒";
+  const seconds = Math.round(elapsedMilliseconds / 1_000);
   if (seconds < 60) return `${seconds} 秒`;
   const minutes = Math.floor(seconds / 60);
   if (minutes < 60) return `${minutes} 分 ${seconds % 60} 秒`;

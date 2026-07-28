@@ -176,6 +176,7 @@ describe("useDataMigration", () => {
   it("submits a read-only precheck with automatic backup locked on", async () => {
     const api = fakeApi();
     const { state, wrapper } = mountComposable(api);
+    expect(state.form.dockerImage).toBe("");
     state.form.source = "C:\\Zvec\\workspace";
     state.form.target = "C:\\Zvec\\workspace";
     state.form.libraryId = "lib-1";
@@ -188,7 +189,6 @@ describe("useDataMigration", () => {
         source: "C:\\Zvec\\workspace",
         target: "C:\\Zvec\\workspace",
         library_id: "lib-1",
-        docker_image: "zvec-image-search:local",
         automatic_backup: true,
       },
       expect.any(AbortSignal),

@@ -3,7 +3,9 @@ from __future__ import annotations
 import re
 import unicodedata
 from collections.abc import Iterable
-from pathlib import Path, PurePosixPath
+from pathlib import Path
+
+from .folder_name_tags import folder_name_tags_for_relative_path
 
 _IMAGE_COUNT_PATTERN = re.compile(
     r"(?i)\d+(?:\.\d+)?\s*(?:p|张|枚|幅|图|pics?|pictures?|images?|files?)"
@@ -68,7 +70,7 @@ def is_technical_metadata_tag(value: str) -> bool:
 
 
 def folder_tags_for_image(image_path: Path, root_path: Path) -> tuple[str, ...]:
-    """Derive one cleaned tag from the nearest meaningful parent folder.
+    """Derive cleaned tags from the nearest meaningful parent folder.
 
     The lookup never walks above the configured image root. This keeps a path
     such as ``作品/120P-1.2GB/001.jpg`` useful by falling back to ``作品`` while
@@ -89,22 +91,9 @@ def folder_tags_for_relative_path(
     relative_path: str,
     root_name: str,
 ) -> tuple[str, ...]:
-    """Derive folder tags from an already validated portable relative path.
+    """Derive deterministic folder-source tags from a portable relative path."""
 
-    Index staging stores only normalized relative paths.  Using that value here
-    avoids a filesystem ``resolve`` for every unchanged image while preserving
-    the same nearest-meaningful-folder behavior as ``folder_tags_for_image``.
-    """
-
-    portable = PurePosixPath(str(relative_path).replace("\\", "/"))
-    if portable.is_absolute() or not portable.name or ".." in portable.parts:
-        raise ValueError("Image relative path is invalid.")
-    parent_names = portable.parts[:-1]
-    for name in (*reversed(parent_names), root_name):
-        tag = clean_generated_tag(name)
-        if tag:
-            return (tag,)
-    return ()
+    return folder_name_tags_for_relative_path(relative_path, root_name)
 
 
 def build_tags_filter(tags: Iterable[str] | None, mode: str = "all") -> str | None:

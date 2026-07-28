@@ -6,7 +6,7 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 
-from zvec_desktop.backend_host import BackendBusyError
+from zvec_host.backend_host import BackendBusyError
 
 from .facade import PreviewFacade
 from .server import GatewayAddress, GatewayServer
@@ -37,7 +37,7 @@ class PreviewRuntime:
     def start(self) -> RuntimeStart:
         with self._lock:
             if self._closed:
-                raise RuntimeError("Preview runtime has already been closed.")
+                raise RuntimeError("YaoLens runtime has already been closed.")
             address = self.gateway.start()
             if self._started:
                 return RuntimeStart(address, backend_started_async=False)

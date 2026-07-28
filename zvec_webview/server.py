@@ -938,6 +938,35 @@ def _handler_type(gateway: GatewayServer) -> type[BaseHTTPRequestHandler]:
                 method == "POST"
                 and len(segments) == 4
                 and segments[0] == "libraries"
+                and segments[2:4] == ("folder-name-tags", "preview")
+            ):
+                body = self._read_json()
+                unknown = sorted(set(body) - {"selection"})
+                if unknown:
+                    raise FacadeError(
+                        "invalid_request",
+                        "文件夹名称标签预览包含不支持的字段。",
+                        details={"unknown_fields": unknown},
+                    )
+                selection = body.get("selection")
+                if not isinstance(selection, Mapping):
+                    raise FacadeError(
+                        "invalid_request",
+                        "selection 必须是对象。",
+                        status=400,
+                    )
+                self._json(
+                    HTTPStatus.OK,
+                    gateway._facade.preview_folder_name_tags(
+                        segments[1],
+                        selection=selection,
+                    ),
+                )
+                return
+            if (
+                method == "POST"
+                and len(segments) == 4
+                and segments[0] == "libraries"
                 and segments[2:4] == ("folder-delete", "preview")
             ):
                 body = self._read_json()

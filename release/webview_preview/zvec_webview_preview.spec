@@ -6,6 +6,7 @@ from pathlib import Path
 ROOT = Path(SPECPATH).resolve().parents[1]
 RELEASE_DIR = ROOT / "release" / "webview_preview"
 ICON = ROOT / "assets" / "Zvec.AppIcon.ico"
+VERSION_INFO = RELEASE_DIR / "yaolens_version_info.txt"
 WEB_ASSETS = ROOT / "zvec_webview" / "frontend_dist"
 
 # All executables intentionally share one Analysis/PYZ/COLLECT dependency graph.
@@ -52,8 +53,10 @@ analysis = Analysis(
         "zvec_webview.lan_access",
         "zvec_webview.lan_settings",
         "zvec_webview.native_bridge",
+        "zvec_webview.resident_task",
         "zvec_webview.runtime",
         "zvec_webview.server",
+        "zvec_webview.single_instance",
         "bottle",
         "clr",
         "clr_loader",
@@ -69,7 +72,6 @@ analysis = Analysis(
     ],
     hookspath=[
         str(RELEASE_DIR / "hooks"),
-        str(ROOT / "release" / "python_preview" / "hooks"),
     ],
     hooksconfig={},
     runtime_hooks=[str(RELEASE_DIR / "runtime_hook.py")],
@@ -90,13 +92,6 @@ analysis = Analysis(
         "webview.platforms.cocoa",
         "webview.platforms.gtk",
         "webview.platforms.qt",
-        "zvec_desktop.app",
-        "zvec_desktop.organize_panel",
-        "zvec_desktop.settings_panel",
-        "zvec_desktop.theme",
-        "zvec_desktop.tray",
-        "zvec_desktop.ui",
-        "zvec_desktop.widgets",
     ],
     noarchive=False,
     optimize=1,
@@ -109,13 +104,14 @@ preview_exe = EXE(
     analysis.scripts,
     [],
     exclude_binaries=True,
-    name="Zvec.WebviewPreview",
+    name="YaoLens",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
     console=False,
     icon=str(ICON),
+    version=str(VERSION_INFO),
 )
 
 cli_exe = EXE(
@@ -130,6 +126,7 @@ cli_exe = EXE(
     upx=False,
     console=True,
     icon=str(ICON),
+    version=str(VERSION_INFO),
 )
 
 backend_exe = EXE(
@@ -144,6 +141,7 @@ backend_exe = EXE(
     upx=False,
     console=True,
     icon=str(ICON),
+    version=str(VERSION_INFO),
 )
 
 preview = COLLECT(
@@ -154,5 +152,5 @@ preview = COLLECT(
     analysis.datas,
     strip=False,
     upx=False,
-    name="Zvec-Webview-Preview",
+    name="YaoLens",
 )

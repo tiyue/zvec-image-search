@@ -32,6 +32,7 @@ _LOG_LEVELS: Final = frozenset({"debug", "info", "warning", "error"})
 _ACTIVE_JOB_STATUSES: Final = frozenset(
     {"queued", "pending", "running", "cancelling", "cancel_requested"}
 )
+_HIDDEN_JOB_HISTORY_TASK_TYPES: Final = ("cluster_detail", "cluster_list")
 _RECOVERABLE_JOB_STATUSES: Final = frozenset(
     {"queued", "pending", "running", "cancelling"}
 )
@@ -1381,8 +1382,9 @@ class ActivityStore:
         library_id: str | None,
         query: str | None,
     ) -> tuple[list[str], list[Any]]:
-        filters: list[str] = []
-        parameters: list[Any] = []
+        hidden_values = ", ".join("?" for _ in _HIDDEN_JOB_HISTORY_TASK_TYPES)
+        filters = [f"task_type NOT IN ({hidden_values})"]
+        parameters: list[Any] = [*_HIDDEN_JOB_HISTORY_TASK_TYPES]
         _append_multi_filter(filters, parameters, "status", status)
         _append_multi_filter(filters, parameters, "task_type", task_type)
         if library_id:

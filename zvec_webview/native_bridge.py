@@ -112,7 +112,7 @@ class NativeBridge:
         try:
             path = self._registry.resolve(image_id)
             if os.name != "nt":
-                raise OSError("此 Preview 仅支持 Windows x64。")
+                raise OSError("YaoLens 仅支持 Windows x64。")
             action_key = self._claim_native_action("open", path)
             if action_key is None:
                 return _duplicate_action_error()
@@ -130,7 +130,7 @@ class NativeBridge:
         try:
             path = self._registry.resolve(image_id)
             if os.name != "nt":
-                raise OSError("此 Preview 仅支持 Windows x64。")
+                raise OSError("YaoLens 仅支持 Windows x64。")
             action_key = self._claim_native_action("reveal", path)
             if action_key is None:
                 return _duplicate_action_error()
@@ -267,7 +267,7 @@ class NativeBridge:
             errors = list(job.errors) if job is not None else []
         manifest_written = False
         if errors:
-            manifest = destination / f"zvec-export-errors-{job_id[:8]}.json"
+            manifest = destination / f"yaolens-export-errors-{job_id[:8]}.json"
             try:
                 manifest.write_text(
                     json.dumps(
@@ -430,7 +430,7 @@ def _first_dialog_path(value: Any) -> Path | None:
 
 def _copy_windows_clipboard(text: str) -> None:
     if os.name != "nt":
-        raise OSError("此 Preview 仅支持 Windows x64。")
+        raise OSError("YaoLens 仅支持 Windows x64。")
     if not isinstance(text, str) or not text:
         raise ValueError("剪贴板文本不能为空。")
     unicode_text = 13
@@ -440,7 +440,7 @@ def _copy_windows_clipboard(text: str) -> None:
 
 def _copy_windows_files(paths: tuple[Path, ...]) -> None:
     if os.name != "nt":
-        raise OSError("此 Preview 仅支持 Windows x64。")
+        raise OSError("YaoLens 仅支持 Windows x64。")
     if not paths:
         raise ValueError("没有可复制的图片。")
     # DROPFILES followed by a double-NUL-terminated UTF-16 path list.
@@ -453,7 +453,7 @@ def _copy_windows_files(paths: tuple[Path, ...]) -> None:
 
 def _copy_windows_image(path: Path) -> None:
     if os.name != "nt":
-        raise OSError("此 Preview 仅支持 Windows x64。")
+        raise OSError("YaoLens 仅支持 Windows x64。")
     try:
         with Image.open(path) as source:
             width, height = source.size
@@ -472,7 +472,7 @@ def _copy_windows_image(path: Path) -> None:
 
 def _set_windows_clipboard_data(format_id: int, payload: bytes) -> None:
     if os.name != "nt":
-        raise OSError("此 Preview 仅支持 Windows x64。")
+        raise OSError("YaoLens 仅支持 Windows x64。")
     if not payload:
         raise ValueError("剪贴板内容不能为空。")
     user32 = _windows_dll("user32")
@@ -516,7 +516,7 @@ def _select_file_with_shell(path: Path) -> bool:
     """Ask Windows Shell to open Explorer and select a Unicode/long-path file."""
 
     if os.name != "nt":
-        raise OSError("此 Preview 仅支持 Windows x64。")
+        raise OSError("YaoLens 仅支持 Windows x64。")
     shell32 = _windows_dll("shell32")
     ole32 = _windows_dll("ole32")
     shell32.SHParseDisplayName.argtypes = [
@@ -574,7 +574,7 @@ def _windows_startfile(path: Path) -> None:
 
     startfile = getattr(os, "startfile", None)
     if startfile is None:
-        raise OSError("此 Preview 仅支持 Windows x64。")
+        raise OSError("YaoLens 仅支持 Windows x64。")
     startfile(path)
 
 
@@ -583,7 +583,7 @@ def _windows_dll(name: str) -> Any:
 
     loader = getattr(ctypes, "windll", None)
     if loader is None:
-        raise OSError("此 Preview 仅支持 Windows x64。")
+        raise OSError("YaoLens 仅支持 Windows x64。")
     return getattr(loader, name)
 
 

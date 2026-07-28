@@ -617,10 +617,8 @@ class ImageTagSearchTest(unittest.TestCase):
         self.assertEqual(
             len(self.service.state.entries_for_index_run(report.index_run_id)), 2
         )
-        self.assertEqual(
-            self._folder_tags_for(self.warm_dir / "red.png"), ["warm-images"]
-        )
-        self.assertEqual(self._folder_tags_for(image), ["原神-刻晴"])
+        self.assertEqual(self._folder_tags_for(self.warm_dir / "red.png"), [])
+        self.assertEqual(self._folder_tags_for(image), ["原神刻晴"])
         self.assertEqual(self._tags_for(image), [])
         self.assertNotIn("120P", self.service.state.list_effective_tags())
         self.assertNotIn("1.2GB", self.service.state.list_effective_tags())
@@ -755,7 +753,7 @@ class ImageTagSearchTest(unittest.TestCase):
         self.assertEqual(all_tags.result_count, 1)
         self.assertEqual(
             all_tags.results[0].tags,
-            ["warm", "O'Reilly", "warm-images"],
+            ["warm", "O'Reilly"],
         )
 
         missing_combination = self.service.search_by_text(
@@ -775,8 +773,8 @@ class ImageTagSearchTest(unittest.TestCase):
         self.assertEqual(
             {tuple(result.tags) for result in any_tag.results},
             {
-                ("warm", "O'Reilly", "warm-images"),
-                ("cool", "cool-images"),
+                ("warm", "O'Reilly"),
+                ("cool",),
             },
         )
 

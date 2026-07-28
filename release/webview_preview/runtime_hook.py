@@ -15,12 +15,12 @@ def _require_windows_x64() -> None:
     """Fail clearly if a payload is copied to an unsupported runtime."""
 
     if sys.platform != "win32" or os.name != "nt":
-        raise RuntimeError("Zvec Webview Preview supports Windows only.")
+        raise RuntimeError("YaoLens supports Windows only.")
     if struct.calcsize("P") != 8 or platform.machine().casefold() not in {
         "amd64",
         "x86_64",
     }:
-        raise RuntimeError("Zvec Webview Preview requires Windows x64.")
+        raise RuntimeError("YaoLens requires Windows x64.")
 
 
 def _configure_frozen_environment() -> None:
@@ -52,7 +52,10 @@ def _configure_x64_pywebview_loader() -> None:
 
 
 def _is_preview_executable() -> bool:
-    return Path(sys.executable).stem.casefold() == "zvec.webviewpreview"
+    return Path(sys.executable).stem.casefold() in {
+        "yaolens",
+        "zvec.webviewpreview",
+    }
 
 
 if getattr(sys, "frozen", False):

@@ -12,8 +12,8 @@ from unittest.mock import patch
 from PIL import Image
 
 from image_vector_service.activity_store import ActivityStoreUnavailable
-from zvec_desktop.configuration_service import DesktopConfigurationService
-from zvec_desktop.credentials import SessionCredentialStore
+from zvec_host.configuration_service import DesktopConfigurationService
+from zvec_host.credentials import SessionCredentialStore
 from zvec_webview.facade import FacadeError, PreviewFacade
 
 
