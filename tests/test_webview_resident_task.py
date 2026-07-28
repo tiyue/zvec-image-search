@@ -26,7 +26,9 @@ from zvec_webview.resident_task import (
 _TASK_NAMESPACE = "http://schemas.microsoft.com/windows/2004/02/mit/task"
 _SID = "S-1-5-21-111-222-333-1001"
 _TASK_NOT_FOUND = "ERROR: The system cannot find the file specified."
+_TASK_PATH_NOT_FOUND = "ERROR: The system cannot find the path specified."
 _TASK_NOT_FOUND_ZH = "错误: 系统找不到指定的文件。"
+_TASK_PATH_NOT_FOUND_ZH = "错误: 系统找不到指定的路径。"
 
 
 def _tag(name: str) -> str:
@@ -175,6 +177,7 @@ class WebviewResidentTaskInstallTest(unittest.TestCase):
                 options["creationflags"],
                 getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
+            self.assertEqual(options["encoding"], "oem")
             self.assertFalse(runner.task_xml_path.exists())
             assert runner.task_xml is not None
             action = ET.fromstring(runner.task_xml).find(
@@ -492,33 +495,42 @@ class WebviewResidentTaskRemoveTest(unittest.TestCase):
             )
 
     def test_remove_is_idempotent_when_the_task_is_absent(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            system_root = _prepare_system_root(root)
-            runner = RecordingRunner(
-                [
-                    subprocess.CompletedProcess(
-                        [],
-                        1,
-                        stdout="",
-                        stderr=_TASK_NOT_FOUND_ZH,
-                    ),
-                    subprocess.CompletedProcess(
-                        [],
-                        1,
-                        stdout="",
-                        stderr=_TASK_NOT_FOUND,
-                    ),
-                ]
-            )
-
-            self.assertFalse(
-                remove_resident_task(
-                    runner=runner,
-                    system_root=system_root,
+        for detail in (
+            _TASK_NOT_FOUND,
+            _TASK_PATH_NOT_FOUND,
+            _TASK_NOT_FOUND_ZH,
+            _TASK_PATH_NOT_FOUND_ZH,
+        ):
+            with (
+                self.subTest(detail=detail),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                root = Path(temporary)
+                system_root = _prepare_system_root(root)
+                runner = RecordingRunner(
+                    [
+                        subprocess.CompletedProcess(
+                            [],
+                            1,
+                            stdout="",
+                            stderr=detail,
+                        ),
+                        subprocess.CompletedProcess(
+                            [],
+                            1,
+                            stdout="",
+                            stderr=detail,
+                        ),
+                    ]
                 )
-            )
-            self.assertEqual(len(runner.calls), 2)
+
+                self.assertFalse(
+                    remove_resident_task(
+                        runner=runner,
+                        system_root=system_root,
+                    )
+                )
+                self.assertEqual(len(runner.calls), 2)
 
     def test_remove_rejects_non_missing_query_failures(self) -> None:
         failures = (

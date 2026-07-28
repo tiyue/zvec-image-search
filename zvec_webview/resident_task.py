@@ -26,10 +26,13 @@ _TASK_NAMESPACE: Final = "http://schemas.microsoft.com/windows/2004/02/mit/task"
 _SID_PATTERN: Final = re.compile(r"\bS-\d+(?:-\d+){2,}\b", re.IGNORECASE)
 _CREATE_NO_WINDOW: Final = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 _COMMAND_TIMEOUT_SECONDS: Final = 30
+_WINDOWS_COMMAND_ENCODING: Final = "oem"
 _TASK_NOT_FOUND_EXIT_CODE: Final = 1
 _TASK_NOT_FOUND_MARKERS: Final = (
     "the system cannot find the file specified",
+    "the system cannot find the path specified",
     "系统找不到指定的文件",
+    "系统找不到指定的路径",
 )
 
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
@@ -334,7 +337,7 @@ def _run(
             check=False,
             capture_output=True,
             text=True,
-            encoding="utf-8",
+            encoding=_WINDOWS_COMMAND_ENCODING,
             errors="replace",
             timeout=_COMMAND_TIMEOUT_SECONDS,
             creationflags=_CREATE_NO_WINDOW,

@@ -99,6 +99,7 @@ Vue 3 + TypeScript + Vite SPA：
 ### Windows 登录后常驻生命周期
 
 - NSIS 安装版为当前用户注册 `AtLogon` 计划任务。任务使用 `InteractiveToken` 登录类型、`LeastPrivilege` 运行级别、`IgnoreNew` 多实例策略、无限执行时间，并只配置固定有限次数的失败重启；不得保存用户密码、切换到 SYSTEM 或请求管理员权限。
+- 计划任务命令输出按 Windows OEM 代码页解码；查询精确任务名时，“文件不存在”或“路径不存在”均表示任务尚未创建，必须保持全新安装和重复卸载幂等，其他查询失败仍应阻止安装或卸载。
 - 登录任务以隐藏状态启动 YaoLens。关闭 WebView 窗口仅隐藏界面，不停止宿主；已接受的后台任务、Android LAN 服务和自动增量索引 watcher 必须继续运行。
 - 用户二次启动时必须唤醒已有窗口，不得创建第二个宿主、BackendHost 或 LAN listener。
 - 用户完全停止应用的唯一产品入口是“设置 → 应用 → 退出 YaoLens”。存在活动任务时必须拒绝退出；任务空闲后才依次安全停止 backend、LAN、Gateway 和宿主。
