@@ -215,6 +215,7 @@ Kotlin + Gradle 构建的安卓应用，通过 LAN API 与 Windows WebView 宿�
 ## 发布与构建
 
 - **触发方式**：GitHub Actions `workflow_dispatch` 手动触发 `release.yml`
+- **发布入口**：`prepare_python_release.py` 与 `assemble_python_release.py` 必须支持从仓库根目录直接执行，以匹配 GitHub Actions 调用方式
 - **Windows WebView**：PyInstaller 打包 → NSIS 生成 .exe 安装程序
 - **安装版常驻**：NSIS 注册当前用户登录任务；卸载时移除该任务
 - **portable 常驻**：不注册计划任务，仅手工启动后的当前登录会话内常驻

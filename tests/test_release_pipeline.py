@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -238,6 +239,23 @@ class ReleaseAssemblyTest(unittest.TestCase):
 
 
 class ReleaseWorkflowContractTest(unittest.TestCase):
+    def test_release_cli_entry_points_run_directly_from_repository_root(self) -> None:
+        root = repository_root()
+        for script in (
+            "scripts/prepare_python_release.py",
+            "scripts/assemble_python_release.py",
+        ):
+            with self.subTest(script=script):
+                completed = subprocess.run(
+                    [sys.executable, script, "--help"],
+                    cwd=root,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+
     def test_release_publishes_only_webview_and_android(self) -> None:
         root = repository_root()
         release = (root / ".github/workflows/release.yml").read_text(encoding="utf-8")

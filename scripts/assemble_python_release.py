@@ -12,6 +12,10 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPOSITORY_ROOT))
+
 if __package__:
     from scripts.webview_preview_packaging import public_version
 else:

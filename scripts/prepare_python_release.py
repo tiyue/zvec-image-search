@@ -9,6 +9,10 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPOSITORY_ROOT))
+
 if __package__:
     from scripts.verify_search_quality_gate import verify_release_gate
     from scripts.webview_preview_packaging import public_version, read_project_version
