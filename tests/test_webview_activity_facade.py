@@ -103,6 +103,40 @@ class WebviewActivityFacadeTests(unittest.TestCase):
                 payload.extend(path.read_bytes())
         return bytes(payload)
 
+    def test_model_concurrency_round_trips_through_the_facade(self) -> None:
+        facade = self._facade()
+        try:
+            response = facade.assign_models(
+                {
+                    "embedding_model": "qwen3-vl-embedding",
+                    "auto_tag_primary_model": "qwen3-vl-flash",
+                    "auto_tag_escalation_model": "qwen3-vl-plus",
+                    "embedding_concurrency": 6,
+                    "auto_tag_concurrency": 1,
+                }
+            )
+
+            self.assertEqual(response["embedding_concurrency"], 6)
+            self.assertEqual(response["auto_tag_concurrency"], 1)
+            self.assertFalse(response["restart_required"])
+            settings = facade.settings()["models"]
+            self.assertEqual(settings["embedding_concurrency"], 6)
+            self.assertEqual(settings["auto_tag_concurrency"], 1)
+
+            with self.assertRaises(FacadeError) as raised:
+                facade.assign_models(
+                    {
+                        "embedding_model": "qwen3-vl-embedding",
+                        "auto_tag_primary_model": "qwen3-vl-flash",
+                        "auto_tag_escalation_model": "qwen3-vl-plus",
+                        "embedding_concurrency": 3,
+                        "auto_tag_concurrency": 4,
+                    }
+                )
+            self.assertEqual(raised.exception.code, "invalid_request")
+        finally:
+            facade.close(force=True)
+
     def test_successful_settings_operations_are_queryable_without_secret_payloads(
         self,
     ) -> None:

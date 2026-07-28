@@ -22,6 +22,8 @@ class HostModelSettingsServiceTest(unittest.TestCase):
         self.assertEqual(snapshot.embedding_model, "qwen3-vl-embedding")
         self.assertEqual(snapshot.auto_tag_primary_model, "qwen3-vl-flash")
         self.assertEqual(snapshot.auto_tag_escalation_model, "qwen3-vl-plus")
+        self.assertEqual(snapshot.embedding_concurrency, 2)
+        self.assertEqual(snapshot.auto_tag_concurrency, 4)
         self.assertEqual(
             [choice.model_id for choice in snapshot.embedding_choices],
             ["qwen3-vl-embedding"],
@@ -40,6 +42,37 @@ class HostModelSettingsServiceTest(unittest.TestCase):
         self.assertEqual(snapshot.auto_tag_escalation_model, "qwen3-vl-flash")
         reloaded = self.service.load(create=False)
         self.assertEqual(reloaded.auto_tag_primary_model, "qwen3-vl-plus")
+        self.assertEqual(reloaded.embedding_concurrency, 2)
+        self.assertEqual(reloaded.auto_tag_concurrency, 4)
+
+    def test_assign_roles_persists_model_concurrency(self) -> None:
+        self.service.load()
+        snapshot = self.service.assign_roles(
+            embedding_model="qwen3-vl-embedding",
+            auto_tag_primary_model="qwen3-vl-flash",
+            auto_tag_escalation_model="qwen3-vl-plus",
+            embedding_concurrency=6,
+            auto_tag_concurrency=1,
+        )
+
+        self.assertEqual(snapshot.embedding_concurrency, 6)
+        self.assertEqual(snapshot.auto_tag_concurrency, 1)
+        reloaded = self.service.load(create=False)
+        self.assertEqual(reloaded.embedding_concurrency, 6)
+        self.assertEqual(reloaded.auto_tag_concurrency, 1)
+
+    def test_assign_roles_rejects_invalid_concurrency_without_replacing_file(
+        self,
+    ) -> None:
+        before = self.service.load().json_text
+        with self.assertRaises(ModelSettingsError):
+            self.service.assign_roles(
+                embedding_model="qwen3-vl-embedding",
+                auto_tag_primary_model="qwen3-vl-flash",
+                auto_tag_escalation_model="qwen3-vl-plus",
+                embedding_concurrency=3,
+            )
+        self.assertEqual(self.service.load(create=False).json_text, before)
 
     def test_role_assignment_rejects_incompatible_model(self) -> None:
         self.service.load()

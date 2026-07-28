@@ -225,9 +225,15 @@ def main(argv: list[str] | None = None) -> int:
             ServiceConfig(
                 workspace=Path(args.workspace).expanduser().resolve(),
                 model_configuration=model_configuration,
+                embedding_concurrency=model_configuration.embedding_concurrency,
+                auto_tag_concurrency=model_configuration.auto_tag_concurrency,
             )
             if args.workspace
-            else ServiceConfig(model_configuration=model_configuration)
+            else ServiceConfig(
+                model_configuration=model_configuration,
+                embedding_concurrency=model_configuration.embedding_concurrency,
+                auto_tag_concurrency=model_configuration.auto_tag_concurrency,
+            )
         )
         if args.command in {"migrate-schema", "migrate-path-schema"}:
             print(

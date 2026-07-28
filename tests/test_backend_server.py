@@ -12,6 +12,7 @@ import threading
 import time
 import unittest
 from contextlib import redirect_stderr
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -24,6 +25,7 @@ from image_vector_service.backend_instance_lock import (
 from image_vector_service.backend_server import create_backend_server
 from image_vector_service.config import ServiceConfig
 from image_vector_service.library_config import LibraryCatalog, LibraryDefinition
+from image_vector_service.model_catalog import default_model_configuration
 from image_vector_service.models import (
     ExportedHit,
     PreparedSearch,
@@ -1929,9 +1931,19 @@ class ServeCommandTest(unittest.TestCase):
 
     def test_serve_subcommand_uses_environment_token(self):
         workspace = Path(tempfile.mkdtemp(prefix="zvec_serve_cli_test_"))
+        model_configuration = replace(
+            default_model_configuration(),
+            embedding_concurrency=6,
+            auto_tag_concurrency=1,
+        )
         try:
             with (
                 patch.dict(os.environ, {"ZVEC_BACKEND_TOKEN": "secret"}),
+                patch.object(
+                    image_service,
+                    "load_active_model_configuration",
+                    return_value=model_configuration,
+                ),
                 patch(
                     "image_vector_service.backend_server.serve_backend"
                 ) as serve_backend,
@@ -1972,6 +1984,8 @@ class ServeCommandTest(unittest.TestCase):
                 kwargs["instance_lock_path"], str(workspace / "backend.lock")
             )
             self.assertEqual(kwargs["config"].workspace, workspace.resolve())
+            self.assertEqual(kwargs["config"].embedding_concurrency, 6)
+            self.assertEqual(kwargs["config"].auto_tag_concurrency, 1)
         finally:
             shutil.rmtree(workspace, ignore_errors=True)
 

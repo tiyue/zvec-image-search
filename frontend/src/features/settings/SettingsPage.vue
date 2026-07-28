@@ -426,47 +426,89 @@ async function exitApplication(): Promise<void> {
           <div><p class="eyebrow">阿里云模型</p><h2 id="models-title">模型角色</h2></div>
           <span class="status-pill success">{{ settings.models.provider || "aliyun" }}</span>
         </header>
-        <p class="section-copy">配置只影响后续新任务，不会重新计算已经保存的图片向量。</p>
+        <p class="section-copy">
+          配置只影响后续新任务，不会重新计算已经保存的图片向量；运行中的后台需重启后加载，并发仍受模型服务速率限制。
+        </p>
         <form class="model-form" @submit.prevent="settings.saveModels">
-          <label>
-            <span>图片与文字向量</span>
-            <select v-model="settings.models.embedding" name="embedding_model" required>
-              <option
-                v-if="settings.models.embedding && !containsChoice(settings.embeddingChoices.value, settings.models.embedding)"
-                :value="settings.models.embedding"
-              >{{ settings.models.embedding }}</option>
-              <option v-for="choice in settings.embeddingChoices.value" :key="choice.id" :value="choice.id">
-                {{ choice.displayName }}
-              </option>
-            </select>
-            <small>用于建立索引和语义检索。</small>
-          </label>
-          <label>
-            <span>智能标注主模型</span>
-            <select v-model="settings.models.primary" name="auto_tag_primary_model" required>
-              <option
-                v-if="settings.models.primary && !containsChoice(settings.primaryChoices.value, settings.models.primary)"
-                :value="settings.models.primary"
-              >{{ settings.models.primary }}</option>
-              <option v-for="choice in settings.primaryChoices.value" :key="choice.id" :value="choice.id">
-                {{ choice.displayName }}
-              </option>
-            </select>
-            <small>常规标签识别，默认使用低成本模型。</small>
-          </label>
-          <label>
-            <span>疑难升级模型</span>
-            <select v-model="settings.models.escalation" name="auto_tag_escalation_model" required>
-              <option
-                v-if="settings.models.escalation && !containsChoice(settings.escalationChoices.value, settings.models.escalation)"
-                :value="settings.models.escalation"
-              >{{ settings.models.escalation }}</option>
-              <option v-for="choice in settings.escalationChoices.value" :key="choice.id" :value="choice.id">
-                {{ choice.displayName }}
-              </option>
-            </select>
-            <small>只在置信度不足或身份冲突时使用。</small>
-          </label>
+          <fieldset class="model-role-group">
+            <legend>向量角色</legend>
+            <div class="model-role-fields">
+              <label>
+                <span>图片与文字向量</span>
+                <select v-model="settings.models.embedding" name="embedding_model" required>
+                  <option
+                    v-if="settings.models.embedding && !containsChoice(settings.embeddingChoices.value, settings.models.embedding)"
+                    :value="settings.models.embedding"
+                  >{{ settings.models.embedding }}</option>
+                  <option v-for="choice in settings.embeddingChoices.value" :key="choice.id" :value="choice.id">
+                    {{ choice.displayName }}
+                  </option>
+                </select>
+                <small>用于建立索引和语义检索。</small>
+              </label>
+              <label>
+                <span>向量并发</span>
+                <select
+                  v-model.number="settings.models.embeddingConcurrency"
+                  name="embedding_concurrency"
+                  required
+                >
+                  <option
+                    v-for="value in settings.modelConcurrencyOptions"
+                    :key="`embedding-${value}`"
+                    :value="value"
+                  >{{ value }} 路</option>
+                </select>
+                <small>所有图库统一使用，不按单个任务覆盖；每个请求最多处理 5 张图片。</small>
+              </label>
+            </div>
+          </fieldset>
+          <fieldset class="model-role-group">
+            <legend>智能标注角色</legend>
+            <div class="model-role-fields">
+              <label>
+                <span>智能标注主模型</span>
+                <select v-model="settings.models.primary" name="auto_tag_primary_model" required>
+                  <option
+                    v-if="settings.models.primary && !containsChoice(settings.primaryChoices.value, settings.models.primary)"
+                    :value="settings.models.primary"
+                  >{{ settings.models.primary }}</option>
+                  <option v-for="choice in settings.primaryChoices.value" :key="choice.id" :value="choice.id">
+                    {{ choice.displayName }}
+                  </option>
+                </select>
+                <small>常规标签识别，默认使用低成本模型。</small>
+              </label>
+              <label>
+                <span>疑难升级模型</span>
+                <select v-model="settings.models.escalation" name="auto_tag_escalation_model" required>
+                  <option
+                    v-if="settings.models.escalation && !containsChoice(settings.escalationChoices.value, settings.models.escalation)"
+                    :value="settings.models.escalation"
+                  >{{ settings.models.escalation }}</option>
+                  <option v-for="choice in settings.escalationChoices.value" :key="choice.id" :value="choice.id">
+                    {{ choice.displayName }}
+                  </option>
+                </select>
+                <small>只在置信度不足或身份冲突时使用。</small>
+              </label>
+              <label>
+                <span>智能标注并发</span>
+                <select
+                  v-model.number="settings.models.autoTagConcurrency"
+                  name="auto_tag_concurrency"
+                  required
+                >
+                  <option
+                    v-for="value in settings.modelConcurrencyOptions"
+                    :key="`auto-tag-${value}`"
+                    :value="value"
+                  >{{ value }} 路</option>
+                </select>
+                <small>所有图库统一使用，主模型与疑难升级模型共享，不按单个任务覆盖。</small>
+              </label>
+            </div>
+          </fieldset>
           <button class="button primary" type="submit" :disabled="settings.savingModels.value">
             {{ settings.savingModels.value ? "保存中…" : "保存模型配置" }}
           </button>
@@ -608,6 +650,10 @@ label small { color: #8a91a2; font-weight: 500; }
 .save-status { min-height: 18px; margin: 10px 2px 0; color: #68718a; font-size: 12px; }
 .settings-grid { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 14px; }
 .model-form { display: grid; gap: 11px; margin-top: 14px; }
+.model-role-group { display: grid; min-width: 0; gap: 8px; margin: 0; padding: 0; border: 0; }
+.model-role-group + .model-role-group { padding-top: 12px; border-top: 1px solid var(--border); }
+.model-role-group legend { padding: 0; color: var(--text); font-size: 13px; font-weight: 700; }
+.model-role-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
 .model-form .button { justify-self: start; }
 .credential-form { display: grid; grid-template-columns: minmax(220px,1fr) auto; gap: 10px; align-items: end; margin-top: 14px; }
 .credential-note { margin-top: 14px; padding: 11px; border-radius: 10px; background: #f7f8fc; color: #6f788e; font-size: 12px; }
@@ -658,6 +704,7 @@ label small { color: #8a91a2; font-weight: 500; }
   .settings-nav { display:flex; padding:0 0 8px; overflow:auto; border-right:0; border-bottom:1px solid #e5e5e5; }
   .settings-nav button { flex:0 0 auto; justify-content:center; white-space:nowrap; }
   .page-heading, .library-editor footer, .credential-note, .application-action { align-items: stretch; flex-direction: column; }
+  .model-role-fields { grid-template-columns: 1fr; }
   .results-form, .credential-form, .library-options, .library-options.single-option { grid-template-columns: 1fr; }
   .section-actions { align-items: flex-end; flex-direction: column; }
 }

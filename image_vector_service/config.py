@@ -8,6 +8,8 @@ from pathlib import Path
 from .model_catalog import (
     AUTO_TAG_ESCALATION_ROLE,
     AUTO_TAG_PRIMARY_ROLE,
+    DEFAULT_AUTO_TAG_CONCURRENCY,
+    DEFAULT_EMBEDDING_CONCURRENCY,
     EMBEDDING_ROLE,
     ModelConfiguration,
     ModelConfigurationError,
@@ -93,8 +95,8 @@ class ServiceConfig:
     max_source_image_bytes: int = 256 * 1024 * 1024
     max_request_bytes: int = 50 * 1024 * 1024
     scan_concurrency: int = 4
-    embedding_concurrency: int = 2
-    auto_tag_concurrency: int = 4
+    embedding_concurrency: int = DEFAULT_EMBEDDING_CONCURRENCY
+    auto_tag_concurrency: int = DEFAULT_AUTO_TAG_CONCURRENCY
     max_inflight_request_bytes: int = 96 * 1024 * 1024
     rate_limit_requests_per_minute: int = 48
     rate_limit_tokens_per_minute: int = 80_000

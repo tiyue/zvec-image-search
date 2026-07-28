@@ -20,6 +20,8 @@ interface SettingsEvents {
   autoLoad?: boolean;
 }
 
+const MODEL_CONCURRENCY_OPTIONS = [1, 2, 4, 6] as const;
+
 function text(...values: unknown[]): string {
   for (const value of values) {
     if (typeof value === "string" && value.trim()) return value.trim();
@@ -58,6 +60,13 @@ function modelChoice(raw: ModelChoiceWire, index = 0): ModelChoice {
   };
 }
 
+function modelConcurrency(value: unknown, fallback: number): number {
+  return typeof value === "number"
+    && MODEL_CONCURRENCY_OPTIONS.includes(value as (typeof MODEL_CONCURRENCY_OPTIONS)[number])
+    ? value
+    : fallback;
+}
+
 function modelsFrom(payload: SettingsResponse | ModelSettingsWire): ModelSettingsWire {
   const response = payload as SettingsResponse;
   return response.models ?? response.model_settings ?? (payload as ModelSettingsWire);
@@ -91,6 +100,8 @@ export function useSettings(api: SettingsApi = settingsApi, events: SettingsEven
     embedding: "",
     primary: "",
     escalation: "",
+    embeddingConcurrency: 2,
+    autoTagConcurrency: 4,
   });
   const credentialsConfigured = ref(false);
   const credentialsPersistent = ref(false);
@@ -122,6 +133,14 @@ export function useSettings(api: SettingsApi = settingsApi, events: SettingsEven
     models.embedding = text(source.embedding_model, source.embedding, models.embedding, "qwen3-vl-embedding");
     models.primary = text(source.auto_tag_primary_model, source.tagging_model, source.auto_tag_primary, models.primary, "qwen3-vl-flash");
     models.escalation = text(source.auto_tag_escalation_model, source.escalation_model, source.auto_tag_escalation, models.escalation, "qwen3-vl-plus");
+    models.embeddingConcurrency = modelConcurrency(
+      source.embedding_concurrency,
+      models.embeddingConcurrency,
+    );
+    models.autoTagConcurrency = modelConcurrency(
+      source.auto_tag_concurrency,
+      models.autoTagConcurrency,
+    );
     if (Array.isArray(source.catalog)) {
       modelCatalog.value = source.catalog
         .filter((item): item is ModelChoiceWire => Boolean(item) && typeof item === "object")
@@ -363,6 +382,17 @@ export function useSettings(api: SettingsApi = settingsApi, events: SettingsEven
       notify("模型配置不完整", "请为三个模型角色分别选择一个模型。", "error");
       return false;
     }
+    if (
+      !MODEL_CONCURRENCY_OPTIONS.includes(
+        models.embeddingConcurrency as (typeof MODEL_CONCURRENCY_OPTIONS)[number],
+      )
+      || !MODEL_CONCURRENCY_OPTIONS.includes(
+        models.autoTagConcurrency as (typeof MODEL_CONCURRENCY_OPTIONS)[number],
+      )
+    ) {
+      notify("模型并发无效", "向量并发和智能标注并发必须选择 1、2、4 或 6。", "error");
+      return false;
+    }
     if (savingModels.value) return false;
     savingModels.value = true;
     try {
@@ -370,10 +400,22 @@ export function useSettings(api: SettingsApi = settingsApi, events: SettingsEven
         embedding_model: models.embedding,
         auto_tag_primary_model: models.primary,
         auto_tag_escalation_model: models.escalation,
+        embedding_concurrency: models.embeddingConcurrency,
+        auto_tag_concurrency: models.autoTagConcurrency,
       });
       applyModels(payload);
       lastError.value = "";
-      notify("模型配置已保存", "只影响后续新任务，不会重算已有向量。", "success");
+      const restart = payload.restart ?? {};
+      const requiresRestart = payload.restart_required === true || restart.required === true;
+      notify(
+        "模型配置已保存",
+        requiresRestart
+          ? restart.active_jobs === true
+            ? "活动任务全部完成并重启 YaoLens 后生效，不会重算已有向量。"
+            : "重启 YaoLens 后生效，不会重算已有向量。"
+          : "将用于后续新任务，不会重算已有向量。",
+        "success",
+      );
       return true;
     } catch (error) {
       lastError.value = errorMessage(error);
@@ -445,6 +487,7 @@ export function useSettings(api: SettingsApi = settingsApi, events: SettingsEven
     configPath,
     modelCatalog,
     models,
+    modelConcurrencyOptions: MODEL_CONCURRENCY_OPTIONS,
     embeddingChoices,
     primaryChoices,
     escalationChoices,

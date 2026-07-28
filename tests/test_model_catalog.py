@@ -12,8 +12,11 @@ from unittest.mock import patch
 from image_vector_service import model_catalog
 from image_vector_service.model_catalog import (
     AUTO_TAG_PRIMARY_ROLE,
+    DEFAULT_AUTO_TAG_CONCURRENCY,
+    DEFAULT_EMBEDDING_CONCURRENCY,
     EMBEDDING_PROTOCOL,
     EMBEDDING_ROLE,
+    MODEL_CONCURRENCY_OPTIONS,
     MODEL_PROVIDER,
     ConfigurationError,
     default_model_configuration,
@@ -58,6 +61,48 @@ class ModelCatalogTests(unittest.TestCase):
         self.assertEqual(embedding["id"], "qwen3-vl-embedding")
         self.assertEqual(embedding["protocol"], EMBEDDING_PROTOCOL)
         self.assertEqual(embedding["dimension"], 1024)
+        self.assertEqual(
+            python_payload["embedding_concurrency"],
+            DEFAULT_EMBEDDING_CONCURRENCY,
+        )
+        self.assertEqual(
+            python_payload["auto_tag_concurrency"],
+            DEFAULT_AUTO_TAG_CONCURRENCY,
+        )
+
+    def test_model_concurrency_is_backward_compatible_and_strict(self) -> None:
+        legacy_payload = self._payload()
+        legacy_payload.pop("embedding_concurrency")
+        legacy_payload.pop("auto_tag_concurrency")
+        legacy = parse_model_configuration(legacy_payload)
+        self.assertEqual(
+            legacy.embedding_concurrency,
+            DEFAULT_EMBEDDING_CONCURRENCY,
+        )
+        self.assertEqual(
+            legacy.auto_tag_concurrency,
+            DEFAULT_AUTO_TAG_CONCURRENCY,
+        )
+
+        for option in MODEL_CONCURRENCY_OPTIONS:
+            with self.subTest(option=option):
+                payload = self._payload()
+                payload["embedding_concurrency"] = option
+                payload["auto_tag_concurrency"] = option
+                parsed = parse_model_configuration(payload)
+                self.assertEqual(parsed.embedding_concurrency, option)
+                self.assertEqual(parsed.auto_tag_concurrency, option)
+
+        for field in ("embedding_concurrency", "auto_tag_concurrency"):
+            for invalid in (None, False, 0, 3, 5, 7, "4"):
+                with self.subTest(field=field, invalid=invalid):
+                    payload = self._payload()
+                    payload[field] = invalid
+                    with self.assertRaisesRegex(
+                        ConfigurationError,
+                        rf"{field} must be one of",
+                    ):
+                        parse_model_configuration(payload)
 
     def test_unknown_fields_are_rejected_at_every_schema_level(self) -> None:
         root_payload = self._payload()

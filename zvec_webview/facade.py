@@ -37,6 +37,11 @@ from image_vector_service.migration_recovery import (
     MigrationRecoveryRecord,
     MigrationRecoveryStore,
 )
+from image_vector_service.model_catalog import (
+    DEFAULT_AUTO_TAG_CONCURRENCY,
+    DEFAULT_EMBEDDING_CONCURRENCY,
+    MODEL_CONCURRENCY_OPTIONS,
+)
 from image_vector_service.process_lock import ProcessLock
 from image_vector_service.search_features import (
     FEATURE_SCHEMA_VERSION,
@@ -1854,22 +1859,35 @@ class PreviewFacade:
                 auto_tag_escalation_model=_required_string(
                     payload, "auto_tag_escalation_model"
                 ),
+                embedding_concurrency=_optional_model_concurrency(
+                    payload, "embedding_concurrency"
+                ),
+                auto_tag_concurrency=_optional_model_concurrency(
+                    payload, "auto_tag_concurrency"
+                ),
             )
         except Exception as exc:
             raise _facade_error(exc, code="model_settings_failed") from exc
+        restart_required, restart = self._configuration_restart_state()
         self._activity_log(
             level="info",
             category="model_configuration",
             event="model_roles_updated",
-            message="模型职责配置已更新。",
+            message="模型职责与并发配置已更新。",
             details={
                 "provider": snapshot.provider,
                 "embedding_model": snapshot.embedding_model,
                 "auto_tag_primary_model": snapshot.auto_tag_primary_model,
                 "auto_tag_escalation_model": snapshot.auto_tag_escalation_model,
+                "embedding_concurrency": snapshot.embedding_concurrency,
+                "auto_tag_concurrency": snapshot.auto_tag_concurrency,
+                "restart_required": restart_required,
             },
         )
-        return _models_view(snapshot)
+        response = _models_view(snapshot)
+        response["restart_required"] = restart_required
+        response["restart"] = restart
+        return response
 
     def replace_model_json(self, payload: Mapping[str, Any]) -> JsonObject:
         try:
@@ -1878,6 +1896,7 @@ class PreviewFacade:
             )
         except Exception as exc:
             raise _facade_error(exc, code="model_settings_failed") from exc
+        restart_required, restart = self._configuration_restart_state()
         model_ids = {
             choice.model_id
             for choices in (
@@ -1898,9 +1917,15 @@ class PreviewFacade:
                 "embedding_model": snapshot.embedding_model,
                 "auto_tag_primary_model": snapshot.auto_tag_primary_model,
                 "auto_tag_escalation_model": snapshot.auto_tag_escalation_model,
+                "embedding_concurrency": snapshot.embedding_concurrency,
+                "auto_tag_concurrency": snapshot.auto_tag_concurrency,
+                "restart_required": restart_required,
             },
         )
-        return _models_view(snapshot)
+        response = _models_view(snapshot)
+        response["restart_required"] = restart_required
+        response["restart"] = restart
+        return response
 
     def save_credentials(self, payload: Mapping[str, Any]) -> JsonObject:
         secret = _required_string(payload, "api_key", maximum=4096)
@@ -4373,6 +4398,8 @@ def _models_view(snapshot: ModelSettingsSnapshot | None) -> JsonObject:
             "embedding_model": "",
             "auto_tag_primary_model": "",
             "auto_tag_escalation_model": "",
+            "embedding_concurrency": DEFAULT_EMBEDDING_CONCURRENCY,
+            "auto_tag_concurrency": DEFAULT_AUTO_TAG_CONCURRENCY,
             "catalog": [],
             "error": {"message": "模型配置不可用。"},
         }
@@ -4396,6 +4423,8 @@ def _models_view(snapshot: ModelSettingsSnapshot | None) -> JsonObject:
         "embedding_model": snapshot.embedding_model,
         "auto_tag_primary_model": snapshot.auto_tag_primary_model,
         "auto_tag_escalation_model": snapshot.auto_tag_escalation_model,
+        "embedding_concurrency": snapshot.embedding_concurrency,
+        "auto_tag_concurrency": snapshot.auto_tag_concurrency,
         "catalog": list(by_id.values()),
     }
 
@@ -5029,6 +5058,26 @@ def _string_tuple(value: Any, name: str) -> tuple[str, ...]:
             result.append(normalized)
             seen.add(folded)
     return tuple(result)
+
+
+def _optional_model_concurrency(
+    payload: Mapping[str, Any],
+    name: str,
+) -> int | None:
+    if name not in payload:
+        return None
+    value = payload.get(name)
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value not in MODEL_CONCURRENCY_OPTIONS
+    ):
+        raise FacadeError(
+            "invalid_request",
+            f"{name} 必须是 1、2、4 或 6。",
+            details={"supported": list(MODEL_CONCURRENCY_OPTIONS)},
+        )
+    return value
 
 
 def _bounded_int(value: Any, name: str, minimum: int, maximum: int) -> int:

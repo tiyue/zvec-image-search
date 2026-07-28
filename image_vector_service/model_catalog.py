@@ -24,12 +24,24 @@ CONVERSATION_PROTOCOL: Final = "dashscope_multimodal_conversation"
 MODEL_PROTOCOLS: Final = frozenset({EMBEDDING_PROTOCOL, CONVERSATION_PROTOCOL})
 DEFAULT_MODEL_CATALOG_FILE: Final = "model-catalog.default.json"
 USER_MODEL_CONFIG_FILE: Final = "models.json"
+MODEL_CONCURRENCY_OPTIONS: Final = (1, 2, 4, 6)
+DEFAULT_EMBEDDING_CONCURRENCY: Final = 2
+DEFAULT_AUTO_TAG_CONCURRENCY: Final = 4
 
 _MAX_CONFIG_BYTES = 1024 * 1024
 _MAX_MODELS = 100
 _MODEL_ID = re.compile(r"^[a-z0-9][a-z0-9._:-]{0,127}$")
 _EFFECTIVE_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-_ROOT_FIELDS = frozenset({"schema_version", "provider", "models", "roles"})
+_ROOT_FIELDS = frozenset(
+    {
+        "schema_version",
+        "provider",
+        "models",
+        "roles",
+        "embedding_concurrency",
+        "auto_tag_concurrency",
+    }
+)
 _MODEL_FIELDS = frozenset(
     {"id", "display_name", "roles", "protocol", "dimension", "enabled", "pricing"}
 )
@@ -99,6 +111,8 @@ class ModelConfiguration:
     provider: str
     models: tuple[ModelDefinition, ...]
     role_models: tuple[tuple[str, str], ...]
+    embedding_concurrency: int = DEFAULT_EMBEDDING_CONCURRENCY
+    auto_tag_concurrency: int = DEFAULT_AUTO_TAG_CONCURRENCY
 
     @property
     def by_id(self) -> dict[str, ModelDefinition]:
@@ -156,6 +170,8 @@ class ModelConfiguration:
             "provider": self.provider,
             "models": [model.to_dict() for model in self.models],
             "roles": self.roles,
+            "embedding_concurrency": self.embedding_concurrency,
+            "auto_tag_concurrency": self.auto_tag_concurrency,
         }
 
 
@@ -322,7 +338,21 @@ def parse_model_configuration(payload: Any) -> ModelConfiguration:
                 f"Selected visual model {model_id!r} requires pricing metadata."
             )
         role_models.append((role, model_id))
-    return ModelConfiguration(MODEL_PROVIDER, models, tuple(role_models))
+    embedding_concurrency = _model_concurrency(
+        payload.get("embedding_concurrency", DEFAULT_EMBEDDING_CONCURRENCY),
+        "embedding_concurrency",
+    )
+    auto_tag_concurrency = _model_concurrency(
+        payload.get("auto_tag_concurrency", DEFAULT_AUTO_TAG_CONCURRENCY),
+        "auto_tag_concurrency",
+    )
+    return ModelConfiguration(
+        MODEL_PROVIDER,
+        models,
+        tuple(role_models),
+        embedding_concurrency,
+        auto_tag_concurrency,
+    )
 
 
 def _parse_model(payload: Any, index: int) -> ModelDefinition:
@@ -455,6 +485,17 @@ def _non_negative_number(value: Any, label: str) -> float:
     return normalized
 
 
+def _model_concurrency(value: Any, label: str) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value not in MODEL_CONCURRENCY_OPTIONS
+    ):
+        choices = ", ".join(str(option) for option in MODEL_CONCURRENCY_OPTIONS)
+        raise ConfigurationError(f"{label} must be one of: {choices}.")
+    return value
+
+
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
@@ -532,4 +573,6 @@ def _default_payload() -> dict[str, Any]:
             AUTO_TAG_PRIMARY_ROLE: "qwen3-vl-flash",
             AUTO_TAG_ESCALATION_ROLE: "qwen3-vl-plus",
         },
+        "embedding_concurrency": DEFAULT_EMBEDDING_CONCURRENCY,
+        "auto_tag_concurrency": DEFAULT_AUTO_TAG_CONCURRENCY,
     }

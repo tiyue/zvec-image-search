@@ -54,7 +54,16 @@ export interface ModelSettingsWire {
   auto_tag_escalation_model?: unknown;
   escalation_model?: unknown;
   auto_tag_escalation?: unknown;
+  embedding_concurrency?: unknown;
+  auto_tag_concurrency?: unknown;
   catalog?: unknown;
+  restart_required?: unknown;
+  restart?: {
+    required?: unknown;
+    active_jobs?: unknown;
+    can_restart_now?: unknown;
+    reason?: unknown;
+  };
 }
 
 export interface SettingsResponse {
@@ -113,6 +122,8 @@ export interface SettingsApi {
     embedding_model: string;
     auto_tag_primary_model: string;
     auto_tag_escalation_model: string;
+    embedding_concurrency: number;
+    auto_tag_concurrency: number;
   }, signal?: AbortSignal): Promise<ModelSettingsWire>;
   saveCredentials(apiKey: string, signal?: AbortSignal): Promise<CredentialsResponse>;
   deleteCredentials(signal?: AbortSignal): Promise<CredentialsResponse>;

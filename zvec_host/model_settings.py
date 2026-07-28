@@ -45,6 +45,8 @@ class ModelSettingsSnapshot:
     embedding_model: str
     auto_tag_primary_model: str
     auto_tag_escalation_model: str
+    embedding_concurrency: int
+    auto_tag_concurrency: int
     embedding_choices: tuple[ModelChoice, ...]
     auto_tag_primary_choices: tuple[ModelChoice, ...]
     auto_tag_escalation_choices: tuple[ModelChoice, ...]
@@ -82,6 +84,8 @@ class ModelSettingsService:
         embedding_model: str,
         auto_tag_primary_model: str,
         auto_tag_escalation_model: str,
+        embedding_concurrency: int | None = None,
+        auto_tag_concurrency: int | None = None,
     ) -> ModelSettingsSnapshot:
         """Assign existing enabled models to all three supported roles."""
 
@@ -96,6 +100,10 @@ class ModelSettingsService:
                 auto_tag_escalation_model, AUTO_TAG_ESCALATION_ROLE
             ),
         }
+        if embedding_concurrency is not None:
+            payload["embedding_concurrency"] = embedding_concurrency
+        if auto_tag_concurrency is not None:
+            payload["auto_tag_concurrency"] = auto_tag_concurrency
         return self._validate_save_snapshot(payload)
 
     def replace_json(self, json_text: str) -> ModelSettingsSnapshot:
@@ -144,6 +152,8 @@ def _snapshot(path: Path, configuration: ModelConfiguration) -> ModelSettingsSna
         embedding_model=configuration.embedding_model,
         auto_tag_primary_model=configuration.auto_tag_primary_model,
         auto_tag_escalation_model=configuration.auto_tag_escalation_model,
+        embedding_concurrency=configuration.embedding_concurrency,
+        auto_tag_concurrency=configuration.auto_tag_concurrency,
         embedding_choices=embedding,
         auto_tag_primary_choices=primary,
         auto_tag_escalation_choices=escalation,

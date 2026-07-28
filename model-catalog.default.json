@@ -47,5 +47,7 @@
     "embedding": "qwen3-vl-embedding",
     "auto_tag_primary": "qwen3-vl-flash",
     "auto_tag_escalation": "qwen3-vl-plus"
-  }
+  },
+  "embedding_concurrency": 2,
+  "auto_tag_concurrency": 4
 }

@@ -25,6 +25,8 @@ function settingsPayload(overrides: Partial<SettingsResponse> = {}): SettingsRes
       embedding_model: "qwen3-vl-embedding",
       auto_tag_primary_model: "qwen3-vl-flash",
       auto_tag_escalation_model: "qwen3-vl-plus",
+      embedding_concurrency: 2,
+      auto_tag_concurrency: 4,
       catalog: [
         { id: "qwen3-vl-embedding", display_name: "Qwen3 VL Embedding", roles: ["embedding"] },
         { id: "qwen3-vl-flash", display_name: "Qwen3 VL Flash", roles: ["auto_tag_primary"] },
@@ -66,7 +68,13 @@ function fakeApi(): SettingsApi {
       restart_required: true,
       restart: { required: true, active_jobs: false },
     })),
-    updateModels: vi.fn(async (body) => ({ ...body, provider: "aliyun", catalog: [] })),
+    updateModels: vi.fn(async (body) => ({
+      ...body,
+      provider: "aliyun",
+      catalog: [],
+      restart_required: true,
+      restart: { required: true, active_jobs: false },
+    })),
     saveCredentials: vi.fn(async () => ({ configured: true, persistent: true })),
     deleteCredentials: vi.fn(async () => ({ configured: false, persistent: true })),
   };
@@ -222,18 +230,58 @@ describe("SettingsPage", () => {
     });
   });
 
-  it("updates three model roles and clears credentials before or after every write", async () => {
+  it("shows model concurrency defaults, options, and role group membership", async () => {
+    const wrapper = mount(SettingsPage, {
+      props: { api: fakeApi(), lanApi: fakeLanApi() },
+    });
+    await flushPromises();
+
+    const embeddingConcurrency = wrapper.get(
+      'select[name="embedding_concurrency"]',
+    );
+    const autoTagConcurrency = wrapper.get(
+      'select[name="auto_tag_concurrency"]',
+    );
+    expect((embeddingConcurrency.element as HTMLSelectElement).value).toBe("2");
+    expect((autoTagConcurrency.element as HTMLSelectElement).value).toBe("4");
+    for (const select of [embeddingConcurrency, autoTagConcurrency]) {
+      expect(
+        select.findAll("option").map((option) => option.attributes("value")),
+      ).toEqual(["1", "2", "4", "6"]);
+    }
+
+    const groups = wrapper.findAll("fieldset.model-role-group");
+    expect(groups).toHaveLength(2);
+    expect(groups[0].get("legend").text()).toBe("向量角色");
+    expect(groups[0].find('select[name="embedding_model"]').exists()).toBe(true);
+    expect(groups[0].find('select[name="embedding_concurrency"]').exists()).toBe(true);
+    expect(groups[1].get("legend").text()).toBe("智能标注角色");
+    expect(groups[1].find('select[name="auto_tag_primary_model"]').exists()).toBe(true);
+    expect(groups[1].find('select[name="auto_tag_escalation_model"]').exists()).toBe(true);
+    expect(groups[1].find('select[name="auto_tag_concurrency"]').exists()).toBe(true);
+  });
+
+  it("updates three model roles, both concurrency limits, and credentials", async () => {
     const api = fakeApi();
     const wrapper = mount(SettingsPage, { props: { api, lanApi: fakeLanApi() } });
     await flushPromises();
 
+    await wrapper.get('select[name="embedding_concurrency"]').setValue("4");
+    await wrapper.get('select[name="auto_tag_concurrency"]').setValue("6");
     await wrapper.get(".model-form").trigger("submit");
     await flushPromises();
     expect(api.updateModels).toHaveBeenCalledWith({
       embedding_model: "qwen3-vl-embedding",
       auto_tag_primary_model: "qwen3-vl-flash",
       auto_tag_escalation_model: "qwen3-vl-plus",
+      embedding_concurrency: 4,
+      auto_tag_concurrency: 6,
     });
+    expect(wrapper.emitted("toast")?.at(-1)).toEqual([
+      "模型配置已保存",
+      "重启 YaoLens 后生效，不会重算已有向量。",
+      "success",
+    ]);
 
     const keyInput = wrapper.get('input[name="api_key"]');
     await keyInput.setValue("sk-test-secret");
@@ -247,6 +295,28 @@ describe("SettingsPage", () => {
     await flushPromises();
     expect(api.deleteCredentials).toHaveBeenCalledOnce();
     expect(wrapper.text()).toContain("未配置");
+  });
+
+  it("rejects an unsupported model concurrency before sending the request", async () => {
+    const api = fakeApi();
+    const wrapper = mount(SettingsPage, { props: { api, lanApi: fakeLanApi() } });
+    await flushPromises();
+
+    const select = wrapper.get('select[name="embedding_concurrency"]');
+    const invalid = document.createElement("option");
+    invalid.value = "3";
+    invalid.textContent = "3 路";
+    (select.element as HTMLSelectElement).append(invalid);
+    await select.setValue("3");
+    await wrapper.get(".model-form").trigger("submit");
+    await flushPromises();
+
+    expect(api.updateModels).not.toHaveBeenCalled();
+    expect(wrapper.emitted("toast")?.at(-1)).toEqual([
+      "模型并发无效",
+      "向量并发和智能标注并发必须选择 1、2、4 或 6。",
+      "error",
+    ]);
   });
 
   it("includes search-learning settings and forwards its action toasts", async () => {
