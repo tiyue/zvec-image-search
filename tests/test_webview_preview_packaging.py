@@ -116,6 +116,7 @@ class WebviewPreviewSourceContractTest(unittest.TestCase):
             "clr_loader==0.3.1",
             "bottle==0.13.4",
             "proxy_tools==0.1.0",
+            "watchdog==6.0.0",
         ):
             self.assertIn(requirement, requirements)
 
@@ -460,6 +461,7 @@ class WebviewPreviewSourceContractTest(unittest.TestCase):
             "image_vector_service.active_learning",
             "image_vector_service.active_learning_review_store",
             "image_vector_service.cluster_operation_store",
+            "image_vector_service.file_watcher",
             "image_vector_service.image_clustering",
             "image_vector_service.large_cluster_adapter",
             "image_vector_service.large_image_clustering",
@@ -486,6 +488,7 @@ class WebviewPreviewSourceContractTest(unittest.TestCase):
                 "image_vector_service.data_migration",
                 "image_vector_service.migration_recovery",
                 "image_vector_service.folder_deletion",
+                "image_vector_service.file_watcher",
                 "image_vector_service.image_clustering",
                 "image_vector_service.large_cluster_adapter",
                 "image_vector_service.large_image_clustering",
@@ -515,6 +518,7 @@ class WebviewPreviewSourceContractTest(unittest.TestCase):
                 "zvec_webview.native_bridge",
                 "zvec_webview.runtime",
                 "zvec_webview.server",
+                "watchdog.observers",
             ]
 
             def completed(command: list[str], **_kwargs: object) -> object:
@@ -572,6 +576,7 @@ class WebviewPreviewSourceContractTest(unittest.TestCase):
         self.assertIn("image_vector_service.data_migration", result["modules"])
         self.assertIn("image_vector_service.migration_recovery", result["modules"])
         self.assertIn("image_vector_service.library_browser", result["modules"])
+        self.assertIn("image_vector_service.file_watcher", result["modules"])
         self.assertIn("image_vector_service.image_clustering", result["modules"])
         self.assertIn(
             "image_vector_service.large_cluster_adapter",
@@ -586,6 +591,7 @@ class WebviewPreviewSourceContractTest(unittest.TestCase):
             "image_vector_service.search_learning_evaluator",
             result["modules"],
         )
+        self.assertIn("watchdog.observers", result["modules"])
         self.assertEqual(result["persistence"]["cluster_store_schema"], 1)
         self.assertEqual(result["persistence"]["cluster_store_api_requests"], 0)
         self.assertEqual(result["persistence"]["active_learning_recovered"], 0)

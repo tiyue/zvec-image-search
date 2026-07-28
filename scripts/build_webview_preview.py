@@ -212,6 +212,7 @@ def _run_frozen_self_test(plan: BuildPlan) -> dict[str, object]:
             "image_vector_service.data_migration",
             "image_vector_service.migration_recovery",
             "image_vector_service.folder_deletion",
+            "image_vector_service.file_watcher",
             "image_vector_service.image_clustering",
             "image_vector_service.large_cluster_adapter",
             "image_vector_service.large_image_clustering",
@@ -241,6 +242,7 @@ def _run_frozen_self_test(plan: BuildPlan) -> dict[str, object]:
             "zvec_webview.native_bridge",
             "zvec_webview.runtime",
             "zvec_webview.server",
+            "watchdog.observers",
         }
         if not isinstance(modules, list) or not required_modules.issubset(modules):
             raise WebviewPreviewPackagingError(

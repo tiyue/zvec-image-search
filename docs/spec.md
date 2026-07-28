@@ -238,6 +238,7 @@ Kotlin + Gradle 构建的安卓应用，通过 LAN API 与 Windows WebView 宿�
 - **禁止产物**：不发布 Zvec-Desktop 安装包、便携包或 Python wheel
 - **内部组件**：`zvec.exe`、`zvec-backend.exe` 仅随 WebView 包交付
 - **质量门禁**：搜索质量验证；显式使用 `allow_uncertified_search_quality=true` 时记录为未提供正式认证
+- **冻结依赖门禁**：Windows 构建环境固定安装并校验 `watchdog==6.0.0`；冻结包自检必须成功导入 `image_vector_service.file_watcher` 与 `watchdog.observers`，防止自动索引监听依赖遗漏后进入发布包
 
 ## API 协议
 

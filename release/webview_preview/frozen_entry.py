@@ -46,6 +46,7 @@ def _run_packaging_self_test(output_path: Path) -> int:
 
     try:
         import clr
+        import watchdog.observers as watchdog_observers
         import webview
         import webview.platforms.edgechromium as edgechromium
         import webview.platforms.winforms as winforms
@@ -57,6 +58,7 @@ def _run_packaging_self_test(output_path: Path) -> int:
         import image_vector_service.activity_store as activity_store
         import image_vector_service.cluster_operation_store as cluster_store
         import image_vector_service.data_migration as data_migration
+        import image_vector_service.file_watcher as file_watcher
         import image_vector_service.folder_deletion as folder_deletion
         import image_vector_service.image_clustering as image_clustering
         import image_vector_service.large_cluster_adapter as large_cluster_adapter
@@ -156,6 +158,7 @@ def _run_packaging_self_test(output_path: Path) -> int:
                     data_migration.__name__,
                     migration_recovery.__name__,
                     folder_deletion.__name__,
+                    file_watcher.__name__,
                     image_clustering.__name__,
                     large_cluster_adapter.__name__,
                     large_image_clustering.__name__,
@@ -182,6 +185,7 @@ def _run_packaging_self_test(output_path: Path) -> int:
                     preview_facade.__name__,
                     preview_runtime.__name__,
                     preview_server.__name__,
+                    watchdog_observers.__name__,
                     webview.__name__,
                     winforms.__name__,
                     zvec.__name__,

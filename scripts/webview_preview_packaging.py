@@ -46,6 +46,7 @@ LOCKED_DISTRIBUTIONS: Final = {
     "pythonnet": "3.1.0",
     "pywebview": "6.2.1",
     "typing_extensions": "4.16.0",
+    "watchdog": "6.0.0",
 }
 EXCLUDED_PACKAGES: Final = frozenset(
     {
