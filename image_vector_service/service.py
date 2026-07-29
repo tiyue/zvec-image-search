@@ -2212,6 +2212,7 @@ class ImageVectorService:
         folder_path: str,
         root_id: str,
         *,
+        changes: Sequence[dict[str, Any]],
         recursive: bool = True,
         tags: Iterable[str] | None = None,
         inserted_commit_callback: (
@@ -2228,7 +2229,6 @@ class ImageVectorService:
         root = Path(folder_path).expanduser().resolve()
         normalized_root = normalize_path(root)
 
-        changes = self.state.drain_pending_changes(root_id)
         if not changes:
             self.progress("No pending changes; incremental index skipped.")
             return IndexReport(
@@ -2457,18 +2457,30 @@ class ImageVectorService:
             external_processing_confirmed=external_processing_confirmed,
             activity_callback=metrics.set_flash_active,
         )
+        changes = self.state.claim_pending_changes(root_id, limit=max_images)
+        change_ids = [int(change["id"]) for change in changes]
         try:
             index_report = self._index_incremental(
                 folder_path,
                 root_id,
+                changes=changes,
                 recursive=recursive,
                 tags=tags,
                 inserted_commit_callback=session.offer,
                 network_metrics=metrics,
             )
             auto_tag_report = session.finish()
+            self.state.acknowledge_claimed_changes(change_ids)
         except BaseException:
-            session.abort()
+            with suppress(Exception):
+                session.abort()
+            try:
+                self.state.recover_interrupted_changes(root_id)
+            except Exception:
+                self.logger.exception(
+                    "incremental_index_recovery_failed root_id=%s",
+                    root_id,
+                )
             raise
 
         index_payload = index_report.to_dict()

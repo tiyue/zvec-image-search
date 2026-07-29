@@ -219,6 +219,35 @@ class PipelineCancelled(RuntimeError):
     pass
 
 
+class _StreamingSessionStub:
+    selected_model = "qwen3-vl-flash"
+    max_pending = 1
+    peak_pending = 0
+    peak_pending_bytes = 0
+    candidate_count = 0
+
+    def __init__(self, *, finish_error: BaseException | None = None) -> None:
+        self.finish_error = finish_error
+        self.aborted = False
+
+    def offer(self, _content_hash: str, entries: list[dict[str, object]]) -> None:
+        self.candidate_count += len(entries)
+
+    def finish(self) -> dict[str, object]:
+        if self.finish_error is not None:
+            raise self.finish_error
+        return {
+            "failed": 0,
+            "needs_attention": False,
+            "failure_manifest": "",
+            "quarantined": 0,
+            "quarantine_copy_failures": 0,
+        }
+
+    def abort(self) -> None:
+        self.aborted = True
+
+
 class IndexAndAutoTagPipelineTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = Path(tempfile.mkdtemp(prefix="zvec_combined_pipeline_"))
@@ -569,6 +598,122 @@ class IndexAndAutoTagPipelineTest(unittest.TestCase):
         finally:
             BlockingVisionClient.release.set()
             canceller.join(timeout=2)
+            service.close()
+
+    def test_incremental_failure_requeues_and_finishes_run(self) -> None:
+        self._write(self.root / "existing.png", (10, 20, 30))
+        service = self._service(ImmediateEmbeddingClient())
+        session = _StreamingSessionStub()
+        try:
+            service.index_folder(str(self.root))
+            root_id = str(service.state.list_roots()[0]["root_id"])
+            self._write(self.root / "new.png", (40, 50, 60))
+            service.state.enqueue_change(root_id, "new.png", "created")
+
+            with (
+                patch.object(
+                    service.auto_tagging,
+                    "begin_stream",
+                    return_value=session,
+                ),
+                patch.object(
+                    service,
+                    "_run_embedding_pipeline",
+                    side_effect=RuntimeError("synthetic incremental failure"),
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "synthetic incremental failure",
+                ),
+            ):
+                service.index_and_auto_tag_incremental(
+                    str(self.root),
+                    root_id,
+                    external_processing_confirmed=True,
+                )
+
+            latest = service.state.connection.execute(
+                "SELECT status, finished_at FROM index_runs "
+                "ORDER BY started_at DESC, rowid DESC LIMIT 1"
+            ).fetchone()
+            self.assertEqual(service.state.count_pending_changes(root_id), 1)
+            self.assertIsNotNone(latest)
+            self.assertEqual(str(latest["status"]), "failed")
+            self.assertIsNotNone(latest["finished_at"])
+            self.assertTrue(session.aborted)
+        finally:
+            service.close()
+
+    def test_incremental_auto_tag_failure_requeues_claimed_changes(self) -> None:
+        self._write(self.root / "existing.png", (10, 20, 30))
+        service = self._service(ImmediateEmbeddingClient())
+        session = _StreamingSessionStub(
+            finish_error=RuntimeError("synthetic auto-tag failure")
+        )
+        try:
+            service.index_folder(str(self.root))
+            root_id = str(service.state.list_roots()[0]["root_id"])
+            self._write(self.root / "new.png", (40, 50, 60))
+            service.state.enqueue_change(root_id, "new.png", "created")
+
+            with (
+                patch.object(
+                    service.auto_tagging,
+                    "begin_stream",
+                    return_value=session,
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "synthetic auto-tag failure",
+                ),
+            ):
+                service.index_and_auto_tag_incremental(
+                    str(self.root),
+                    root_id,
+                    external_processing_confirmed=True,
+                )
+
+            self.assertEqual(service.state.count_pending_changes(root_id), 1)
+            self.assertTrue(session.aborted)
+        finally:
+            service.close()
+
+    def test_incremental_pipeline_claims_bounded_batches(self) -> None:
+        self._write(self.root / "existing.png", (10, 20, 30))
+        service = self._service(ImmediateEmbeddingClient())
+        sessions = [_StreamingSessionStub(), _StreamingSessionStub()]
+        try:
+            service.index_folder(str(self.root))
+            root_id = str(service.state.list_roots()[0]["root_id"])
+            self._write(self.root / "first.png", (40, 50, 60))
+            self._write(self.root / "second.png", (70, 80, 90))
+            service.state.enqueue_change(root_id, "first.png", "created")
+            service.state.enqueue_change(root_id, "second.png", "created")
+
+            with patch.object(
+                service.auto_tagging,
+                "begin_stream",
+                side_effect=sessions,
+            ):
+                first = service.index_and_auto_tag_incremental(
+                    str(self.root),
+                    root_id,
+                    max_images=1,
+                    external_processing_confirmed=True,
+                )
+                self.assertEqual(first["index"]["inserted"], 1)
+                self.assertEqual(service.state.count_pending_changes(root_id), 1)
+
+                second = service.index_and_auto_tag_incremental(
+                    str(self.root),
+                    root_id,
+                    max_images=1,
+                    external_processing_confirmed=True,
+                )
+
+            self.assertEqual(second["index"]["inserted"], 1)
+            self.assertEqual(service.state.count_pending_changes(root_id), 0)
+        finally:
             service.close()
 
 

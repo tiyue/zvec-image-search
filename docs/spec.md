@@ -235,11 +235,11 @@ CLI 入口将配置创建、迁移/后端服务、需要 `ImageVectorService` �
 基于 watchdog 文件系统监听实现自动增量索引，避免每次索引时全量扫描目录树：
 
 - **开关位置**：设置 → 图库与路径 → 每个图库编辑器“保存图库设置”按钮下方的 toggle 开关（`auto_index_enabled`）
-- **工作流程**：watchdog 后台监听已索引 root 目录 → 文件变化事件持久化到 `fs_change_queue` 表 → 5 秒防抖等待无新事件 → 自动提交增量索引+智能标注任务（`index_and_auto_tag_incremental`）
+- **工作流程**：watchdog 后台监听已索引 root 目录 → 文件变化事件持久化到 `fs_change_queue` 表 → 5 秒防抖等待无新事件 → 自动提交增量索引+智能标注任务（`index_and_auto_tag_incremental`）。每批最多领取本次智能标注上限对应的事件，成功后自动续跑下一批，直至积压清空
 - **授权语义**：用户为图库启用 `auto_index_enabled` 即持续授权该图库的自动增量索引与智能标注流水线；watcher 提交内部任务时必须携带外部处理确认。手动智能标注任务仍须逐次明确确认
 - **任务隔离**：watcher 提交的是不依赖用户任务 ID 的内部批处理调用，不进入手动任务的取消与进度查询链路，但仍随图库 worker 关闭而停止
-- **增量路径**：只处理变更队列中的文件（created/modified → inspect + embed + auto_tag；deleted → 删除记录），绕过全量 `scan_folder_to_staging`
-- **启动行为**：信任上次索引结果，不做启动时全量扫描；watcher 直接接管新变化，并对 `fs_change_queue` 中未处理的持久化积压重新执行防抖调度
+- **增量路径**：只处理变更队列中的文件（created/modified → inspect + embed + auto_tag；deleted → 删除记录），绕过全量 `scan_folder_to_staging`。事件先进入“已领取”状态，索引和智能标注流水线完整结束后才确认完成；异常、取消或确认失败必须恢复为待处理
+- **启动行为**：信任上次索引结果，不做启动时全量扫描；watcher 直接接管新变化，并恢复进程中断时遗留的“已领取”事件、把悬空索引批次收尾为失败，再对持久化积压重新执行防抖调度
 - **兜底机制**：watchdog buffer 溢出 → 标记需全量扫描；程序关闭期间变化 → 下次启动 watcher 接管，提供手动全量索引兜底
 - **配置项**：`watcher_debounce_seconds`（默认 5 秒）、`watcher_overflow_triggers_full_scan`（默认 True）
 - **持久化约束**：保存图库设置后，`auto_index_enabled` 必须在接口返回值和 `config.json` 重载结果中保持一致

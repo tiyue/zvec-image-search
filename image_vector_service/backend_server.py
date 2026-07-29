@@ -605,6 +605,14 @@ class _LibraryWorker:
             return
         root_id = str(root_info["root_id"])
         recursive = bool(root_info["recursive"])
+        recovery = service.state.recover_interrupted_changes(root_id)
+        if recovery["changes"] or recovery["index_runs"]:
+            service.logger.warning(
+                "auto_index_recovered root_id=%s changes=%d index_runs=%d",
+                root_id,
+                recovery["changes"],
+                recovery["index_runs"],
+            )
         self._watcher = FileChangeWatcher(
             debounce_seconds=service.config.watcher_debounce_seconds,
             on_changes_settled=self._on_changes_settled,
@@ -630,8 +638,45 @@ class _LibraryWorker:
                 external_processing_confirmed=True,
             )
 
-        with suppress(Exception):
-            self.submit(None, callback, priority=_JobPriority.BATCH)
+        try:
+            submission = self.submit(None, callback, priority=_JobPriority.BATCH)
+        except Exception:
+            service = self._service
+            if service is not None:
+                service.logger.exception(
+                    "auto_index_submit_failed root_id=%s",
+                    root_id,
+                )
+            return
+        submission.future.add_done_callback(
+            lambda future: self._auto_index_finished(root_id, future)
+        )
+
+    def _auto_index_finished(self, root_id: str, future: Future[Any]) -> None:
+        if future.cancelled():
+            return
+        service = self._service
+        error = future.exception()
+        if error is not None:
+            if service is not None:
+                service.logger.error(
+                    "auto_index_failed root_id=%s",
+                    root_id,
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+            return
+        if self._stop.is_set() or service is None:
+            return
+        try:
+            pending = service.state.count_pending_changes(root_id)
+        except Exception:
+            service.logger.exception(
+                "auto_index_pending_check_failed root_id=%s",
+                root_id,
+            )
+            return
+        if pending > 0:
+            self._on_changes_settled(root_id)
 
     def _main(self) -> None:
         service: Any = None

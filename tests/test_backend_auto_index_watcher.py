@@ -15,6 +15,7 @@ class _WatcherState:
     def __init__(self, *, registered: bool = False, pending_changes: int = 1) -> None:
         self.registered = registered
         self.pending_changes = pending_changes
+        self.recovery_calls: list[str] = []
 
     def root_for_path(self, _path: str) -> dict[str, Any] | None:
         if not self.registered:
@@ -26,6 +27,10 @@ class _WatcherState:
 
     def count_pending_changes(self, root_id: str) -> int:
         return self.pending_changes if root_id == "root-1" else 0
+
+    def recover_interrupted_changes(self, root_id: str) -> dict[str, int]:
+        self.recovery_calls.append(root_id)
+        return {"changes": 0, "index_runs": 0}
 
     def enqueue_change(
         self,
@@ -41,11 +46,20 @@ class _WatcherConfig:
 
 
 class _WatcherService:
-    def __init__(self, *, registered_root: bool = False) -> None:
-        self.state = _WatcherState(registered=registered_root)
+    def __init__(
+        self,
+        *,
+        registered_root: bool = False,
+        pending_changes: int = 1,
+    ) -> None:
+        self.state = _WatcherState(
+            registered=registered_root,
+            pending_changes=pending_changes,
+        )
         self.config = _WatcherConfig()
         self.invoked = threading.Event()
-        self.pending_changes = 1
+        self.completed = threading.Event()
+        self.invocation_count = 0
         self.external_processing_confirmed: bool | None = None
 
     def index_and_auto_tag_incremental(
@@ -56,12 +70,15 @@ class _WatcherService:
         external_processing_confirmed: bool = False,
     ) -> dict[str, Any]:
         self.external_processing_confirmed = external_processing_confirmed
+        self.invocation_count += 1
         self.invoked.set()
         if not external_processing_confirmed:
             raise RuntimeError(
                 "External image processing must be explicitly confirmed."
             )
-        self.pending_changes = 0
+        self.state.pending_changes = max(0, self.state.pending_changes - 1)
+        if self.state.pending_changes == 0:
+            self.completed.set()
         return {"folder_path": folder_path, "root_id": root_id}
 
     def close(self) -> None:
@@ -120,7 +137,7 @@ class BackendAutoIndexWatcherTest(unittest.TestCase):
 
             self.assertTrue(service.invoked.wait(timeout=2))
             self.assertTrue(service.external_processing_confirmed)
-            self.assertEqual(service.pending_changes, 0)
+            self.assertEqual(service.state.pending_changes, 0)
         finally:
             worker.close()
 
@@ -140,7 +157,7 @@ class BackendAutoIndexWatcherTest(unittest.TestCase):
             worker._on_changes_settled("root-1")
 
             self.assertTrue(service.invoked.wait(timeout=2))
-            self.assertEqual(service.pending_changes, 0)
+            self.assertEqual(service.state.pending_changes, 0)
         finally:
             worker.close()
 
@@ -156,9 +173,25 @@ class BackendAutoIndexWatcherTest(unittest.TestCase):
             try:
                 self.assertTrue(worker._ready.wait(timeout=2))
                 self.assertTrue(worker.ready, worker.startup_error)
+                self.assertEqual(service.state.recovery_calls, ["root-1"])
                 self.assertEqual(worker._watcher.pending_roots, ["root-1"])
             finally:
                 worker.close()
+
+    def test_successful_auto_batches_continue_until_backlog_is_empty(self) -> None:
+        service = _WatcherService(pending_changes=3)
+        worker = self._worker(service)
+
+        worker.start()
+        try:
+            self.assertTrue(worker._ready.wait(timeout=2))
+            worker._on_changes_settled("root-1")
+
+            self.assertTrue(service.completed.wait(timeout=2))
+            self.assertEqual(service.invocation_count, 3)
+            self.assertEqual(service.state.pending_changes, 0)
+        finally:
+            worker.close()
 
 
 if __name__ == "__main__":

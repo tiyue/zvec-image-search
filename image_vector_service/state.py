@@ -55,6 +55,9 @@ DOCUMENT_ANNOTATION_COLUMNS = (
 _SQLITE_PARAMETER_CHUNK = 900
 DEFAULT_STATE_READ_PAGE_SIZE = 256
 MAX_STATE_READ_PAGE_SIZE = 1_000
+_FS_CHANGE_PENDING = 0
+_FS_CHANGE_PROCESSED = 1
+_FS_CHANGE_CLAIMED = 2
 
 
 class IndexState:
@@ -2648,26 +2651,36 @@ class IndexState:
                 (root_id, relative_path, event_type),
             )
 
-    def drain_pending_changes(self, root_id: str) -> list[dict[str, Any]]:
-        """Return all pending changes for *root_id* and mark them processed."""
-        rows = self.connection.execute(
-            "SELECT id, root_id, relative_path, event_type, queued_at "
-            "FROM fs_change_queue WHERE root_id = ? AND processed = 0 "
-            "ORDER BY queued_at",
-            (root_id,),
-        ).fetchall()
-        if not rows:
-            return []
-        ids = [int(row["id"]) for row in rows]
+    def claim_pending_changes(
+        self,
+        root_id: str,
+        *,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Atomically claim pending changes without marking them complete."""
+
+        if limit is not None and limit < 1:
+            raise ValueError("limit must be positive.")
+        limit_clause = " LIMIT ?" if limit is not None else ""
+        parameters: list[object] = [
+            _FS_CHANGE_CLAIMED,
+            root_id,
+            _FS_CHANGE_PENDING,
+        ]
+        if limit is not None:
+            parameters.append(limit)
+        parameters.append(_FS_CHANGE_PENDING)
         with self.connection:
-            for offset in range(0, len(ids), _SQLITE_PARAMETER_CHUNK):
-                chunk = ids[offset : offset + _SQLITE_PARAMETER_CHUNK]
-                placeholders = ", ".join("?" for _ in chunk)
-                self.connection.execute(
-                    f"UPDATE fs_change_queue SET processed = 1 "
-                    f"WHERE id IN ({placeholders})",
-                    chunk,
-                )
+            rows = self.connection.execute(
+                "UPDATE fs_change_queue SET processed = ? WHERE id IN ("
+                "SELECT id FROM fs_change_queue "
+                "WHERE root_id = ? AND processed = ? "
+                f"ORDER BY queued_at, id{limit_clause}"
+                ") AND processed = ? "
+                "RETURNING id, root_id, relative_path, event_type, queued_at",
+                parameters,
+            ).fetchall()
+        rows = sorted(rows, key=lambda row: (str(row["queued_at"]), int(row["id"])))
         return [
             {
                 "id": int(row["id"]),
@@ -2678,6 +2691,73 @@ class IndexState:
             }
             for row in rows
         ]
+
+    def acknowledge_claimed_changes(self, change_ids: Iterable[int]) -> int:
+        """Mark successfully handled claims as processed."""
+
+        return self._update_claimed_changes(
+            change_ids,
+            target_state=_FS_CHANGE_PROCESSED,
+        )
+
+    def release_claimed_changes(self, change_ids: Iterable[int]) -> int:
+        """Return interrupted claims to the pending queue."""
+
+        return self._update_claimed_changes(
+            change_ids,
+            target_state=_FS_CHANGE_PENDING,
+        )
+
+    def _update_claimed_changes(
+        self,
+        change_ids: Iterable[int],
+        *,
+        target_state: int,
+    ) -> int:
+        ids = list(dict.fromkeys(int(change_id) for change_id in change_ids))
+        if not ids:
+            return 0
+        updated = 0
+        with self.connection:
+            for offset in range(0, len(ids), _SQLITE_PARAMETER_CHUNK):
+                chunk = ids[offset : offset + _SQLITE_PARAMETER_CHUNK]
+                placeholders = ", ".join("?" for _ in chunk)
+                cursor = self.connection.execute(
+                    f"UPDATE fs_change_queue SET processed = ? "
+                    f"WHERE processed = ? AND id IN ({placeholders})",
+                    (target_state, _FS_CHANGE_CLAIMED, *chunk),
+                )
+                updated += cursor.rowcount
+        return updated
+
+    def recover_interrupted_changes(self, root_id: str) -> dict[str, int]:
+        """Restore interrupted claims and close stale index runs at startup."""
+
+        with self.connection:
+            changes = self.connection.execute(
+                "UPDATE fs_change_queue SET processed = ? "
+                "WHERE root_id = ? AND processed = ?",
+                (_FS_CHANGE_PENDING, root_id, _FS_CHANGE_CLAIMED),
+            )
+            index_runs = self.connection.execute(
+                "UPDATE index_runs SET status = 'failed', "
+                "finished_at = CURRENT_TIMESTAMP, needs_attention = 1 "
+                "WHERE root_id = ? AND status = 'running'",
+                (root_id,),
+            )
+        return {
+            "changes": changes.rowcount,
+            "index_runs": index_runs.rowcount,
+        }
+
+    def drain_pending_changes(self, root_id: str) -> list[dict[str, Any]]:
+        """Compatibility helper that immediately acknowledges claimed changes."""
+
+        changes = self.claim_pending_changes(root_id)
+        self.acknowledge_claimed_changes(
+            int(change["id"]) for change in changes
+        )
+        return changes
 
     def count_pending_changes(self, root_id: str) -> int:
         row = (
