@@ -273,8 +273,8 @@ class IndexAndAutoTagPipelineTest(unittest.TestCase):
 
             with (
                 patch(
-                    "image_vector_service.annotation_service."
-                    "DashScopeVisionTaggingClient",
+                    "image_vector_service.model_services.aliyun.vision."
+                    "AliyunVisionTaggingProvider",
                     OverlapVisionClient,
                 ),
                 patch.object(
@@ -331,7 +331,7 @@ class IndexAndAutoTagPipelineTest(unittest.TestCase):
         SelectiveVisionClient.reset()
         try:
             with patch(
-                "image_vector_service.annotation_service.DashScopeVisionTaggingClient",
+                "image_vector_service.model_services.aliyun.vision.AliyunVisionTaggingProvider",
                 SelectiveVisionClient,
             ):
                 report = service.index_and_auto_tag_folder(
@@ -371,7 +371,7 @@ class IndexAndAutoTagPipelineTest(unittest.TestCase):
         service = self._service(ImmediateEmbeddingClient())
         try:
             with patch(
-                "image_vector_service.annotation_service.DashScopeVisionTaggingClient",
+                "image_vector_service.model_services.aliyun.vision.AliyunVisionTaggingProvider",
                 MutatingVisionClient,
             ):
                 report = service.index_and_auto_tag_folder(
@@ -403,7 +403,7 @@ class IndexAndAutoTagPipelineTest(unittest.TestCase):
         MutateFirstDuplicateVisionClient.reset()
         try:
             with patch(
-                "image_vector_service.annotation_service.DashScopeVisionTaggingClient",
+                "image_vector_service.model_services.aliyun.vision.AliyunVisionTaggingProvider",
                 MutateFirstDuplicateVisionClient,
             ):
                 report = service.index_and_auto_tag_folder(
@@ -472,7 +472,7 @@ class IndexAndAutoTagPipelineTest(unittest.TestCase):
         MutatingPlusVisionClient.reset()
         try:
             with patch(
-                "image_vector_service.annotation_service.DashScopeVisionTaggingClient",
+                "image_vector_service.model_services.aliyun.vision.AliyunVisionTaggingProvider",
                 MutatingPlusVisionClient,
             ):
                 report = service.index_and_auto_tag_folder(
@@ -520,8 +520,8 @@ class IndexAndAutoTagPipelineTest(unittest.TestCase):
         try:
             with (
                 patch(
-                    "image_vector_service.annotation_service."
-                    "DashScopeVisionTaggingClient",
+                    "image_vector_service.model_services.aliyun.vision."
+                    "AliyunVisionTaggingProvider",
                     BlockingVisionClient,
                 ),
                 self.assertRaises(PipelineCancelled),

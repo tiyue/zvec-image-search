@@ -9,8 +9,8 @@ from pathlib import Path
 from image_vector_service import ImageVectorService
 from image_vector_service.backend_instance_lock import BackendInstanceLockError
 from image_vector_service.config import ConfigurationError, ServiceConfig
-from image_vector_service.dashscope_client import DashScopeError
 from image_vector_service.model_catalog import load_active_model_configuration
+from image_vector_service.model_services import ModelProviderError
 from image_vector_service.path_migration import migrate_schema
 
 
@@ -408,8 +408,8 @@ def main(argv: list[str] | None = None) -> int:
     except (ConfigurationError, ValueError) as exc:
         print(f"Configuration error: {exc}", file=sys.stderr)
         return 1
-    except DashScopeError as exc:
-        print(f"DashScope error: {exc}", file=sys.stderr)
+    except ModelProviderError as exc:
+        print(f"Model provider error: {exc}", file=sys.stderr)
         return 2
     except (FileNotFoundError, NotADirectoryError, PermissionError) as exc:
         print(f"Path error: {exc}", file=sys.stderr)

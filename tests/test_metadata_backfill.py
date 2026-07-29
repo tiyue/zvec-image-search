@@ -14,6 +14,7 @@ from image_vector_service.metadata_backfill import (
     MetadataBackfillRunner,
 )
 from image_vector_service.metadata_text import build_metadata_text
+from image_vector_service.model_services import ModelProviderError
 from image_vector_service.service import ImageVectorService
 
 
@@ -22,6 +23,7 @@ class _Response:
     vectors: list[list[float]]
     request_id: str = ""
     usage: dict[str, int] | None = None
+    attempts: int = 1
 
     def __post_init__(self) -> None:
         self.usage = dict(self.usage or {})
@@ -103,6 +105,31 @@ class MetadataBackfillRunnerTest(unittest.TestCase):
         self.assertEqual(report.failed, 0)
         self.assertEqual(report.changed_during_run, 1)
         self.assertEqual(report.remaining, 1)
+
+    def test_api_request_accounting_uses_provider_attempts(self) -> None:
+        class RetryingClient:
+            def embed_text(self, text: str) -> _Response:
+                if text == "failed":
+                    raise ModelProviderError(
+                        "provider unavailable",
+                        category="transient",
+                        attempts=2,
+                    )
+                return _Response(
+                    vectors=[[0.1, 0.2, 0.3]],
+                    attempts=3,
+                )
+
+        report = MetadataBackfillRunner(
+            client=RetryingClient(),
+            commit=lambda _item, _vector: None,
+            expected_dimension=3,
+        ).run([_item("succeeded"), _item("failed", "failed")])
+
+        self.assertEqual(report.attempted, 2)
+        self.assertEqual(report.api_requests, 5)
+        self.assertEqual(report.succeeded, 1)
+        self.assertEqual(report.failed, 1)
 
     def test_invalid_response_is_an_item_failure_not_a_job_failure(self) -> None:
         class InvalidThenValidClient:

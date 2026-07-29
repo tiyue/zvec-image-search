@@ -7,6 +7,7 @@ from unittest.mock import Mock, patch
 
 import image_service
 from image_service import build_parser
+from image_vector_service.model_services import ModelProviderError
 
 
 class CommandLineParserTest(unittest.TestCase):
@@ -49,6 +50,23 @@ class CommandLineParserTest(unittest.TestCase):
                 )
             self.assertEqual(exit_code, 1)
             service_type.return_value.index_folder.assert_not_called()
+
+    def test_model_provider_failure_keeps_dedicated_exit_code(self):
+        error = ModelProviderError(
+            "offline provider failure",
+            category="transient",
+            attempts=2,
+        )
+        stderr = io.StringIO()
+        with (
+            patch.object(image_service, "ImageVectorService", side_effect=error),
+            redirect_stdout(io.StringIO()),
+            redirect_stderr(stderr),
+        ):
+            exit_code = image_service.main(["stats"])
+
+        self.assertEqual(exit_code, 2)
+        self.assertIn("Model provider error", stderr.getvalue())
 
     def test_search_uses_tk_and_tag_filter_options(self):
         args = self.parser.parse_args(

@@ -265,7 +265,7 @@ class DynamicModelIntegrationTests(unittest.TestCase):
             self.assertEqual(estimate["plus_requests"], 0)
 
             with patch(
-                "image_vector_service.annotation_service.DashScopeVisionTaggingClient",
+                "image_vector_service.model_services.aliyun.vision.AliyunVisionTaggingProvider",
                 _RecordingVisionClient,
             ):
                 first = service.auto_tag_images(

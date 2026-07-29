@@ -128,7 +128,7 @@ class _ItemFailure(RuntimeError):
 class MetadataBackfillRunner:
     """Embed and immediately commit independent metadata documents.
 
-    The configured DashScope client remains responsible for the process-wide
+    The configured embedding provider remains responsible for the process-wide
     RPM/TPM permit.  This runner keeps a bounded number of network requests in
     flight, but validates and commits completed results on the calling thread so
     Collection writes remain serialized.  It polls the job's cancellation
@@ -260,7 +260,7 @@ class MetadataBackfillRunner:
             # On cancellation, do not make the Collection worker wait for a late
             # HTTP response.  The request may finish in the background, but its
             # result has no path to the commit callback and is safely discarded.
-            # A DashScope client wired to this event also abandons a pending
+            # A provider wired to this event also abandons a pending
             # process-wide limiter wait before it can consume an API request.
             if not clean_shutdown and self.client_cancel_event is not None:
                 self.client_cancel_event.set()
@@ -275,9 +275,9 @@ class MetadataBackfillRunner:
         eligible_count: int,
     ) -> None:
         report.attempted += 1
-        report.api_requests += 1
         try:
             response = future.result()
+            report.api_requests += _provider_attempts(response, default=1)
             vector = self._extract_vector(response)
         except _ItemFailure as failure:
             self._record_failure(report, item, failure)
@@ -287,6 +287,7 @@ class MetadataBackfillRunner:
             )
             return
         except Exception as exc:
+            report.api_requests += _provider_attempts(exc, default=1)
             self._record_failure(
                 report,
                 item,
@@ -385,3 +386,10 @@ class MetadataBackfillRunner:
                 error_type=failure.cause.__class__.__name__,
             )
         )
+
+
+def _provider_attempts(value: object, *, default: int) -> int:
+    attempts = getattr(value, "attempts", default)
+    if isinstance(attempts, bool) or not isinstance(attempts, int):
+        return default
+    return max(0, attempts)

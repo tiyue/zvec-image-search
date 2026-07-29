@@ -39,8 +39,8 @@
               ┌────────────┼────────────┐
               ▼            ▼            ▼
         ┌──────────┐ ┌──────────┐ ┌──────────┐
-        │ zvec引擎 │ │ DashScope│ │  zvec_lan│
-        │(向量存储)│ │ (嵌入API)│ │(局域网服务)│
+        │ zvec引擎 │ │ 模型服务 │ │  zvec_lan│
+        │(向量存储)│ │(阿里云适配)│ │(局域网服务)│
         └──────────┘ └──────────┘ └──────────┘
 ```
 
@@ -55,7 +55,11 @@ Python 包，提供所有业务逻辑：
 | `service.py` | 顶层服务编排（索引、搜索、同步） |
 | `backend_server.py` | HTTP API 服务器（ThreadingHTTPServer） |
 | `config.py` | 配置管理（ServiceConfig dataclass） |
-| `dashscope_client.py` | DashScope API 调用封装 |
+| `model_services/contracts.py` | 供应商无关的嵌入、视觉标注、错误与诊断契约 |
+| `model_services/factory.py` | 单一活动模型供应商的装配边界 |
+| `model_services/tagging.py` | 视觉标注领域类型、预算与严格解析入口 |
+| `model_services/aliyun/` | 阿里云百炼嵌入与视觉 HTTP 适配器 |
+| `dashscope_client.py` / `vision_tagging_client.py` | 旧导入路径兼容层；不参与业务装配 |
 | `hybrid_search.py` | 混合检索（标签意图识别 + 多路召回） |
 | `rank_fusion.py` | RRF 融合与置信度排序 |
 | `federated_search.py` | 跨库联邦聚合 |
@@ -175,6 +179,7 @@ CLI 入口将配置创建、迁移/后端服务、需要 `ImageVectorService` �
 |------|------|
 | `DASHSCOPE_API_KEY` | 阿里云百炼 API 密钥（必需） |
 | `DASHSCOPE_API_URL` | API 地址（可选，有默认值） |
+| `DASHSCOPE_VISION_API_URL` | 视觉标注 API 地址（可选，有默认值） |
 | `ZVEC_IMAGE_WORKSPACE` | 工作空间路径 |
 | `ZVEC_IMAGE_RESULTS_DIR` | 搜索结果输出目录 |
 | `ZVEC_IMAGE_LOG_DIR` | 日志目录 |
@@ -190,6 +195,16 @@ CLI 入口将配置创建、迁移/后端服务、需要 `ImageVectorService` �
 - 后端启动时将模型配置中的并发值注入 `ServiceConfig`。运行中的后端不热加载该文件，保存后必须明确返回重启状态，不得中断活动任务进行静默重启。
 - 模型并发只控制外部模型请求；单个图库的 SQLite 与向量 Collection 仍由单一所有者线程按最多 256 条一批顺序写入。
 - 自动标注运行结果使用 `AutoTagRunReport` 固定字段类型；并发基准直接消费其中的数值指标，Mypy 必须能够检查吞吐量和成本计算，防止报告字段类型漂移。
+
+### 模型服务边界与替换约束
+
+- 当前采用“单一活动供应商、内部可替换”方案。业务服务只依赖 `EmbeddingProvider`、`VisionTaggingProvider`、`ModelProviderError` 和 `ModelProviderFactory`；不得导入、构造或读取阿里云适配器的具体类型、限流器或请求计数属性。
+- 阿里云专属的 URL、环境变量回退、图片请求编码、DashScope envelope、HTTP 重试、`Retry-After` 和错误码解释集中在 `model_services/aliyun/`。替换模型服务时应重写适配器和工厂装配，不得修改索引、搜索、标注编排或图库存储逻辑。
+- 供应商错误跨边界时必须携带稳定类别与实际 HTTP `attempts`。稳定类别包括配置、认证、输入、内容策略、限流、瞬态故障、非法响应、取消和未知；业务层不得依赖供应商错误文案或 HTTP 状态码决定隔离、重试和告警策略。
+- 嵌入结果必须验证数量、唯一连续索引、向量维度以及所有元素的有限数值性；供应商响应必须有大小上限。模型服务测试必须离线运行，使用内存替身或回环服务，并用网络守卫阻止意外外联。
+- `models.json` 继续使用 schema v1，现有 provider、protocol、角色、并发字段及其含义不变；`DASHSCOPE_*` 环境变量、`dashscope_api_key` 请求字段和 Windows 凭证目标保持兼容。本次边界调整不改变 Prompt、自动标注缓存 schema、LAN 协议、存储 schema 或发布矩阵。
+- `dashscope_client.py` 与 `vision_tagging_client.py` 的旧公开导入保留一个发布周期；新业务代码必须使用 `model_services` 契约或工厂。
+- 任何会改变嵌入向量空间的操作——包括更换嵌入模型、维度、向量生成语义或不兼容的预处理——都必须新建或完整重建图片向量及描述向量索引。禁止在同一 Collection 中混用不同向量空间，也不得把“仅重写供应商适配器”误认为可免重建索引。
 
 ## 数据存储
 

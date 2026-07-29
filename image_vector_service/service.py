@@ -53,12 +53,6 @@ from .collection_write_coordinator import (
     PreparedCollectionUpsert,
 )
 from .config import ConfigurationError, ServiceConfig
-from .dashscope_client import (
-    DashScopeEmbeddingClient,
-    DashScopeError,
-    EmbeddingResponse,
-    ImageInputError,
-)
 from .failure_sink import IndexFailureSink
 from .folder_deletion import FolderDeletionManager
 from .hybrid_search import (
@@ -107,6 +101,15 @@ from .metadata_search import (
     fuse_text_metadata_hits,
 )
 from .metadata_text import build_metadata_text
+from .model_services import (
+    EmbeddingProvider,
+    EmbeddingResponse,
+    ModelInputError,
+    ModelProviderError,
+    ModelProviderFactory,
+    create_model_provider_factory,
+    provider_diagnostic_snapshot,
+)
 from .models import (
     FailureKind,
     FileFailure,
@@ -208,6 +211,7 @@ class _EmbeddingBatchResult:
     usage: list[dict[str, object]] = field(default_factory=list)
     systemic_error: str = ""
     systemic_items: list[_EmbeddingWorkItem] = field(default_factory=list)
+    attempts: int = 0
 
     def extend(self, other: _EmbeddingBatchResult) -> None:
         self.successes.extend(other.successes)
@@ -215,6 +219,7 @@ class _EmbeddingBatchResult:
         self.usage.extend(other.usage)
         self.systemic_error = self.systemic_error or other.systemic_error
         self.systemic_items.extend(other.systemic_items)
+        self.attempts += other.attempts
 
 
 @dataclass
@@ -309,9 +314,13 @@ class ImageVectorService:
         repository: ZvecImageRepository | None = None,
         progress: Callable[[str], None] | None = None,
         cancel_check: Callable[[], None] | None = None,
+        model_provider_factory: ModelProviderFactory | None = None,
     ):
         self.config = config or ServiceConfig()
         self.config.validate()
+        self._model_provider_factory = (
+            model_provider_factory or create_model_provider_factory(self.config)
+        )
         self.search_quality = load_search_quality(self.config.workspace)
         self.search_learning = load_search_learning(self.config.config_home_path)
         self._search_learning_reload_lock = threading.Lock()
@@ -349,6 +358,7 @@ class ImageVectorService:
                 )
             self.repository = repository or ZvecImageRepository(self.config)
             self._embedding_client = embedding_client
+            self._embedding_client_injected = embedding_client is not None
             self.state = IndexState(
                 self.config.state_path, legacy_path=self.config.legacy_state_path
             )
@@ -472,6 +482,7 @@ class ImageVectorService:
                 progress=self.progress,
                 cancel_check=self.cancel_check,
                 collection_writes=self.collection_writes,
+                model_provider_factory=self._model_provider_factory,
             )
             self.validate_documents = self.repository.doc_count != self.state.count()
         except Exception:
@@ -488,9 +499,9 @@ class ImageVectorService:
             raise
 
     @property
-    def embedding_client(self):
+    def embedding_client(self) -> EmbeddingProvider:
         if self._embedding_client is None:
-            self._embedding_client = DashScopeEmbeddingClient(self.config)
+            self._embedding_client = self._model_provider_factory.create_embedding()
         return self._embedding_client
 
     def configure_optimize_runtime(
@@ -3149,7 +3160,6 @@ class ImageVectorService:
         halt_submission = control.storage_halted
         commit_buffer = _EmbeddingBatchResult()
         client = self.embedding_client
-        request_count_before = getattr(client, "request_count", 0)
 
         executor = ThreadPoolExecutor(
             max_workers=self.config.embedding_concurrency,
@@ -3212,6 +3222,7 @@ class ImageVectorService:
                         result = _EmbeddingBatchResult(
                             systemic_error=str(exc) or exc.__class__.__name__,
                             systemic_items=submitted_batch,
+                            attempts=max(0, int(getattr(exc, "attempts", 0))),
                         )
                     completed_result.extend(result)
                     completed += len(submitted_batch)
@@ -3256,6 +3267,7 @@ class ImageVectorService:
                         usage=commit_buffer.usage,
                         systemic_error=commit_buffer.systemic_error,
                         systemic_items=commit_buffer.systemic_items,
+                        attempts=commit_buffer.attempts,
                     )
                     self._apply_embedding_result(
                         discarded,
@@ -3286,9 +3298,6 @@ class ImageVectorService:
         else:
             executor.shutdown(wait=True)
 
-        request_count_after = getattr(client, "request_count", request_count_before)
-        report.api_requests += max(0, request_count_after - request_count_before)
-
     def _apply_embedding_result(
         self,
         result: _EmbeddingBatchResult,
@@ -3304,6 +3313,7 @@ class ImageVectorService:
             Callable[[str, list[dict[str, Any]]], None] | None
         ) = None,
     ) -> bool:
+        report.api_requests += result.attempts
         report.usage.extend(result.usage)
         for failure in result.failures:
             for item in failure.items:
@@ -4906,7 +4916,7 @@ class ImageVectorService:
     @staticmethod
     def _ensure_query_image_unchanged(path: Path, expected_hash: str) -> None:
         if file_sha256(path) != expected_hash:
-            raise ImageInputError("Query image changed during embedding; try again.")
+            raise ModelInputError("Query image changed during embedding; try again.")
 
     def _log_search(self, report: SearchReport) -> None:
         self.logger.info(
@@ -7301,12 +7311,10 @@ class ImageVectorService:
             configured_client = self.embedding_client
             client_cancel_event = threading.Event()
             client = (
-                DashScopeEmbeddingClient(
-                    self.config,
-                    limiter=configured_client.limiter,
+                self._model_provider_factory.create_embedding(
                     cancel_event=client_cancel_event,
                 )
-                if isinstance(configured_client, DashScopeEmbeddingClient)
+                if not getattr(self, "_embedding_client_injected", True)
                 else configured_client
             )
             runner = MetadataBackfillRunner(
@@ -7320,12 +7328,7 @@ class ImageVectorService:
                 concurrency=self.config.embedding_concurrency,
             )
             runner_report = runner.run(selected, eligible=candidate_count)
-            limiter = getattr(client, "limiter", None)
-            snapshot = (
-                limiter.snapshot().as_dict()
-                if limiter is not None and callable(getattr(limiter, "snapshot", None))
-                else None
-            )
+            snapshot = provider_diagnostic_snapshot(client)
         else:
             runner_report = MetadataBackfillReport(
                 selected=0,
@@ -7716,7 +7719,8 @@ def _embed_batch_resilient(
         response: EmbeddingResponse = client.embed_images(  # type: ignore[attr-defined]
             [Path(item.representative.absolute_path) for item in batch]
         )
-    except (DashScopeError, ImageInputError) as exc:
+    except ModelProviderError as exc:
+        result.attempts += max(0, int(getattr(exc, "attempts", 0)))
         if getattr(exc, "splittable", False) and len(batch) > 1:
             midpoint = len(batch) // 2
             first = _embed_batch_resilient(client, batch[:midpoint])
@@ -7739,6 +7743,7 @@ def _embed_batch_resilient(
         result.systemic_items.extend(batch)
         return result
 
+    result.attempts += max(0, int(getattr(response, "attempts", 1)))
     if len(response.vectors) != len(batch):
         result.systemic_error = (
             f"Expected {len(batch)} embedding vectors, received "
@@ -7754,19 +7759,12 @@ def _embed_batch_resilient(
     return result
 
 
-def _classify_embedding_error(error: DashScopeError | ImageInputError) -> FailureKind:
-    if isinstance(error, ImageInputError) or getattr(error, "splittable", False):
+def _classify_embedding_error(error: ModelProviderError) -> FailureKind:
+    if error.category == "input" or getattr(error, "splittable", False):
         return "item"
-    status_code = getattr(error, "status_code", None)
-    if status_code in {401, 403}:
+    if error.category in {"configuration", "authentication"}:
         return "systemic"
-    if status_code in {408, 409, 429, 500, 502, 503, 504}:
-        return "retryable"
-    message = str(error).casefold()
-    if status_code is None and any(
-        token in message
-        for token in ("request failed", "timed out", "timeout", "connection")
-    ):
+    if error.category in {"rate_limit", "transient", "cancelled"}:
         return "retryable"
     return "systemic"
 

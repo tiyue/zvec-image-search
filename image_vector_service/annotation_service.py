@@ -35,13 +35,12 @@ from .collection_write_coordinator import (
 from .config import ConfigurationError, ServiceConfig
 from .failure_sink import FailureSink
 from .model_catalog import ModelConfiguration, default_model_configuration
-from .models import FailureKind, ImageRecord
-from .source_resolver import SourcePathResolver
-from .state import IndexState
-from .tag_aliases import TagAliasDictionary
-from .tags import normalize_tags
-from .vision_tagging_client import (
-    DashScopeVisionTaggingClient,
+from .model_services import (
+    ModelProviderFactory,
+    ProviderErrorCategory,
+    create_model_provider_factory,
+)
+from .model_services.tagging import (
     TaggingBudget,
     TaggingBudgetExceeded,
     TaggingBudgetTracker,
@@ -52,6 +51,11 @@ from .vision_tagging_client import (
     VisionTaggingResponse,
     sanitize_generated_tag,
 )
+from .models import FailureKind, ImageRecord
+from .source_resolver import SourcePathResolver
+from .state import IndexState
+from .tag_aliases import TagAliasDictionary
+from .tags import normalize_tags
 from .zvec_repository import ZvecImageRepository
 
 DEFAULT_AUTO_TAG_LIMIT = 200
@@ -194,6 +198,7 @@ class _ModelResolution:
     error: str = ""
     budget_exhausted: bool = False
     failure_kind: FailureKind = "item"
+    provider_error_category: ProviderErrorCategory | None = None
 
 
 @dataclass(frozen=True)
@@ -217,6 +222,7 @@ class _CompletedModelRequest:
     budget_exhausted: bool = False
     http_attempts: int = 0
     failure_kind: FailureKind = "item"
+    provider_error_category: ProviderErrorCategory | None = None
 
 
 @dataclass
@@ -619,6 +625,7 @@ class AutoTaggingCoordinator:
         progress: Callable[[str], None],
         cancel_check: Callable[[], None],
         collection_writes: CollectionWriteCoordinator,
+        model_provider_factory: ModelProviderFactory | None = None,
     ) -> None:
         self.config = config
         self.state = state
@@ -628,6 +635,9 @@ class AutoTaggingCoordinator:
         self.progress = progress
         self.cancel_check = cancel_check
         self.collection_writes = collection_writes
+        self._model_provider_factory = (
+            model_provider_factory or create_model_provider_factory(config)
+        )
 
     def estimate(
         self,
@@ -1089,6 +1099,7 @@ class AutoTaggingCoordinator:
                 failure_category = _annotation_failure_category(
                     primary.error,
                     primary.failure_kind,
+                    primary.provider_error_category,
                 )
                 self._store_resolution_failure(
                     entries,
@@ -1409,13 +1420,13 @@ class AutoTaggingCoordinator:
             flight.release()
             raise
 
-    @staticmethod
     def _execute_model_request(
+        self,
         prepared: _PreparedModelRequest,
     ) -> _CompletedModelRequest:
         """Run image encoding and HTTP without touching Collection state."""
 
-        client = DashScopeVisionTaggingClient(
+        client = self._model_provider_factory.create_vision_tagger(
             prepared.config,
             budget_tracker=prepared.tracker,
         )
@@ -1426,16 +1437,15 @@ class AutoTaggingCoordinator:
                 prepared=prepared,
                 error=str(exc),
                 budget_exhausted=True,
-                http_attempts=max(0, int(getattr(client, "request_count", 0))),
+                http_attempts=max(0, int(getattr(exc, "attempts", 0))),
             )
         except VisionTaggingError as exc:
             return _CompletedModelRequest(
                 prepared=prepared,
                 error=str(exc) or exc.__class__.__name__,
-                # Real clients expose an exact count. Local encoding/SHA
-                # failures happen before HTTP and must remain zero-cost.
-                http_attempts=max(0, int(getattr(client, "request_count", 1))),
+                http_attempts=max(0, int(getattr(exc, "attempts", 0))),
                 failure_kind=_vision_failure_kind(exc),
+                provider_error_category=exc.category,
             )
         except (OSError, ValueError, RuntimeError) as exc:
             # File disappearance, image encoding failures and malformed remote
@@ -1444,13 +1454,13 @@ class AutoTaggingCoordinator:
             return _CompletedModelRequest(
                 prepared=prepared,
                 error=str(exc) or exc.__class__.__name__,
-                http_attempts=max(1, int(getattr(client, "request_count", 1))),
+                http_attempts=max(1, int(getattr(exc, "attempts", 0))),
                 failure_kind="item",
             )
         return _CompletedModelRequest(
             prepared=prepared,
             response=response,
-            http_attempts=max(1, int(getattr(client, "request_count", 1))),
+            http_attempts=max(0, int(getattr(response, "attempts", 1))),
         )
 
     def _finalize_model_request(
@@ -1505,6 +1515,7 @@ class AutoTaggingCoordinator:
                 status="failed",
                 error=completed.error,
                 failure_kind=completed.failure_kind,
+                provider_error_category=completed.provider_error_category,
             )
 
         response = completed.response
@@ -1703,6 +1714,7 @@ class AutoTaggingCoordinator:
         failure_category = _annotation_failure_category(
             error,
             resolution.failure_kind,
+            resolution.provider_error_category,
         )
         retry_eligible = _failure_category_is_retryable(failure_category)
         policy = {
@@ -1781,6 +1793,7 @@ class AutoTaggingCoordinator:
                         "failure_category": _annotation_failure_category(
                             resolution.error,
                             resolution.failure_kind,
+                            resolution.provider_error_category,
                         ),
                     },
                 )
@@ -5378,18 +5391,32 @@ def _vision_failure_kind(error: VisionTaggingError) -> FailureKind:
 
     if bool(getattr(error, "retryable", False)):
         return "retryable"
-    status_code = getattr(error, "status_code", None)
-    if status_code in {401, 403}:
+    category = getattr(error, "category", "unknown")
+    if category in {"configuration", "authentication"}:
         return "systemic"
-    if status_code in {408, 409, 429, 500, 502, 503, 504}:
-        return "retryable"
-    message = str(error).casefold()
-    if any(token in message for token in ("timed out", "timeout", "connection")):
+    if category in {"rate_limit", "transient", "cancelled"}:
         return "retryable"
     return "item"
 
 
-def _annotation_failure_category(error: str, kind: FailureKind) -> str:
+def _annotation_failure_category(
+    error: str,
+    kind: FailureKind,
+    provider_category: ProviderErrorCategory | None = None,
+) -> str:
+    provider_mapping = {
+        "authentication": "provider_auth",
+        "content_policy": "content_policy",
+        "invalid_response": "schema_response",
+        "input": "invalid_input",
+        "rate_limit": "retryable_transport",
+        "transient": "retryable_transport",
+        "cancelled": "retryable_transport",
+        "configuration": "systemic",
+    }
+    mapped = provider_mapping.get(provider_category or "")
+    if mapped is not None:
+        return mapped
     text = str(error or "").casefold()
     if any(
         marker in text

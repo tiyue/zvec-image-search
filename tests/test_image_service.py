@@ -105,7 +105,8 @@ class DashScopeEncodingTest(unittest.TestCase):
             )
             with (
                 patch(
-                    "image_vector_service.dashscope_client.encode_image_data_uri",
+                    "image_vector_service.model_services.aliyun.embedding."
+                    "encode_image_data_uri",
                     return_value=encoded,
                 ) as encode,
                 patch.object(client, "_embed", return_value=expected) as embed,
@@ -163,7 +164,8 @@ class DashScopeEncodingTest(unittest.TestCase):
             )
             with (
                 patch(
-                    "image_vector_service.dashscope_client.encode_image_data_uri",
+                    "image_vector_service.model_services.aliyun.embedding."
+                    "encode_image_data_uri",
                     side_effect=[first, second],
                 ) as encode,
                 patch.object(
@@ -205,7 +207,8 @@ class DashScopeEncodingTest(unittest.TestCase):
             )
             with (
                 patch(
-                    "image_vector_service.dashscope_client.encode_image_data_uri",
+                    "image_vector_service.model_services.aliyun.embedding."
+                    "encode_image_data_uri",
                     return_value=encoded,
                 ) as encode,
                 patch.object(client, "_embed", side_effect=auth_error),

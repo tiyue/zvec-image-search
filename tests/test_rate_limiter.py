@@ -386,7 +386,8 @@ class RateLimitedClientTests(unittest.TestCase):
             )
             with (
                 patch(
-                    "image_vector_service.vision_tagging_client.urllib.request.urlopen",
+                    "image_vector_service.model_services.aliyun.vision."
+                    "urllib.request.urlopen",
                     side_effect=[
                         _http_error(429, retry_after="0"),
                         _http_error(400),

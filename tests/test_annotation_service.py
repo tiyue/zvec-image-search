@@ -569,7 +569,7 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
             )
 
         with patch(
-            "image_vector_service.annotation_service.DashScopeVisionTaggingClient",
+            "image_vector_service.model_services.aliyun.vision.AliyunVisionTaggingProvider",
             FakeVisionClient,
         ):
             report = self.service.auto_tag_images(
@@ -648,7 +648,7 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
         ConcurrentVisionClient.models = []
         ConcurrentVisionClient.responses = {}
         with patch(
-            "image_vector_service.annotation_service.DashScopeVisionTaggingClient",
+            "image_vector_service.model_services.aliyun.vision.AliyunVisionTaggingProvider",
             ConcurrentVisionClient,
         ):
             report = self.service.auto_tag_images(
@@ -722,8 +722,8 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
                     ConcurrentVisionClient.responses = {}
 
                     with patch(
-                        "image_vector_service.annotation_service."
-                        "DashScopeVisionTaggingClient",
+                        "image_vector_service.model_services.aliyun.vision."
+                        "AliyunVisionTaggingProvider",
                         ConcurrentVisionClient,
                     ):
                         report = service.auto_tag_images(
@@ -782,8 +782,8 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
         try:
             with (
                 patch(
-                    "image_vector_service.annotation_service."
-                    "DashScopeVisionTaggingClient",
+                    "image_vector_service.model_services.aliyun.vision."
+                    "AliyunVisionTaggingProvider",
                     BlockingVisionClient,
                 ),
                 self.assertRaisesRegex(PipelineCancelled, "cancel requested"),
@@ -940,7 +940,7 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
 
         with (
             patch(
-                "image_vector_service.annotation_service.DashScopeVisionTaggingClient",
+                "image_vector_service.model_services.aliyun.vision.AliyunVisionTaggingProvider",
                 FakeVisionClient,
             ),
             patch.object(
@@ -964,7 +964,7 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
         self.assertEqual(indexed.inserted, 2)
 
         with patch(
-            "image_vector_service.annotation_service.DashScopeVisionTaggingClient",
+            "image_vector_service.model_services.aliyun.vision.AliyunVisionTaggingProvider",
             FailingVisionClient,
         ):
             report = self.service.auto_tag_images(
@@ -980,7 +980,7 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
         self.assertEqual(retry["api_request_count"], 0)
 
         with patch(
-            "image_vector_service.annotation_service.DashScopeVisionTaggingClient",
+            "image_vector_service.model_services.aliyun.vision.AliyunVisionTaggingProvider",
             FakeVisionClient,
         ):
             cached_failure = self.service.auto_tag_images(
@@ -995,7 +995,7 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
     def test_failed_annotations_can_be_completed_with_manual_tags(self):
         self.service.index_folder(str(self.root))
         with patch(
-            "image_vector_service.annotation_service.DashScopeVisionTaggingClient",
+            "image_vector_service.model_services.aliyun.vision.AliyunVisionTaggingProvider",
             FailingVisionClient,
         ):
             self.service.auto_tag_images(
@@ -1042,7 +1042,7 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
     def test_failed_manual_label_requires_a_non_empty_tag(self):
         self.service.index_folder(str(self.root))
         with patch(
-            "image_vector_service.annotation_service.DashScopeVisionTaggingClient",
+            "image_vector_service.model_services.aliyun.vision.AliyunVisionTaggingProvider",
             FailingVisionClient,
         ):
             self.service.auto_tag_images(
@@ -1131,7 +1131,7 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
 
         with (
             patch(
-                "image_vector_service.annotation_service.DashScopeVisionTaggingClient",
+                "image_vector_service.model_services.aliyun.vision.AliyunVisionTaggingProvider",
                 FolderFallbackVisionClient,
             ),
             patch.object(
@@ -1204,7 +1204,7 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
         )
 
         with patch(
-            "image_vector_service.annotation_service.DashScopeVisionTaggingClient",
+            "image_vector_service.model_services.aliyun.vision.AliyunVisionTaggingProvider",
             FolderFallbackVisionClient,
         ):
             report = self.service.auto_tag_images(
@@ -1243,7 +1243,7 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
         )
 
         with patch(
-            "image_vector_service.annotation_service.DashScopeVisionTaggingClient",
+            "image_vector_service.model_services.aliyun.vision.AliyunVisionTaggingProvider",
             FolderFallbackVisionClient,
         ):
             report = self.service.auto_tag_images(
@@ -1282,7 +1282,7 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
             work="Work-A",
         )
         with patch(
-            "image_vector_service.annotation_service.DashScopeVisionTaggingClient",
+            "image_vector_service.model_services.aliyun.vision.AliyunVisionTaggingProvider",
             FolderFallbackVisionClient,
         ):
             donor_report = self.service.auto_tag_images(
@@ -1295,7 +1295,7 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
         self.service.index_folder(str(refused_root.parent))
         FolderFallbackVisionClient.refused_names = {"refused.png"}
         with patch(
-            "image_vector_service.annotation_service.DashScopeVisionTaggingClient",
+            "image_vector_service.model_services.aliyun.vision.AliyunVisionTaggingProvider",
             FolderFallbackVisionClient,
         ):
             refused_report = self.service.auto_tag_images(
@@ -1370,7 +1370,7 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
         self.assertEqual(indexed.inserted, 2)
 
         with patch(
-            "image_vector_service.annotation_service.DashScopeVisionTaggingClient",
+            "image_vector_service.model_services.aliyun.vision.AliyunVisionTaggingProvider",
             RetryableVisionClient,
         ):
             retryable = self.service.auto_tag_images(
@@ -1399,7 +1399,7 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
         second_index = self.service.index_folder(str(self.root))
         self.assertEqual(second_index.inserted, 1)
         with patch(
-            "image_vector_service.annotation_service.DashScopeVisionTaggingClient",
+            "image_vector_service.model_services.aliyun.vision.AliyunVisionTaggingProvider",
             SystemicVisionClient,
         ):
             systemic = self.service.auto_tag_images(
@@ -1426,7 +1426,7 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
     def test_scope_all_reuses_cache_without_repeating_requests(self):
         self.service.index_folder(str(self.root))
         with patch(
-            "image_vector_service.annotation_service.DashScopeVisionTaggingClient",
+            "image_vector_service.model_services.aliyun.vision.AliyunVisionTaggingProvider",
             FakeVisionClient,
         ):
             first = self.service.auto_tag_images(
@@ -1464,7 +1464,7 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
             ],
         }
         with patch(
-            "image_vector_service.annotation_service.DashScopeVisionTaggingClient",
+            "image_vector_service.model_services.aliyun.vision.AliyunVisionTaggingProvider",
             FakeVisionClient,
         ):
             report = self.service.auto_tag_images(
@@ -1543,7 +1543,7 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
         }
 
         with patch(
-            "image_vector_service.annotation_service.DashScopeVisionTaggingClient",
+            "image_vector_service.model_services.aliyun.vision.AliyunVisionTaggingProvider",
             FakeVisionClient,
         ):
             report = self.service.auto_tag_images(
@@ -1591,7 +1591,7 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
             PLUS_MODEL: [annotation_payload(controlled_tags=("全身",))]
         }
         with patch(
-            "image_vector_service.annotation_service.DashScopeVisionTaggingClient",
+            "image_vector_service.model_services.aliyun.vision.AliyunVisionTaggingProvider",
             FakeVisionClient,
         ):
             report = self.service.auto_tag_images(
@@ -1645,7 +1645,7 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
             ],
         }
         with patch(
-            "image_vector_service.annotation_service.DashScopeVisionTaggingClient",
+            "image_vector_service.model_services.aliyun.vision.AliyunVisionTaggingProvider",
             FakeVisionClient,
         ):
             report = self.service.auto_tag_images(
@@ -1681,7 +1681,7 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
             PLUS_MODEL: [annotation_payload(controlled_tags=("全身",))],
         }
         with patch(
-            "image_vector_service.annotation_service.DashScopeVisionTaggingClient",
+            "image_vector_service.model_services.aliyun.vision.AliyunVisionTaggingProvider",
             FakeVisionClient,
         ):
             report = self.service.auto_tag_images(
@@ -1770,7 +1770,7 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
         indexed = self.service.index_folder(str(self.root))
         self.assertEqual(indexed.inserted, 103)
         with patch(
-            "image_vector_service.annotation_service.DashScopeVisionTaggingClient",
+            "image_vector_service.model_services.aliyun.vision.AliyunVisionTaggingProvider",
             FakeVisionClient,
         ):
             report = self.service.auto_tag_images(
@@ -1793,7 +1793,7 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
         (self.root / "set-b").rename(self.root / "角色-set-b")
         self.service.index_folder(str(self.root), tags=["人工标签"])
         with patch(
-            "image_vector_service.annotation_service.DashScopeVisionTaggingClient",
+            "image_vector_service.model_services.aliyun.vision.AliyunVisionTaggingProvider",
             FakeVisionClient,
         ):
             report = self.service.auto_tag_images(
@@ -1914,7 +1914,7 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
     def test_all_valid_model_tags_are_auto_accepted_without_confirmation(self):
         self.service.index_folder(str(self.root))
         with patch(
-            "image_vector_service.annotation_service.DashScopeVisionTaggingClient",
+            "image_vector_service.model_services.aliyun.vision.AliyunVisionTaggingProvider",
             FakeVisionClient,
         ):
             report = self.service.auto_tag_images(
@@ -1949,7 +1949,7 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
         )
 
         with patch(
-            "image_vector_service.annotation_service.DashScopeVisionTaggingClient",
+            "image_vector_service.model_services.aliyun.vision.AliyunVisionTaggingProvider",
             FakeVisionClient,
         ):
             report = self.service.auto_tag_images(
@@ -2057,7 +2057,7 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
             PLUS_MODEL: [annotation_payload(character="甘雨")],
         }
         with patch(
-            "image_vector_service.annotation_service.DashScopeVisionTaggingClient",
+            "image_vector_service.model_services.aliyun.vision.AliyunVisionTaggingProvider",
             FakeVisionClient,
         ):
             report = self.service.auto_tag_images(
@@ -2099,7 +2099,7 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
             ],
         }
         with patch(
-            "image_vector_service.annotation_service.DashScopeVisionTaggingClient",
+            "image_vector_service.model_services.aliyun.vision.AliyunVisionTaggingProvider",
             FakeVisionClient,
         ):
             report = self.service.auto_tag_images(
@@ -2358,7 +2358,7 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
             for service, root in zip(services, roots, strict=True):
                 service.index_folder(str(root))
             with patch(
-                "image_vector_service.annotation_service.DashScopeVisionTaggingClient",
+                "image_vector_service.model_services.aliyun.vision.AliyunVisionTaggingProvider",
                 FakeVisionClient,
             ):
                 first = services[0].auto_tag_images(
@@ -2420,8 +2420,8 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
         try:
             with (
                 patch(
-                    "image_vector_service.annotation_service."
-                    "DashScopeVisionTaggingClient",
+                    "image_vector_service.model_services.aliyun.vision."
+                    "AliyunVisionTaggingProvider",
                     BlockingVisionClient,
                 ),
                 patch.object(
@@ -2501,7 +2501,7 @@ class AutoTaggingIntegrationTest(unittest.TestCase):
             services[0].index_folder(str(first_root), tags=["Alice"])
             services[1].index_folder(str(second_root), tags=["Bob"])
             with patch(
-                "image_vector_service.annotation_service.DashScopeVisionTaggingClient",
+                "image_vector_service.model_services.aliyun.vision.AliyunVisionTaggingProvider",
                 FakeVisionClient,
             ):
                 first = services[0].auto_tag_images(
