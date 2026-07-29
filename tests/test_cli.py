@@ -201,6 +201,27 @@ class CommandLineParserTest(unittest.TestCase):
 
         self.assertEqual(exit_code, 4)
 
+    def test_main_closes_service_after_successful_command(self):
+        with patch.object(image_service, "ImageVectorService") as service_type:
+            service_type.return_value.stats.return_value = {"count": 0}
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                exit_code = image_service.main(["stats"])
+
+        self.assertEqual(exit_code, 0)
+        service_type.return_value.close.assert_called_once_with()
+
+    def test_migration_does_not_create_image_service(self):
+        with (
+            patch.object(image_service, "ImageVectorService") as service_type,
+            patch.object(image_service, "migrate_schema", return_value={"changed": 0}),
+            redirect_stdout(io.StringIO()),
+            redirect_stderr(io.StringIO()),
+        ):
+            exit_code = image_service.main(["migrate-schema", "--dry-run"])
+
+        self.assertEqual(exit_code, 0)
+        service_type.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -13,7 +13,7 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path, PurePosixPath
 from time import monotonic
-from typing import Any
+from typing import Any, TypedDict
 
 from .auto_tag_cache import (
     AutoTagCacheFlight,
@@ -133,6 +133,50 @@ _CONTROLLED_TAG_FIELDS = {
     for code in spec.values
     for value in (code, FIELD_TAG_LABELS[code])
 }
+
+
+class AutoTagRunReport(TypedDict):
+    scope: str
+    model: str
+    primary_model: str
+    escalation_model: str
+    candidate_count: int
+    unique_image_count: int
+    processed: int
+    unique_processed: int
+    cached: int
+    cache_hits: int
+    succeeded: int
+    failed: int
+    model_failed: int
+    deferred: int
+    needs_attention: bool
+    failures: list[dict[str, Any]]
+    failure_manifest: str
+    quarantined: int
+    quarantine_copy_failures: int
+    stopped_reason: str
+    actual_cost_cny: float
+    input_tokens: int
+    output_tokens: int
+    api_request_count: int
+    http_attempt_count: int
+    logical_model_calls: int
+    retry_count: int
+    network_concurrency: int
+    flash_requests: int
+    plus_requests: int
+    escalated_count: int
+    escalation_failures: int
+    auto_accepted_tag_count: int
+    auto_accepted_identity_count: int
+    folder_inheritance_recovered: int
+    folder_inheritance_unresolved: int
+    folder_inheritance_failures: list[dict[str, Any]]
+    folder_inheritance_failures_total: int
+    folder_inheritance_failures_truncated: bool
+    pending_count: int
+    proposals: list[dict[str, Any]]
 
 
 class AutoTaggingRequestError(ValueError):
@@ -791,7 +835,7 @@ class AutoTaggingCoordinator:
         max_images: int = DEFAULT_AUTO_TAG_LIMIT,
         max_budget_cny: float | None = None,
         external_processing_confirmed: bool = False,
-    ) -> dict[str, Any]:
+    ) -> AutoTagRunReport:
         if not external_processing_confirmed:
             raise AutoTaggingRequestError(
                 "External image processing must be explicitly confirmed."
@@ -990,7 +1034,7 @@ class AutoTaggingCoordinator:
         accounting: _RunAccounting,
         failure_sink: FailureSink,
         freshness_validator: Callable[[str], bool] | None = None,
-    ) -> dict[str, Any]:
+    ) -> AutoTagRunReport:
         processed = 0
         cached_count = 0
         cache_hits = 0
@@ -3500,7 +3544,7 @@ class StreamingAutoTagSession:
         self._assert_owner_open()
         self._drain(block=False)
 
-    def finish(self) -> dict[str, Any]:
+    def finish(self) -> AutoTagRunReport:
         self._assert_owner_open()
         self._finish_deadline = monotonic() + self._finish_timeout_seconds()
         self._finish_last_progress = 0.0
@@ -3753,7 +3797,7 @@ class StreamingAutoTagSession:
                 self.work_items[index] = (group_hash, entries, context)
                 return
 
-    def _append_stale_failures(self, report: dict[str, Any]) -> dict[str, Any]:
+    def _append_stale_failures(self, report: AutoTagRunReport) -> AutoTagRunReport:
         for content_hash, entry in self.stale_entries:
             resolution = _ModelResolution(
                 model=self.selected_model,

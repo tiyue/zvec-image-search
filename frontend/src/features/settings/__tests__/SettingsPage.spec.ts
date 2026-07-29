@@ -1,4 +1,4 @@
-import { flushPromises, mount } from "@vue/test-utils";
+import { flushPromises, mount, type DOMWrapper } from "@vue/test-utils";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type {
@@ -146,7 +146,10 @@ function fakeLanApi(): LanAccessApi {
   };
 }
 
-function buttonWithText(wrapper: ReturnType<typeof mount>, label: string) {
+function buttonWithText(
+  wrapper: Pick<DOMWrapper<Element>, "findAll">,
+  label: string,
+) {
   const button = wrapper.findAll("button").find((item) => item.text().includes(label));
   if (!button) throw new Error(`button not found: ${label}`);
   return button;

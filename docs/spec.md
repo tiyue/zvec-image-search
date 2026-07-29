@@ -133,6 +133,8 @@ Kotlin + Gradle 构建的安卓应用，通过 LAN API 与 Windows WebView 宿�
 
 入口：`zvec-image-search`（`image_service.py`）
 
+CLI 入口将配置创建、迁移/后端服务、需要 `ImageVectorService` 的命令和搜索分派分别隔离；迁移与后端服务不会创建图片服务实例，其他命令由入口统一关闭服务并映射退出码。
+
 | 命令 | 说明 |
 |------|------|
 | `index <folder> [tags...]` | 索引图片文件夹（支持标签、`--clear-tags`） |
@@ -187,6 +189,7 @@ Kotlin + Gradle 构建的安卓应用，通过 LAN API 与 Windows WebView 宿�
 - 并发值与角色分配一同保存在 `models.json`。旧配置缺少并发字段时必须继续使用 `2`、`4`，下一次保存时写出规范化字段；显式空值、布尔值、字符串及其他整数必须拒绝。
 - 后端启动时将模型配置中的并发值注入 `ServiceConfig`。运行中的后端不热加载该文件，保存后必须明确返回重启状态，不得中断活动任务进行静默重启。
 - 模型并发只控制外部模型请求；单个图库的 SQLite 与向量 Collection 仍由单一所有者线程按最多 256 条一批顺序写入。
+- 自动标注运行结果使用 `AutoTagRunReport` 固定字段类型；并发基准直接消费其中的数值指标，Mypy 必须能够检查吞吐量和成本计算，防止报告字段类型漂移。
 
 ## 数据存储
 
@@ -264,4 +267,5 @@ Kotlin + Gradle 构建的安卓应用，通过 LAN API 与 Windows WebView 宿�
 - 类型检查：mypy（Python 3.10 target）
 - 前端类型检查：vue-tsc + tsc
 - 测试：pytest（Python）、vitest（前端）
+- 前端组件测试固定使用 `@vue/test-utils` 2.2.7，避免 2.4.x 引入存在已知高危漏洞的 `js-beautify`/`glob` 开发依赖链；升级时必须同时通过 `npm audit`、前端测试、类型检查和构建。
 - 提交前检查：`python -m ruff format . && python -m ruff check --fix .`

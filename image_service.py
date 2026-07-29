@@ -216,178 +216,182 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
-    service = None
-    try:
-        model_configuration = load_active_model_configuration()
-        config = (
-            ServiceConfig(
-                workspace=Path(args.workspace).expanduser().resolve(),
-                model_configuration=model_configuration,
-                embedding_concurrency=model_configuration.embedding_concurrency,
-                auto_tag_concurrency=model_configuration.auto_tag_concurrency,
+def _build_config(args: argparse.Namespace) -> ServiceConfig:
+    model_configuration = load_active_model_configuration()
+    if args.workspace:
+        return ServiceConfig(
+            workspace=Path(args.workspace).expanduser().resolve(),
+            model_configuration=model_configuration,
+            embedding_concurrency=model_configuration.embedding_concurrency,
+            auto_tag_concurrency=model_configuration.auto_tag_concurrency,
+        )
+    return ServiceConfig(
+        model_configuration=model_configuration,
+        embedding_concurrency=model_configuration.embedding_concurrency,
+        auto_tag_concurrency=model_configuration.auto_tag_concurrency,
+    )
+
+
+def _run_migration(args: argparse.Namespace, config: ServiceConfig) -> int:
+    print(
+        json.dumps(
+            migrate_schema(config, dry_run=args.dry_run),
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    return 0
+
+
+def _run_backend(args: argparse.Namespace, config: ServiceConfig) -> int:
+    from image_vector_service.backend_server import serve_backend
+
+    token = (args.token or os.getenv("ZVEC_BACKEND_TOKEN", "")).strip()
+    if not token:
+        raise ConfigurationError("ZVEC_BACKEND_TOKEN or --token is required for serve.")
+    serve_backend(
+        host=args.host,
+        port=args.port,
+        token=token,
+        instance_id=(args.instance_id or os.getenv("ZVEC_BACKEND_INSTANCE_ID")),
+        config_fingerprint=(
+            args.config_fingerprint or os.getenv("ZVEC_BACKEND_CONFIG_FINGERPRINT")
+        ),
+        instance_lock_path=(
+            args.instance_lock_path or os.getenv("ZVEC_BACKEND_LOCK_PATH")
+        ),
+        config=config,
+        query_root=args.query_root,
+        libraries_config=(args.libraries_config or os.getenv("ZVEC_LIBRARIES_CONFIG")),
+    )
+    return 0
+
+
+def _run_index_or_sync(args: argparse.Namespace, service: ImageVectorService) -> int:
+    if args.command == "index":
+        if args.clear_tags and args.tags:
+            raise ValueError("Tags cannot be combined with --clear-tags.")
+        report = service.index_folder(
+            args.folder,
+            recursive=not args.no_recursive,
+            verify_hash=args.verify_hash,
+            tags=[] if args.clear_tags else (args.tags or None),
+        )
+    else:
+        report = service.sync_folder(
+            args.folder,
+            recursive=not args.no_recursive,
+            verify_hash=args.verify_hash,
+            dry_run=args.dry_run,
+            allow_scope_change=args.allow_scope_change,
+        )
+    print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
+    return 4 if report.failed else 0
+
+
+def _run_search(args: argparse.Namespace, service: ImageVectorService) -> int:
+    if not args.text and not args.image:
+        raise ValueError("search requires --text, --image, or both.")
+    if args.search_mode == "tags":
+        if not args.text or args.image:
+            raise ValueError(
+                "tag-only search requires --text and does not accept --image."
             )
-            if args.workspace
-            else ServiceConfig(
-                model_configuration=model_configuration,
-                embedding_concurrency=model_configuration.embedding_concurrency,
-                auto_tag_concurrency=model_configuration.auto_tag_concurrency,
+        report = service.search_by_tags(
+            args.text,
+            top_k=args.tk,
+            tags=args.tags,
+            tag_mode=args.tag_mode,
+            show_low_confidence=args.show_low_confidence,
+            diversify_results=not args.show_all_series,
+        )
+    elif args.text and args.image:
+        report = service.search_by_image_and_text(
+            image_path=args.image,
+            text=args.text,
+            top_k=args.tk,
+            image_weight=args.image_weight,
+            text_weight=args.text_weight,
+            include_self=args.include_self,
+            tags=args.tags,
+            tag_mode=args.tag_mode,
+            show_low_confidence=args.show_low_confidence,
+            diversify_results=not args.show_all_series,
+        )
+    elif args.image:
+        report = service.search_by_image(
+            image_path=args.image,
+            top_k=args.tk,
+            include_self=args.include_self,
+            tags=args.tags,
+            tag_mode=args.tag_mode,
+            show_low_confidence=args.show_low_confidence,
+            diversify_results=not args.show_all_series,
+        )
+    else:
+        report = service.search_by_text(
+            args.text,
+            top_k=args.tk,
+            tags=args.tags,
+            tag_mode=args.tag_mode,
+            show_low_confidence=args.show_low_confidence,
+            diversify_results=not args.show_all_series,
+        )
+    print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
+    return 0
+
+
+def _run_service_command(args: argparse.Namespace, service: ImageVectorService) -> int:
+    if args.command in {"index", "sync"}:
+        return _run_index_or_sync(args, service)
+    if args.command == "stats":
+        print(json.dumps(service.stats(), ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "roots":
+        print(json.dumps(service.list_roots(), ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "rebind-root":
+        print(
+            json.dumps(
+                service.rebind_root(args.root_id, args.folder),
+                ensure_ascii=False,
+                indent=2,
             )
         )
-        if args.command in {"migrate-schema", "migrate-path-schema"}:
-            print(
-                json.dumps(
-                    migrate_schema(config, dry_run=args.dry_run),
-                    ensure_ascii=False,
-                    indent=2,
-                )
+        return 0
+    if args.command == "cache-clear":
+        print(json.dumps(service.clear_embedding_cache(), ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "metadata-backfill":
+        report = service.backfill_metadata_embeddings(max_images=args.max_images)
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 4 if report["failed"] else 0
+    if args.command == "clean-results":
+        print(
+            json.dumps(
+                service.clean_results(args.days, dry_run=args.dry_run),
+                ensure_ascii=False,
+                indent=2,
             )
-            return 0
-        if args.command == "serve":
-            from image_vector_service.backend_server import serve_backend
+        )
+        return 0
+    return _run_search(args, service)
 
-            token = (args.token or os.getenv("ZVEC_BACKEND_TOKEN", "")).strip()
-            if not token:
-                raise ConfigurationError(
-                    "ZVEC_BACKEND_TOKEN or --token is required for serve."
-                )
-            serve_backend(
-                host=args.host,
-                port=args.port,
-                token=token,
-                instance_id=(args.instance_id or os.getenv("ZVEC_BACKEND_INSTANCE_ID")),
-                config_fingerprint=(
-                    args.config_fingerprint
-                    or os.getenv("ZVEC_BACKEND_CONFIG_FINGERPRINT")
-                ),
-                instance_lock_path=(
-                    args.instance_lock_path or os.getenv("ZVEC_BACKEND_LOCK_PATH")
-                ),
-                config=config,
-                query_root=args.query_root,
-                libraries_config=(
-                    args.libraries_config or os.getenv("ZVEC_LIBRARIES_CONFIG")
-                ),
-            )
-            return 0
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    service: ImageVectorService | None = None
+    try:
+        config = _build_config(args)
+        if args.command in {"migrate-schema", "migrate-path-schema"}:
+            return _run_migration(args, config)
+        if args.command == "serve":
+            return _run_backend(args, config)
         service = ImageVectorService(
             config=config,
             progress=lambda message: print(message, flush=True),
         )
-        if args.command in {"index", "sync"}:
-            if args.command == "index":
-                if args.clear_tags and args.tags:
-                    raise ValueError("Tags cannot be combined with --clear-tags.")
-                index_report = service.index_folder(
-                    args.folder,
-                    recursive=not args.no_recursive,
-                    verify_hash=args.verify_hash,
-                    tags=[] if args.clear_tags else (args.tags or None),
-                )
-            else:
-                index_report = service.sync_folder(
-                    args.folder,
-                    recursive=not args.no_recursive,
-                    verify_hash=args.verify_hash,
-                    dry_run=args.dry_run,
-                    allow_scope_change=args.allow_scope_change,
-                )
-            print(json.dumps(index_report.to_dict(), ensure_ascii=False, indent=2))
-            return 4 if index_report.failed else 0
-
-        if args.command == "stats":
-            print(json.dumps(service.stats(), ensure_ascii=False, indent=2))
-            return 0
-
-        if args.command == "roots":
-            print(json.dumps(service.list_roots(), ensure_ascii=False, indent=2))
-            return 0
-
-        if args.command == "rebind-root":
-            print(
-                json.dumps(
-                    service.rebind_root(args.root_id, args.folder),
-                    ensure_ascii=False,
-                    indent=2,
-                )
-            )
-            return 0
-
-        if args.command == "cache-clear":
-            print(
-                json.dumps(
-                    service.clear_embedding_cache(), ensure_ascii=False, indent=2
-                )
-            )
-            return 0
-
-        if args.command == "metadata-backfill":
-            report = service.backfill_metadata_embeddings(
-                max_images=args.max_images,
-            )
-            print(json.dumps(report, ensure_ascii=False, indent=2))
-            return 4 if report["failed"] else 0
-
-        if args.command == "clean-results":
-            print(
-                json.dumps(
-                    service.clean_results(args.days, dry_run=args.dry_run),
-                    ensure_ascii=False,
-                    indent=2,
-                )
-            )
-            return 0
-
-        if not args.text and not args.image:
-            raise ValueError("search requires --text, --image, or both.")
-        if args.search_mode == "tags":
-            if not args.text or args.image:
-                raise ValueError(
-                    "tag-only search requires --text and does not accept --image."
-                )
-            search_report = service.search_by_tags(
-                args.text,
-                top_k=args.tk,
-                tags=args.tags,
-                tag_mode=args.tag_mode,
-                show_low_confidence=args.show_low_confidence,
-                diversify_results=not args.show_all_series,
-            )
-        elif args.text and args.image:
-            search_report = service.search_by_image_and_text(
-                image_path=args.image,
-                text=args.text,
-                top_k=args.tk,
-                image_weight=args.image_weight,
-                text_weight=args.text_weight,
-                include_self=args.include_self,
-                tags=args.tags,
-                tag_mode=args.tag_mode,
-                show_low_confidence=args.show_low_confidence,
-                diversify_results=not args.show_all_series,
-            )
-        elif args.image:
-            search_report = service.search_by_image(
-                image_path=args.image,
-                top_k=args.tk,
-                include_self=args.include_self,
-                tags=args.tags,
-                tag_mode=args.tag_mode,
-                show_low_confidence=args.show_low_confidence,
-                diversify_results=not args.show_all_series,
-            )
-        else:
-            search_report = service.search_by_text(
-                args.text,
-                top_k=args.tk,
-                tags=args.tags,
-                tag_mode=args.tag_mode,
-                show_low_confidence=args.show_low_confidence,
-                diversify_results=not args.show_all_series,
-            )
-        print(json.dumps(search_report.to_dict(), ensure_ascii=False, indent=2))
-        return 0
+        return _run_service_command(args, service)
     except KeyboardInterrupt:
         print("Interrupted. Completed records remain indexed.", file=sys.stderr)
         return 130

@@ -1,4 +1,4 @@
-import { flushPromises, mount } from "@vue/test-utils";
+import { flushPromises, mount, type DOMWrapper } from "@vue/test-utils";
 import { describe, expect, it, vi } from "vitest";
 
 import DataMigrationSection from "../DataMigrationSection.vue";
@@ -77,7 +77,7 @@ function fakeApi(overrides: Partial<DataMigrationApi> = {}): DataMigrationApi {
   };
 }
 
-function button(wrapper: ReturnType<typeof mount>, label: string) {
+function button(wrapper: Pick<DOMWrapper<Element>, "findAll">, label: string) {
   const result = wrapper.findAll("button").find((item) => item.text().includes(label));
   if (!result) throw new Error(`button not found: ${label}`);
   return result;

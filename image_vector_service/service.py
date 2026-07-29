@@ -33,7 +33,11 @@ from .active_learning_review_store import (
     ActiveLearningReviewStore,
     ActiveLearningReviewStoreError,
 )
-from .annotation_service import AutoTaggingCoordinator, StreamingAutoTagSession
+from .annotation_service import (
+    AutoTaggingCoordinator,
+    AutoTagRunReport,
+    StreamingAutoTagSession,
+)
 from .app_logging import close_app_logger, get_app_logger
 from .auto_tag_cache import SharedAutoTagCache
 from .cluster_operation_store import (
@@ -3839,7 +3843,7 @@ class ImageVectorService:
         max_images: int = 200,
         max_budget_cny: float | None = None,
         external_processing_confirmed: bool = False,
-    ) -> dict[str, object]:
+    ) -> AutoTagRunReport:
         return self.auto_tagging.run(
             scope=scope,
             model=model,

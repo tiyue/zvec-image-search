@@ -1,4 +1,4 @@
-import { flushPromises, mount, type VueWrapper } from "@vue/test-utils";
+import { flushPromises, mount, type DOMWrapper } from "@vue/test-utils";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import OrganizePage from "../OrganizePage.vue";
@@ -121,23 +121,28 @@ function fakeApi(overrides: Partial<OrganizeApi> = {}): OrganizeApi {
   };
 }
 
-function buttonWithText(wrapper: VueWrapper, label: string) {
+type QueryWrapper = Pick<DOMWrapper<Element>, "findAll" | "get">;
+
+function buttonWithText(wrapper: QueryWrapper, label: string) {
   const button = wrapper.findAll("button").find((item) => item.text().includes(label));
   if (!button) throw new Error(`button not found: ${label}`);
   return button;
 }
 
-function imageButton(wrapper: VueWrapper, id: string) {
+function imageButton(wrapper: QueryWrapper, id: string) {
   return wrapper.get(`[data-image-id="${id}"] .image-select`);
 }
 
-async function mountPage(api: OrganizeApi): Promise<VueWrapper> {
+async function mountPage(api: OrganizeApi) {
   const wrapper = mount(OrganizePage, { props: { api } });
   await flushPromises();
   return wrapper;
 }
 
-async function selectOneAndEnterTags(wrapper: VueWrapper, tags = "原神、雷电将军"): Promise<void> {
+async function selectOneAndEnterTags(
+  wrapper: QueryWrapper,
+  tags = "原神、雷电将军",
+): Promise<void> {
   await imageButton(wrapper, "doc-1").trigger("click");
   const input = wrapper.get(".tag-input-label textarea");
   await input.setValue(tags);
