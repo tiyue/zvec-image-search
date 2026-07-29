@@ -1,10 +1,17 @@
-# YaoLens 0.1
+# YaoLens 0.1.1
 
 本版提供 Windows x64 原生 Python 后端和 Vue 3 桌面界面。发布包冻结 Python、WebView2 桥接和前端静态资源；用户运行时不需要 Node.js、PowerShell、.NET、Docker、WSL 或单独安装 Python。
 
-本次使用机器版本 `0.1.0`、公开展示版本 `0.1` 和稳定标签 `v0.1.0`。
+本次使用机器版本 `0.1.1`、公开展示版本 `0.1.1` 和稳定标签 `v0.1.1`。
 
 ## 本版更新
+
+### 模型服务边界
+
+- 业务层改为只依赖供应商无关的嵌入、视觉标注、错误和诊断契约；阿里云百炼 HTTP 实现集中在独立适配器中。
+- 嵌入与视觉请求统一记录实际 HTTP 尝试次数，并对认证、限流、瞬态故障、内容策略和非法响应使用稳定错误类别。
+- 嵌入响应新增数量、索引、维度及有限数值校验，模型响应增加大小上限；旧 DashScope 导入路径继续兼容一个发布周期。
+- 更换嵌入模型、维度、预处理或其他向量空间语义时，必须完整重建图片和描述向量索引。
 
 ### 图库扫描、智能标注与任务进度修复
 
@@ -161,14 +168,14 @@
 以下是完成最终构建和校验后采用的文件名。本说明不代表这些文件已经由当前源码重新生成；实际交付必须同时提供 SHA-256 和验证报告。
 
 ```text
-YaoLens-0.1-win-x64-portable.zip
-YaoLens-0.1-win-x64-setup.exe
-YaoLens-0.1-android.apk
+YaoLens-0.1.1-win-x64-portable.zip
+YaoLens-0.1.1-win-x64-setup.exe
+YaoLens-0.1.1-android.apk
 ```
 
 登录常驻没有新增独立发布资产；GitHub Release 资产矩阵仍为上述 Windows 安装包、便携包、Android APK 及对应校验和、验证报告和策略元数据。
 
-GitHub Release 标题固定为 `YaoLens 0.1`，并从精确指向工作流提交的稳定标签 `v0.1.0` 发布。
+GitHub Release 标题固定为 `YaoLens 0.1.1`，并从精确指向工作流提交的稳定标签 `v0.1.1` 发布。
 
 Windows 应用入口：
 

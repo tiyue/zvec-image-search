@@ -437,10 +437,10 @@ class WebviewPreviewSourceContractTest(unittest.TestCase):
             / "webview_preview"
             / "yaolens_version_info.txt"
         ).read_text(encoding="utf-8")
-        self.assertIn("filevers=(0, 1, 0, 0)", version_info)
+        self.assertIn("filevers=(0, 1, 1, 0)", version_info)
         self.assertIn('StringStruct("ProductName", "YaoLens")', version_info)
-        self.assertIn('StringStruct("FileVersion", "0.1")', version_info)
-        self.assertIn('StringStruct("ProductVersion", "0.1")', version_info)
+        self.assertIn('StringStruct("FileVersion", "0.1.1")', version_info)
+        self.assertIn('StringStruct("ProductVersion", "0.1.1")', version_info)
         self.assertIn('"image_vector_service.search_learning_evaluator"', spec)
         self.assertIn('"image_vector_service.search_learning_store"', spec)
         self.assertIn('"image_vector_service.search_learning_runtime"', spec)
