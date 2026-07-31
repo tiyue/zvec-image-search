@@ -1,10 +1,16 @@
-# YaoLens 0.1.1
+# YaoLens 0.1.2
 
 本版提供 Windows x64 原生 Python 后端和 Vue 3 桌面界面。发布包冻结 Python、WebView2 桥接和前端静态资源；用户运行时不需要 Node.js、PowerShell、.NET、Docker、WSL 或单独安装 Python。
 
-本次使用机器版本 `0.1.1`、公开展示版本 `0.1.1` 和稳定标签 `v0.1.1`。
+本次使用机器版本 `0.1.2`、公开展示版本 `0.1.2` 和稳定标签 `v0.1.2`。
 
 ## 本版更新
+
+### 自动增量索引可靠性
+
+- 文件变化事件先进入“已领取”状态，只有在索引与智能标注完整成功后才确认完成；异常、取消或确认失败会把事件安全恢复为待处理。
+- 启动 watcher 时会恢复进程中断前遗留的已领取事件，并将悬空索引批次标记为失败，避免新增图片永久卡在队列中。
+- 自动任务按智能标注上限分批领取事件；每批成功后自动续跑直到积压清空，不会因此触发全图库重新索引或重新标注。
 
 ### 模型服务边界
 
@@ -168,14 +174,14 @@
 以下是完成最终构建和校验后采用的文件名。本说明不代表这些文件已经由当前源码重新生成；实际交付必须同时提供 SHA-256 和验证报告。
 
 ```text
-YaoLens-0.1.1-win-x64-portable.zip
-YaoLens-0.1.1-win-x64-setup.exe
-YaoLens-0.1.1-android.apk
+YaoLens-0.1.2-win-x64-portable.zip
+YaoLens-0.1.2-win-x64-setup.exe
+YaoLens-0.1.2-android.apk
 ```
 
 登录常驻没有新增独立发布资产；GitHub Release 资产矩阵仍为上述 Windows 安装包、便携包、Android APK 及对应校验和、验证报告和策略元数据。
 
-GitHub Release 标题固定为 `YaoLens 0.1.1`，并从精确指向工作流提交的稳定标签 `v0.1.1` 发布。
+GitHub Release 标题固定为 `YaoLens 0.1.2`，并从精确指向工作流提交的稳定标签 `v0.1.2` 发布。
 
 Windows 应用入口：
 

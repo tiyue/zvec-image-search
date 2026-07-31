@@ -2754,9 +2754,7 @@ class IndexState:
         """Compatibility helper that immediately acknowledges claimed changes."""
 
         changes = self.claim_pending_changes(root_id)
-        self.acknowledge_claimed_changes(
-            int(change["id"]) for change in changes
-        )
+        self.acknowledge_claimed_changes(int(change["id"]) for change in changes)
         return changes
 
     def count_pending_changes(self, root_id: str) -> int:
