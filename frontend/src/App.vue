@@ -12,6 +12,7 @@ import { useNativeImageActions } from "./composables/useNativeImageActions";
 import { useSearch } from "./composables/useSearch";
 import { installGlobalDiagnostics, reportFrontendDiagnostic } from "./diagnostics";
 import { OrganizePage } from "./features/organize";
+import { RecommendationPage } from "./features/recommendations";
 import { canRecordFeedback, useSearchFeedback } from "./features/search-learning";
 import { SettingsPage } from "./features/settings";
 import type { SettingsLibrary } from "./features/settings";
@@ -24,14 +25,14 @@ import type {
   ToastMessage,
 } from "./types/contracts";
 
-type PageName = "search" | "tasks" | "batch" | "groups" | "learning" | "settings";
+type PageName = "search" | "tasks" | "batch" | "groups" | "learning" | "recommendations" | "settings";
 
 const pageDefinitions: Array<{
   id: PageName;
   label: string;
   description: string;
-  icon: "search" | "tasks" | "tags" | "groups" | "learning";
-  shortcut: `Alt+${1 | 2 | 3 | 4 | 5}`;
+  icon: "search" | "tasks" | "tags" | "groups" | "learning" | "image";
+  shortcut: `Alt+${1 | 2 | 3 | 4 | 5 | 6}`;
 }> = [
   {
     id: "search",
@@ -67,6 +68,13 @@ const pageDefinitions: Array<{
     description: "审核搜索与分组反馈",
     icon: "learning",
     shortcut: "Alt+5",
+  },
+  {
+    id: "recommendations",
+    label: "图片推荐",
+    description: "多样发现与随机探索",
+    icon: "image",
+    shortcut: "Alt+6",
   },
 ];
 
@@ -406,6 +414,11 @@ async function exportSelectedImages(imageIds: string[], source: string): Promise
   }
 }
 
+async function exportRecommendedImage(mediaId: string): Promise<boolean> {
+  if (!(await nativeActions.exportImages([mediaId]))) return false;
+  return (nativeActions.exportJob.value?.exported ?? 0) > 0;
+}
+
 async function markContextFeedback(action: "relevant" | "not_relevant"): Promise<void> {
   const item = contextFeedbackItem.value;
   if (!item) return;
@@ -547,12 +560,12 @@ function handleLibrariesUpdated(libraries: SettingsLibrary[]): void {
 function handleGlobalKeydown(event: KeyboardEvent): void {
   // Use the physical digit code as a fallback so Alt shortcuts work under
   // keyboard layouts that transform event.key. Ignore AltGr (Ctrl+Alt).
-  const shortcutKey = /^Digit([1-5])$/u.exec(event.code)?.[1] ?? event.key;
+  const shortcutKey = /^Digit([1-6])$/u.exec(event.code)?.[1] ?? event.key;
   if (
     event.altKey &&
     !event.ctrlKey &&
     !event.metaKey &&
-    ["1", "2", "3", "4", "5"].includes(shortcutKey)
+    ["1", "2", "3", "4", "5", "6"].includes(shortcutKey)
   ) {
     event.preventDefault();
     const page = pageDefinitions[Number(shortcutKey) - 1]?.id;
@@ -857,6 +870,16 @@ watch(
 
       <div v-if="visitedPages.includes('tasks')" v-show="activePage === 'tasks'" class="feature-page" data-page-section="tasks">
         <TasksPage :libraries="search.libraries.value" :visible="activePage === 'tasks'" @toast="handleFeatureToast" />
+      </div>
+
+      <div v-if="visitedPages.includes('recommendations')" v-show="activePage === 'recommendations'" class="feature-page" data-page-section="recommendations">
+        <RecommendationPage
+          :visible="activePage === 'recommendations'"
+          :export-busy="nativeActions.exporting.value"
+          :open-image="nativeActions.open"
+          :export-image="exportRecommendedImage"
+          @toast="handleFeatureToast"
+        />
       </div>
 
       <div v-if="organizeVisited" v-show="activePage === 'batch' || activePage === 'groups' || activePage === 'learning'" class="feature-page" data-page-section="organize">

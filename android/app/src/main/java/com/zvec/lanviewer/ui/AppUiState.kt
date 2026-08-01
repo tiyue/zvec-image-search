@@ -4,6 +4,9 @@ import android.net.Uri
 import com.zvec.lanviewer.data.local.SavedFileRecord
 import com.zvec.lanviewer.data.model.DiscoveredServer
 import com.zvec.lanviewer.data.model.LibraryDto
+import com.zvec.lanviewer.data.model.OriginalMediaItem
+import com.zvec.lanviewer.data.model.RecommendationAction
+import com.zvec.lanviewer.data.model.RecommendationItem
 import com.zvec.lanviewer.data.model.SearchItem
 import com.zvec.lanviewer.data.model.SearchMode
 import kotlinx.collections.immutable.PersistentList
@@ -24,6 +27,27 @@ data class QueryImageUiState(
     val uploading: Boolean = false,
     val bytesUploaded: Long = 0L,
     val totalBytes: Long? = null,
+)
+
+enum class ViewerSource {
+    SEARCH,
+    RECOMMENDATIONS,
+}
+
+data class RecommendationUiState(
+    val batchId: String? = null,
+    val preloadedBatchId: String? = null,
+    val shownBatchId: String? = null,
+    val shownEventId: String? = null,
+    val items: PersistentList<RecommendationItem> = persistentListOf(),
+    val isLoading: Boolean = false,
+    val errorMessage: String? = null,
+    val partial: Boolean = false,
+    val partialReason: String? = null,
+    val reactions: Map<String, RecommendationAction> = emptyMap(),
+    val pendingReactionItemIds: Set<String> = emptySet(),
+    val actionEventIds: Map<String, String> = emptyMap(),
+    val pendingActionKeys: Set<String> = emptySet(),
 )
 
 data class AppUiState(
@@ -48,11 +72,22 @@ data class AppUiState(
     val totalResults: Int = 0,
     val activeSearchId: String? = null,
     val nextPage: Int = 1,
+    val recommendations: RecommendationUiState = RecommendationUiState(),
+    val viewerSource: ViewerSource? = null,
     val viewerIndex: Int? = null,
     val transferMessage: String? = null,
     val transferFraction: Float? = null,
     val savedFiles: List<SavedFileRecord> = emptyList(),
 )
+
+internal fun AppUiState.viewerItems(): List<OriginalMediaItem> = when (viewerSource) {
+    ViewerSource.SEARCH -> results
+    ViewerSource.RECOMMENDATIONS -> recommendations.items
+    null -> emptyList()
+}
+
+internal fun AppUiState.currentViewerItem(): OriginalMediaItem? =
+    viewerIndex?.let(viewerItems()::getOrNull)
 
 /**
  * The phone exposes only semantic and tag choices. Image and combined modes

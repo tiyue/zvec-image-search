@@ -2,6 +2,7 @@ package com.zvec.lanviewer.ui
 
 import com.zvec.lanviewer.data.model.SearchItem
 import com.zvec.lanviewer.data.model.SearchMode
+import com.zvec.lanviewer.data.model.RecommendationItem
 import kotlinx.collections.immutable.persistentListOf
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
@@ -49,5 +50,35 @@ class AppUiStateTest {
         assertEquals(SearchMode.IMAGE, resolveSearchMode(SearchMode.TEXT, hasText = false, hasImage = true))
         assertEquals(SearchMode.COMBINED, resolveSearchMode(SearchMode.TEXT, hasText = true, hasImage = true))
         assertEquals(SearchMode.TAG, resolveSearchMode(SearchMode.TAG, hasText = true, hasImage = true))
+    }
+
+    @Test
+    fun viewerUsesTheSourceSpecificItems() {
+        val search = SearchItem(mediaId = "search")
+        val recommendation = RecommendationItem(
+            itemId = "item",
+            mediaId = "recommended",
+            name = "recommended.jpg",
+            width = 100,
+            height = 100,
+            tags = emptyList(),
+            libraryId = "library",
+            libraryName = "Library",
+            contentType = "image/jpeg",
+            sizeBytes = 100,
+            bucket = "quality",
+            thumbnailUrl = "http://127.0.0.1/thumbnail.jpg",
+            previewUrl = "http://127.0.0.1/preview.jpg",
+        )
+
+        val recommendationState = AppUiState(
+            results = persistentListOf(search),
+            recommendations = RecommendationUiState(items = persistentListOf(recommendation)),
+            viewerSource = ViewerSource.RECOMMENDATIONS,
+            viewerIndex = 0,
+        )
+
+        assertEquals("recommended", recommendationState.currentViewerItem()?.mediaId)
+        assertEquals(listOf(recommendation), recommendationState.viewerItems())
     }
 }

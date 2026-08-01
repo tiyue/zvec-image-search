@@ -7147,6 +7147,129 @@ class ImageVectorService:
         payload["embedding_recomputed"] = False
         return payload
 
+    def collect_recommendation_candidates(
+        self,
+        *,
+        random_cursor: str,
+        limit_per_pool: int = 100,
+    ) -> dict[str, object]:
+        """Collect one bounded candidate set on the Collection owner thread."""
+
+        sampled = self.state.sample_recommendation_entries(
+            random_cursor=random_cursor,
+            limit_per_pool=limit_per_pool,
+        )
+        doc_ids = [str(entry["doc_id"]) for entry, _annotation in sampled]
+        vectors: dict[str, list[float]] = {}
+        for offset in range(0, len(doc_ids), 256):
+            chunk_vectors, _failures = self.repository.fetch_vectors(
+                doc_ids[offset : offset + 256]
+            )
+            vectors.update(chunk_vectors)
+
+        candidates: list[dict[str, object]] = []
+        for entry, annotation in sampled:
+            doc_id = str(entry["doc_id"])
+            source_tags = normalize_tags(
+                [
+                    *entry.get("tags", ()),
+                    *entry.get("folder_tags", ()),
+                    *entry.get("accepted_auto_tags", ()),
+                    *entry.get("inherited_tags", ()),
+                ]
+            )
+            raw_vector = vectors.get(doc_id)
+            vector = (
+                tuple(float(value) for value in raw_vector)
+                if raw_vector is not None
+                and len(raw_vector) == int(self.config.dimension)
+                else None
+            )
+            item: dict[str, object] = {
+                "doc_id": doc_id,
+                "sha256": str(entry["sha256"]),
+                "root_id": str(entry["root_id"]),
+                "relative_path": str(entry["relative_path"]),
+                "name": str(
+                    entry.get("file_name") or Path(str(entry["relative_path"])).name
+                ),
+                "content_type": str(
+                    entry.get("mime_type") or "application/octet-stream"
+                ),
+                "size_bytes": int(entry.get("size_bytes") or 0),
+                "mtime_ns": int(entry.get("mtime_ns") or 0),
+                "width": int(entry.get("width") or 0),
+                "height": int(entry.get("height") or 0),
+                "tags": list(source_tags),
+                "album_id": (
+                    f"{entry['root_id']}\0{entry.get('parent_directory') or ''}"
+                ),
+                "character": _accepted_recommendation_character(entry, annotation),
+                "vector": vector,
+            }
+            resolver = getattr(self, "source_resolver", None)
+            if resolver is not None:
+                with suppress(OSError, ValueError, ConfigurationError):
+                    item["source_path"] = str(resolver.resolve_fields(dict(entry)))
+            candidates.append(item)
+        return {
+            "vector_space": {
+                "model": self.config.model,
+                "dimension": self.config.dimension,
+                "metric": self.config.metric,
+            },
+            "candidates": candidates,
+        }
+
+    def load_recommendation_items(
+        self, doc_ids: Sequence[str]
+    ) -> list[dict[str, object]]:
+        """Rehydrate persisted batch identities without reading vectors."""
+
+        normalized = list(dict.fromkeys(str(doc_id) for doc_id in doc_ids))
+        entries = self.state.get_many(normalized)
+        items: list[dict[str, object]] = []
+        for doc_id in normalized:
+            entry = entries.get(doc_id)
+            if entry is None:
+                continue
+            resolver = getattr(self, "source_resolver", None)
+            if resolver is None:
+                continue
+            try:
+                source_path = str(resolver.resolve_fields(dict(entry)))
+            except (OSError, ValueError, ConfigurationError):
+                continue
+            tags = normalize_tags(
+                [
+                    *entry.get("tags", ()),
+                    *entry.get("folder_tags", ()),
+                    *entry.get("accepted_auto_tags", ()),
+                    *entry.get("inherited_tags", ()),
+                ]
+            )
+            items.append(
+                {
+                    "doc_id": doc_id,
+                    "sha256": str(entry["sha256"]),
+                    "root_id": str(entry["root_id"]),
+                    "relative_path": str(entry["relative_path"]),
+                    "name": str(
+                        entry.get("file_name") or Path(str(entry["relative_path"])).name
+                    ),
+                    "content_type": str(
+                        entry.get("mime_type") or "application/octet-stream"
+                    ),
+                    "size_bytes": int(entry.get("size_bytes") or 0),
+                    "mtime_ns": int(entry.get("mtime_ns") or 0),
+                    "width": int(entry.get("width") or 0),
+                    "height": int(entry.get("height") or 0),
+                    "tags": list(tags),
+                    "source_path": source_path,
+                }
+            )
+        return items
+
     def stats(self) -> dict:
         collection_stats = self.repository.stats
         return {
@@ -7619,6 +7742,34 @@ def _cluster_identity_evidence(
 
 def _tag_key(value: object) -> str:
     return str(value).strip().casefold()
+
+
+def _accepted_recommendation_character(
+    entry: Mapping[str, object],
+    annotation: Mapping[str, object] | None,
+) -> str | None:
+    if annotation is None or annotation.get("status") != "accepted":
+        return None
+    structured = annotation.get("structured")
+    if not isinstance(structured, Mapping):
+        return None
+    entities = structured.get("entities")
+    if not isinstance(entities, Mapping):
+        return None
+    characters = entities.get("character")
+    if isinstance(characters, (str, bytes, bytearray)) or not isinstance(
+        characters, Sequence
+    ):
+        return None
+    accepted_auto_tags = cast(Iterable[object], entry.get("accepted_auto_tags", ()))
+    accepted = {_tag_key(value) for value in accepted_auto_tags if str(value).strip()}
+    for raw in characters:
+        if not isinstance(raw, Mapping) or raw.get("state") != "confirmed":
+            continue
+        name = str(raw.get("name") or "").strip()
+        if name and _tag_key(name) in accepted:
+            return name
+    return None
 
 
 def _matched_source_tags(value: object, matched: set[str]) -> list[str]:

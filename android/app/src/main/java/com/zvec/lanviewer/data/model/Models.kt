@@ -2,6 +2,7 @@ package com.zvec.lanviewer.data.model
 
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.JsonElement
 
 @Serializable
 data class DiscoveryResponse(
@@ -96,19 +97,32 @@ data class SearchCreatedResponse(
     @SerialName("search_id") val searchId: String,
 )
 
+interface OriginalMediaItem {
+    val mediaId: String
+    val score: Double?
+    val name: String
+    val width: Int?
+    val height: Int?
+    val tags: List<String>
+    val libraryId: String?
+    val libraryName: String?
+    val contentType: String?
+    val sizeBytes: Long?
+}
+
 @Serializable
 data class SearchItem(
-    @SerialName("media_id") val mediaId: String,
-    val score: Double? = null,
-    val name: String = "",
-    val width: Int? = null,
-    val height: Int? = null,
-    val tags: List<String> = emptyList(),
-    @SerialName("library_id") val libraryId: String? = null,
-    @SerialName("library_name") val libraryName: String? = null,
-    @SerialName("content_type") val contentType: String? = null,
-    @SerialName("size_bytes") val sizeBytes: Long? = null,
-)
+    @SerialName("media_id") override val mediaId: String,
+    override val score: Double? = null,
+    override val name: String = "",
+    override val width: Int? = null,
+    override val height: Int? = null,
+    override val tags: List<String> = emptyList(),
+    @SerialName("library_id") override val libraryId: String? = null,
+    @SerialName("library_name") override val libraryName: String? = null,
+    @SerialName("content_type") override val contentType: String? = null,
+    @SerialName("size_bytes") override val sizeBytes: Long? = null,
+) : OriginalMediaItem
 
 @Serializable
 data class SearchPageResponse(
@@ -130,6 +144,80 @@ sealed interface SearchPageResult {
     data class Ready(val page: SearchPageResponse) : SearchPageResult
     data class Pending(val status: String, val retryAfterSeconds: Long) : SearchPageResult
 }
+
+@Serializable
+data class RecommendationRequest(
+    @SerialName("request_id") val requestId: String,
+)
+
+@Serializable
+data class RecommendationQuota(
+    val quality: Int = 0,
+    val recent: Int = 0,
+    @SerialName("low_exposure") val lowExposure: Int = 0,
+    val random: Int = 0,
+)
+
+@Serializable
+data class RecommendationDiversity(
+    val applied: Boolean = false,
+    val reason: String? = null,
+    @SerialName("missing_vectors") val missingVectors: Int = 0,
+    @SerialName("vector_space") val vectorSpace: JsonElement? = null,
+)
+
+@Serializable
+data class RecommendationItem(
+    @SerialName("item_id") val itemId: String,
+    @SerialName("media_id") override val mediaId: String,
+    override val name: String,
+    override val width: Int,
+    override val height: Int,
+    override val tags: List<String>,
+    @SerialName("library_id") override val libraryId: String,
+    @SerialName("library_name") override val libraryName: String,
+    @SerialName("content_type") override val contentType: String,
+    @SerialName("size_bytes") override val sizeBytes: Long,
+    val bucket: String,
+    @SerialName("thumbnail_url") val thumbnailUrl: String,
+    @SerialName("preview_url") val previewUrl: String,
+    override val score: Double? = null,
+) : OriginalMediaItem
+
+@Serializable
+data class RecommendationsResponse(
+    @SerialName("request_id") val requestId: String,
+    @SerialName("batch_id") val batchId: String,
+    val count: Int,
+    val partial: Boolean,
+    @SerialName("partial_reason") val partialReason: String,
+    @SerialName("quota_degraded") val quotaDegraded: Boolean,
+    @SerialName("history_window") val historyWindow: Int,
+    val items: List<RecommendationItem>,
+    val quota: RecommendationQuota,
+    val diversity: RecommendationDiversity,
+)
+
+@Serializable
+data class RecommendationShownRequest(
+    @SerialName("event_id") val eventId: String,
+)
+
+@Serializable
+enum class RecommendationAction {
+    @SerialName("open") OPEN,
+    @SerialName("like") LIKE,
+    @SerialName("export") EXPORT,
+    @SerialName("dislike") DISLIKE,
+}
+
+@Serializable
+data class RecommendationActionRequest(
+    @SerialName("event_id") val eventId: String,
+    @SerialName("item_id") val itemId: String,
+    val action: RecommendationAction,
+    val metadata: Map<String, String>? = null,
+)
 
 @Serializable
 data class ErrorEnvelope(

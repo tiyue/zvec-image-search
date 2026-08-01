@@ -10,6 +10,10 @@ import com.zvec.lanviewer.data.model.PairPollResponse
 import com.zvec.lanviewer.data.model.PairRequest
 import com.zvec.lanviewer.data.model.PairStartResponse
 import com.zvec.lanviewer.data.model.QueryImageResponse
+import com.zvec.lanviewer.data.model.RecommendationActionRequest
+import com.zvec.lanviewer.data.model.RecommendationRequest
+import com.zvec.lanviewer.data.model.RecommendationShownRequest
+import com.zvec.lanviewer.data.model.RecommendationsResponse
 import com.zvec.lanviewer.data.model.SearchCreatedResponse
 import com.zvec.lanviewer.data.model.SearchPageResponse
 import com.zvec.lanviewer.data.model.SearchPageResult
@@ -113,6 +117,31 @@ class LanApiClient(
     suspend fun libraries(): LibrariesResponse = executeJson(
         Request.Builder().url(currentEndpoint("api", "v1", "libraries")).get().build(),
     )
+
+    suspend fun recommendations(request: RecommendationRequest): RecommendationsResponse = executeJson(
+        Request.Builder()
+            .url(currentEndpoint("api", "v1", "recommendations"))
+            .post(json.encodeToString(request).jsonBody())
+            .build(),
+    )
+
+    suspend fun markRecommendationsShown(batchId: String, request: RecommendationShownRequest) {
+        executeUnit(
+            Request.Builder()
+                .url(currentEndpoint("api", "v1", "recommendations", batchId, "shown"))
+                .post(json.encodeToString(request).jsonBody())
+                .build(),
+        )
+    }
+
+    suspend fun recordRecommendationAction(batchId: String, request: RecommendationActionRequest) {
+        executeUnit(
+            Request.Builder()
+                .url(currentEndpoint("api", "v1", "recommendations", batchId, "actions"))
+                .post(json.encodeToString(request).jsonBody())
+                .build(),
+        )
+    }
 
     suspend fun uploadQueryImage(
         contentResolver: ContentResolver,

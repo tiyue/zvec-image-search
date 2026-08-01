@@ -30,6 +30,8 @@ from .models import (
     LibraryInfo,
     MediaResolver,
     MediaSource,
+    RecommendationAction,
+    RecommendationBackend,
     SearchMode,
     SearchPage,
     SearchPending,
@@ -118,6 +120,7 @@ class LanApiServer:
         media_resolver: MediaResolver,
         pairing_manager: PairingManager,
         query_images: QueryImageStore,
+        recommendation_backend: RecommendationBackend | None = None,
         host: str = "0.0.0.0",
         port: int = API_PORT,
         stream_chunk_bytes: int = DEFAULT_STREAM_CHUNK_BYTES,
@@ -146,6 +149,7 @@ class LanApiServer:
         self._instance_id = instance_id
         self._name = normalized_name
         self._search_backend = search_backend
+        self._recommendation_backend = recommendation_backend
         self._media_resolver = media_resolver
         self._pairing = pairing_manager
         self._query_images = query_images
@@ -523,6 +527,28 @@ class _LanRequestHandler(BaseHTTPRequestHandler):
                     return
                 self._method_not_allowed(("GET", "DELETE"))
 
+            if path == "/api/v1/recommendations":
+                self._require_method("POST")
+                self._require_no_query(target.query)
+                client, _token = self._authenticate()
+                self._create_recommendations(client)
+                return
+
+            recommendation_match = re.fullmatch(
+                r"/api/v1/recommendations/([^/]+)/(shown|actions)",
+                path,
+            )
+            if recommendation_match is not None:
+                self._require_method("POST")
+                self._require_no_query(target.query)
+                client, _token = self._authenticate()
+                batch_id = _opaque_segment(recommendation_match.group(1))
+                if recommendation_match.group(2) == "shown":
+                    self._mark_recommendations_shown(batch_id, client)
+                else:
+                    self._record_recommendation_action(batch_id, client)
+                return
+
             media_match = re.fullmatch(
                 r"/api/v1/media/([^/]+)/original",
                 path,
@@ -721,6 +747,99 @@ class _LanRequestHandler(BaseHTTPRequestHandler):
                 self._cleanup_session_resources(client.session_id)
             raise
         self._send_json(HTTPStatus.ACCEPTED, {"search_id": search_id})
+
+    def _create_recommendations(self, client: AuthenticatedClient) -> None:
+        self._require_active_session(client)
+        payload = self._read_json_object()
+        _require_exact_fields(payload, required={"request_id"})
+        request_id = _validated_opaque_id(
+            _required_json_string(payload, "request_id"),
+            code="invalid_request",
+        )
+        backend = self._recommendation_backend_or_problem()
+        response = self._backend_call(
+            backend.create_recommendations,
+            request_id,
+            client_id=client.session_id,
+            device_id=client.device_id,
+        )
+        if not isinstance(response, Mapping):
+            raise _ApiProblem(
+                500,
+                "invalid_recommendation_response",
+                "Recommendations are unavailable.",
+            )
+        self._require_active_session(client)
+        self._send_json(HTTPStatus.OK, response)
+
+    def _mark_recommendations_shown(
+        self,
+        batch_id: str,
+        client: AuthenticatedClient,
+    ) -> None:
+        self._require_active_session(client)
+        payload = self._read_json_object()
+        _require_exact_fields(payload, required={"event_id"})
+        event_id = _validated_opaque_id(
+            _required_json_string(payload, "event_id"),
+            code="invalid_request",
+        )
+        backend = self._recommendation_backend_or_problem()
+        self._backend_call(
+            backend.mark_recommendations_shown,
+            batch_id,
+            event_id,
+            client_id=client.session_id,
+            device_id=client.device_id,
+        )
+        self._require_active_session(client)
+        self._send_json(HTTPStatus.OK, {"ok": True, "event_id": event_id})
+
+    def _record_recommendation_action(
+        self,
+        batch_id: str,
+        client: AuthenticatedClient,
+    ) -> None:
+        self._require_active_session(client)
+        payload = self._read_json_object()
+        _require_exact_fields(
+            payload,
+            required={"event_id", "item_id", "action"},
+            allowed={"event_id", "item_id", "action", "metadata"},
+        )
+        event_id = _validated_opaque_id(
+            _required_json_string(payload, "event_id"),
+            code="invalid_request",
+        )
+        item_id = _validated_opaque_id(
+            _required_json_string(payload, "item_id"),
+            code="invalid_request",
+        )
+        action = _validated_recommendation_action(payload.get("action"))
+        metadata = _validated_recommendation_metadata(payload.get("metadata"))
+        backend = self._recommendation_backend_or_problem()
+        self._backend_call(
+            backend.record_recommendation_action,
+            batch_id,
+            event_id,
+            item_id,
+            action,
+            metadata,
+            client_id=client.session_id,
+            device_id=client.device_id,
+        )
+        self._require_active_session(client)
+        self._send_json(HTTPStatus.OK, {"ok": True, "event_id": event_id})
+
+    def _recommendation_backend_or_problem(self) -> RecommendationBackend:
+        backend = self.gateway._recommendation_backend
+        if backend is None:
+            raise _ApiProblem(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                "recommendations_unavailable",
+                "Recommendations are unavailable.",
+            )
+        return backend
 
     def _validated_search_request(
         self,
@@ -1377,6 +1496,25 @@ def _required_json_string(payload: Mapping[str, object], name: str) -> str:
     if not isinstance(value, str):
         raise _ApiProblem(400, "invalid_request", "Request fields are invalid.")
     return value
+
+
+def _validated_recommendation_action(value: object) -> RecommendationAction:
+    if value not in {"open", "like", "export", "dislike"}:
+        raise _ApiProblem(400, "invalid_request", "Request fields are invalid.")
+    return cast(RecommendationAction, value)
+
+
+def _validated_recommendation_metadata(
+    value: object,
+) -> Mapping[str, str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict) or any(
+        not isinstance(key, str) or not isinstance(item, str)
+        for key, item in value.items()
+    ):
+        raise _ApiProblem(400, "invalid_request", "Request fields are invalid.")
+    return cast(dict[str, str], value)
 
 
 def _validated_host_header(value: str, expected_port: int) -> str:

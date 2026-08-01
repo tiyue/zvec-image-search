@@ -19,6 +19,11 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from PIL import Image, UnidentifiedImageError
 
+from zvec_host.recommendation_service import (
+    RecommendationService,
+    RecommendationServiceError,
+)
+
 from .diagnostics import (
     DiagnosticValidationError,
     FrontendDiagnosticLog,
@@ -135,6 +140,7 @@ class GatewayServer:
         self._lock = threading.RLock()
         self._query_images: tempfile.TemporaryDirectory[str] | None = None
         self._query_image_ids: set[str] = set()
+        self._recommendations: RecommendationService | None = None
 
     def _record_frontend_diagnostic(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         """Validate and persist a browser event without endangering the UI."""
@@ -335,6 +341,25 @@ class GatewayServer:
             },
         }
 
+    def _recommendation_service(self) -> RecommendationService:
+        with self._lock:
+            if self._recommendations is not None:
+                return self._recommendations
+            config_home = getattr(self._facade, "config_home", None)
+            client_provider = getattr(self._facade, "_ready_client", None)
+            if not isinstance(config_home, Path) or not callable(client_provider):
+                raise FacadeError(
+                    "recommendations_unavailable",
+                    "图片推荐暂不可用，请确认本地服务已经就绪。",
+                    status=503,
+                )
+            self._recommendations = RecommendationService(
+                client_provider,
+                self._facade.image_registry,
+                config_home,
+            )
+            return self._recommendations
+
     def _asset(self, relative: str) -> tuple[bytes, str]:
         decoded = unquote(relative).replace("\\", "/")
         pure = PurePosixPath(decoded)
@@ -419,6 +444,12 @@ def _handler_type(gateway: GatewayServer) -> type[BaseHTTPRequestHandler]:
                     exc.status,
                     {"error": exc.to_dict()},
                 )
+            except RecommendationServiceError as exc:
+                self._json_error(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    "recommendations_unavailable",
+                    str(exc),
+                )
             except ImageRegistryError as exc:
                 self._json_error(HTTPStatus.NOT_FOUND, "image_not_found", str(exc))
             except (ConnectionError, BrokenPipeError):
@@ -438,6 +469,50 @@ def _handler_type(gateway: GatewayServer) -> type[BaseHTTPRequestHandler]:
             query_values = parse_qs(query, keep_blank_values=False)
             if method == "GET" and segments == ("bootstrap",):
                 self._json(HTTPStatus.OK, gateway._facade.bootstrap())
+                return
+            if method == "POST" and segments == ("recommendations",):
+                body = self._read_json()
+                if set(body) != {"request_id"}:
+                    raise FacadeError("invalid_request", "推荐请求字段无效。")
+                self._json(
+                    HTTPStatus.OK,
+                    gateway._recommendation_service().create_recommendations(
+                        _recommendation_text(body, "request_id", maximum=160)
+                    ),
+                )
+                return
+            if (
+                method == "POST"
+                and len(segments) == 3
+                and segments[0] == "recommendations"
+                and segments[2] in {"shown", "actions"}
+            ):
+                batch_id = _recommendation_text(
+                    {"batch_id": segments[1]}, "batch_id", maximum=160
+                )
+                body = self._read_json()
+                if segments[2] == "shown":
+                    if set(body) != {"event_id"}:
+                        raise FacadeError("invalid_request", "推荐展示记录字段无效。")
+                    event_id = _recommendation_text(body, "event_id", maximum=160)
+                    gateway._recommendation_service().mark_recommendations_shown(
+                        batch_id, event_id
+                    )
+                else:
+                    if set(body) - {"event_id", "item_id", "action", "metadata"} or (
+                        not {"event_id", "item_id", "action"}.issubset(body)
+                    ):
+                        raise FacadeError("invalid_request", "推荐操作字段无效。")
+                    event_id = _recommendation_text(body, "event_id", maximum=160)
+                    item_id = _recommendation_text(body, "item_id", maximum=160)
+                    action = _recommendation_text(body, "action", maximum=32)
+                    if action not in {"open", "like", "export", "dislike"}:
+                        raise FacadeError("invalid_request", "推荐操作无效。")
+                    metadata = _recommendation_metadata(body.get("metadata"))
+                    gateway._recommendation_service().record_recommendation_action(
+                        batch_id, event_id, item_id, action, metadata
+                    )
+                self._json(HTTPStatus.OK, {"ok": True, "event_id": event_id})
                 return
             if method == "POST" and segments == ("diagnostics", "frontend"):
                 self._json(
@@ -1328,6 +1403,31 @@ def _query_required_text(
     if not values:
         raise FacadeError("invalid_query", f"{name} is required.")
     return _query_text(query, name, "", maximum=maximum)
+
+
+def _recommendation_text(payload: Mapping[str, Any], name: str, *, maximum: int) -> str:
+    value = payload.get(name)
+    if not isinstance(value, str):
+        raise FacadeError("invalid_request", f"{name} 无效。")
+    normalized = value.strip()
+    if (
+        not normalized
+        or len(normalized) > maximum
+        or any(character in normalized for character in "\r\n\0/")
+    ):
+        raise FacadeError("invalid_request", f"{name} 无效。")
+    return normalized
+
+
+def _recommendation_metadata(value: Any) -> dict[str, str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping) or any(
+        not isinstance(key, str) or not isinstance(item, str)
+        for key, item in value.items()
+    ):
+        raise FacadeError("invalid_request", "推荐操作元数据无效。")
+    return dict(value)
 
 
 def _query_bool(

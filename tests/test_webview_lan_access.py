@@ -104,6 +104,53 @@ class _Facade:
         }
 
 
+class _RecommendationBackend:
+    def __init__(self, media_id: str) -> None:
+        self.media_id = media_id
+        self.calls: list[tuple[object, ...]] = []
+
+    def create_recommendations(
+        self, request_id: str, *, viewer_id: str | None = None
+    ) -> dict[str, object]:
+        self.calls.append(("create", viewer_id, request_id))
+        return {
+            "request_id": request_id,
+            "batch_id": "batch-1",
+            "count": 1,
+            "partial": False,
+            "partial_reason": "",
+            "quota_degraded": False,
+            "items": [
+                {
+                    "item_id": "item-1",
+                    "media_id": self.media_id,
+                    "content_type": "image/png",
+                    "source_path": r"C:\must-not-leak\raiden.png",
+                    "vector": [0.2, 0.4],
+                }
+            ],
+        }
+
+    def mark_recommendations_shown(
+        self, batch_id: str, event_id: str, *, viewer_id: str | None = None
+    ) -> None:
+        self.calls.append(("shown", viewer_id, batch_id, event_id))
+
+    def record_recommendation_action(
+        self,
+        batch_id: str,
+        event_id: str,
+        item_id: str,
+        action: str,
+        metadata: dict[str, str] | None,
+        *,
+        viewer_id: str | None = None,
+    ) -> None:
+        self.calls.append(
+            ("action", viewer_id, batch_id, event_id, item_id, action, metadata)
+        )
+
+
 class _Clock:
     def __init__(self, now: float = 1_000.0) -> None:
         self.now = now
@@ -142,6 +189,66 @@ class PreviewLanAdapterTests(unittest.TestCase):
             [(item.id, item.name) for item in libraries],
             [("lib-a", "人物图库")],
         )
+
+    def test_recommendations_use_anonymous_device_viewers_and_media_outlive_searches(
+        self,
+    ) -> None:
+        backend = _RecommendationBackend(self.facade.image_id)
+        adapter = PreviewLanAdapter(self.facade, recommendation_backend=backend)  # type: ignore[arg-type]
+        adapter.set_recommendation_media_origin("http://192.168.1.20:39000")
+
+        payload = adapter.create_recommendations(
+            "request-1", client_id="session-a", device_id="android-install-a"
+        )
+        media_id = payload["items"][0]["media_id"]  # type: ignore[index]
+        self.assertNotEqual(media_id, self.facade.image_id)
+        self.assertEqual(
+            payload["items"][0]["thumbnail_url"],
+            f"http://192.168.1.20:39000/api/v1/media/{media_id}/original",
+        )
+        self.assertNotIn("source_path", str(payload))
+        self.assertNotIn("vector", str(payload))
+        resolved = adapter.resolve_original(media_id, client_id="session-a")
+        self.assertEqual(resolved.path, self.source)
+
+        adapter.mark_recommendations_shown(
+            "batch-1",
+            "shown-1",
+            client_id="session-a",
+            device_id="android-install-a",
+        )
+        adapter.record_recommendation_action(
+            "batch-1",
+            "action-1",
+            "item-1",
+            "like",
+            None,
+            client_id="session-a",
+            device_id="android-install-a",
+        )
+        viewer = backend.calls[0][1]
+        self.assertIsInstance(viewer, str)
+        self.assertNotIn("android-install-a", str(viewer))
+        self.assertEqual(backend.calls[1][1], viewer)
+        self.assertEqual(backend.calls[2][1], viewer)
+        adapter.delete_client_session(client_id="session-a")
+        self.assertIsNone(adapter.resolve_original(media_id, client_id="session-a"))
+
+    def test_recommendation_media_filter_marks_batch_partial(self) -> None:
+        adapter = PreviewLanAdapter(
+            self.facade,
+            recommendation_backend=_RecommendationBackend("missing-media"),
+        )  # type: ignore[arg-type]
+        adapter.set_recommendation_media_origin("http://192.168.1.20:39000")
+
+        payload = adapter.create_recommendations(
+            "request-1", client_id="session-a", device_id="android-install-a"
+        )
+
+        self.assertEqual(payload["count"], 0)
+        self.assertTrue(payload["partial"])
+        self.assertEqual(payload["partial_reason"], "media_unavailable")
+        self.assertTrue(payload["quota_degraded"])
 
     def test_tag_search_uses_existing_fuzzy_tag_contract_and_is_async(self) -> None:
         search_id = self.adapter.create_search(
@@ -519,6 +626,7 @@ class LanAccessControllerTests(unittest.TestCase):
             gateway = _Gateway.instances[-1]
             self.assertEqual(gateway.kwargs["bind_host"], "192.168.1.20")
             self.assertEqual(gateway.kwargs["advertised_host"], "192.168.1.20")
+            self.assertIs(gateway.kwargs["recommendation_backend"], controller._adapter)
             first_identity = gateway.kwargs["instance_id"]
 
             controller.stop()

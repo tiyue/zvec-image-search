@@ -33,7 +33,7 @@
 │              image_vector_service (核心服务层)            │
 │  backend_server.py - HTTP API (端口 8765, Bearer Token) │
 ├─────────────────────────────────────────────────────────┤
-│  索引 | 搜索 | 标签 | 聚类 | 联邦检索 | 结果导出        │
+│  索引 | 搜索 | 标签 | 聚类 | 联邦检索 | 推荐 | 结果导出 │
 └──────────────────────────┬──────────────────────────────┘
                            │
               ┌────────────┼────────────┐
@@ -74,6 +74,7 @@ Python 包，提供所有业务逻辑：
 | `result_exporter.py` | 搜索结果导出 |
 | `library_browser.py` | 只读文件夹/图片浏览 |
 | `source_resolver.py` / `logical_paths.py` | 路径安全解析 |
+| `recommendations.py` / `recommendation_store.py` | 固定配额推荐选择与按 viewer 隔离的批次、曝光事件存储 |
 
 ### zvec_host（无界面应用服务）
 
@@ -88,6 +89,7 @@ WebView 与 LAN 宿主共用的 Python 服务层，不包含 Tkinter、系统托
 Vue 3 + TypeScript + Vite SPA：
 - 组件：`GalleryGrid`、`ImageCard`、`ImagePreview`、`PaginationBar` 等
 - 功能模块（`src/features/`）：search-learning、organize、settings、tasks、activity、cleanup
+- 图片推荐模块（`src/features/recommendations/`）：推荐批次、缩略图预加载与 shown/action 事件同步
 - API 层（`src/api/`）：`client.ts`、`gateway.ts`
 - 构建产物嵌入 `zvec_webview/frontend_dist/`
 - 缩略图显示策略：所有图片网格统一使用 `object-fit: contain` 确保全图可见不裁切；图库浏览 4 列 + dense 自动填充，待学习 2 列 + dense 自动填充，搜索结果 5×3 固定布局；横图（宽高比 > 1.5）自动跨 2 列；网格采用 masonry 瀑布流布局（`grid-auto-rows: 10px` + 动态 `grid-row: span N`），每张图的行跨度由宽高比和列宽自动计算，竖图高窄、横图矮宽，dense 模式自动填缝
@@ -118,12 +120,14 @@ Vue 3 + TypeScript + Vite SPA：
 - HTTP API（`http_server.py`，端口 API_PORT）
 - 设备配对（`pairing.py`）
 - 查询图片上传（`uploads.py`）
+- 推荐批次及 shown/action 事件（`/api/v1/recommendations`）
 
 ### android（安卓客户端）
 
 Kotlin + Gradle 构建的安卓应用，通过 LAN API 与 Windows WebView 宿主通信。
 
 - 启动器使用橙黑相机搜索标识，提供白色背景的 Android 自适应图标以及各屏幕密度的传统、圆形兼容资源。
+- 底部栏提供“推荐”入口；推荐界面采用 Material3，随系统使用 light/dark 配色。
 
 ### 搜索查询语义
 
@@ -213,12 +217,28 @@ CLI 入口将配置创建、迁移/后端服务、需要 `ImageVectorService` �
 | `image_collection/` | zvec 向量集合（RocksDB） |
 | `image_collection.meta.json` | 集合元数据 |
 | `image_collection.state.sqlite3` | 索引状态数据库（含 `fs_change_queue` 表：文件变更队列） |
+| `recommendations.sqlite3` | 推荐批次、批次项、事件和 viewer 内容曝光计数；不存路径、向量或 token |
 | `search_results/` | 搜索结果导出目录 |
 | `search-learning/` | 搜索学习产物（聚类快照、主动学习队列） |
 | `fixed-evaluation.json` | 搜索学习固定评测包（离线排序质量评估基准） |
 | `model-catalog.default.json` | 默认模型配置 |
 
 集合写入前会对字段做安全校验（`collection_write_outbox`）：拒绝凭据、绝对路径（Windows 盘符 / UNC / Unix `/` 开头）和 NUL 字符。`relative_path` 必须是 POSIX 风格的相对路径，支持 CJK 字符及多级子目录（如 `作品/子目录/1.jpg`）。
+
+### 图片推荐
+
+- 每批目标为 15 张，固定池配额为：技术质量（`quality`）5、最近入库（`recent`）4、低曝光（`low_exposure`）4、随机发现（`random`）2。某个池不足时，只能以其他合格候选随机补位，并标记 `quota_degraded`。
+- 选择过程按 SHA-256 去重；同一图集（`library_id + root_id + parent_directory`）最多 3 张，同一已确认角色最多 5 张。推荐不含作者字段，也不施加作者维度的限制。
+- 角色只读取与当前 SHA-256 匹配、状态同时为 accepted 和 confirmed 的标注，并且只使用其 `accepted_auto_tags`。
+- 已展示历史依次使用 60、45、30、15、0 的窗口尝试；候选不足时不复制图片，返回 `partial` 批次及原因。
+- 向量多样性只使用现有索引向量，不得为推荐临时调用模型。MMR 将余弦相似度 `>= .95` 视为强惩罚，`.85–.95` 采用渐进软惩罚。跨图库仅在 `model + dimension + metric` 完全一致时比较向量；否则返回 `incompatible_vector_spaces`。
+- Windows viewer 与每台 Android viewer 的推荐批次、shown 历史和曝光计数完全隔离。只有客户端成功显示并提交 `shown` 后才计入曝光；创建批次本身不计曝光。
+- `recommendations.sqlite3` 仅含 `batches`、`items`、`events`、`content_stats` 四表，并保存不透明标识与计数，不保存文件路径、向量或 token。
+- LAN 契约为已认证的 `POST /api/v1/recommendations`（仅 `{request_id}`）、`POST /api/v1/recommendations/{batch_id}/shown`（仅 `{event_id}`）和 `POST /api/v1/recommendations/{batch_id}/actions`（`event_id`、`item_id`、`action`，export 可带 metadata）。`request_id` 使批次创建幂等；`event_id` 使 shown 与 action 幂等。
+- Web 和 Android 都必须先完成缩略图预加载，且页面实际可见后才提交 shown。shown/action 同步失败时必须复用原 `event_id`；Android shown 使用有上限的指数退避自动重试。Android 仅在保存原图成功后提交 `export`（`metadata.channel=save`）；分享不记录 export 事件。
+- 个性化推荐仍属后续能力；当前固定池、历史与多样性规则不根据个人偏好重排。
+
+本图片推荐章节不改变现有发布矩阵。
 
 ### 文件夹名称批量标签
 

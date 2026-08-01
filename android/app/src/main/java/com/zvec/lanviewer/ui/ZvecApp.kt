@@ -53,6 +53,8 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
@@ -62,6 +64,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -80,6 +83,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
@@ -93,10 +97,15 @@ import coil.compose.AsyncImage
 import coil.compose.SubcomposeAsyncImage
 import coil.compose.SubcomposeAsyncImageContent
 import coil.request.ImageRequest
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import com.zvec.lanviewer.data.local.SavedFileRecord
 import com.zvec.lanviewer.data.local.ServerAddress
 import com.zvec.lanviewer.data.model.DiscoveredServer
 import com.zvec.lanviewer.data.model.LibraryDto
+import com.zvec.lanviewer.data.model.OriginalMediaItem
+import com.zvec.lanviewer.data.model.RecommendationAction
+import com.zvec.lanviewer.data.model.RecommendationItem
 import com.zvec.lanviewer.data.model.SearchItem
 import com.zvec.lanviewer.data.model.SearchMode
 import kotlinx.coroutines.flow.distinctUntilChanged
@@ -109,7 +118,7 @@ fun ZvecApp(viewModel: AppViewModel) {
     val state by viewModel.state.collectAsState()
     val context = LocalContext.current
     val snackbarHostState = remember { SnackbarHostState() }
-    val currentItem = state.viewerIndex?.let(state.results::getOrNull)
+    val currentItem = state.currentViewerItem()
 
     val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
         uri?.let {
@@ -145,7 +154,7 @@ fun ZvecApp(viewModel: AppViewModel) {
         }
     }
 
-    if (state.viewerIndex != null && state.results.isNotEmpty()) {
+    if (state.viewerIndex != null && state.viewerItems().isNotEmpty()) {
         OriginalViewer(
             state = state,
             mediaUrl = viewModel::mediaUrl,
@@ -154,6 +163,7 @@ fun ZvecApp(viewModel: AppViewModel) {
             onClose = viewModel::closeViewer,
             onSave = { saveLauncher.launch(currentItem?.name?.ifBlank { "yaolens-original" } ?: "yaolens-original") },
             onShare = viewModel::shareCurrent,
+            onReaction = viewModel::reactToRecommendation,
         )
         return
     }
@@ -195,6 +205,10 @@ fun ZvecApp(viewModel: AppViewModel) {
                 onCancelSearch = viewModel::cancelSearch,
                 onLoadMore = viewModel::loadNextPage,
                 onOpen = viewModel::openViewer,
+                onLoadRecommendations = viewModel::loadRecommendations,
+                onRecommendationsVisible = viewModel::onRecommendationsVisible,
+                onOpenRecommendation = viewModel::openRecommendation,
+                onReaction = viewModel::reactToRecommendation,
                 onDisconnect = viewModel::disconnect,
             )
         }
@@ -337,7 +351,7 @@ private fun CenterStatus(title: String, detail: String, modifier: Modifier) {
 private fun SearchScreen(
     state: AppUiState,
     modifier: Modifier,
-    mediaUrl: (SearchItem) -> String,
+    mediaUrl: (OriginalMediaItem) -> String,
     onMode: (SearchMode) -> Unit,
     onText: (String) -> Unit,
     onTopK: (String) -> Unit,
@@ -349,6 +363,10 @@ private fun SearchScreen(
     onCancelSearch: () -> Unit,
     onLoadMore: () -> Unit,
     onOpen: (Int) -> Unit,
+    onLoadRecommendations: () -> Unit,
+    onRecommendationsVisible: () -> Unit,
+    onOpenRecommendation: (Int) -> Unit,
+    onReaction: (String, RecommendationAction) -> Unit,
     onDisconnect: () -> Unit,
 ) {
     var selectedTab by remember { mutableStateOf(MobileTab.SEARCH) }
@@ -387,6 +405,13 @@ private fun SearchScreen(
                         modifier = Modifier.fillMaxSize(),
                     )
                 }
+                MobileTab.RECOMMENDATIONS -> RecommendationPanel(
+                    state = state,
+                    onLoad = onLoadRecommendations,
+                    onVisible = onRecommendationsVisible,
+                    onOpen = onOpenRecommendation,
+                    onReaction = onReaction,
+                )
                 MobileTab.DEVICE -> DevicePanel(state = state, onDisconnect = onDisconnect)
             }
         }
@@ -395,23 +420,139 @@ private fun SearchScreen(
     }
 }
 
-private enum class MobileTab { SEARCH, RESULTS, DEVICE }
+private enum class MobileTab { SEARCH, RESULTS, RECOMMENDATIONS, DEVICE }
 
 @Composable
 private fun MobileBottomBar(selected: MobileTab, onSelected: (MobileTab) -> Unit) {
-    Row(
-        modifier = Modifier.fillMaxWidth().navigationBarsPadding().background(MaterialTheme.colorScheme.surface).padding(horizontal = 10.dp, vertical = 6.dp),
-        horizontalArrangement = Arrangement.SpaceAround,
-    ) {
+    NavigationBar(modifier = Modifier.fillMaxWidth().navigationBarsPadding()) {
         listOf(
             Triple(MobileTab.SEARCH, "⌕", "搜索"),
             Triple(MobileTab.RESULTS, "▧", "结果"),
+            Triple(MobileTab.RECOMMENDATIONS, "✦", "推荐"),
             Triple(MobileTab.DEVICE, "▣", "设备"),
         ).forEach { (tab, glyph, label) ->
-            TextButton(onClick = { onSelected(tab) }, modifier = Modifier.weight(1f)) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text(glyph, fontSize = 18.sp, color = if (selected == tab) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.secondary)
-                    Text(label, style = MaterialTheme.typography.labelSmall, color = if (selected == tab) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.secondary)
+            NavigationBarItem(
+                selected = selected == tab,
+                onClick = { onSelected(tab) },
+                icon = { Text(glyph, fontSize = 18.sp) },
+                label = { Text(label) },
+                alwaysShowLabel = true,
+            )
+        }
+    }
+}
+
+@Composable
+private fun RecommendationPanel(
+    state: AppUiState,
+    onLoad: () -> Unit,
+    onVisible: () -> Unit,
+    onOpen: (Int) -> Unit,
+    onReaction: (String, RecommendationAction) -> Unit,
+) {
+    val recommendations = state.recommendations
+    val lifecycleOwner = LocalLifecycleOwner.current
+    var isResumed by remember(lifecycleOwner) {
+        mutableStateOf(lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED))
+    }
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, _ ->
+            isResumed = lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+    LaunchedEffect(recommendations.batchId, recommendations.items.size, isResumed) {
+        if (!isResumed) return@LaunchedEffect
+        if (recommendations.batchId == null && !recommendations.isLoading) onLoad()
+        if (recommendations.batchId != null && recommendations.items.isNotEmpty()) onVisible()
+    }
+    Column(Modifier.fillMaxSize()) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text("推荐", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
+                if (recommendations.partial) {
+                    Text(
+                        recommendations.partialReason ?: "可用图片不足，已展示当前结果",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.secondary,
+                    )
+                }
+            }
+            TextButton(onClick = onLoad, enabled = !recommendations.isLoading) {
+                Text(if (recommendations.isLoading) "加载中" else "换一批")
+            }
+        }
+        recommendations.errorMessage?.let { ErrorBanner(it) }
+        when {
+            recommendations.items.isNotEmpty() -> LazyVerticalGrid(
+                columns = GridCells.Fixed(2),
+                modifier = Modifier.fillMaxSize(),
+                contentPadding = PaddingValues(8.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                itemsIndexed(recommendations.items, key = { _, item -> item.itemId }) { index, item ->
+                    RecommendationCard(
+                        item = item,
+                        url = item.thumbnailUrl,
+                        reaction = recommendations.reactions[item.itemId],
+                        reactionPending = item.itemId in recommendations.pendingReactionItemIds,
+                        onOpen = { onOpen(index) },
+                        onLike = { onReaction(item.itemId, RecommendationAction.LIKE) },
+                        onDislike = { onReaction(item.itemId, RecommendationAction.DISLIKE) },
+                    )
+                }
+            }
+            recommendations.isLoading -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                CircularProgressIndicator()
+            }
+            else -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Text("暂时没有可推荐的图片", color = MaterialTheme.colorScheme.secondary)
+            }
+        }
+    }
+}
+
+@Composable
+private fun RecommendationCard(
+    item: RecommendationItem,
+    url: String,
+    reaction: RecommendationAction?,
+    reactionPending: Boolean,
+    onOpen: () -> Unit,
+    onLike: () -> Unit,
+    onDislike: () -> Unit,
+) {
+    val context = LocalContext.current
+    Card(
+        modifier = Modifier.fillMaxWidth().clickable(onClick = onOpen),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+    ) {
+        AsyncImage(
+            model = ImageRequest.Builder(context).data(url).size(640).crossfade(true).build(),
+            contentDescription = item.name,
+            contentScale = ContentScale.Crop,
+            modifier = Modifier.fillMaxWidth().height(190.dp).background(MaterialTheme.colorScheme.surfaceVariant),
+        )
+        Column(Modifier.padding(8.dp)) {
+            Text(item.name.ifBlank { "未命名图片" }, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text(
+                item.libraryName.ifBlank { item.bucket },
+                style = MaterialTheme.typography.bodySmall,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                color = MaterialTheme.colorScheme.secondary,
+            )
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                TextButton(onClick = onDislike, enabled = !reactionPending) {
+                    Text(if (reaction == RecommendationAction.DISLIKE) "已跳过" else "不喜欢")
+                }
+                TextButton(onClick = onLike, enabled = !reactionPending) {
+                    Text(if (reaction == RecommendationAction.LIKE) "已喜欢" else "喜欢")
                 }
             }
         }
@@ -715,31 +856,33 @@ private fun ResultCard(item: SearchItem, url: String, onClick: () -> Unit) {
 @Composable
 private fun OriginalViewer(
     state: AppUiState,
-    mediaUrl: (SearchItem) -> String,
+    mediaUrl: (OriginalMediaItem) -> String,
     onIndexChanged: (Int) -> Unit,
     onLoadMore: () -> Unit,
     onClose: () -> Unit,
     onSave: () -> Unit,
     onShare: () -> Unit,
+    onReaction: (String, RecommendationAction) -> Unit,
 ) {
     BackHandler(onBack = onClose)
-    val initial = state.viewerIndex?.coerceIn(state.results.indices) ?: 0
-    val pagerState = rememberPagerState(initialPage = initial, pageCount = { state.results.size })
-    var sheetItem by remember { mutableStateOf<SearchItem?>(null) }
+    val viewerItems = state.viewerItems()
+    val initial = state.viewerIndex?.coerceIn(viewerItems.indices) ?: 0
+    val pagerState = rememberPagerState(initialPage = initial, pageCount = { viewerItems.size })
+    var sheetItem by remember { mutableStateOf<OriginalMediaItem?>(null) }
     var showInfo by remember { mutableStateOf(false) }
     val rotations = remember { mutableStateMapOf<Int, Float>() }
 
     LaunchedEffect(pagerState) {
         snapshotFlow { pagerState.currentPage }.distinctUntilChanged().collect { page ->
             onIndexChanged(page)
-            if (page >= state.results.lastIndex - 4) onLoadMore()
+            if (state.viewerSource == ViewerSource.SEARCH && page >= viewerItems.lastIndex - 4) onLoadMore()
         }
     }
 
     Surface(color = androidx.compose.ui.graphics.Color.Black, modifier = Modifier.fillMaxSize()) {
         Box(Modifier.fillMaxSize()) {
             HorizontalPager(state = pagerState, modifier = Modifier.fillMaxSize()) { page ->
-                val item = state.results[page]
+                val item = viewerItems[page]
                 Box(
                     Modifier.fillMaxSize(),
                     contentAlignment = Alignment.Center,
@@ -784,6 +927,16 @@ private fun OriginalViewer(
                     onClick = { sheetItem = null; onShare() },
                     modifier = Modifier.fillMaxWidth(),
                 ) { Text("分享", modifier = Modifier.fillMaxWidth(), style = MaterialTheme.typography.bodyLarge) }
+                (item as? RecommendationItem)?.let { recommendation ->
+                    TextButton(
+                        onClick = { onReaction(recommendation.itemId, RecommendationAction.LIKE) },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) { Text("喜欢", modifier = Modifier.fillMaxWidth(), style = MaterialTheme.typography.bodyLarge) }
+                    TextButton(
+                        onClick = { onReaction(recommendation.itemId, RecommendationAction.DISLIKE) },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) { Text("不喜欢", modifier = Modifier.fillMaxWidth(), style = MaterialTheme.typography.bodyLarge) }
+                }
                 TextButton(
                     onClick = {
                         val page = pagerState.currentPage

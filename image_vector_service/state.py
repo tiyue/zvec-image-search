@@ -413,6 +413,10 @@ class IndexState:
             "ON entries(root_id, relative_path, doc_id)"
         )
         self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_entries_recommendation_recent "
+            "ON entries(mtime_ns DESC, doc_id)"
+        )
+        self.connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_document_annotations_status_page "
             "ON document_annotations("
             "status, updated_at DESC, doc_id, retry_eligible)"
@@ -922,6 +926,95 @@ class IndexState:
             "SELECT * FROM entries ORDER BY root_id, relative_path"
         )
         return [self._entry_from_row(row) for row in rows]
+
+    def sample_recommendation_entries(
+        self,
+        *,
+        random_cursor: str,
+        limit_per_pool: int = 100,
+    ) -> list[tuple[dict[str, Any], dict[str, Any] | None]]:
+        """Return a bounded quality/recent/random candidate union.
+
+        ``doc_id`` is a SHA-256 logical-path digest, so a random point in that
+        key space gives an efficient approximately uniform sample without a
+        full-library ``ORDER BY RANDOM()`` scan. Only current, fully accepted
+        annotations are joined; callers cannot accidentally apply a stale or
+        pending character identity.
+        """
+
+        cursor = str(random_cursor).strip().lower()
+        if len(cursor) != 64 or any(
+            value not in "0123456789abcdef" for value in cursor
+        ):
+            raise ValueError(
+                "Recommendation random_cursor must be a SHA-256 hex value."
+            )
+        if (
+            isinstance(limit_per_pool, bool)
+            or not isinstance(limit_per_pool, int)
+            or not 1 <= limit_per_pool <= 256
+        ):
+            raise ValueError("Recommendation limit_per_pool must be between 1 and 256.")
+
+        connection = self._read_connection()
+        select = (
+            _joined_annotation_select()
+            + " FROM entries LEFT JOIN document_annotations AS annotations "
+            "ON annotations.doc_id = entries.doc_id "
+            "AND annotations.source_sha256 = entries.sha256 "
+            "AND annotations.status = 'accepted' "
+        )
+        quality = (
+            "entries.width > 0 AND entries.height > 0 "
+            "AND entries.width * entries.height >= 2000000 "
+            "AND entries.width <= entries.height * 4 "
+            "AND entries.height <= entries.width * 4"
+        )
+
+        rows: list[sqlite3.Row] = []
+        rows.extend(
+            connection.execute(
+                select + "ORDER BY entries.mtime_ns DESC, entries.doc_id LIMIT ?",
+                (limit_per_pool,),
+            ).fetchall()
+        )
+
+        def cursor_page(predicate: str | None) -> list[sqlite3.Row]:
+            filters = ["entries.doc_id >= ?"]
+            values: list[Any] = [cursor]
+            if predicate:
+                filters.insert(0, predicate)
+            page = connection.execute(
+                select + f"WHERE {' AND '.join(filters)} "
+                "ORDER BY entries.doc_id LIMIT ?",
+                (*values, limit_per_pool),
+            ).fetchall()
+            if len(page) >= limit_per_pool:
+                return page
+            wrap_filters = ["entries.doc_id < ?"]
+            if predicate:
+                wrap_filters.insert(0, predicate)
+            wrapped = connection.execute(
+                select + f"WHERE {' AND '.join(wrap_filters)} "
+                "ORDER BY entries.doc_id LIMIT ?",
+                (cursor, limit_per_pool - len(page)),
+            ).fetchall()
+            return [*page, *wrapped]
+
+        rows.extend(cursor_page(quality))
+        rows.extend(cursor_page(None))
+
+        result: list[tuple[dict[str, Any], dict[str, Any] | None]] = []
+        seen: set[str] = set()
+        for row in rows:
+            doc_id = str(row["entry_doc_id"])
+            if doc_id in seen:
+                continue
+            seen.add(doc_id)
+            result.append(
+                _decode_joined_annotation_row(dict(row), annotation_optional=True)
+            )
+        return result
 
     def iter_entries(
         self,

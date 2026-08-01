@@ -3,6 +3,10 @@ package com.zvec.lanviewer.data.network
 import com.zvec.lanviewer.data.local.ConnectionReader
 import com.zvec.lanviewer.data.local.SavedConnection
 import com.zvec.lanviewer.data.model.PairRequest
+import com.zvec.lanviewer.data.model.RecommendationAction
+import com.zvec.lanviewer.data.model.RecommendationActionRequest
+import com.zvec.lanviewer.data.model.RecommendationRequest
+import com.zvec.lanviewer.data.model.RecommendationShownRequest
 import com.zvec.lanviewer.data.model.SearchPageResult
 import com.zvec.lanviewer.data.repository.applyPairingPollResponse
 import com.zvec.lanviewer.data.security.InMemoryTokenStore
@@ -209,5 +213,40 @@ class LanApiClientTest {
 
         assertTrue(result is SearchPageResult.Pending)
         assertEquals(2L, (result as SearchPageResult.Pending).retryAfterSeconds)
+    }
+
+    @Test
+    fun recommendationRoutesUseTheSpecifiedPayloads() = runBlocking {
+        server.enqueue(
+            MockResponse().setResponseCode(200).setBody(
+                """{"request_id":"r1","batch_id":"b1","count":1,"partial":false,"partial_reason":"","quota_degraded":false,"history_window":60,"items":[{"item_id":"i1","media_id":"m1","name":"one.jpg","width":100,"height":80,"tags":["tag"],"library_id":"library-1","library_name":"Library","content_type":"image/jpeg","size_bytes":99,"bucket":"quality","thumbnail_url":"http://127.0.0.1/thumb.jpg","preview_url":"http://127.0.0.1/preview.jpg"}],"quota":{"quality":5,"recent":4,"low_exposure":4,"random":2},"diversity":{"applied":true,"reason":"","missing_vectors":0,"vector_space":"clip"}}""",
+            ),
+        )
+        server.enqueue(MockResponse().setResponseCode(200).setBody("{}"))
+        server.enqueue(MockResponse().setResponseCode(200).setBody("{}"))
+
+        val response = client.recommendations(RecommendationRequest("r1"))
+        client.markRecommendationsShown("b1", RecommendationShownRequest("shown-1"))
+        client.recordRecommendationAction(
+            "b1",
+            RecommendationActionRequest("action-1", "i1", RecommendationAction.EXPORT, mapOf("channel" to "save")),
+        )
+
+        assertEquals("b1", response.batchId)
+        assertEquals("quality", response.items.single().bucket)
+        assertEquals("http://127.0.0.1/thumb.jpg", response.items.single().thumbnailUrl)
+        assertEquals(60, response.historyWindow)
+        val recommendationRequest = server.takeRequest()
+        assertEquals("/api/v1/recommendations", recommendationRequest.path)
+        assertEquals("{\"request_id\":\"r1\"}", recommendationRequest.body.readUtf8())
+        val shown = server.takeRequest()
+        assertEquals("/api/v1/recommendations/b1/shown", shown.path)
+        assertEquals("{\"event_id\":\"shown-1\"}", shown.body.readUtf8())
+        val action = server.takeRequest()
+        assertEquals("/api/v1/recommendations/b1/actions", action.path)
+        assertEquals(
+            "{\"event_id\":\"action-1\",\"item_id\":\"i1\",\"action\":\"export\",\"metadata\":{\"channel\":\"save\"}}",
+            action.body.readUtf8(),
+        )
     }
 }

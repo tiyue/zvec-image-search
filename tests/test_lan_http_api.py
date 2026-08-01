@@ -74,6 +74,11 @@ class _FakeBackend:
         self.created: list[tuple[SearchRequest, str]] = []
         self.deleted: list[tuple[str, str]] = []
         self.deleted_sessions: list[str] = []
+        self.recommendation_created: list[tuple[str, str, str]] = []
+        self.recommendation_shown: list[tuple[str, str, str, str]] = []
+        self.recommendation_actions: list[
+            tuple[str, str, str, str, str, str, dict[str, str] | None]
+        ] = []
         self.session_cleanup_error: Exception | None = None
         self.create_started: threading.Event | None = None
         self.create_release: threading.Event | None = None
@@ -122,6 +127,52 @@ class _FakeBackend:
         self.deleted_sessions.append(client_id)
         if self.session_cleanup_error is not None:
             raise self.session_cleanup_error
+
+    def create_recommendations(
+        self,
+        request_id: str,
+        *,
+        client_id: str,
+        device_id: str,
+    ) -> dict[str, object]:
+        self.recommendation_created.append((request_id, client_id, device_id))
+        return {
+            "request_id": request_id,
+            "batch_id": "batch-1",
+            "count": 1,
+            "items": [
+                {
+                    "item_id": "item-1",
+                    "media_id": "media-1",
+                    "bucket": "random",
+                }
+            ],
+        }
+
+    def mark_recommendations_shown(
+        self,
+        batch_id: str,
+        event_id: str,
+        *,
+        client_id: str,
+        device_id: str,
+    ) -> None:
+        self.recommendation_shown.append((batch_id, event_id, client_id, device_id))
+
+    def record_recommendation_action(
+        self,
+        batch_id: str,
+        event_id: str,
+        item_id: str,
+        action: str,
+        metadata: dict[str, str] | None,
+        *,
+        client_id: str,
+        device_id: str,
+    ) -> None:
+        self.recommendation_actions.append(
+            (batch_id, event_id, item_id, action, client_id, device_id, metadata)
+        )
 
 
 class _FakeResolver:
@@ -179,6 +230,7 @@ class LanHttpApiTests(unittest.TestCase):
             instance_id="stable-instance-id-1234567890",
             name="Zvec on TEST-PC",
             search_backend=self.backend,
+            recommendation_backend=self.backend,
             media_resolver=self.resolver,
             pairing_manager=self.pairing,
             query_images=self.uploads,
@@ -243,6 +295,7 @@ class LanHttpApiTests(unittest.TestCase):
             instance_id="stable-instance-id-1234567890",
             name="Zvec on TEST-PC",
             search_backend=self.backend,
+            recommendation_backend=self.backend,
             media_resolver=self.resolver,
             pairing_manager=(
                 self.pairing if pairing_manager is None else pairing_manager
@@ -864,6 +917,9 @@ class LanHttpApiTests(unittest.TestCase):
             ("POST", "/api/v1/searches", b"{}"),
             ("GET", "/api/v1/searches/search-1", None),
             ("DELETE", "/api/v1/searches/search-1", None),
+            ("POST", "/api/v1/recommendations", b"{}"),
+            ("POST", "/api/v1/recommendations/batch-1/shown", b"{}"),
+            ("POST", "/api/v1/recommendations/batch-1/actions", b"{}"),
             ("GET", "/api/v1/media/media-1/original", None),
             ("HEAD", "/api/v1/media/media-1/original", None),
             ("DELETE", "/api/v1/session", None),
@@ -886,6 +942,110 @@ class LanHttpApiTests(unittest.TestCase):
                         response.json()["error"]["code"],
                         "unauthorized",
                     )
+
+    def test_recommendation_routes_are_authenticated_and_device_scoped(self) -> None:
+        created = self.json_request(
+            "POST",
+            "/api/v1/recommendations",
+            {"request_id": "request-1"},
+        )
+        shown = self.json_request(
+            "POST",
+            "/api/v1/recommendations/batch-1/shown",
+            {"event_id": "event-shown-1"},
+        )
+        action = self.json_request(
+            "POST",
+            "/api/v1/recommendations/batch-1/actions",
+            {
+                "event_id": "event-action-1",
+                "item_id": "item-1",
+                "action": "like",
+                "metadata": {"surface": "grid"},
+            },
+        )
+
+        self.assertEqual(created.status, 200)
+        self.assertEqual(
+            created.json(),
+            {
+                "request_id": "request-1",
+                "batch_id": "batch-1",
+                "count": 1,
+                "items": [
+                    {
+                        "item_id": "item-1",
+                        "media_id": "media-1",
+                        "bucket": "random",
+                    }
+                ],
+            },
+        )
+        self.assertEqual(shown.status, 200)
+        self.assertEqual(shown.json(), {"ok": True, "event_id": "event-shown-1"})
+        self.assertEqual(action.status, 200)
+        self.assertEqual(action.json(), {"ok": True, "event_id": "event-action-1"})
+        self.assertEqual(
+            self.backend.recommendation_created,
+            [("request-1", self.client_id, "android-install-main")],
+        )
+        self.assertEqual(
+            self.backend.recommendation_shown,
+            [
+                (
+                    "batch-1",
+                    "event-shown-1",
+                    self.client_id,
+                    "android-install-main",
+                )
+            ],
+        )
+        self.assertEqual(
+            self.backend.recommendation_actions,
+            [
+                (
+                    "batch-1",
+                    "event-action-1",
+                    "item-1",
+                    "like",
+                    self.client_id,
+                    "android-install-main",
+                    {"surface": "grid"},
+                )
+            ],
+        )
+
+    def test_recommendation_routes_reject_invalid_ids_fields_actions_and_metadata(
+        self,
+    ) -> None:
+        cases = (
+            ("/api/v1/recommendations", {"request_id": ""}),
+            ("/api/v1/recommendations", {"request_id": "request-1", "viewer_id": "x"}),
+            ("/api/v1/recommendations/batch-1/shown", {"event_id": "bad/id"}),
+            (
+                "/api/v1/recommendations/batch-1/shown",
+                {"event_id": "event-1", "item_id": "item-1"},
+            ),
+            (
+                "/api/v1/recommendations/batch-1/actions",
+                {"event_id": "event-1", "item_id": "item-1", "action": "share"},
+            ),
+            (
+                "/api/v1/recommendations/batch-1/actions",
+                {
+                    "event_id": "event-1",
+                    "item_id": "item-1",
+                    "action": "open",
+                    "metadata": {"surface": 1},
+                },
+            ),
+        )
+
+        for path, payload in cases:
+            with self.subTest(path=path, payload=payload):
+                response = self.json_request("POST", path, payload)
+                self.assertEqual(response.status, 400)
+                self.assertEqual(response.json()["error"]["code"], "invalid_request")
 
     def test_route_allow_list_does_not_expose_desktop_management(self) -> None:
         for method, path in (
@@ -1414,6 +1574,25 @@ class LanHttpApiTests(unittest.TestCase):
 
 
 class LanGatewayLifecycleTests(unittest.TestCase):
+    def test_gateway_passes_recommendation_backend_to_http_api(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            backend = _FakeBackend()
+            gateway = LanGatewayServer(
+                instance_id="stable-instance-id-1234567890",
+                name="Zvec on TEST-PC",
+                advertised_host="127.0.0.1",
+                search_backend=backend,
+                recommendation_backend=backend,
+                media_resolver=_FakeResolver({}),
+                upload_directory=Path(directory) / "uploads",
+                bind_host="127.0.0.1",
+                api_port=0,
+                discovery_port=0,
+            )
+            self.addCleanup(gateway.stop)
+
+            self.assertIs(gateway.api_server._recommendation_backend, backend)
+
     @staticmethod
     def pair_device(
         gateway: LanGatewayServer,

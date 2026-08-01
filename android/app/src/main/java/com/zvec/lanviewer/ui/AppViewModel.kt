@@ -8,11 +8,20 @@ import android.provider.OpenableColumns
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
+import coil.imageLoader
+import coil.request.ImageRequest
+import coil.request.SuccessResult
 import com.zvec.lanviewer.data.local.SavedConnection
 import com.zvec.lanviewer.data.local.SavedFileRecord
 import com.zvec.lanviewer.data.local.SavedFilesStore
 import com.zvec.lanviewer.data.local.ServerAddress
 import com.zvec.lanviewer.data.model.DiscoveredServer
+import com.zvec.lanviewer.data.model.OriginalMediaItem
+import com.zvec.lanviewer.data.model.RecommendationAction
+import com.zvec.lanviewer.data.model.RecommendationActionRequest
+import com.zvec.lanviewer.data.model.RecommendationItem
+import com.zvec.lanviewer.data.model.RecommendationRequest
+import com.zvec.lanviewer.data.model.RecommendationShownRequest
 import com.zvec.lanviewer.data.model.SearchItem
 import com.zvec.lanviewer.data.model.SearchMode
 import com.zvec.lanviewer.data.model.SearchRequest
@@ -26,6 +35,9 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -37,7 +49,40 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeout
 import kotlinx.collections.immutable.persistentListOf
+import kotlinx.collections.immutable.toPersistentList
 import java.io.IOException
+import java.util.UUID
+
+private const val RECOMMENDATION_SHOWN_RETRY_INITIAL_DELAY_MILLIS = 1_000L
+private const val RECOMMENDATION_SHOWN_RETRY_MAX_DELAY_MILLIS = 30_000L
+
+internal suspend fun retryRecommendationShown(
+    isCurrentBatch: () -> Boolean,
+    submit: suspend () -> Unit,
+): Boolean {
+    var retryDelayMillis = RECOMMENDATION_SHOWN_RETRY_INITIAL_DELAY_MILLIS
+    while (isCurrentBatch()) {
+        try {
+            submit()
+            return true
+        } catch (error: Throwable) {
+            if (error is CancellationException) throw error
+            if (!isRetryableRecommendationShownError(error)) return false
+        }
+        if (!isCurrentBatch()) return false
+        delay(retryDelayMillis)
+        retryDelayMillis = (retryDelayMillis * 2).coerceAtMost(
+            RECOMMENDATION_SHOWN_RETRY_MAX_DELAY_MILLIS,
+        )
+    }
+    return false
+}
+
+private fun isRetryableRecommendationShownError(error: Throwable): Boolean = when (error) {
+    is ApiException -> error.httpStatus == 408 || error.httpStatus == 429 || error.httpStatus >= 500
+    is IOException -> true
+    else -> false
+}
 
 class AppViewModel(
     private val appContext: Context,
@@ -57,6 +102,9 @@ class AppViewModel(
     private var pageJob: Job? = null
     private var searchJob: Job? = null
     private var actionJob: Job? = null
+    private var recommendationJob: Job? = null
+    private var recommendationShownJob: Job? = null
+    private var recommendationActionJob: Job? = null
 
     init {
         _state.update { it.copy(savedFiles = savedFilesStore.list()) }
@@ -365,21 +413,191 @@ class AppViewModel(
         throw IOException("搜索等待超时，请重试")
     }
 
-    fun mediaUrl(item: SearchItem): String = repository.mediaUrl(item.mediaId)
+    fun mediaUrl(item: OriginalMediaItem): String = repository.mediaUrl(item.mediaId)
 
     fun openViewer(index: Int) {
-        if (index in _state.value.results.indices) _state.update { it.copy(viewerIndex = index) }
+        if (index in _state.value.results.indices) {
+            _state.update { it.copy(viewerSource = ViewerSource.SEARCH, viewerIndex = index) }
+        }
     }
 
     fun setViewerIndex(index: Int) {
-        if (index in _state.value.results.indices) {
+        if (index in _state.value.viewerItems().indices) {
             _state.update { it.copy(viewerIndex = index) }
-            if (index >= _state.value.results.lastIndex - 4) loadNextPage()
+            if (_state.value.viewerSource == ViewerSource.SEARCH && index >= _state.value.results.lastIndex - 4) {
+                loadNextPage()
+            }
         }
     }
 
     fun closeViewer() {
-        _state.update { it.copy(viewerIndex = null, transferMessage = null, transferFraction = null) }
+        _state.update {
+            it.copy(
+                viewerSource = null,
+                viewerIndex = null,
+                transferMessage = null,
+                transferFraction = null,
+            )
+        }
+    }
+
+    fun loadRecommendations() {
+        if (_state.value.recommendations.isLoading) return
+        val requestId = UUID.randomUUID().toString()
+        recommendationJob?.cancel()
+        recommendationJob = viewModelScope.launch {
+            _state.update { current ->
+                current.copy(recommendations = current.recommendations.copy(isLoading = true, errorMessage = null))
+            }
+            try {
+                val response = repository.recommendations(RecommendationRequest(requestId))
+                if (response.requestId != requestId) throw IOException("推荐响应与请求不一致")
+                preloadRecommendationThumbnails(response.items)
+                _state.update {
+                    it.copy(
+                        recommendations = RecommendationUiState(
+                            batchId = response.batchId,
+                            preloadedBatchId = response.batchId,
+                            items = response.items.toPersistentList(),
+                            partial = response.partial,
+                            partialReason = response.partialReason,
+                        ),
+                    )
+                }
+            } catch (error: Throwable) {
+                if (error is CancellationException) throw error
+                _state.update { current ->
+                    current.copy(
+                        recommendations = current.recommendations.copy(
+                            isLoading = false,
+                            errorMessage = userMessage(error),
+                        ),
+                    )
+                }
+            }
+        }
+    }
+
+    fun onRecommendationsVisible() {
+        val recommendation = _state.value.recommendations
+        val batchId = recommendation.batchId ?: return
+        if (recommendation.preloadedBatchId != batchId || recommendation.items.isEmpty() ||
+            recommendation.shownBatchId == batchId || recommendationShownJob?.isActive == true
+        ) return
+        val eventId = recommendation.shownEventId ?: UUID.randomUUID().toString().also { generatedId ->
+            _state.update { current ->
+                if (current.recommendations.batchId == batchId) {
+                    current.copy(recommendations = current.recommendations.copy(shownEventId = generatedId))
+                } else current
+            }
+        }
+        recommendationShownJob = viewModelScope.launch {
+            val recorded = retryRecommendationShown(
+                isCurrentBatch = {
+                    val current = _state.value.recommendations
+                    current.batchId == batchId && current.shownBatchId != batchId
+                },
+                submit = {
+                    repository.markRecommendationsShown(batchId, RecommendationShownRequest(eventId))
+                },
+            )
+            if (recorded) {
+                _state.update { current ->
+                    if (current.recommendations.batchId == batchId) {
+                        current.copy(
+                            recommendations = current.recommendations.copy(
+                                shownBatchId = batchId,
+                                shownEventId = null,
+                            ),
+                        )
+                    } else current
+                }
+            }
+        }
+    }
+
+    fun openRecommendation(index: Int) {
+        val item = _state.value.recommendations.items.getOrNull(index) ?: return
+        _state.update { it.copy(viewerSource = ViewerSource.RECOMMENDATIONS, viewerIndex = index) }
+        recordRecommendationAction(item, RecommendationAction.OPEN)
+    }
+
+    fun reactToRecommendation(itemId: String, action: RecommendationAction) {
+        if (action !in setOf(RecommendationAction.LIKE, RecommendationAction.DISLIKE)) return
+        val item = _state.value.recommendations.items.firstOrNull { it.itemId == itemId } ?: return
+        recordRecommendationAction(item, action)
+    }
+
+    private fun recordRecommendationAction(
+        item: RecommendationItem,
+        action: RecommendationAction,
+        metadata: Map<String, String>? = null,
+    ) {
+        val batchId = _state.value.recommendations.batchId ?: return
+        val actionKey = "${item.itemId}:${action.name}"
+        val eventId = _state.value.recommendations.actionEventIds[actionKey] ?: UUID.randomUUID().toString()
+        if (actionKey in _state.value.recommendations.pendingActionKeys) return
+        _state.update { current ->
+            if (current.recommendations.batchId != batchId) return@update current
+            current.copy(
+                recommendations = current.recommendations.copy(
+                    actionEventIds = current.recommendations.actionEventIds + (actionKey to eventId),
+                    pendingActionKeys = current.recommendations.pendingActionKeys + actionKey,
+                    pendingReactionItemIds = if (action in setOf(RecommendationAction.LIKE, RecommendationAction.DISLIKE)) {
+                        current.recommendations.pendingReactionItemIds + item.itemId
+                    } else current.recommendations.pendingReactionItemIds,
+                ),
+            )
+        }
+        recommendationActionJob = viewModelScope.launch {
+            try {
+                repository.recordRecommendationAction(
+                    batchId,
+                    RecommendationActionRequest(eventId, item.itemId, action, metadata),
+                )
+                _state.update { current ->
+                    if (current.recommendations.batchId != batchId) return@update current
+                    current.copy(
+                        recommendations = current.recommendations.copy(
+                            reactions = if (action in setOf(RecommendationAction.LIKE, RecommendationAction.DISLIKE)) {
+                                current.recommendations.reactions + (item.itemId to action)
+                            } else current.recommendations.reactions,
+                            actionEventIds = current.recommendations.actionEventIds - actionKey,
+                            pendingActionKeys = current.recommendations.pendingActionKeys - actionKey,
+                            pendingReactionItemIds = if (action in setOf(RecommendationAction.LIKE, RecommendationAction.DISLIKE)) {
+                                current.recommendations.pendingReactionItemIds - item.itemId
+                            } else current.recommendations.pendingReactionItemIds,
+                        ),
+                    )
+                }
+            } catch (error: Throwable) {
+                if (error is CancellationException) throw error
+                _state.update { current ->
+                    if (current.recommendations.batchId != batchId) return@update current
+                    current.copy(
+                        recommendations = current.recommendations.copy(
+                            pendingActionKeys = current.recommendations.pendingActionKeys - actionKey,
+                            pendingReactionItemIds = if (action in setOf(RecommendationAction.LIKE, RecommendationAction.DISLIKE)) {
+                                current.recommendations.pendingReactionItemIds - item.itemId
+                            } else current.recommendations.pendingReactionItemIds,
+                        ),
+                    )
+                }
+            }
+        }
+    }
+
+    private suspend fun preloadRecommendationThumbnails(items: List<RecommendationItem>) = coroutineScope {
+        val loaded = items.map { item ->
+            async {
+                runCatching {
+                    appContext.imageLoader.execute(
+                        ImageRequest.Builder(appContext).data(item.thumbnailUrl).size(640).build(),
+                    )
+                }.getOrNull() is SuccessResult
+            }
+        }.awaitAll()
+        if (loaded.any { !it }) throw IOException("推荐缩略图预载失败")
     }
 
     fun saveCurrent(destination: Uri) {
@@ -399,6 +617,13 @@ class AppViewModel(
                     ),
                 )
                 _state.update { it.copy(savedFiles = savedFilesStore.list()) }
+                (item as? RecommendationItem)?.let { recommendation ->
+                    recordRecommendationAction(
+                        recommendation,
+                        RecommendationAction.EXPORT,
+                        metadata = mapOf("channel" to "save"),
+                    )
+                }
                 _events.emit(AppEvent.Message("原图已保存"))
             } catch (error: Throwable) {
                 if (error is CancellationException) throw error
@@ -434,6 +659,9 @@ class AppViewModel(
         pageJob?.cancel()
         searchJob?.cancel()
         actionJob?.cancel()
+        recommendationJob?.cancel()
+        recommendationShownJob?.cancel()
+        recommendationActionJob?.cancel()
         viewModelScope.launch {
             activeSearchId?.let { runCatching { repository.deleteSearch(it) } }
             queryImageId?.let { runCatching { repository.deleteQueryImage(it) } }
@@ -642,8 +870,7 @@ class AppViewModel(
         }
     }
 
-    private fun currentViewerItem(): SearchItem? =
-        _state.value.viewerIndex?.let(_state.value.results::getOrNull)
+    private fun currentViewerItem(): OriginalMediaItem? = _state.value.currentViewerItem()
 
     private fun beginTransfer(message: String) {
         _state.update { it.copy(transferMessage = message, transferFraction = null) }

@@ -213,6 +213,76 @@ class BackendApiClient:
             )
         return payload
 
+    def create_recommendations(
+        self,
+        viewer_id: str,
+        request_id: str,
+    ) -> JsonObject:
+        return self._request_json(
+            "POST",
+            "v1/recommendations",
+            json_body={
+                "viewer_id": self._validate_recommendation_id(viewer_id, "viewer_id"),
+                "request_id": self._validate_recommendation_id(
+                    request_id,
+                    "request_id",
+                ),
+            },
+            expected_statuses={200},
+        )
+
+    def mark_recommendations_shown(
+        self,
+        viewer_id: str,
+        batch_id: str,
+        event_id: str,
+    ) -> JsonObject:
+        normalized_batch = self._validate_recommendation_id(batch_id, "batch_id")
+        return self._request_json(
+            "POST",
+            f"v1/recommendations/{quote(normalized_batch, safe='')}/shown",
+            json_body={
+                "viewer_id": self._validate_recommendation_id(viewer_id, "viewer_id"),
+                "event_id": self._validate_recommendation_id(event_id, "event_id"),
+            },
+            expected_statuses={200},
+        )
+
+    def record_recommendation_action(
+        self,
+        viewer_id: str,
+        batch_id: str,
+        event_id: str,
+        item_id: str,
+        action: str,
+        metadata: Mapping[str, str] | None = None,
+    ) -> JsonObject:
+        if action not in {"open", "like", "export", "dislike"}:
+            raise ValueError("action is invalid")
+        if metadata is not None and (
+            not isinstance(metadata, Mapping)
+            or any(
+                not isinstance(key, str) or not isinstance(value, str)
+                for key, value in metadata.items()
+            )
+        ):
+            raise ValueError("metadata must be a string mapping or None")
+        normalized_batch = self._validate_recommendation_id(batch_id, "batch_id")
+        payload: JsonObject = {
+            "viewer_id": self._validate_recommendation_id(viewer_id, "viewer_id"),
+            "event_id": self._validate_recommendation_id(event_id, "event_id"),
+            "item_id": self._validate_recommendation_id(item_id, "item_id"),
+            "action": action,
+        }
+        if metadata is not None:
+            payload["metadata"] = dict(metadata)
+        return self._request_json(
+            "POST",
+            f"v1/recommendations/{quote(normalized_batch, safe='')}/actions",
+            json_body=payload,
+            expected_statuses={200},
+        )
+
     def submit_job(
         self,
         command: str,
@@ -307,6 +377,17 @@ class BackendApiClient:
         if not isinstance(job_id, str) or not job_id.strip():
             raise ValueError("job_id must be non-empty")
         return job_id.strip()
+
+    @staticmethod
+    def _validate_recommendation_id(value: str, name: str) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{name} must be non-empty")
+        normalized = value.strip()
+        if len(normalized) > 256 or any(
+            ord(character) < 32 for character in normalized
+        ):
+            raise ValueError(f"{name} is invalid")
+        return normalized
 
     def _extract_job(
         self,

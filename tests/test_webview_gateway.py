@@ -526,6 +526,100 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, 404)
         caught.exception.close()
 
+    def test_recommendation_routes_inject_viewer_and_hide_paths(self) -> None:
+        source = self.root / "raiden.png"
+        Image.new("RGB", (80, 120), (80, 50, 160)).save(source)
+
+        class Client:
+            def __init__(self) -> None:
+                self.calls: list[tuple[object, ...]] = []
+
+            def create_recommendations(
+                self, viewer_id: str, request_id: str
+            ) -> dict[str, Any]:
+                self.calls.append(("create", viewer_id, request_id))
+                return {
+                    "request_id": request_id,
+                    "batch_id": "batch-1",
+                    "count": 1,
+                    "items": [
+                        {
+                            "item_id": "item-1",
+                            "source_path": str(source),
+                            "vector": [0.2, 0.4],
+                            "bucket": "quality",
+                        }
+                    ],
+                }
+
+            def mark_recommendations_shown(
+                self, viewer_id: str, batch_id: str, event_id: str
+            ) -> dict[str, Any]:
+                self.calls.append(("shown", viewer_id, batch_id, event_id))
+                return {"recorded": True}
+
+            def record_recommendation_action(
+                self,
+                viewer_id: str,
+                batch_id: str,
+                event_id: str,
+                item_id: str,
+                action: str,
+                metadata: dict[str, str] | None = None,
+            ) -> dict[str, Any]:
+                self.calls.append(
+                    ("action", viewer_id, batch_id, event_id, item_id, action, metadata)
+                )
+                return {"recorded": True}
+
+        client = Client()
+        self.facade.config_home = self.root
+        self.facade._ready_client = lambda: client  # type: ignore[attr-defined]
+        status, _headers, created = _json(
+            self.server.url + "api/recommendations",
+            method="POST",
+            body={"request_id": "request-1"},
+        )
+        self.assertEqual(status, 200)
+        self.assertNotIn("source_path", str(created))
+        self.assertNotIn("vector", created["items"][0])
+        self.assertIn("media_id", created["items"][0])
+        self.assertEqual(
+            _json(
+                self.server.url + "api/recommendations/batch-1/shown",
+                method="POST",
+                body={"event_id": "shown-1"},
+            )[0],
+            200,
+        )
+        self.assertEqual(
+            _json(
+                self.server.url + "api/recommendations/batch-1/actions",
+                method="POST",
+                body={
+                    "event_id": "action-1",
+                    "item_id": "item-1",
+                    "action": "like",
+                    "metadata": {"surface": "grid"},
+                },
+            )[0],
+            200,
+        )
+        self.assertTrue((self.root / "desktop-recommendation-viewer.json").exists())
+        viewer = client.calls[0][1]
+        self.assertEqual(client.calls[1][1], viewer)
+        self.assertEqual(client.calls[2][1], viewer)
+        self.assertEqual(client.calls[2][-1], {"surface": "grid"})
+
+        with self.assertRaises(HTTPError) as caught:
+            _json(
+                self.server.url + "api/recommendations",
+                method="POST",
+                body={"request_id": "request-2", "viewer_id": "browser-value"},
+            )
+        self.assertEqual(caught.exception.code, 400)
+        caught.exception.close()
+
     def test_lan_access_control_routes_remain_loopback_only(self) -> None:
         status, _headers, payload = _json(self.server.url + "api/lan-access")
         self.assertEqual(status, 200)

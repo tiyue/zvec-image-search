@@ -91,6 +91,35 @@ const SettingsStub = defineComponent({
   },
 });
 
+const RecommendationStub = defineComponent({
+  name: "RecommendationPage",
+  props: {
+    visible: { type: Boolean, default: true },
+    exportBusy: { type: Boolean, default: false },
+    openImage: { type: Function, default: undefined },
+    exportImage: { type: Function, default: undefined },
+  },
+  emits: ["toast"],
+  setup(props) {
+    return () => h("section", {
+      "data-testid": "recommendation-page",
+      "data-visible": String(props.visible),
+    }, [
+      "图片推荐内容",
+      h("button", {
+        type: "button",
+        "data-testid": "recommendation-open",
+        onClick: () => props.openImage?.("recommendation-media-1"),
+      }, "打开推荐图片"),
+      h("button", {
+        type: "button",
+        "data-testid": "recommendation-export",
+        onClick: () => props.exportImage?.("recommendation-media-1"),
+      }, "导出推荐图片"),
+    ]);
+  },
+});
+
 function jsonResponse(payload: unknown): Response {
   return new Response(JSON.stringify(payload), {
     status: 200,
@@ -105,6 +134,7 @@ function mountApp(): VueWrapper {
       stubs: {
         TasksPage: TasksStub,
         OrganizePage: OrganizeStub,
+        RecommendationPage: RecommendationStub,
         SettingsPage: SettingsStub,
       },
     },
@@ -166,11 +196,11 @@ describe("App page shell", () => {
     vi.unstubAllGlobals();
   });
 
-  it("starts on the compact search page and exposes the five preserved workspaces", async () => {
+  it("starts on the compact search page and adds recommendations without replacing a workspace", async () => {
     wrapper = mountApp();
     await flushPromises();
 
-    expect(wrapper.findAll(".nav-item")).toHaveLength(5);
+    expect(wrapper.findAll(".nav-item")).toHaveLength(6);
     expect(wrapper.get(".nav-item[data-page='search']").attributes("aria-current")).toBe("page");
     expect(wrapper.get("[data-page-section='search']").isVisible()).toBe(true);
     expect(wrapper.find("[data-page-section='search'] .page-heading").exists()).toBe(false);
@@ -194,7 +224,7 @@ describe("App page shell", () => {
 
     await wrapper.get(".sidebar-toggle").trigger("click");
     expect(wrapper.get(".app-shell").classes()).toContain("sidebar-collapsed");
-    expect(wrapper.findAll(".nav-item")).toHaveLength(5);
+    expect(wrapper.findAll(".nav-item")).toHaveLength(6);
   });
 
   it("keeps the requested result count uncapped without a redundant fixed-page summary", async () => {
@@ -305,7 +335,7 @@ describe("App page shell", () => {
     expect(wrapper.find(".gallery-panel").exists()).toBe(true);
   });
 
-  it("supports Alt+1 through Alt+5 plus slash, Ctrl+K and Ctrl+G", async () => {
+  it("supports Alt+1 through Alt+6 plus slash, Ctrl+K and Ctrl+G", async () => {
     latestPayload = {
       ...latestPayload,
       total_items: 30,
@@ -314,14 +344,16 @@ describe("App page shell", () => {
     wrapper = mountApp();
     await flushPromises();
 
-    const destinations = ["search", "tasks", "batch", "groups", "learning"];
+    const destinations = ["search", "tasks", "batch", "groups", "learning", "recommendations"];
     for (const [index, page] of destinations.entries()) {
       const digit = String(index + 1);
       window.dispatchEvent(
         new KeyboardEvent("keydown", { key: digit, code: `Digit${digit}`, altKey: true }),
       );
       await wrapper.vm.$nextTick();
-      const section = page === "search" || page === "tasks" ? page : "organize";
+      const section = page === "search" || page === "tasks" || page === "recommendations"
+        ? page
+        : "organize";
       expect(wrapper.get(`[data-page-section='${section}']`).isVisible()).toBe(true);
       expect(wrapper.get(`.nav-item[data-page='${page}']`).attributes("aria-current")).toBe("page");
     }
@@ -360,6 +392,20 @@ describe("App page shell", () => {
 
     await wrapper.get(".nav-item[data-page='search']").trigger("click");
     expect(wrapper.get("[data-testid='tasks-page']").attributes("data-visible")).toBe("false");
+  });
+
+  it("mounts recommendations lazily and reuses the native open and export actions", async () => {
+    wrapper = mountApp();
+    await flushPromises();
+
+    expect(wrapper.find("[data-testid='recommendation-page']").exists()).toBe(false);
+    await wrapper.get(".nav-item[data-page='recommendations']").trigger("click");
+    expect(wrapper.get("[data-testid='recommendation-page']").attributes("data-visible")).toBe("true");
+
+    await wrapper.get("[data-testid='recommendation-open']").trigger("click");
+    await wrapper.get("[data-testid='recommendation-export']").trigger("click");
+    expect(nativeActionMocks.open).toHaveBeenCalledWith("recommendation-media-1");
+    expect(nativeActionMocks.exportImages).toHaveBeenCalledWith(["recommendation-media-1"]);
   });
 
   it("shows resident shutdown failures reported by the host", async () => {

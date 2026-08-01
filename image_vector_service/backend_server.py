@@ -3,12 +3,13 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import threading
 import uuid
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import asdict, dataclass, field, is_dataclass, replace
@@ -39,6 +40,17 @@ from .library_config import (
 )
 from .models import SearchReport
 from .rank_fusion import confidence_candidate_limit
+from .recommendation_store import (
+    RecommendationBatch,
+    RecommendationBatchItem,
+    RecommendationStore,
+)
+from .recommendations import (
+    SLOT_QUOTAS,
+    RecommendationCandidate,
+    RecommendationSelection,
+    select_recommendations,
+)
 from .result_exporter import search_report_payload
 from .service import ImageVectorService
 from .tag_search import TagSearchError, split_tag_search_query
@@ -52,6 +64,9 @@ _TERMINAL_STATUSES = frozenset(
     {"succeeded", "partial", "needs_attention", "failed", "cancelled"}
 )
 _JOB_PATH = re.compile(r"^/v1/jobs/([0-9a-f]{32})/?$")
+_RECOMMENDATION_EVENT_PATH = re.compile(
+    r"^/v1/recommendations/([^/]+)/(shown|actions)$"
+)
 _PROGRESS_NUMBERS = re.compile(r"(?P<current>\d+)\s*/\s*(?P<total>\d+)")
 _MAX_REQUEST_BYTES = 1024 * 1024
 _PROTOCOL_VERSION = 2
@@ -921,6 +936,14 @@ class BackendJobManager:
             max_workers=max(2, len(self._library_workers)),
             thread_name_prefix="zvec-backend-control",
         )
+        self._recommendation_store_path = (
+            self._config.config_home_path / "recommendations.sqlite3"
+        )
+        self._recommendation_store: RecommendationStore | None = None
+        self._recommendation_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="zvec-recommendations",
+        )
         self._job_futures: dict[str, Future[Any]] = {}
         self._job_worker_ids: dict[str, str] = {}
 
@@ -1171,6 +1194,8 @@ class BackendJobManager:
                 for worker in self._library_workers.values():
                     worker.close()
             self._control_executor.shutdown(wait=True, cancel_futures=False)
+            self._close_recommendation_store()
+            self._recommendation_executor.shutdown(wait=True, cancel_futures=False)
         finally:
             self._activity_log(
                 level="info",
@@ -1326,6 +1351,277 @@ class BackendJobManager:
                 self._activity.add_redactions(normalized_key)
         self._credentials.configure(normalized_key, api_url)
         return {"credentials_configured": True}
+
+    def create_recommendations(
+        self,
+        viewer_id: str,
+        request_id: str,
+    ) -> dict[str, Any]:
+        """Create or replay one device-scoped recommendation batch."""
+
+        viewer = _recommendation_identifier(viewer_id, "viewer_id")
+        request = _recommendation_identifier(request_id, "request_id")
+        return self._recommendation_call(
+            lambda store: self._create_recommendations_on_worker(store, viewer, request)
+        )
+
+    def mark_recommendations_shown(
+        self,
+        viewer_id: str,
+        batch_id: str,
+        event_id: str,
+    ) -> dict[str, Any]:
+        viewer = _recommendation_identifier(viewer_id, "viewer_id")
+        batch = _recommendation_identifier(batch_id, "batch_id")
+        event = _recommendation_identifier(event_id, "event_id")
+        recorded = self._recommendation_call(
+            lambda store: store.mark_shown(viewer, batch, event)
+        )
+        return {"recorded": recorded, "event_id": event}
+
+    def record_recommendation_action(
+        self,
+        viewer_id: str,
+        batch_id: str,
+        event_id: str,
+        item_id: str,
+        action: str,
+        metadata: Mapping[str, str] | None = None,
+    ) -> dict[str, Any]:
+        del metadata
+        viewer = _recommendation_identifier(viewer_id, "viewer_id")
+        batch = _recommendation_identifier(batch_id, "batch_id")
+        event = _recommendation_identifier(event_id, "event_id")
+        item = _recommendation_identifier(item_id, "item_id")
+        if action not in {"open", "like", "export", "dislike"}:
+            raise BackendRequestError(
+                "invalid_request", "Recommendation action is invalid."
+            )
+        recorded = self._recommendation_call(
+            lambda store: store.record_action(viewer, batch, event, item, action)
+        )
+        return {"recorded": recorded, "event_id": event}
+
+    def _recommendation_call(
+        self,
+        callback: Callable[[RecommendationStore], Any],
+    ) -> Any:
+        if self._closed or self._stop_requested.is_set():
+            raise BackendRequestError(
+                "service_unavailable",
+                "The backend is shutting down.",
+                status=HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+        try:
+            return self._recommendation_executor.submit(
+                self._run_recommendation_call,
+                callback,
+            ).result()
+        except ValueError as exc:
+            raise BackendRequestError(
+                "invalid_recommendation_request",
+                "The recommendation request is invalid.",
+            ) from exc
+
+    def _run_recommendation_call(
+        self,
+        callback: Callable[[RecommendationStore], Any],
+    ) -> Any:
+        store = self._recommendation_store
+        if store is None:
+            store = RecommendationStore(self._recommendation_store_path)
+            self._recommendation_store = store
+        return callback(store)
+
+    def _close_recommendation_store(self) -> None:
+        def close(store: RecommendationStore) -> None:
+            store.close()
+
+        store = self._recommendation_store
+        if store is not None:
+            self._recommendation_executor.submit(close, store).result()
+            self._recommendation_store = None
+
+    def _create_recommendations_on_worker(
+        self,
+        store: RecommendationStore,
+        viewer_id: str,
+        request_id: str,
+    ) -> dict[str, Any]:
+        existing = store.batch_for_request(viewer_id, request_id)
+        if existing is not None:
+            items = self._reload_recommendation_items(existing.items)
+            return _recommendation_response(
+                existing,
+                items,
+                history_window=0,
+                diversity=_replayed_recommendation_diversity(),
+            )
+
+        candidates, vector_spaces = self._collect_recommendation_candidates(
+            store,
+            viewer_id,
+            request_id,
+        )
+        diversity = _recommendation_diversity(vector_spaces, candidates)
+        if not diversity["applied"]:
+            candidates = tuple(
+                replace(candidate, vector=None) for candidate in candidates
+            )
+        selection = select_recommendations(
+            candidates,
+            recent_sha256=store.recent_sha256(viewer_id),
+            rng_seed=_recommendation_seed(viewer_id, request_id),
+        )
+        selected_items = self._reload_recommendation_items(
+            tuple(
+                RecommendationBatchItem(
+                    item_id="pending",
+                    position=index,
+                    candidate_id=item.candidate.candidate_id,
+                    library_id=_recommendation_library_id(item.candidate.candidate_id),
+                    doc_id=item.candidate.doc_id,
+                    sha256=item.candidate.sha256,
+                    slot=item.slot,
+                )
+                for index, item in enumerate(selection.items)
+            )
+        )
+        selected_by_candidate = {item["media_id"]: item for item in selected_items}
+        available_selection = tuple(
+            item
+            for item in selection.items
+            if item.candidate.candidate_id in selected_by_candidate
+        )
+        persisted_items = tuple(
+            RecommendationBatchItem(
+                item_id=uuid.uuid4().hex,
+                position=position,
+                candidate_id=item.candidate.candidate_id,
+                library_id=_recommendation_library_id(item.candidate.candidate_id),
+                doc_id=item.candidate.doc_id,
+                sha256=item.candidate.sha256,
+                slot=item.slot,
+            )
+            for position, item in enumerate(available_selection)
+        )
+        batch = store.create_batch(viewer_id, request_id, persisted_items)
+        response_items = self._reload_recommendation_items(batch.items)
+        return _recommendation_response(
+            batch,
+            response_items,
+            history_window=selection.history_window,
+            diversity=diversity,
+        )
+
+    def _collect_recommendation_candidates(
+        self,
+        store: RecommendationStore,
+        viewer_id: str,
+        request_id: str,
+    ) -> tuple[
+        tuple[RecommendationCandidate, ...],
+        tuple[dict[str, object] | None, ...],
+    ]:
+        futures: list[tuple[LibraryDefinition, Future[Any]]] = []
+        for library in self._catalog.enabled:
+            cursor = hashlib.sha256(
+                f"{viewer_id}:{request_id}:{library.library_id}".encode()
+            ).hexdigest()
+
+            def collect_candidates(
+                service: Any,
+                *,
+                random_cursor: str = cursor,
+            ) -> Any:
+                return service.collect_recommendation_candidates(
+                    random_cursor=random_cursor,
+                    limit_per_pool=100,
+                )
+
+            submission = self._library_workers[library.library_id].submit(
+                None,
+                collect_candidates,
+                priority=_JobPriority.HIGH,
+            )
+            futures.append((library, submission.future))
+
+        raw_candidates: list[tuple[LibraryDefinition, Mapping[str, object]]] = []
+        vector_spaces: list[dict[str, object] | None] = []
+        for library, future in futures:
+            result = future.result()
+            if not isinstance(result, Mapping):
+                continue
+            vector_space = _recommendation_vector_space(result.get("vector_space"))
+            values = result.get("candidates")
+            if not isinstance(values, list):
+                continue
+            vector_spaces.append(vector_space)
+            for value in values:
+                if isinstance(value, Mapping):
+                    raw_candidates.append((library, value))
+        exposure = _recommendation_exposure_counts(
+            store,
+            viewer_id,
+            (str(value.get("sha256") or "") for _library, value in raw_candidates),
+        )
+        candidates = tuple(
+            candidate
+            for library, value in raw_candidates
+            if (
+                candidate := _recommendation_candidate(
+                    library,
+                    value,
+                    exposure.get(str(value.get("sha256") or ""), 0),
+                )
+            )
+            is not None
+        )
+        return candidates, tuple(vector_spaces)
+
+    def _reload_recommendation_items(
+        self,
+        batch_items: Sequence[RecommendationBatchItem],
+    ) -> list[dict[str, object]]:
+        by_library: dict[str, list[str]] = {}
+        for item in batch_items:
+            by_library.setdefault(item.library_id, []).append(item.doc_id)
+        loaded: dict[tuple[str, str], Mapping[str, object]] = {}
+        futures: list[tuple[str, Future[Any]]] = []
+        for library_id, doc_ids in by_library.items():
+            worker = self._library_workers.get(library_id)
+            if worker is None:
+                continue
+
+            def load_items(
+                service: Any,
+                *,
+                selected_doc_ids: list[str] = doc_ids,
+            ) -> Any:
+                return service.load_recommendation_items(selected_doc_ids)
+
+            submission = worker.submit(
+                None,
+                load_items,
+                priority=_JobPriority.HIGH,
+            )
+            futures.append((library_id, submission.future))
+        for library_id, future in futures:
+            values = future.result()
+            if not isinstance(values, list):
+                continue
+            for value in values:
+                if isinstance(value, Mapping) and isinstance(value.get("doc_id"), str):
+                    loaded[(library_id, value["doc_id"])] = value
+        result: list[dict[str, object]] = []
+        for item in batch_items:
+            value = loaded.get((item.library_id, item.doc_id))
+            if value is None:
+                continue
+            payload = _recommendation_item_payload(item, value, self._catalog)
+            if payload is not None:
+                result.append(payload)
+        return result
 
     def submit(self, payload: dict[str, Any]) -> dict[str, Any]:
         command, params = _normalize_job(payload, self._query_root)
@@ -2314,6 +2610,66 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
                     # thread. Starting it after the response also prevents a
                     # successful request from being cut off mid-body.
                     self.backend.shutdown_async()
+            return
+        if path == "/v1/recommendations":
+
+            def create_recommendations() -> tuple[HTTPStatus, dict[str, Any]]:
+                payload = self._read_json_object()
+                _require_recommendation_fields(
+                    payload,
+                    required={"viewer_id", "request_id"},
+                )
+                return (
+                    HTTPStatus.OK,
+                    self.backend.manager.create_recommendations(
+                        payload["viewer_id"],
+                        payload["request_id"],
+                    ),
+                )
+
+            self._run_request(create_recommendations)
+            return
+        recommendation_event = _RECOMMENDATION_EVENT_PATH.fullmatch(path)
+        if recommendation_event is not None:
+            batch_id = recommendation_event.group(1)
+            operation = recommendation_event.group(2)
+
+            def record_recommendation_event() -> tuple[HTTPStatus, dict[str, Any]]:
+                payload = self._read_json_object()
+                if operation == "shown":
+                    _require_recommendation_fields(
+                        payload,
+                        required={"viewer_id", "event_id"},
+                    )
+                    response = self.backend.manager.mark_recommendations_shown(
+                        payload["viewer_id"],
+                        batch_id,
+                        payload["event_id"],
+                    )
+                else:
+                    _require_recommendation_fields(
+                        payload,
+                        required={"viewer_id", "event_id", "item_id", "action"},
+                        allowed={
+                            "viewer_id",
+                            "event_id",
+                            "item_id",
+                            "action",
+                            "metadata",
+                        },
+                    )
+                    metadata = _recommendation_metadata(payload.get("metadata"))
+                    response = self.backend.manager.record_recommendation_action(
+                        payload["viewer_id"],
+                        batch_id,
+                        payload["event_id"],
+                        payload["item_id"],
+                        payload["action"],
+                        metadata,
+                    )
+                return HTTPStatus.OK, response
+
+            self._run_request(record_recommendation_event)
             return
         if path != "/v1/jobs":
             self._send_error(
@@ -4199,6 +4555,291 @@ def _json_safe(value: Any) -> Any:
     if is_dataclass(value) and not isinstance(value, type):
         return _json_safe(asdict(value))
     return str(value)
+
+
+def _recommendation_identifier(value: object, name: str) -> str:
+    if not isinstance(value, str):
+        raise BackendRequestError("invalid_request", f"{name} must be text.")
+    normalized = value.strip()
+    if (
+        not normalized
+        or len(normalized) > 256
+        or any(ord(character) < 32 for character in normalized)
+    ):
+        raise BackendRequestError("invalid_request", f"{name} is invalid.")
+    return normalized
+
+
+def _require_recommendation_fields(
+    payload: Mapping[str, object],
+    *,
+    required: set[str],
+    allowed: set[str] | None = None,
+) -> None:
+    accepted = required if allowed is None else allowed
+    if not required.issubset(payload) or set(payload) - accepted:
+        raise BackendRequestError(
+            "invalid_request", "Recommendation request fields are invalid."
+        )
+    if any(not isinstance(payload[name], str) for name in required):
+        raise BackendRequestError(
+            "invalid_request", "Recommendation request fields are invalid."
+        )
+
+
+def _recommendation_metadata(value: object) -> Mapping[str, str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict) or any(
+        not isinstance(key, str) or not isinstance(item, str)
+        for key, item in value.items()
+    ):
+        raise BackendRequestError(
+            "invalid_request", "Recommendation metadata is invalid."
+        )
+    return value
+
+
+def _recommendation_seed(viewer_id: str, request_id: str) -> int:
+    digest = hashlib.blake2b(
+        f"{viewer_id}:{request_id}".encode(), digest_size=8
+    ).digest()
+    return int.from_bytes(digest, "big")
+
+
+def _recommendation_exposure_counts(
+    store: RecommendationStore,
+    viewer_id: str,
+    sha256_values: Iterable[str],
+) -> dict[str, int]:
+    values = tuple(dict.fromkeys(value for value in sha256_values if value))
+    result: dict[str, int] = {}
+    for offset in range(0, len(values), 800):
+        result.update(store.exposure_counts(viewer_id, values[offset : offset + 800]))
+    return result
+
+
+def _recommendation_vector_space(value: object) -> dict[str, object] | None:
+    if not isinstance(value, Mapping):
+        return None
+    model = value.get("model")
+    dimension = value.get("dimension")
+    metric = value.get("metric")
+    if (
+        not isinstance(model, str)
+        or not model.strip()
+        or isinstance(dimension, bool)
+        or not isinstance(dimension, int)
+        or dimension < 1
+        or not isinstance(metric, str)
+        or not metric.strip()
+    ):
+        return None
+    return {
+        "model": model.strip(),
+        "dimension": dimension,
+        "metric": metric.strip(),
+    }
+
+
+def _recommendation_candidate(
+    library: LibraryDefinition,
+    value: Mapping[str, object],
+    exposure_count: int,
+) -> RecommendationCandidate | None:
+    doc_id = value.get("doc_id")
+    sha256 = value.get("sha256")
+    source_path = value.get("source_path")
+    width = value.get("width")
+    height = value.get("height")
+    mtime_ns = value.get("mtime_ns")
+    if (
+        not isinstance(doc_id, str)
+        or not doc_id.strip()
+        or not isinstance(sha256, str)
+        or not sha256.strip()
+        or not isinstance(source_path, str)
+        or not source_path.strip()
+        or isinstance(width, bool)
+        or not isinstance(width, int)
+        or isinstance(height, bool)
+        or not isinstance(height, int)
+        or isinstance(mtime_ns, bool)
+        or not isinstance(mtime_ns, int)
+    ):
+        return None
+    try:
+        if not Path(source_path).is_file():
+            return None
+    except OSError:
+        return None
+    raw_vector = value.get("vector")
+    vector: tuple[float, ...] | None = None
+    if isinstance(raw_vector, (list, tuple)):
+        try:
+            normalized = tuple(float(item) for item in raw_vector)
+        except (TypeError, ValueError):
+            normalized = ()
+        if normalized and all(math.isfinite(item) for item in normalized):
+            vector = normalized
+    album_id = value.get("album_id")
+    character = value.get("character")
+    return RecommendationCandidate(
+        candidate_id=f"{library.library_id}:{doc_id.strip()}",
+        doc_id=doc_id.strip(),
+        sha256=sha256.strip(),
+        width=width,
+        height=height,
+        mtime_ns=mtime_ns,
+        exposure_count=max(0, exposure_count),
+        album_id=(
+            f"{library.library_id}\0{album_id.strip()}"
+            if isinstance(album_id, str) and album_id.strip()
+            else None
+        ),
+        character=(
+            character.strip()
+            if isinstance(character, str) and character.strip()
+            else None
+        ),
+        vector=vector,
+    )
+
+
+def _recommendation_library_id(candidate_id: str) -> str:
+    library_id, separator, _doc_id = candidate_id.partition(":")
+    if not separator or not library_id:
+        raise ValueError("recommendation candidate is missing its library id")
+    return library_id
+
+
+def _recommendation_diversity(
+    vector_spaces: Sequence[dict[str, object] | None],
+    candidates: Sequence[RecommendationCandidate],
+) -> dict[str, object]:
+    known_spaces = [space for space in vector_spaces if space is not None]
+    unique_spaces = {
+        json.dumps(space, separators=(",", ":"), sort_keys=True)
+        for space in known_spaces
+    }
+    missing_vectors = sum(1 for candidate in candidates if candidate.vector is None)
+    if len(unique_spaces) > 1 or (
+        known_spaces and len(known_spaces) != len(vector_spaces)
+    ):
+        return {
+            "applied": False,
+            "reason": "incompatible_vector_spaces",
+            "missing_vectors": missing_vectors,
+        }
+    if not known_spaces:
+        return {
+            "applied": False,
+            "reason": "vector_space_unavailable",
+            "missing_vectors": missing_vectors,
+        }
+    if not any(candidate.vector is not None for candidate in candidates):
+        return {
+            "applied": False,
+            "reason": "vectors_unavailable",
+            "missing_vectors": missing_vectors,
+            "vector_space": known_spaces[0],
+        }
+    return {
+        "applied": True,
+        "reason": None,
+        "missing_vectors": missing_vectors,
+        "vector_space": known_spaces[0],
+    }
+
+
+def _replayed_recommendation_diversity() -> dict[str, object]:
+    return {
+        "applied": False,
+        "reason": "replayed",
+        "missing_vectors": 0,
+    }
+
+
+def _recommendation_item_payload(
+    batch_item: RecommendationBatchItem,
+    value: Mapping[str, object],
+    catalog: LibraryCatalog,
+) -> dict[str, object] | None:
+    library = catalog.by_id.get(batch_item.library_id)
+    if library is None:
+        return None
+    source_path = value.get("source_path")
+    if not isinstance(source_path, str) or not source_path.strip():
+        return None
+    try:
+        if not Path(source_path).is_file():
+            return None
+    except OSError:
+        return None
+    name = value.get("name")
+    normalized_name = (
+        name.replace("\\", "/").rsplit("/", 1)[-1].strip()
+        if isinstance(name, str)
+        else ""
+    )
+    tags = value.get("tags")
+    if not isinstance(tags, (list, tuple)):
+        tags = ()
+    payload: dict[str, object] = {
+        "item_id": batch_item.item_id,
+        "media_id": batch_item.candidate_id,
+        "name": normalized_name,
+        "tags": [tag for tag in tags if isinstance(tag, str)],
+        "library_id": library.library_id,
+        "library_name": library.name,
+        "bucket": batch_item.slot,
+        "source_path": source_path,
+    }
+    for key in ("width", "height", "size_bytes", "mtime_ns"):
+        item = value.get(key)
+        if isinstance(item, int) and not isinstance(item, bool) and item >= 0:
+            payload[key] = item
+    content_type = value.get("content_type")
+    if isinstance(content_type, str) and content_type:
+        payload["content_type"] = content_type
+    return payload
+
+
+def _recommendation_response(
+    batch: RecommendationBatch,
+    items: Sequence[dict[str, object]],
+    *,
+    history_window: int,
+    diversity: Mapping[str, object],
+    selection: RecommendationSelection | None = None,
+) -> dict[str, Any]:
+    counts = {slot: 0 for slot in SLOT_QUOTAS}
+    if selection is not None:
+        counts.update(
+            {
+                slot: count
+                for slot, count in selection.counts_by_slot.items()
+                if slot in counts and isinstance(count, int)
+            }
+        )
+    else:
+        for item in batch.items:
+            if item.slot in counts:
+                counts[item.slot] += 1
+    partial = len(items) < sum(SLOT_QUOTAS.values())
+    quota_degraded = any(counts[slot] < quota for slot, quota in SLOT_QUOTAS.items())
+    return {
+        "request_id": batch.request_id,
+        "batch_id": batch.batch_id,
+        "count": len(items),
+        "partial": partial,
+        "partial_reason": "insufficient_eligible_candidates" if partial else "",
+        "quota_degraded": quota_degraded,
+        "history_window": history_window,
+        "items": list(items),
+        "quota": counts,
+        "diversity": dict(diversity),
+    }
 
 
 def _result_failure_count(value: Any) -> int:

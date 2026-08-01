@@ -8,7 +8,7 @@ from pathlib import Path
 
 from .discovery import DISCOVERY_PORT, DiscoveryServer
 from .http_server import API_PORT, LanApiServer
-from .models import LanSearchBackend, MediaResolver
+from .models import LanSearchBackend, MediaResolver, RecommendationBackend
 from .pairing import (
     CredentialStore,
     MemoryCredentialStore,
@@ -49,6 +49,7 @@ class LanGatewayServer:
         advertised_host: str,
         search_backend: LanSearchBackend,
         media_resolver: MediaResolver,
+        recommendation_backend: RecommendationBackend | None = None,
         credential_store: CredentialStore | None = None,
         upload_directory: str | Path | None = None,
         upload_min_free_bytes: int = DEFAULT_MIN_FREE_BYTES,
@@ -76,6 +77,7 @@ class LanGatewayServer:
             name=name,
             search_backend=search_backend,
             media_resolver=media_resolver,
+            recommendation_backend=recommendation_backend,
             pairing_manager=self._pairing,
             query_images=self._query_images,
             host=bind_host,

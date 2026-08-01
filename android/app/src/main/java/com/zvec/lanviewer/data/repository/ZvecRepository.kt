@@ -11,12 +11,16 @@ import com.zvec.lanviewer.data.local.SavedConnection
 import com.zvec.lanviewer.data.model.DiscoveredServer
 import com.zvec.lanviewer.data.model.DownloadProgress
 import com.zvec.lanviewer.data.model.LibrariesResponse
+import com.zvec.lanviewer.data.model.OriginalMediaItem
 import com.zvec.lanviewer.data.model.PairPollResponse
 import com.zvec.lanviewer.data.model.PairRequest
 import com.zvec.lanviewer.data.model.PairStartResponse
 import com.zvec.lanviewer.data.model.QueryImageResponse
+import com.zvec.lanviewer.data.model.RecommendationActionRequest
+import com.zvec.lanviewer.data.model.RecommendationRequest
+import com.zvec.lanviewer.data.model.RecommendationShownRequest
+import com.zvec.lanviewer.data.model.RecommendationsResponse
 import com.zvec.lanviewer.data.model.SearchCreatedResponse
-import com.zvec.lanviewer.data.model.SearchItem
 import com.zvec.lanviewer.data.model.SearchPageResponse
 import com.zvec.lanviewer.data.model.SearchPageResult
 import com.zvec.lanviewer.data.model.SearchRequest
@@ -94,6 +98,15 @@ class ZvecRepository(
 
     suspend fun libraries(): LibrariesResponse = api.libraries()
 
+    suspend fun recommendations(request: RecommendationRequest): RecommendationsResponse =
+        api.recommendations(request)
+
+    suspend fun markRecommendationsShown(batchId: String, request: RecommendationShownRequest) =
+        api.markRecommendationsShown(batchId, request)
+
+    suspend fun recordRecommendationAction(batchId: String, request: RecommendationActionRequest) =
+        api.recordRecommendationAction(batchId, request)
+
     suspend fun uploadQueryImage(
         contentResolver: ContentResolver,
         uri: Uri,
@@ -120,7 +133,7 @@ class ZvecRepository(
     fun mediaUrl(mediaId: String): String = api.mediaUrl(mediaId)
 
     suspend fun cacheOriginal(
-        item: SearchItem,
+        item: OriginalMediaItem,
         onProgress: (DownloadProgress) -> Unit = {},
     ): File {
         val extension = item.name.substringAfterLast('.', "bin")
@@ -134,7 +147,7 @@ class ZvecRepository(
     }
 
     suspend fun copyOriginalTo(
-        item: SearchItem,
+        item: OriginalMediaItem,
         destination: Uri,
         onProgress: (DownloadProgress) -> Unit = {},
     ) {
@@ -144,7 +157,7 @@ class ZvecRepository(
         output.use { sink -> cached.inputStream().use { source -> source.copyTo(sink, 256 * 1024) } }
     }
 
-    suspend fun shareUri(item: SearchItem, onProgress: (DownloadProgress) -> Unit = {}): Uri {
+    suspend fun shareUri(item: OriginalMediaItem, onProgress: (DownloadProgress) -> Unit = {}): Uri {
         val cached = cacheOriginal(item, onProgress)
         return FileProvider.getUriForFile(context, "${context.packageName}.files", cached)
     }

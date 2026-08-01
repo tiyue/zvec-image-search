@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
+from zvec_host.recommendation_service import RecommendationService
 from zvec_lan import (
     DISCOVERY_PORT,
     JsonCredentialStore,
@@ -118,6 +119,7 @@ class PreviewLanAdapter:
         self,
         facade: PreviewLanFacade,
         *,
+        recommendation_backend: RecommendationService | None = None,
         search_ttl_seconds: float = _DEFAULT_SEARCH_TTL_SECONDS,
         cleanup_interval_seconds: float = _DEFAULT_SEARCH_CLEANUP_INTERVAL_SECONDS,
         clock: Callable[[], float] = time.monotonic,
@@ -137,6 +139,7 @@ class PreviewLanAdapter:
         ):
             raise ValueError("cleanup_interval_seconds must be finite and non-negative")
         self._facade = facade
+        self._recommendation_backend = recommendation_backend
         self._search_owners: dict[str, str] = {}
         self._search_media: dict[str, set[str]] = {}
         self._search_last_access: dict[str, float] = {}
@@ -149,6 +152,9 @@ class PreviewLanAdapter:
         # result-count cap: DELETE search/session releases all associated rows.
         self._media: dict[str, _MediaBinding] = {}
         self._media_keys: dict[tuple[str, str, str, str], str] = {}
+        self._recommendation_media: dict[str, _MediaBinding] = {}
+        self._recommendation_media_keys: dict[tuple[str, str, str], str] = {}
+        self._recommendation_media_origin = ""
         # Indexed SHA-256 values still need one content check before an original
         # is exposed. Cache that proof by the exact file version so repeated
         # searches do not read the same large source twice. In-flight checks are
@@ -179,6 +185,15 @@ class PreviewLanAdapter:
             if library_id and name:
                 libraries.append(LibraryInfo(id=library_id, name=name))
         return tuple(libraries)
+
+    def set_recommendation_media_origin(self, origin: str) -> None:
+        """Set the authenticated LAN origin after its listener is running."""
+
+        normalized = _safe_text(origin, maximum=512).rstrip("/")
+        if not normalized.startswith(("http://", "https://")):
+            raise ValueError("recommendation media origin must be an HTTP(S) URL")
+        with self._lock:
+            self._recommendation_media_origin = normalized
 
     def create_search(self, request: SearchRequest, *, client_id: str) -> str:
         owner = _client_id(client_id)
@@ -330,8 +345,128 @@ class PreviewLanAdapter:
         with self._lock:
             self._client_generations[owner] = self._client_generations.get(owner, 0) + 1
             search_ids = self._release_client_searches_locked(owner)
+            self._release_recommendation_media_locked(owner)
         for search_id in search_ids:
             self._cancel_search_best_effort(search_id)
+
+    def create_recommendations(
+        self,
+        request_id: str,
+        *,
+        client_id: str,
+        device_id: str,
+    ) -> Mapping[str, object]:
+        owner = _client_id(client_id)
+        backend = self._recommendation_backend
+        if backend is None:
+            raise LanBackendError(
+                "recommendations_unavailable",
+                "图片推荐暂不可用，请确认电脑端服务已经就绪。",
+                status=503,
+            )
+        try:
+            response = backend.create_recommendations(
+                request_id,
+                viewer_id=_lan_recommendation_viewer(device_id),
+            )
+        except Exception as exc:
+            raise _adapter_failure(exc, "recommendations_unavailable", 503) from exc
+        items = response.get("items")
+        public_items: list[dict[str, Any]] = []
+        for raw in items if isinstance(items, list) else []:
+            if not isinstance(raw, Mapping):
+                continue
+            source_image_id = _safe_text(raw.get("media_id"), maximum=160)
+            if not source_image_id:
+                continue
+            media_id = self._remember_recommendation_media(
+                source_image_id,
+                owner=owner,
+                content_type=_optional_text(raw.get("content_type"), maximum=256),
+            )
+            if media_id is None:
+                continue
+            with self._lock:
+                origin = self._recommendation_media_origin
+            if not origin:
+                continue
+            item = dict(raw)
+            item["media_id"] = media_id
+            item.pop("source_path", None)
+            item.pop("vector", None)
+            original_url = f"{origin}/api/v1/media/{media_id}/original"
+            item["thumbnail_url"] = original_url
+            item["preview_url"] = original_url
+            public_items.append(item)
+        public = {
+            key: value
+            for key, value in response.items()
+            if key not in {"source_path", "vector"}
+        }
+        public["items"] = public_items
+        public["count"] = len(public_items)
+        if len(public_items) < _non_negative_int(response.get("count")):
+            public["partial"] = True
+            if not _safe_text(public.get("partial_reason"), maximum=128):
+                public["partial_reason"] = "media_unavailable"
+            public["quota_degraded"] = True
+        return public
+
+    def mark_recommendations_shown(
+        self,
+        batch_id: str,
+        event_id: str,
+        *,
+        client_id: str,
+        device_id: str,
+    ) -> None:
+        _client_id(client_id)
+        backend = self._recommendation_backend
+        if backend is None:
+            raise LanBackendError(
+                "recommendations_unavailable",
+                "图片推荐暂不可用，请确认电脑端服务已经就绪。",
+                status=503,
+            )
+        try:
+            backend.mark_recommendations_shown(
+                batch_id,
+                event_id,
+                viewer_id=_lan_recommendation_viewer(device_id),
+            )
+        except Exception as exc:
+            raise _adapter_failure(exc, "recommendations_unavailable", 503) from exc
+
+    def record_recommendation_action(
+        self,
+        batch_id: str,
+        event_id: str,
+        item_id: str,
+        action: str,
+        metadata: Mapping[str, str] | None,
+        *,
+        client_id: str,
+        device_id: str,
+    ) -> None:
+        _client_id(client_id)
+        backend = self._recommendation_backend
+        if backend is None:
+            raise LanBackendError(
+                "recommendations_unavailable",
+                "图片推荐暂不可用，请确认电脑端服务已经就绪。",
+                status=503,
+            )
+        try:
+            backend.record_recommendation_action(
+                batch_id,
+                event_id,
+                item_id,
+                action,
+                metadata,
+                viewer_id=_lan_recommendation_viewer(device_id),
+            )
+        except Exception as exc:
+            raise _adapter_failure(exc, "recommendations_unavailable", 503) from exc
 
     def resolve_original(
         self,
@@ -344,13 +479,20 @@ class PreviewLanAdapter:
         normalized_id = _safe_text(media_id, maximum=160)
         with self._lock:
             binding = self._media.get(normalized_id)
+            recommendation_media = binding is None
+            if binding is None:
+                binding = self._recommendation_media.get(normalized_id)
             if (
                 binding is None
                 or binding.owner != owner
-                or self._search_owners.get(binding.search_id) != owner
+                or (
+                    not recommendation_media
+                    and self._search_owners.get(binding.search_id) != owner
+                )
             ):
                 return None
-            self._search_last_access[binding.search_id] = self._clock()
+            if not recommendation_media:
+                self._search_last_access[binding.search_id] = self._clock()
             digest = binding.sha256
             content_type = binding.content_type
             source_path = binding.source_path
@@ -382,10 +524,15 @@ class PreviewLanAdapter:
                 return None
         with self._lock:
             current = self._media.get(normalized_id)
+            if recommendation_media:
+                current = self._recommendation_media.get(normalized_id)
             if (
                 current is not binding
                 or current.owner != owner
-                or self._search_owners.get(current.search_id) != owner
+                or (
+                    not recommendation_media
+                    and self._search_owners.get(current.search_id) != owner
+                )
             ):
                 return None
             if not digest_verified:
@@ -527,6 +674,58 @@ class PreviewLanAdapter:
                 None,
             )
 
+    def _remember_recommendation_media(
+        self,
+        source_image_id: str,
+        *,
+        owner: str,
+        content_type: str | None,
+    ) -> str | None:
+        try:
+            source_path = self._facade.image_registry.resolve(source_image_id)
+            status = source_path.stat()
+            digest = _sha256_file(source_path)
+            after = source_path.stat()
+        except (ImageRegistryError, OSError):
+            return None
+        if (after.st_mtime_ns, after.st_size) != (status.st_mtime_ns, status.st_size):
+            return None
+        source_version = (source_path, status.st_mtime_ns, status.st_size)
+        key = (owner, source_image_id, digest)
+        with self._lock:
+            existing = self._recommendation_media_keys.get(key)
+            if existing is not None and existing in self._recommendation_media:
+                binding = self._recommendation_media[existing]
+                binding.content_type = content_type or binding.content_type
+                return existing
+            media_id = secrets.token_urlsafe(24)
+            while media_id in self._media or media_id in self._recommendation_media:
+                media_id = secrets.token_urlsafe(24)
+            self._recommendation_media[media_id] = _MediaBinding(
+                source_image_id=source_image_id,
+                source_path=source_path,
+                source_version=source_version,
+                owner=owner,
+                search_id="",
+                sha256=digest,
+                content_type=content_type,
+                digest_verified=True,
+            )
+            self._recommendation_media_keys[key] = media_id
+            return media_id
+
+    def _release_recommendation_media_locked(self, owner: str) -> None:
+        released = [
+            media_id
+            for media_id, binding in self._recommendation_media.items()
+            if binding.owner == owner
+        ]
+        for media_id in released:
+            binding = self._recommendation_media.pop(media_id)
+            self._recommendation_media_keys.pop(
+                (binding.owner, binding.source_image_id, binding.sha256), None
+            )
+
     def _begin_client_search(self, owner: str) -> tuple[int, tuple[str, ...]]:
         """Atomically supersede prior work before submitting a new search."""
 
@@ -664,11 +863,23 @@ class LanAccessController:
         settings_store: LanSettingsStore | None = None,
         gateway_factory: Callable[..., Any] = LanGatewayServer,
         credential_store: Any | None = None,
+        recommendation_backend: RecommendationService | None = None,
     ) -> None:
         self._config_home = Path(config_home).expanduser().resolve()
         self._settings = settings_store or LanSettingsStore(self._config_home)
         self._identity = _InstanceIdStore(self._config_home)
-        self._adapter = PreviewLanAdapter(facade)
+        if recommendation_backend is None:
+            client_provider = getattr(facade, "_ready_client", None)
+            if callable(client_provider):
+                recommendation_backend = RecommendationService(
+                    client_provider,
+                    facade.image_registry,
+                    self._config_home,
+                )
+        self._adapter = PreviewLanAdapter(
+            facade,
+            recommendation_backend=recommendation_backend,
+        )
         self._gateway_factory = gateway_factory
         self._credentials = credential_store
         self._credential_error: Exception | None = None
@@ -836,6 +1047,7 @@ class LanAccessController:
                 name=settings.display_name,
                 advertised_host=settings.bind_host,
                 search_backend=self._adapter,
+                recommendation_backend=self._adapter,
                 media_resolver=self._adapter,
                 credential_store=self._credentials,
                 upload_directory=self._config_home / "lan-query-images",
@@ -844,6 +1056,7 @@ class LanAccessController:
                 discovery_port=DISCOVERY_PORT,
             )
             server.start()
+            self._adapter.set_recommendation_media_origin(server.address.origin)
         except Exception as exc:
             if server is not None:
                 with suppress(Exception):
@@ -1006,6 +1219,18 @@ def _client_id(value: object) -> str:
     if not normalized:
         raise LanBackendError("invalid_client", "设备会话无效。", status=401)
     return normalized
+
+
+def _lan_recommendation_viewer(device_id: object) -> str:
+    """Derive one stable opaque viewer without forwarding the paired id."""
+
+    device = _safe_text(device_id, maximum=160)
+    if not device:
+        raise LanBackendError("invalid_client", "设备标识无效。", status=401)
+    digest = hashlib.sha256(
+        b"zvec-lan-recommendation-viewer-v1\0" + device.encode("utf-8")
+    ).hexdigest()
+    return f"lan-{digest}"
 
 
 def _safe_text(value: object, *, maximum: int) -> str:

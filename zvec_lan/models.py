@@ -7,13 +7,14 @@ without giving the LAN HTTP layer access to settings or native actions.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Protocol
 
 SearchMode = Literal["text", "tag", "image", "combined"]
 SearchProgress = Literal["queued", "running"]
+RecommendationAction = Literal["open", "like", "export", "dislike"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,6 +117,42 @@ class LanSearchBackend(Protocol):
 
     def delete_client_session(self, *, client_id: str) -> None:
         """Release every search/media capability owned by a bearer session."""
+
+
+class RecommendationBackend(Protocol):
+    """Recommendation callbacks independent from search and media lifecycles."""
+
+    def create_recommendations(
+        self,
+        request_id: str,
+        *,
+        client_id: str,
+        device_id: str,
+    ) -> Mapping[str, object]:
+        """Create a device-scoped recommendation batch response."""
+
+    def mark_recommendations_shown(
+        self,
+        batch_id: str,
+        event_id: str,
+        *,
+        client_id: str,
+        device_id: str,
+    ) -> None:
+        """Record a successful display for the supplied batch event."""
+
+    def record_recommendation_action(
+        self,
+        batch_id: str,
+        event_id: str,
+        item_id: str,
+        action: RecommendationAction,
+        metadata: Mapping[str, str] | None,
+        *,
+        client_id: str,
+        device_id: str,
+    ) -> None:
+        """Record one explicit recommendation interaction."""
 
 
 class MediaResolver(Protocol):
