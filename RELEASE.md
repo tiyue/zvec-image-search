@@ -1,10 +1,19 @@
-# YaoLens 0.1.2
+# YaoLens 0.2
 
 本版提供 Windows x64 原生 Python 后端和 Vue 3 桌面界面。发布包冻结 Python、WebView2 桥接和前端静态资源；用户运行时不需要 Node.js、PowerShell、.NET、Docker、WSL 或单独安装 Python。
 
-本次使用机器版本 `0.1.2`、公开展示版本 `0.1.2` 和稳定标签 `v0.1.2`。
+本次使用机器版本 `0.2.0`、公开展示版本 `0.2` 和稳定标签 `v0.2.0`。
 
 ## 本版更新
+
+### 图片推荐与向量多样性
+
+- Windows WebView 与 Android 同步增加“推荐”页面；每批目标为 15 张，固定配额为技术质量 5、最近入库 4、低曝光 4、随机发现 2。
+- 候选按 SHA-256 去重，同一图集最多 3 张、同一已确认角色最多 5 张；推荐不再读取或限制作者维度。
+- 已展示历史按 `60 → 45 → 30 → 15 → 0` 逐级放宽。候选不足时只使用其他合格候选补位，仍不足则返回部分批次，不复制图片凑数。
+- 多样性排序复用现有索引向量并使用 MMR：余弦相似度 `.85–.95` 渐进惩罚，达到 `.95` 后强惩罚；推荐过程不临时调用模型。
+- Windows 与每台 Android viewer 的批次、已展示历史和曝光计数相互隔离。Web 与 Android 仅在缩略图实际可见后提交 shown；Android 复用同一事件 ID 做有上限的指数退避重试。
+- 本版不按个人偏好重排，个性化推荐留待后续补全。
 
 ### 自动增量索引可靠性
 
@@ -174,14 +183,14 @@
 以下是完成最终构建和校验后采用的文件名。本说明不代表这些文件已经由当前源码重新生成；实际交付必须同时提供 SHA-256 和验证报告。
 
 ```text
-YaoLens-0.1.2-win-x64-portable.zip
-YaoLens-0.1.2-win-x64-setup.exe
-YaoLens-0.1.2-android.apk
+YaoLens-0.2-win-x64-portable.zip
+YaoLens-0.2-win-x64-setup.exe
+YaoLens-0.2-android.apk
 ```
 
 登录常驻没有新增独立发布资产；GitHub Release 资产矩阵仍为上述 Windows 安装包、便携包、Android APK 及对应校验和、验证报告和策略元数据。
 
-GitHub Release 标题固定为 `YaoLens 0.1.2`，并从精确指向工作流提交的稳定标签 `v0.1.2` 发布。
+GitHub Release 标题固定为 `YaoLens 0.2`，并从精确指向工作流提交的稳定标签 `v0.2.0` 发布。
 
 Windows 应用入口：
 

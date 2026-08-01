@@ -1,7 +1,7 @@
 # 发布供应链
 
-YaoLens 0.1.2 使用机器版本 `0.1.2`，公开展示版本为 `0.1.2`，稳定标签为
-`v0.1.2`。GitHub Release 只交付 Windows x64、Android，以及对应的校验和、
+YaoLens 0.2 使用机器版本 `0.2.0`，公开展示版本为 `0.2`，稳定标签为
+`v0.2.0`。GitHub Release 只交付 Windows x64、Android，以及对应的校验和、
 验证报告和发布策略元数据。Zvec-Desktop 和 Python wheel 不属于发布矩阵；
 wheel 只在 CI 中用于安装兼容性验证。
 
@@ -10,9 +10,9 @@ wheel 只在 CI 中用于安装兼容性验证。
 产品附件名称固定为：
 
 ```text
-YaoLens-0.1.2-win-x64-portable.zip
-YaoLens-0.1.2-win-x64-setup.exe
-YaoLens-0.1.2-android.apk
+YaoLens-0.2-win-x64-portable.zip
+YaoLens-0.2-win-x64-setup.exe
+YaoLens-0.2-android.apk
 ```
 
 发布装配还会提供以下验证材料：
@@ -80,8 +80,8 @@ gradlew.bat --no-daemon testDebugUnitTest assembleDebug lintDebug
 
 稳定发布必须满足以下条件：
 
-- 版本为 `0.1.2`，标签为 `v0.1.2`，且标签精确指向工作流提交。
-- GitHub Release 标题为 `YaoLens 0.1.2`。
+- 版本为 `0.2.0`，标签为 `v0.2.0`，且标签精确指向工作流提交。
+- GitHub Release 标题为 `YaoLens 0.2`。
 - Release 不使用草稿或预发布参数。
 - 三个产品附件名称与本文件列出的名称完全一致。
 - 所有上游和最终附件均通过 SHA-256 复核。
