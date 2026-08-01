@@ -209,7 +209,7 @@ class PreviewLanAdapterTests(unittest.TestCase):
         self.assertNotIn("source_path", str(payload))
         self.assertNotIn("vector", str(payload))
         resolved = adapter.resolve_original(media_id, client_id="session-a")
-        self.assertEqual(resolved.path, self.source)
+        self.assertEqual(resolved.path, self.source.resolve())
 
         adapter.mark_recommendations_shown(
             "batch-1",
