@@ -181,9 +181,7 @@ class RecommendationBackendTests(unittest.TestCase):
             self.assertNotEqual(first.album_id, second.album_id)
 
     def test_complete_batch_with_pool_fallback_reports_quota_degraded(self) -> None:
-        slots = (
-            ("quality",) * 4 + ("recent",) * 4 + ("low_exposure",) * 4 + ("random",) * 3
-        )
+        slots = ("quality",) * 4 + ("low_exposure",) * 6 + ("random",) * 5
         batch = RecommendationBatch(
             batch_id="batch-1",
             viewer_id="viewer-1",
@@ -217,7 +215,8 @@ class RecommendationBackendTests(unittest.TestCase):
         self.assertFalse(response["partial"])
         self.assertTrue(response["quota_degraded"])
         self.assertEqual(response["quota"]["quality"], 4)
-        self.assertEqual(response["quota"]["random"], 3)
+        self.assertEqual(response["quota"]["random"], 5)
+        self.assertNotIn("recent", response["quota"])
 
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -309,6 +308,10 @@ class RecommendationBackendTests(unittest.TestCase):
         self.assertFalse(created["partial"])
         self.assertEqual(created["partial_reason"], "")
         self.assertFalse(created["quota_degraded"])
+        self.assertEqual(
+            created["quota"],
+            {"quality": 5, "low_exposure": 6, "random": 4},
+        )
         self.assertFalse(created["diversity"]["applied"])
         self.assertEqual(created["diversity"]["reason"], "incompatible_vector_spaces")
         self.assertEqual(
@@ -343,6 +346,32 @@ class RecommendationBackendTests(unittest.TestCase):
             [item["item_id"] for item in repeated["items"]],
             [item["item_id"] for item in created["items"]],
         )
+
+    def test_replays_a_persisted_legacy_recent_item(self) -> None:
+        doc_id, source = next(iter(self.services["a"].items.items()))
+        legacy_item = RecommendationBatchItem(
+            item_id="legacy-item",
+            position=0,
+            candidate_id=f"a:{doc_id}",
+            library_id="a",
+            doc_id=doc_id,
+            sha256=str(source["sha256"]),
+            slot="recent",
+        )
+        self.manager._recommendation_call(
+            lambda store: store.create_batch(
+                "legacy-viewer", "legacy-request", (legacy_item,)
+            )
+        )
+
+        status, replay = self.request(
+            "/v1/recommendations",
+            {"viewer_id": "legacy-viewer", "request_id": "legacy-request"},
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(replay["items"][0]["bucket"], "recent")
+        self.assertNotIn("recent", replay["quota"])
 
     def test_shown_and_action_events_are_idempotent(self) -> None:
         _status, created = self.request(

@@ -15,10 +15,10 @@ from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import Literal
 
-RecommendationSlot = Literal["quality", "recent", "low_exposure", "random"]
+RecommendationSlot = Literal["quality", "low_exposure", "random"]
 
 SLOT_QUOTAS: Mapping[RecommendationSlot, int] = MappingProxyType(
-    {"quality": 5, "recent": 4, "low_exposure": 4, "random": 2}
+    {"quality": 5, "low_exposure": 6, "random": 4}
 )
 _HISTORY_WINDOWS = (240, 210, 180, 150, 120, 90, 60, 30, 0)
 _MAX_ALBUM_ITEMS = 3
@@ -336,7 +336,7 @@ def _best_candidate(
         ):
             continue
         eligible.append((rank, candidate))
-    if slot in {"recent", "random"} and eligible:
+    if slot in {"low_exposure", "random"} and eligible:
         minimum_exposure = min(
             max(0, candidate.exposure_count) for _rank, candidate in eligible
         )
@@ -371,17 +371,6 @@ def _ranked_for_slot(
                 key=lambda candidate: (
                     candidate.vector is None,
                     -(candidate.width * candidate.height),
-                    -candidate.mtime_ns,
-                    candidate.candidate_id,
-                ),
-            )
-        )
-    if slot == "recent":
-        return tuple(
-            sorted(
-                candidates,
-                key=lambda candidate: (
-                    max(0, candidate.exposure_count),
                     -candidate.mtime_ns,
                     candidate.candidate_id,
                 ),

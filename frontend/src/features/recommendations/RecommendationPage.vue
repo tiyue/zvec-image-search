@@ -90,7 +90,7 @@ const personalizationLabel = computed(() => {
 
 const bucketLabels: Record<RecommendationItem["bucket"], string> = {
   quality: "技术质量",
-  recent: "最近入库",
+  recent: "推荐",
   low_exposure: "低曝光",
   random: "随机发现",
 };
@@ -231,7 +231,7 @@ onBeforeUnmount(() => {
     <header class="recommendation-heading">
       <div>
         <h1 id="recommendation-title">图片推荐</h1>
-        <p>从技术质量、最近入库、低曝光和随机图片中发现内容。</p>
+        <p>从技术质量、低曝光和随机图片中发现内容。</p>
       </div>
       <button
         class="refresh-button"

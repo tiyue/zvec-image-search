@@ -51,4 +51,12 @@ describe("RecommendationDetail", () => {
     expect(wrapper.emitted("open")).toEqual([["media-1"]]);
     expect(wrapper.emitted("reveal")).toEqual([["media-1"]]);
   });
+
+  it("uses a generic label for a legacy recent item", () => {
+    const legacyItem = { ...item(), bucket: "recent" as const };
+    const wrapper = mount(RecommendationDetail, { props: { item: legacyItem } });
+
+    expect(wrapper.text()).toContain("推荐");
+    expect(wrapper.text()).not.toContain("最近入库");
+  });
 });

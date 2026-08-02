@@ -14,7 +14,7 @@ function wireBatch(batchId: string, count = 15): RecommendationBatchWire {
     partial_reason: count < 15 ? "insufficient_candidates" : null,
     quota_degraded: count < 15,
     history_window: 60,
-    quota: { quality: 5, recent: 4, low_exposure: 4, random: 2 },
+    quota: { quality: 5, low_exposure: 6, random: 4 },
     diversity: {
       applied: true,
       reason: "",
@@ -32,7 +32,7 @@ function wireBatch(batchId: string, count = 15): RecommendationBatchWire {
       library_name: "人物图库",
       content_type: "image/jpeg",
       size_bytes: 2048,
-      bucket: index < 5 ? "quality" : index < 9 ? "recent" : index < 13 ? "low_exposure" : "random",
+      bucket: index < 5 ? "quality" : index < 11 ? "low_exposure" : "random",
       thumbnail_url: `api/image/${batchId}-${index + 1}?variant=thumbnail`,
       preview_url: `api/image/${batchId}-${index + 1}?variant=preview`,
     })),
@@ -268,6 +268,12 @@ describe("useRecommendations", () => {
     expect(batch.partial).toBe(true);
     expect(batch.partialReason).toBe("insufficient_candidates");
     expect(batch.quotaDegraded).toBe(true);
+    expect(batch.quota).toEqual({
+      quality: 5,
+      recent: 0,
+      low_exposure: 6,
+      random: 4,
+    });
     expect(batch.diversity).toEqual({
       applied: true,
       reason: "",
@@ -275,6 +281,15 @@ describe("useRecommendations", () => {
       vectorSpace: "clip-test",
     });
     expect(batch).not.toHaveProperty("viewerId");
+  });
+
+  it("keeps legacy recent items readable for persisted batch replay", () => {
+    const wire = wireBatch("legacy-recent", 1);
+    Object.assign(wire.items?.[0] ?? {}, { bucket: "recent" });
+
+    const batch = normalizeRecommendationBatch(wire);
+
+    expect(batch.items[0].bucket).toBe("recent");
   });
 
   it("normalizes the server-final preference and safe personalization status", () => {

@@ -227,20 +227,21 @@ CLI 入口将配置创建、迁移/后端服务、需要 `ImageVectorService` �
 
 ### 图片推荐
 
-- 每批目标为 15 张，固定池配额为：技术质量（`quality`）5、最近入库（`recent`）4、低曝光（`low_exposure`）4、随机发现（`random`）2。某个池不足时，只能以其他合格候选随机补位，并标记 `quota_degraded`。
-- 每个已启用图库的每个候选池最多采样 256 条；候选加载与随机发现保持有界，不执行全库加载或全库随机排序。
+- 每批目标为 15 张，固定池配额为：技术质量（`quality`）5、低曝光（`low_exposure`）6、随机发现（`random`）4。新批次不得生成最近入库（`recent`）来源；某个池不足时，只能以其他合格候选随机补位，并标记 `quota_degraded`。
+- 每个已启用图库分别最多采样 256 条技术质量候选和 256 条稳定随机候选；不再执行按入库时间倒序的最近入库采样。候选加载与随机发现保持有界，不执行全库加载或全库随机排序。
 - 选择过程按 SHA-256 去重；同一图集（`library_id + root_id + parent_directory`）最多 3 张，同一已确认角色最多 5 张。推荐不含作者字段，也不施加作者维度的限制。
 - 角色只读取与当前 SHA-256 匹配、状态同时为 accepted 和 confirmed 的标注，并且只使用其 `accepted_auto_tags`。
 - 每个 viewer 最多读取最近 240 张成功 shown 的 SHA-256，并依次使用 240、210、180、150、120、90、60、30、0 的排除窗口；只有候选不足以组成完整批次时才逐级放宽，最终不足时不复制图片并返回 `partial` 批次及原因。
-- `recent` 与 `random` 每次选择都严格限定在当前合格候选的最低 viewer 曝光层级，再分别按 `mtime_ns` 降序或请求种子稳定随机排序；MMR 不得越过该曝光层级重新选回高曝光候选。
+- `low_exposure` 与 `random` 每次选择都严格限定在当前合格候选的最低 viewer 曝光层级，再分别按 `mtime_ns` 降序或请求种子稳定随机排序；MMR 不得越过该曝光层级重新选回高曝光候选。
 - 向量多样性只使用现有索引向量，不得为推荐临时调用模型。MMR 将余弦相似度 `>= .95` 视为强惩罚，`.85–.95` 采用渐进软惩罚。跨图库仅在 `model + dimension + metric` 完全一致时比较向量；否则返回 `incompatible_vector_spaces`。
 - 当前电脑端实例只有一套显式推荐偏好：Windows 与所有已授权 Android 设备的 `like/dislike` 跨 viewer 合并，同一 SHA-256 以 sequence 最大的最后成功事件为最终状态。`shown`、`open` 和 `export` 不推断为偏好；已有最终偏好的原图从所有新批次永久排除，既有批次回放则显示当前最终偏好。
 - 个性化画像按 sequence 倒序只扫描最近最多 4096 条 `like/dislike` 事件，在该有界窗口内按 SHA-256 首次出现取最终状态并最多保留 256 张，再由各图库 worker 按已知 doc ID 读取现有向量；不调用模型，不把路径或向量写入推荐数据库。极端重复反馈耗尽窗口时，较旧图片只退出画像并安全降级，其全历史最终偏好、原图排除和批次回放状态仍由精确查询保留；删除、缺失、读取失败或 SHA 不匹配的向量同样只退出画像计算。
-- 至少 10 个最终偏好具有可用且兼容的现有向量后才启用个性化。排序调整强度为 `min(0.25, effective_count × 0.005)`，候选调整限制在 `[-0.25, +0.25]`；只作用于 `quality`、`recent` 和 `low_exposure`，`random` 保持稳定随机探索。冷启动、向量不可用或向量空间不兼容时回退到非个性化排序。
+- 至少 10 个最终偏好具有可用且兼容的现有向量后才启用个性化。排序调整强度为 `min(0.25, effective_count × 0.005)`，候选调整限制在 `[-0.25, +0.25]`；只作用于 `quality` 和 `low_exposure`，`random` 保持稳定随机探索。冷启动、向量不可用或向量空间不兼容时回退到非个性化排序。
 - Windows viewer 与每台 Android viewer 的推荐批次、shown 历史和曝光计数继续完全隔离。只有客户端成功显示并提交 `shown` 后才计入该 viewer 曝光；创建批次本身不计曝光。
 - `recommendations.sqlite3` 仍仅含 `batches`、`items`、`events`、`content_stats` 四表，并保存不透明标识与计数，不保存文件路径、向量或 token。共享偏好直接从既有事件计算；增加精确候选偏好查询使用的 `idx_items_sha256`、`idx_events_item_action_sequence`，以及有界画像事件倒序读取使用的部分覆盖索引 `idx_events_preference_sequence`，不新增偏好表或数据迁移。
 - LAN 契约为已认证的 `POST /api/v1/recommendations`（仅 `{request_id}`）、`POST /api/v1/recommendations/{batch_id}/shown`（仅 `{event_id}`）和 `POST /api/v1/recommendations/{batch_id}/actions`（`event_id`、`item_id`、`action`，export 可带 metadata）。`request_id` 使批次创建幂等；`event_id` 使 shown 与 action 幂等。
 - 推荐响应的每个 item 可含最终共享 `preference`（`like`、`dislike` 或 `null`），顶层 `personalization` 返回 `applied`、`effective_count` 和安全 `reason`。降级 reason 为 `insufficient_preferences`、`vectors_unavailable`、`incompatible_vector_spaces`；幂等批次回放使用 `replayed`，并仍重新读取 item 的当前最终偏好。action 成功响应也返回 `recorded` 与原子读取的当前最终 `preference`，客户端不得把较旧 event ID 的幂等回放误显示为新的跨设备偏好。响应不包含 viewer/device ID 或完整反馈历史。
+- 升级前已经持久化的批次允许在幂等回放时继续返回 `bucket=recent`，不得删除或迁移旧批次；Windows 将该旧来源显示为通用“推荐”，Android 继续安全读取，不再向用户显示“最近入库”。
 - Web 和 Android 都必须先完成缩略图预加载，且页面实际可见后才提交 shown。shown/action 同步失败时必须复用原 `event_id`；Android shown 使用有上限的指数退避自动重试。Android 仅在保存原图成功后提交 `export`（`metadata.channel=save`）；分享不记录 export 事件。
 - Windows 推荐卡片仅显示图片及图片右下角的推荐来源角标，不显示文件名、图库名或“打开/喜欢/导出/不喜欢”底部按钮；单击图片继续打开当前图片。右键菜单仅作用于当前单图，推荐详情及既有操作保持可用，菜单提供详情、系统打开、所在文件夹、喜欢/不喜欢、复制图片、复制文件、复制路径和导出；推荐反馈保持 `like/dislike`，搜索菜单仍使用“相关/不相关”且保留原多选语义。菜单受窗口边界约束，并在点击外部、Escape、窗口缩放或离开推荐页时收起。
 

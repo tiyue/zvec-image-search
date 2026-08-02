@@ -933,7 +933,7 @@ class IndexState:
         random_cursor: str,
         limit_per_pool: int = 100,
     ) -> list[tuple[dict[str, Any], dict[str, Any] | None]]:
-        """Return a bounded quality/recent/random candidate union.
+        """Return a bounded quality/random candidate union.
 
         ``doc_id`` is a SHA-256 logical-path digest, so a random point in that
         key space gives an efficient approximately uniform sample without a
@@ -971,14 +971,6 @@ class IndexState:
             "AND entries.height <= entries.width * 4"
         )
 
-        rows: list[sqlite3.Row] = []
-        rows.extend(
-            connection.execute(
-                select + "ORDER BY entries.mtime_ns DESC, entries.doc_id LIMIT ?",
-                (limit_per_pool,),
-            ).fetchall()
-        )
-
         def cursor_page(predicate: str | None) -> list[sqlite3.Row]:
             filters = ["entries.doc_id >= ?"]
             values: list[Any] = [cursor]
@@ -1001,6 +993,7 @@ class IndexState:
             ).fetchall()
             return [*page, *wrapped]
 
+        rows: list[sqlite3.Row] = []
         rows.extend(cursor_page(quality))
         rows.extend(cursor_page(None))
 

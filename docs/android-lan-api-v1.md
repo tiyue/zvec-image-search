@@ -244,9 +244,8 @@ plus the computer-wide explicit preference state:
   "history_window": 240,
   "quota": {
     "quality": 5,
-    "recent": 4,
-    "low_exposure": 4,
-    "random": 2
+    "low_exposure": 6,
+    "random": 4
   },
   "diversity": {
     "applied": true,
@@ -283,6 +282,11 @@ plus the computer-wide explicit preference state:
   ]
 }
 ```
+
+New batches use only `quality`, `low_exposure`, and `random`. An idempotent
+replay of a batch persisted by an earlier version may still contain an item
+with `"bucket": "recent"`; clients must keep that item readable and present it
+as a generic recommendation rather than as a recently added source.
 
 `preference` is the latest successfully recorded `like` or `dislike` for the
 item SHA-256 across the desktop viewer and every authorized Android viewer. It

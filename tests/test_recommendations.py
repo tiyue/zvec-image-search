@@ -39,7 +39,7 @@ def _candidate(
 
 
 class RecommendationSelectionTests(unittest.TestCase):
-    def test_returns_the_fixed_five_four_four_two_quota(self) -> None:
+    def test_returns_the_fixed_five_six_four_quota_without_recent(self) -> None:
         candidates = [_candidate(number) for number in range(30)]
 
         result = select_recommendations(candidates, rng_seed=7)
@@ -50,11 +50,11 @@ class RecommendationSelectionTests(unittest.TestCase):
             result.counts_by_slot,
             {
                 "quality": 5,
-                "recent": 4,
-                "low_exposure": 4,
-                "random": 2,
+                "low_exposure": 6,
+                "random": 4,
             },
         )
+        self.assertNotIn("recent", {item.slot for item in result.items})
         self.assertEqual(len({item.candidate.doc_id for item in result.items}), 15)
 
     def test_quality_pool_requires_technical_usability_and_prefers_vectors(
@@ -114,20 +114,22 @@ class RecommendationSelectionTests(unittest.TestCase):
         self.assertEqual(result.history_window, 210)
         self.assertEqual(len(result.items), 15)
 
-    def test_recent_and_random_rank_low_exposure_before_slot_order(self) -> None:
+    def test_low_exposure_and_random_rank_low_exposure_before_slot_order(self) -> None:
         candidates = (
             _candidate(1, exposure_count=3, mtime_ns=100, vector=None),
             _candidate(2, exposure_count=0, mtime_ns=1, vector=None),
             _candidate(3, exposure_count=1, mtime_ns=50, vector=None),
         )
 
-        recent = _ranked_for_slot(candidates, "recent", 7)
+        low_exposure = _ranked_for_slot(candidates, "low_exposure", 7)
         random = _ranked_for_slot(candidates, "random", 7)
 
-        self.assertEqual([item.exposure_count for item in recent], [0, 1, 3])
+        self.assertEqual([item.exposure_count for item in low_exposure], [0, 1, 3])
         self.assertEqual([item.exposure_count for item in random], [0, 1, 3])
 
-    def test_recent_does_not_skip_unshown_candidate_for_vector_diversity(self) -> None:
+    def test_low_exposure_does_not_skip_unshown_candidate_for_vector_diversity(
+        self,
+    ) -> None:
         basis = tuple(
             tuple(1.0 if index == axis else 0.0 for index in range(6))
             for axis in range(6)
@@ -156,9 +158,60 @@ class RecommendationSelectionTests(unittest.TestCase):
         ]
 
         result = select_recommendations([*quality, unshown, *shown], rng_seed=8)
-        recent = [item.candidate for item in result.items if item.slot == "recent"]
+        low_exposure = [
+            item.candidate for item in result.items if item.slot == "low_exposure"
+        ]
 
-        self.assertEqual(recent[0].candidate_id, unshown.candidate_id)
+        self.assertEqual(low_exposure[0].candidate_id, unshown.candidate_id)
+
+    def test_random_does_not_skip_unshown_candidate_for_vector_diversity(
+        self,
+    ) -> None:
+        basis = tuple(
+            tuple(1.0 if index == axis else 0.0 for index in range(7))
+            for axis in range(7)
+        )
+        quality = [
+            _candidate(number, vector=basis[number], mtime_ns=100 - number)
+            for number in range(5)
+        ]
+        unshown_for_low_exposure = [
+            _candidate(
+                10 + number,
+                width=1,
+                height=1,
+                exposure_count=0,
+                vector=basis[5],
+                mtime_ns=100 - number,
+            )
+            for number in range(6)
+        ]
+        unshown_for_random = _candidate(
+            20,
+            width=1,
+            height=1,
+            exposure_count=0,
+            vector=basis[0],
+            mtime_ns=1,
+        )
+        shown = [
+            _candidate(
+                30 + number,
+                width=1,
+                height=1,
+                exposure_count=1,
+                vector=basis[6],
+            )
+            for number in range(10)
+        ]
+
+        result = select_recommendations(
+            [*quality, *unshown_for_low_exposure, unshown_for_random, *shown],
+            rng_seed=8,
+        )
+        random = [item.candidate for item in result.items if item.slot == "random"]
+
+        self.assertEqual(random[0].candidate_id, unshown_for_random.candidate_id)
 
     def test_explicit_preferences_are_never_relaxed_with_history(self) -> None:
         candidates = [_candidate(number) for number in range(15)]
@@ -218,7 +271,7 @@ class RecommendationSelectionTests(unittest.TestCase):
         self.assertEqual(result.status, "complete")
         self.assertEqual(len(result.items), 15)
         self.assertEqual(result.counts_by_slot["quality"], 0)
-        self.assertGreater(result.counts_by_slot["random"], 2)
+        self.assertGreater(result.counts_by_slot["random"], 4)
 
     def test_mmr_penalizes_near_duplicates_when_a_different_vector_exists(self) -> None:
         duplicate = _candidate(1, vector=(1.0, 0.0), mtime_ns=20)
@@ -280,7 +333,7 @@ class RecommendationSelectionTests(unittest.TestCase):
         self.assertGreater(profile.candidates[0].personalization_score, 0)
         self.assertLess(profile.candidates[1].personalization_score, 0)
         self.assertGreater(
-            _slot_personalization_score(profile.candidates[0], "recent"), 0
+            _slot_personalization_score(profile.candidates[0], "low_exposure"), 0
         )
         self.assertEqual(
             _slot_personalization_score(profile.candidates[0], "random"), 0

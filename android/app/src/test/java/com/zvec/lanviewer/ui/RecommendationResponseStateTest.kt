@@ -71,6 +71,15 @@ class RecommendationResponseStateTest {
     }
 
     @Test
+    fun decodesLegacyRecentBucket() {
+        val response = json.decodeFromString<RecommendationsResponse>(
+            responseJson(bucket = "recent"),
+        )
+
+        assertEquals("recent", response.items.single().bucket)
+    }
+
+    @Test
     fun completedSearchOnlyPreservesRecommendationTab() {
         assertEquals(
             MobileTab.RECOMMENDATIONS,
@@ -204,6 +213,7 @@ class RecommendationResponseStateTest {
     private fun responseJson(
         preference: String? = null,
         personalization: String = "",
+        bucket: String = "quality",
     ): String {
         val preferenceField = preference?.let { "\"preference\": $it," }.orEmpty()
         return """
@@ -227,13 +237,13 @@ class RecommendationResponseStateTest {
                 "library_name": "Library",
                 "content_type": "image/jpeg",
                 "size_bytes": 42,
-                "bucket": "quality",
+                "bucket": "$bucket",
                 "thumbnail_url": "http://192.168.1.2/thumb",
                 "preview_url": "http://192.168.1.2/preview",
                 $preferenceField
                 "score": 0.8
               }],
-              "quota": {"quality": 1, "recent": 0, "low_exposure": 0, "random": 0},
+              "quota": {"quality": 5, "low_exposure": 6, "random": 4},
               "diversity": {"applied": false, "missing_vectors": 0}
             }
         """.trimIndent()

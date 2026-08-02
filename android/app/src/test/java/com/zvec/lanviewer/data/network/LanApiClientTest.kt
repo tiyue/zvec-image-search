@@ -221,7 +221,7 @@ class LanApiClientTest {
     fun recommendationRoutesUseTheSpecifiedPayloads() = runBlocking {
         server.enqueue(
             MockResponse().setResponseCode(200).setBody(
-                """{"request_id":"r1","batch_id":"b1","count":1,"partial":false,"partial_reason":"","quota_degraded":false,"history_window":60,"items":[{"item_id":"i1","media_id":"m1","name":"one.jpg","width":100,"height":80,"tags":["tag"],"library_id":"library-1","library_name":"Library","content_type":"image/jpeg","size_bytes":99,"bucket":"quality","thumbnail_url":"http://127.0.0.1/thumb.jpg","preview_url":"http://127.0.0.1/preview.jpg"}],"quota":{"quality":5,"recent":4,"low_exposure":4,"random":2},"diversity":{"applied":true,"reason":"","missing_vectors":0,"vector_space":"clip"}}""",
+                """{"request_id":"r1","batch_id":"b1","count":1,"partial":false,"partial_reason":"","quota_degraded":false,"history_window":60,"items":[{"item_id":"i1","media_id":"m1","name":"one.jpg","width":100,"height":80,"tags":["tag"],"library_id":"library-1","library_name":"Library","content_type":"image/jpeg","size_bytes":99,"bucket":"quality","thumbnail_url":"http://127.0.0.1/thumb.jpg","preview_url":"http://127.0.0.1/preview.jpg"}],"quota":{"quality":5,"low_exposure":6,"random":4},"diversity":{"applied":true,"reason":"","missing_vectors":0,"vector_space":"clip"}}""",
             ),
         )
         server.enqueue(MockResponse().setResponseCode(200).setBody("{}"))
@@ -238,6 +238,9 @@ class LanApiClientTest {
         assertEquals("quality", response.items.single().bucket)
         assertEquals("http://127.0.0.1/thumb.jpg", response.items.single().thumbnailUrl)
         assertEquals(60, response.historyWindow)
+        assertEquals(0, response.quota.recent)
+        assertEquals(6, response.quota.lowExposure)
+        assertEquals(4, response.quota.random)
         val recommendationRequest = server.takeRequest()
         assertEquals("/api/v1/recommendations", recommendationRequest.path)
         assertEquals("{\"request_id\":\"r1\"}", recommendationRequest.body.readUtf8())

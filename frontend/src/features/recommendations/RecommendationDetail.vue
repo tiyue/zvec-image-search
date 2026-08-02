@@ -24,7 +24,7 @@ const tags = computed(() => [
 
 const bucketLabels: Record<RecommendationItem["bucket"], string> = {
   quality: "技术质量",
-  recent: "最近入库",
+  recent: "推荐",
   low_exposure: "低曝光",
   random: "随机发现",
 };

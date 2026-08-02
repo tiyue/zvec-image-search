@@ -35,7 +35,7 @@ function batch(): RecommendationBatch {
     partialReason: "insufficient_candidates",
     quotaDegraded: true,
     historyWindow: 45,
-    quota: { quality: 5, recent: 4, low_exposure: 4, random: 2 },
+    quota: { quality: 5, recent: 0, low_exposure: 6, random: 4 },
     diversity: {
       applied: true,
       reason: "",
@@ -125,6 +125,7 @@ describe("RecommendationPage", () => {
     expect(wrapper.get(".recommendation-status").text()).toContain("向量多样性已应用，2 张缺少向量");
     expect(wrapper.get(".recommendation-status").text()).toContain("个性化已应用（12 张有效偏好）");
     expect(wrapper.get(".recommendation-media span").text()).toBe("技术质量");
+    expect(wrapper.text()).not.toContain("最近入库");
     expect(wrapper.get(".recommendation-media img").attributes("alt")).toBe("雷电将军.jpg");
     expect(wrapper.find(".recommendation-copy").exists()).toBe(false);
     expect(wrapper.find(".recommendation-actions").exists()).toBe(false);

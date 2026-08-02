@@ -45,7 +45,7 @@ class RecommendationCandidateStateTests(unittest.TestCase):
         self.state.close()
         self.temporary.cleanup()
 
-    def test_sample_is_bounded_and_includes_recent_and_quality_candidates(self) -> None:
+    def test_sample_is_bounded_and_includes_random_and_quality_candidates(self) -> None:
         entries = [
             _entry(
                 f"{index:064x}",
@@ -63,12 +63,16 @@ class RecommendationCandidateStateTests(unittest.TestCase):
             limit_per_pool=4,
         )
 
-        self.assertLessEqual(len(sampled), 12)
-        doc_ids = {str(entry["doc_id"]) for entry, _annotation in sampled}
-        self.assertIn(f"{29:064x}", doc_ids)
+        self.assertLessEqual(len(sampled), 8)
         self.assertTrue(
             any(
                 int(entry["width"]) * int(entry["height"]) >= 2_000_000
+                for entry, _annotation in sampled
+            )
+        )
+        self.assertTrue(
+            any(
+                int(entry["width"]) * int(entry["height"]) < 2_000_000
                 for entry, _annotation in sampled
             )
         )

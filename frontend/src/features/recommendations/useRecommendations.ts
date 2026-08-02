@@ -30,9 +30,9 @@ const BUCKETS = new Set<RecommendationBucket>([
 ]);
 const DEFAULT_QUOTA: Record<RecommendationBucket, number> = {
   quality: 5,
-  recent: 4,
-  low_exposure: 4,
-  random: 2,
+  recent: 0,
+  low_exposure: 6,
+  random: 4,
 };
 const PERSONALIZATION_REASONS = new Set<RecommendationPersonalizationReason>([
   "insufficient_preferences",
