@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import math
 import tempfile
 import threading
 import time
@@ -37,6 +38,7 @@ class _RecommendationService:
         self.candidate_vectors_enabled = True
         self.preference_vectors_enabled = True
         self.preference_vector_error = False
+        self.respect_candidate_limit = False
         self.vector_model = "space-a" if self.library.library_id == "a" else "space-b"
         self.items: dict[str, dict[str, object]] = {}
         source_root.mkdir(parents=True, exist_ok=True)
@@ -65,8 +67,12 @@ class _RecommendationService:
     def collect_recommendation_candidates(
         self, *, random_cursor: str, limit_per_pool: int
     ) -> dict[str, object]:
+        del random_cursor
         self.call_threads.append(threading.get_ident())
         self.candidate_limits.append(limit_per_pool)
+        values = list(self.items.values())
+        if self.respect_candidate_limit:
+            values = values[:limit_per_pool]
         return {
             "vector_space": {
                 "model": self.vector_model,
@@ -75,7 +81,7 @@ class _RecommendationService:
             },
             "candidates": [
                 value if self.candidate_vectors_enabled else {**value, "vector": None}
-                for value in self.items.values()
+                for value in values
             ],
         }
 
@@ -270,6 +276,43 @@ class RecommendationBackendTests(unittest.TestCase):
             if library.library_id == library_id
         )
 
+    def _seed_shown_history(self, viewer_id: str, count: int) -> None:
+        sources = [
+            (library_id, doc_id, source)
+            for library_id, service in self.services.items()
+            for doc_id, source in service.items.items()
+        ][:count]
+
+        def seed(store: Any) -> None:
+            for index, (library_id, doc_id, source) in enumerate(sources):
+                batch = store.create_batch(
+                    viewer_id,
+                    f"history-request-{index}",
+                    (
+                        RecommendationBatchItem(
+                            item_id=f"history-item-{index}",
+                            position=0,
+                            candidate_id=f"{library_id}:{doc_id}",
+                            library_id=library_id,
+                            doc_id=doc_id,
+                            sha256=str(source["sha256"]),
+                            slot="random",
+                        ),
+                    ),
+                )
+                store.mark_shown(
+                    viewer_id,
+                    batch.batch_id,
+                    f"history-shown-{index}",
+                )
+
+        self.manager._recommendation_call(seed)
+
+    def _preference_read_count(self) -> int:
+        return sum(
+            len(service.preference_vector_reads) for service in self.services.values()
+        )
+
     def tearDown(self) -> None:
         self.server.shutdown()
         self.thread.join(timeout=2)
@@ -325,8 +368,23 @@ class RecommendationBackendTests(unittest.TestCase):
         self.assertTrue(all(item["preference"] is None for item in created["items"]))
         self.assertTrue(all("vector" not in item for item in created["items"]))
         self.assertTrue(all("source_path" in item for item in created["items"]))
+        performance = created["performance"]
+        self.assertEqual(performance["initial_request_count"], 2)
+        self.assertEqual(performance["expansion_request_count"], 0)
+        self.assertFalse(performance["profile_cache_hit"])
+        for key in (
+            "candidate_read_ms",
+            "candidate_initial_read_ms",
+            "candidate_expansion_read_ms",
+            "preference_profile_ms",
+            "selection_ms",
+            "result_hydration_ms",
+            "total_ms",
+        ):
+            self.assertTrue(math.isfinite(performance[key]), key)
+            self.assertGreaterEqual(performance[key], 0, key)
         for library_id, service in self.services.items():
-            self.assertEqual(service.candidate_limits, [256])
+            self.assertEqual(service.candidate_limits, [100])
             self.assertTrue(service.call_threads)
             self.assertTrue(
                 all(
@@ -346,6 +404,10 @@ class RecommendationBackendTests(unittest.TestCase):
             [item["item_id"] for item in repeated["items"]],
             [item["item_id"] for item in created["items"]],
         )
+        self.assertEqual(repeated["performance"]["initial_request_count"], 0)
+        self.assertEqual(repeated["performance"]["expansion_request_count"], 0)
+        for service in self.services.values():
+            self.assertEqual(service.candidate_limits, [100])
 
     def test_replays_a_persisted_legacy_recent_item(self) -> None:
         doc_id, source = next(iter(self.services["a"].items.items()))
@@ -372,6 +434,129 @@ class RecommendationBackendTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(replay["items"][0]["bucket"], "recent")
         self.assertNotIn("recent", replay["quota"])
+
+    def test_history_shortage_expands_and_recovers_the_full_240_window(self) -> None:
+        service = self.services["a"]
+        source_root = Path(next(iter(service.items.values()))["source_path"]).parent
+        for index in range(24, 130):
+            doc_id = f"{index:064x}"
+            source = source_root / f"a-{index}.jpg"
+            source.write_bytes(f"a-{index}".encode())
+            service.items[doc_id] = {
+                "doc_id": doc_id,
+                "sha256": f"{index + 1:064x}",
+                "root_id": "root",
+                "relative_path": source.name,
+                "name": source.name,
+                "content_type": "image/jpeg",
+                "size_bytes": source.stat().st_size,
+                "mtime_ns": index,
+                "width": 2_000,
+                "height": 1_200,
+                "tags": [service.library.name],
+                "album_id": f"root\0album-{index // 3}",
+                "character": None,
+                "vector": (1.0, float(index + 1)),
+                "source_path": str(source),
+            }
+        service.respect_candidate_limit = True
+        self.services["b"].items.clear()
+        self.services["b"].respect_candidate_limit = True
+        self._seed_shown_history("history-viewer", 100)
+        preferred_doc_id = f"{129:064x}"
+
+        def seed_preference(store: Any) -> None:
+            source = service.items[preferred_doc_id]
+            batch = store.create_batch(
+                "preference-viewer",
+                "expanded-preference-request",
+                (
+                    RecommendationBatchItem(
+                        item_id="expanded-preference-item",
+                        position=0,
+                        candidate_id=f"a:{preferred_doc_id}",
+                        library_id="a",
+                        doc_id=preferred_doc_id,
+                        sha256=str(source["sha256"]),
+                        slot="random",
+                    ),
+                ),
+            )
+            store.record_action(
+                "preference-viewer",
+                batch.batch_id,
+                "expanded-preference-like",
+                "expanded-preference-item",
+                "like",
+            )
+
+        self.manager._recommendation_call(seed_preference)
+
+        status, created = self.request(
+            "/v1/recommendations",
+            {"viewer_id": "history-viewer", "request_id": "history-expanded"},
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(created["count"], 15)
+        self.assertEqual(created["history_window"], 240)
+        self.assertNotIn(
+            f"a:{preferred_doc_id}",
+            {item["media_id"] for item in created["items"]},
+        )
+        self.assertEqual(created["performance"]["initial_request_count"], 2)
+        self.assertEqual(created["performance"]["expansion_request_count"], 2)
+        self.assertGreaterEqual(
+            created["performance"]["candidate_expansion_read_ms"], 0
+        )
+        for service in self.services.values():
+            self.assertEqual(service.candidate_limits, [100, 256])
+        batch = self.manager._recommendation_call(
+            lambda store: store.batch_for_request(
+                "history-viewer",
+                "history-expanded",
+            )
+        )
+        self.assertIsNotNone(batch)
+        if batch is not None:
+            self.assertEqual(len(batch.items), 15)
+
+    def test_quota_degradation_expands_even_when_the_first_batch_is_complete(
+        self,
+    ) -> None:
+        for service in self.services.values():
+            for item in service.items.values():
+                item["width"] = 1
+                item["height"] = 1
+
+        status, created = self.request(
+            "/v1/recommendations",
+            {"viewer_id": "quota-viewer", "request_id": "quota-expanded"},
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(created["count"], 15)
+        self.assertTrue(created["quota_degraded"])
+        self.assertEqual(created["quota"]["quality"], 0)
+        self.assertEqual(created["performance"]["expansion_request_count"], 2)
+        for service in self.services.values():
+            self.assertEqual(service.candidate_limits, [100, 256])
+
+    def test_partial_candidates_try_only_the_initial_and_expanded_limits(self) -> None:
+        for service in self.services.values():
+            service.items = dict(list(service.items.items())[:4])
+
+        status, created = self.request(
+            "/v1/recommendations",
+            {"viewer_id": "partial-viewer", "request_id": "partial-expanded"},
+        )
+
+        self.assertEqual(status, 200)
+        self.assertTrue(created["partial"])
+        self.assertEqual(created["count"], 8)
+        self.assertEqual(created["performance"]["expansion_request_count"], 2)
+        for service in self.services.values():
+            self.assertEqual(service.candidate_limits, [100, 256])
 
     def test_shown_and_action_events_are_idempotent(self) -> None:
         _status, created = self.request(
@@ -475,7 +660,7 @@ class RecommendationBackendTests(unittest.TestCase):
         )
         self.assertNotIn(shared_media, {item["media_id"] for item in fresh["items"]})
 
-    def test_personalization_uses_ten_bounded_vectors_and_degrades_when_missing(
+    def test_personalization_cache_reuses_and_precisely_invalidates_profiles(
         self,
     ) -> None:
         for service in self.services.values():
@@ -484,7 +669,8 @@ class RecommendationBackendTests(unittest.TestCase):
             "/v1/recommendations",
             {"viewer_id": "feedback-viewer", "request_id": "feedback-batch"},
         )
-        for index, item in enumerate(feedback_batch["items"][:10]):
+        feedback_items = feedback_batch["items"][:10]
+        for index, item in enumerate(feedback_items):
             self.request(
                 f"/v1/recommendations/{feedback_batch['batch_id']}/actions",
                 {
@@ -503,9 +689,9 @@ class RecommendationBackendTests(unittest.TestCase):
         self.assertEqual(personalized["personalization"]["effective_count"], 10)
         self.assertTrue(personalized["personalization"]["applied"])
         self.assertIsNone(personalized["personalization"]["reason"])
-        self.assertTrue(
-            any(service.preference_vector_reads for service in self.services.values())
-        )
+        self.assertFalse(personalized["performance"]["profile_cache_hit"])
+        cold_reads = self._preference_read_count()
+        self.assertGreater(cold_reads, 0)
         for service in self.services.values():
             self.assertTrue(
                 all(
@@ -513,6 +699,73 @@ class RecommendationBackendTests(unittest.TestCase):
                     for thread_id in service.call_threads
                 )
             )
+
+        _status, hot = self.request(
+            "/v1/recommendations",
+            {"viewer_id": "other-viewer", "request_id": "personalized-hot"},
+        )
+        self.assertTrue(hot["personalization"]["applied"])
+        self.assertTrue(hot["performance"]["profile_cache_hit"])
+        self.assertEqual(self._preference_read_count(), cold_reads)
+
+        self.request(
+            f"/v1/recommendations/{hot['batch_id']}/shown",
+            {"viewer_id": "other-viewer", "event_id": "hot-shown"},
+        )
+        for index, action in enumerate(("open", "export")):
+            self.request(
+                f"/v1/recommendations/{hot['batch_id']}/actions",
+                {
+                    "viewer_id": "other-viewer",
+                    "event_id": f"hot-{action}",
+                    "item_id": hot["items"][index]["item_id"],
+                    "action": action,
+                },
+            )
+        _status, after_non_preference = self.request(
+            "/v1/recommendations",
+            {"viewer_id": "other-viewer", "request_id": "after-non-preference"},
+        )
+        self.assertTrue(after_non_preference["performance"]["profile_cache_hit"])
+        self.assertEqual(self._preference_read_count(), cold_reads)
+
+        cache_before_same = self.manager._recommendation_profile_cache
+        self.assertIsNotNone(cache_before_same)
+        _status, same_like = self.request(
+            f"/v1/recommendations/{feedback_batch['batch_id']}/actions",
+            {
+                "viewer_id": "feedback-viewer",
+                "event_id": "feedback-same-like",
+                "item_id": feedback_items[0]["item_id"],
+                "action": "like",
+            },
+        )
+        self.assertTrue(same_like["recorded"])
+        cache_after_same = self.manager._recommendation_profile_cache
+        self.assertIsNotNone(cache_after_same)
+        if cache_before_same is not None and cache_after_same is not None:
+            self.assertGreater(
+                cache_after_same.last_preference_sequence,
+                cache_before_same.last_preference_sequence,
+            )
+        _status, after_same = self.request(
+            "/v1/recommendations",
+            {"viewer_id": "other-viewer", "request_id": "after-same-like"},
+        )
+        self.assertTrue(after_same["performance"]["profile_cache_hit"])
+        self.assertEqual(self._preference_read_count(), cold_reads)
+
+        _status, idempotent = self.request(
+            f"/v1/recommendations/{feedback_batch['batch_id']}/actions",
+            {
+                "viewer_id": "feedback-viewer",
+                "event_id": "feedback-0",
+                "item_id": feedback_items[0]["item_id"],
+                "action": "like",
+            },
+        )
+        self.assertFalse(idempotent["recorded"])
+        self.assertIsNotNone(self.manager._recommendation_profile_cache)
 
         self.services["b"].vector_model = "incompatible-space"
         _status, incompatible = self.request(
@@ -540,7 +793,38 @@ class RecommendationBackendTests(unittest.TestCase):
 
         for service in self.services.values():
             service.candidate_vectors_enabled = True
+        _status, changed = self.request(
+            f"/v1/recommendations/{feedback_batch['batch_id']}/actions",
+            {
+                "viewer_id": "feedback-viewer",
+                "event_id": "feedback-changed-dislike",
+                "item_id": feedback_items[0]["item_id"],
+                "action": "dislike",
+            },
+        )
+        self.assertTrue(changed["recorded"])
+        self.assertEqual(changed["preference"], "dislike")
+        self.assertIsNone(self.manager._recommendation_profile_cache)
+        _status, rebuilt = self.request(
+            "/v1/recommendations",
+            {"viewer_id": "other-viewer", "request_id": "rebuilt-profile"},
+        )
+        self.assertTrue(rebuilt["personalization"]["applied"])
+        self.assertFalse(rebuilt["performance"]["profile_cache_hit"])
+        rebuilt_reads = self._preference_read_count()
+        self.assertGreater(rebuilt_reads, cold_reads)
+
+        for service in self.services.values():
             service.preference_vectors_enabled = False
+        self.request(
+            f"/v1/recommendations/{feedback_batch['batch_id']}/actions",
+            {
+                "viewer_id": "feedback-viewer",
+                "event_id": "feedback-invalidate-missing",
+                "item_id": feedback_items[1]["item_id"],
+                "action": "like",
+            },
+        )
         _status, degraded = self.request(
             "/v1/recommendations",
             {"viewer_id": "other-viewer", "request_id": "missing-vectors"},
@@ -552,6 +836,15 @@ class RecommendationBackendTests(unittest.TestCase):
         for service in self.services.values():
             service.preference_vectors_enabled = True
         self.services["a"].preference_vector_error = True
+        self.request(
+            f"/v1/recommendations/{feedback_batch['batch_id']}/actions",
+            {
+                "viewer_id": "feedback-viewer",
+                "event_id": "feedback-invalidate-error",
+                "item_id": feedback_items[2]["item_id"],
+                "action": "dislike",
+            },
+        )
         status, failed_read = self.request(
             "/v1/recommendations",
             {"viewer_id": "other-viewer", "request_id": "failed-vector-read"},
@@ -563,6 +856,17 @@ class RecommendationBackendTests(unittest.TestCase):
             failed_read["personalization"]["reason"],
             "vectors_unavailable",
         )
+
+        self.services["a"].preference_vector_error = False
+        reads_before_restart = self._preference_read_count()
+        self.manager._close_recommendation_store()
+        _status, after_restart = self.request(
+            "/v1/recommendations",
+            {"viewer_id": "other-viewer", "request_id": "after-cache-restart"},
+        )
+        self.assertFalse(after_restart["performance"]["profile_cache_hit"])
+        self.assertTrue(after_restart["personalization"]["applied"])
+        self.assertGreater(self._preference_read_count(), reads_before_restart)
 
     def test_shown_and_exposure_remain_viewer_isolated(self) -> None:
         _status, desktop = self.request(

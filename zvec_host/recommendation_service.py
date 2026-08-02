@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import secrets
 import threading
@@ -95,7 +96,11 @@ class RecommendationService:
         response = self._client_provider().create_recommendations(viewer, request_id)
         if not isinstance(response, Mapping):
             raise RecommendationServiceError("推荐服务返回无效数据。")
-        return _browser_batch(response, self._registry)
+        return _browser_batch(
+            response,
+            self._registry,
+            include_performance=viewer_id is None,
+        )
 
     def mark_recommendations_shown(
         self,
@@ -129,7 +134,12 @@ class RecommendationService:
         }
 
 
-def _browser_batch(raw: Mapping[str, Any], registry: ImageRegistry) -> dict[str, Any]:
+def _browser_batch(
+    raw: Mapping[str, Any],
+    registry: ImageRegistry,
+    *,
+    include_performance: bool,
+) -> dict[str, Any]:
     request_id = _text(raw.get("request_id"))
     batch_id = _text(raw.get("batch_id"))
     if not request_id or not batch_id:
@@ -147,7 +157,7 @@ def _browser_batch(raw: Mapping[str, Any], registry: ImageRegistry) -> dict[str,
     raw_count = _non_negative_int(raw.get("count"))
     filtered = len(items) < raw_count
     partial_reason = _text(raw.get("partial_reason"))
-    return {
+    batch = {
         "request_id": request_id,
         "batch_id": batch_id,
         "count": len(items),
@@ -160,6 +170,9 @@ def _browser_batch(raw: Mapping[str, Any], registry: ImageRegistry) -> dict[str,
         "personalization": _personalization(raw.get("personalization")),
         "items": items,
     }
+    if include_performance and (performance := _performance(raw.get("performance"))):
+        batch["performance"] = performance
+    return batch
 
 
 def _browser_item(
@@ -238,6 +251,41 @@ def _personalization(value: Any) -> dict[str, Any]:
         "effective_count": _non_negative_int(source.get("effective_count")),
         "reason": reason or None,
     }
+
+
+def _performance(value: Any) -> dict[str, int | float | bool]:
+    source = value if isinstance(value, Mapping) else {}
+    output: dict[str, int | float | bool] = {}
+    for field in (
+        "candidate_read_ms",
+        "candidate_initial_read_ms",
+        "candidate_expansion_read_ms",
+        "preference_profile_ms",
+        "selection_ms",
+        "result_hydration_ms",
+        "total_ms",
+    ):
+        raw_value = source.get(field)
+        if (
+            isinstance(raw_value, bool)
+            or not isinstance(raw_value, (int, float))
+            or raw_value < 0
+            or (isinstance(raw_value, float) and not math.isfinite(raw_value))
+        ):
+            continue
+        output[field] = raw_value
+    for field in ("initial_request_count", "expansion_request_count"):
+        raw_value = source.get(field)
+        if (
+            isinstance(raw_value, int)
+            and not isinstance(raw_value, bool)
+            and raw_value >= 0
+        ):
+            output[field] = raw_value
+    profile_cache_hit = source.get("profile_cache_hit")
+    if isinstance(profile_cache_hit, bool):
+        output["profile_cache_hit"] = profile_cache_hit
+    return output
 
 
 def _preference(value: Any) -> str | None:

@@ -132,6 +132,131 @@ class RecommendationServiceTests(unittest.TestCase):
                 {"recorded": False, "preference": "dislike"},
             )
 
+    def test_desktop_forwards_only_safe_performance_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "raiden.png"
+            Image.new("RGB", (80, 120), (50, 80, 150)).save(source)
+            registry = ImageRegistry(cache_directory=root / "cache")
+            self.addCleanup(registry.close)
+
+            class Client(_Client):
+                def create_recommendations(
+                    self, viewer_id: str, request_id: str
+                ) -> dict[str, Any]:
+                    response = super().create_recommendations(viewer_id, request_id)
+                    response["performance"] = {
+                        "candidate_read_ms": 12.5,
+                        "candidate_initial_read_ms": 0,
+                        "candidate_expansion_read_ms": 2.5,
+                        "preference_profile_ms": 3.25,
+                        "selection_ms": 4.5,
+                        "result_hydration_ms": 5.75,
+                        "total_ms": 26.0,
+                        "initial_request_count": 2,
+                        "expansion_request_count": 0,
+                        "profile_cache_hit": False,
+                        "path": str(source),
+                        "source_path": str(source),
+                        "viewer_id": viewer_id,
+                        "device_id": "android-secret",
+                        "request_id": request_id,
+                        "batch_id": "batch-secret",
+                        "library_id": "library-secret",
+                        "preference": "like",
+                        "preferences": ["private"],
+                    }
+                    return response
+
+            result = RecommendationService(
+                lambda: Client(source), registry, root
+            ).create_recommendations("request-1")
+
+            self.assertEqual(
+                result["performance"],
+                {
+                    "candidate_read_ms": 12.5,
+                    "candidate_initial_read_ms": 0,
+                    "candidate_expansion_read_ms": 2.5,
+                    "preference_profile_ms": 3.25,
+                    "selection_ms": 4.5,
+                    "result_hydration_ms": 5.75,
+                    "total_ms": 26.0,
+                    "initial_request_count": 2,
+                    "expansion_request_count": 0,
+                    "profile_cache_hit": False,
+                },
+            )
+            self.assertNotIn(str(source), str(result["performance"]))
+
+    def test_desktop_drops_invalid_performance_values(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "raiden.png"
+            Image.new("RGB", (80, 120), (50, 80, 150)).save(source)
+            registry = ImageRegistry(cache_directory=root / "cache")
+            self.addCleanup(registry.close)
+
+            class Client(_Client):
+                def create_recommendations(
+                    self, viewer_id: str, request_id: str
+                ) -> dict[str, Any]:
+                    response = super().create_recommendations(viewer_id, request_id)
+                    response["performance"] = {
+                        "candidate_read_ms": float("nan"),
+                        "candidate_initial_read_ms": float("inf"),
+                        "candidate_expansion_read_ms": -0.1,
+                        "preference_profile_ms": True,
+                        "selection_ms": "4.5",
+                        "result_hydration_ms": None,
+                        "total_ms": float("-inf"),
+                        "initial_request_count": True,
+                        "expansion_request_count": 1.0,
+                        "profile_cache_hit": 1,
+                    }
+                    return response
+
+            result = RecommendationService(
+                lambda: Client(source), registry, root
+            ).create_recommendations("request-1")
+
+            self.assertNotIn("performance", result)
+
+    def test_lan_explicit_viewer_never_receives_performance(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "raiden.png"
+            Image.new("RGB", (80, 120), (50, 80, 150)).save(source)
+            registry = ImageRegistry(cache_directory=root / "cache")
+            self.addCleanup(registry.close)
+
+            class Client(_Client):
+                def create_recommendations(
+                    self, viewer_id: str, request_id: str
+                ) -> dict[str, Any]:
+                    response = super().create_recommendations(viewer_id, request_id)
+                    response["performance"] = {
+                        "candidate_read_ms": 1.0,
+                        "initial_request_count": 1,
+                        "profile_cache_hit": True,
+                    }
+                    return response
+
+            client = Client(source)
+            lan_viewer = f"lan-{'a' * 64}"
+            result = RecommendationService(
+                lambda: client, registry, root
+            ).create_recommendations(
+                "request-1",
+                viewer_id=lan_viewer,
+            )
+
+            self.assertNotIn("performance", result)
+            self.assertEqual(
+                client.calls[0],
+                ("create", lan_viewer, "request-1"),
+            )
+
     def test_concurrent_first_viewer_read_uses_one_persisted_value(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

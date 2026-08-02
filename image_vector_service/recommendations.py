@@ -12,6 +12,7 @@ import math
 from collections import Counter
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
+from operator import mul
 from types import MappingProxyType
 from typing import Literal
 
@@ -86,6 +87,28 @@ class PersonalizationResult:
     reason: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class PreparedPersonalizationProfile:
+    positive_vector: tuple[float, ...] | None
+    negative_vector: tuple[float, ...] | None
+    effective_count: int
+    reason: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _RankedCandidate:
+    candidate: RecommendationCandidate
+    rank: int
+    base_score: float
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedSelection:
+    candidates: tuple[RecommendationCandidate, ...]
+    unit_vectors: Mapping[str, tuple[float, ...] | None]
+    ranked_by_slot: Mapping[RecommendationSlot, tuple[_RankedCandidate, ...]]
+
+
 def personalize_candidates(
     candidates: Iterable[RecommendationCandidate],
     preferences: Iterable[PreferenceVector],
@@ -97,6 +120,17 @@ def personalize_candidates(
         not isinstance(candidate, RecommendationCandidate) for candidate in materialized
     ):
         raise TypeError("candidates must contain RecommendationCandidate values")
+    return apply_personalization_profile(
+        materialized,
+        prepare_personalization_profile(preferences),
+    )
+
+
+def prepare_personalization_profile(
+    preferences: Iterable[PreferenceVector],
+) -> PreparedPersonalizationProfile:
+    """Normalize one reusable explicit-preference profile."""
+
     normalized: list[tuple[str, tuple[float, ...]]] = []
     for preference in preferences:
         if not isinstance(preference, PreferenceVector):
@@ -109,39 +143,80 @@ def personalize_candidates(
     effective_count = len(normalized)
     dimensions = {len(vector) for _action, vector in normalized}
     if len(dimensions) > 1:
-        return PersonalizationResult(
-            materialized,
-            False,
+        return PreparedPersonalizationProfile(
+            None,
+            None,
             effective_count,
             "incompatible_vector_spaces",
         )
     if effective_count < _MIN_PERSONALIZATION_FEEDBACK:
-        return PersonalizationResult(
-            materialized,
-            False,
+        return PreparedPersonalizationProfile(
+            None,
+            None,
             effective_count,
             "insufficient_preferences",
         )
     positive = _centroid(vector for action, vector in normalized if action == "like")
     negative = _centroid(vector for action, vector in normalized if action == "dislike")
     if positive is None and negative is None:
-        return PersonalizationResult(
-            materialized,
-            False,
+        return PreparedPersonalizationProfile(
+            None,
+            None,
             effective_count,
             "vectors_unavailable",
         )
+    return PreparedPersonalizationProfile(
+        positive,
+        negative,
+        effective_count,
+        None,
+    )
+
+
+def apply_personalization_profile(
+    candidates: Iterable[RecommendationCandidate],
+    profile: PreparedPersonalizationProfile,
+) -> PersonalizationResult:
+    """Apply a prepared profile without re-reading its preference vectors."""
+
+    materialized = tuple(candidates)
+    if any(
+        not isinstance(candidate, RecommendationCandidate) for candidate in materialized
+    ):
+        raise TypeError("candidates must contain RecommendationCandidate values")
+    if not isinstance(profile, PreparedPersonalizationProfile):
+        raise TypeError("profile must be a PreparedPersonalizationProfile")
+    if profile.reason is not None:
+        return PersonalizationResult(
+            materialized,
+            False,
+            profile.effective_count,
+            profile.reason,
+        )
     strength = min(
         _MAX_PERSONALIZATION_SCORE,
-        _PERSONALIZATION_PER_FEEDBACK * effective_count,
+        _PERSONALIZATION_PER_FEEDBACK * profile.effective_count,
     )
     personalized: list[RecommendationCandidate] = []
     scored = False
     for candidate in materialized:
+        unit_vector = (
+            _unit_vector(candidate.vector) if candidate.vector is not None else None
+        )
         signals: list[float] = []
-        if (similarity := _cosine_similarity(candidate.vector, positive)) is not None:
+        if (
+            similarity := _unit_vector_similarity(
+                unit_vector,
+                profile.positive_vector,
+            )
+        ) is not None:
             signals.append(similarity)
-        if (similarity := _cosine_similarity(candidate.vector, negative)) is not None:
+        if (
+            similarity := _unit_vector_similarity(
+                unit_vector,
+                profile.negative_vector,
+            )
+        ) is not None:
             signals.append(-similarity)
         affinity = sum(signals) / len(signals) if signals else 0.0
         adjustment = strength * max(-1.0, min(1.0, affinity))
@@ -151,13 +226,13 @@ def personalize_candidates(
         return PersonalizationResult(
             materialized,
             False,
-            effective_count,
+            profile.effective_count,
             "vectors_unavailable",
         )
     return PersonalizationResult(
         tuple(personalized),
         True,
-        effective_count,
+        profile.effective_count,
         None,
     )
 
@@ -179,20 +254,53 @@ def select_recommendations(
     call and remain eligible.
     """
 
-    normalized = _normalized_candidates(candidates)
+    prepared = _prepare_selection(candidates, rng_seed)
     history = _normalized_history(recent_sha256)
     explicit = frozenset(_normalized_sha256(excluded_sha256))
     best: RecommendationSelection | None = None
     windows = _HISTORY_WINDOWS
     for window in windows:
         excluded = explicit | frozenset(history[:window])
-        result = _select_once(normalized, excluded, window, rng_seed)
+        result = _select_once(prepared, excluded, window)
         if result.status == "complete":
             return result
         if best is None or len(result.items) >= len(best.items):
             best = result
     assert best is not None
     return best
+
+
+def _prepare_selection(
+    candidates: Iterable[RecommendationCandidate],
+    rng_seed: int,
+) -> _PreparedSelection:
+    normalized = _normalized_candidates(candidates)
+    unit_vectors: Mapping[str, tuple[float, ...] | None] = MappingProxyType(
+        {
+            candidate.candidate_id: (
+                _unit_vector(candidate.vector) if candidate.vector is not None else None
+            )
+            for candidate in normalized
+        }
+    )
+    ranked_by_slot: dict[RecommendationSlot, tuple[_RankedCandidate, ...]] = {}
+    for slot in SLOT_QUOTAS:
+        ranked = _ranked_for_slot(normalized, slot, rng_seed)
+        total = max(1, len(ranked))
+        ranked_by_slot[slot] = tuple(
+            _RankedCandidate(
+                candidate,
+                rank,
+                _base_score(candidate, slot, rank, total)
+                + _slot_personalization_score(candidate, slot),
+            )
+            for rank, candidate in enumerate(ranked)
+        )
+    return _PreparedSelection(
+        normalized,
+        unit_vectors,
+        MappingProxyType(ranked_by_slot),
+    )
 
 
 def _normalized_candidates(
@@ -232,29 +340,28 @@ def _normalized_sha256(
 
 
 def _select_once(
-    candidates: tuple[RecommendationCandidate, ...],
+    prepared: _PreparedSelection,
     excluded_sha256: frozenset[str],
     history_window: int,
-    rng_seed: int,
 ) -> RecommendationSelection:
     selected: list[RecommendationItem] = []
     selected_doc_ids: set[str] = set()
     selected_sha256: set[str] = set()
     album_counts: Counter[str] = Counter()
     character_counts: Counter[str] = Counter()
+    diversity_penalties: dict[str, float] = {}
 
     for slot, quota in SLOT_QUOTAS.items():
         for _index in range(quota):
             choice = _best_candidate(
-                candidates,
+                prepared.ranked_by_slot[slot],
                 slot=slot,
                 excluded_sha256=excluded_sha256,
-                selected=selected,
                 selected_doc_ids=selected_doc_ids,
                 selected_sha256=selected_sha256,
                 album_counts=album_counts,
                 character_counts=character_counts,
-                rng_seed=rng_seed,
+                diversity_penalties=diversity_penalties,
             )
             if choice is None:
                 break
@@ -266,18 +373,22 @@ def _select_once(
                 album_counts[group] += 1
             if character := _group_key(candidate.character):
                 character_counts[character] += 1
+            _update_diversity_penalties(
+                candidate,
+                prepared.unit_vectors,
+                diversity_penalties,
+            )
 
     while len(selected) < sum(SLOT_QUOTAS.values()):
         choice = _best_candidate(
-            candidates,
+            prepared.ranked_by_slot["random"],
             slot="random",
             excluded_sha256=excluded_sha256,
-            selected=selected,
             selected_doc_ids=selected_doc_ids,
             selected_sha256=selected_sha256,
             album_counts=album_counts,
             character_counts=character_counts,
-            rng_seed=rng_seed,
+            diversity_penalties=diversity_penalties,
         )
         if choice is None:
             break
@@ -289,6 +400,11 @@ def _select_once(
             album_counts[group] += 1
         if character := _group_key(candidate.character):
             character_counts[character] += 1
+        _update_diversity_penalties(
+            candidate,
+            prepared.unit_vectors,
+            diversity_penalties,
+        )
 
     counts = Counter(item.slot for item in selected)
     materialized_counts: Mapping[str, int] = MappingProxyType(
@@ -303,22 +419,20 @@ def _select_once(
 
 
 def _best_candidate(
-    candidates: tuple[RecommendationCandidate, ...],
+    ranked: tuple[_RankedCandidate, ...],
     *,
     slot: RecommendationSlot,
     excluded_sha256: frozenset[str],
-    selected: list[RecommendationItem],
     selected_doc_ids: set[str],
     selected_sha256: set[str],
     album_counts: Counter[str],
     character_counts: Counter[str],
-    rng_seed: int,
+    diversity_penalties: Mapping[str, float],
 ) -> tuple[RecommendationCandidate, float] | None:
-    ranked = _ranked_for_slot(candidates, slot, rng_seed)
     best: tuple[RecommendationCandidate, float, int] | None = None
-    total = max(1, len(ranked))
-    eligible: list[tuple[int, RecommendationCandidate]] = []
-    for rank, candidate in enumerate(ranked):
+    eligible: list[_RankedCandidate] = []
+    for ranked_candidate in ranked:
+        candidate = ranked_candidate.candidate
         if candidate.sha256 in excluded_sha256:
             continue
         if (
@@ -335,23 +449,29 @@ def _best_candidate(
             and character_counts[character] >= _MAX_CHARACTER_ITEMS
         ):
             continue
-        eligible.append((rank, candidate))
+        eligible.append(ranked_candidate)
     if slot in {"low_exposure", "random"} and eligible:
         minimum_exposure = min(
-            max(0, candidate.exposure_count) for _rank, candidate in eligible
+            max(0, item.candidate.exposure_count) for item in eligible
         )
         eligible = [
-            (rank, candidate)
-            for rank, candidate in eligible
-            if max(0, candidate.exposure_count) == minimum_exposure
+            item
+            for item in eligible
+            if max(0, item.candidate.exposure_count) == minimum_exposure
         ]
-    for rank, candidate in eligible:
-        score = _base_score(candidate, slot, rank, total)
-        score += _slot_personalization_score(candidate, slot)
-        score -= _maximum_diversity_penalty(candidate, selected)
+    for ranked_candidate in eligible:
+        candidate = ranked_candidate.candidate
+        score = ranked_candidate.base_score - diversity_penalties.get(
+            candidate.candidate_id,
+            0.0,
+        )
         # Stable rank resolution avoids process-random order when scores tie.
-        if best is None or score > best[1] or (score == best[1] and rank < best[2]):
-            best = (candidate, score, rank)
+        if (
+            best is None
+            or score > best[1]
+            or (score == best[1] and ranked_candidate.rank < best[2])
+        ):
+            best = (candidate, score, ranked_candidate.rank)
     return None if best is None else (best[0], best[1])
 
 
@@ -423,34 +543,39 @@ def _slot_personalization_score(
     )
 
 
-def _maximum_diversity_penalty(
-    candidate: RecommendationCandidate,
-    selected: list[RecommendationItem],
-) -> float:
-    largest = 0.0
-    for item in selected:
-        similarity = _cosine_similarity(candidate.vector, item.candidate.vector)
+def _update_diversity_penalties(
+    selected: RecommendationCandidate,
+    unit_vectors: Mapping[str, tuple[float, ...] | None],
+    penalties: dict[str, float],
+) -> None:
+    selected_vector = unit_vectors.get(selected.candidate_id)
+    if selected_vector is None:
+        return
+    for candidate_id, candidate_vector in unit_vectors.items():
+        similarity = _unit_vector_similarity(candidate_vector, selected_vector)
         if similarity is None:
             continue
-        largest = max(largest, _similarity_penalty(similarity))
-    return largest
+        penalty = _similarity_penalty(similarity)
+        if penalty > penalties.get(candidate_id, 0.0):
+            penalties[candidate_id] = penalty
 
 
 def _cosine_similarity(
     left: tuple[float, ...] | None,
     right: tuple[float, ...] | None,
 ) -> float | None:
+    left_unit = _unit_vector(left) if left is not None else None
+    right_unit = _unit_vector(right) if right is not None else None
+    return _unit_vector_similarity(left_unit, right_unit)
+
+
+def _unit_vector_similarity(
+    left: tuple[float, ...] | None,
+    right: tuple[float, ...] | None,
+) -> float | None:
     if left is None or right is None or not left or len(left) != len(right):
         return None
-    try:
-        dot = sum(a * b for a, b in zip(left, right, strict=True))
-        left_norm = math.sqrt(sum(value * value for value in left))
-        right_norm = math.sqrt(sum(value * value for value in right))
-    except (TypeError, ValueError):
-        return None
-    if not math.isfinite(dot) or left_norm == 0 or right_norm == 0:
-        return None
-    similarity = dot / (left_norm * right_norm)
+    similarity = sum(map(mul, left, right))
     return similarity if math.isfinite(similarity) else None
 
 

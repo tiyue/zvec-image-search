@@ -5,6 +5,7 @@ import tempfile
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 
 from image_vector_service.recommendation_store import (
@@ -200,6 +201,170 @@ class RecommendationStoreTests(unittest.TestCase):
         self.assertEqual(complete[1].action, "dislike")
         with self.assertRaises(ValueError):
             self.store.recent_final_preferences(limit=257)
+
+    def test_detailed_action_result_tracks_exact_cross_viewer_preference_changes(
+        self,
+    ) -> None:
+        desktop = self.store.create_batch(
+            "desktop",
+            "desktop-details",
+            (_shared_item(1, item_id="desktop-details-item", sha256="shared-sha"),),
+        )
+        android = self.store.create_batch(
+            "android-a",
+            "android-details",
+            (_shared_item(2, item_id="android-details-item", sha256="shared-sha"),),
+        )
+        dislike_first = self.store.create_batch(
+            "desktop",
+            "dislike-first-details",
+            (
+                _shared_item(
+                    3, item_id="dislike-first-item", sha256="dislike-first-sha"
+                ),
+            ),
+        )
+
+        opened = self.store.record_action_with_preference_details(
+            "desktop",
+            desktop.batch_id,
+            "desktop-open",
+            "desktop-details-item",
+            "open",
+        )
+        first_disliked = self.store.record_action_with_preference_details(
+            "desktop",
+            dislike_first.batch_id,
+            "dislike-first-event",
+            "dislike-first-item",
+            "dislike",
+        )
+        liked = self.store.record_action_with_preference_details(
+            "desktop",
+            desktop.batch_id,
+            "desktop-like-details",
+            "desktop-details-item",
+            "like",
+        )
+        same_like = self.store.record_action_with_preference_details(
+            "android-a",
+            android.batch_id,
+            "android-like-details",
+            "android-details-item",
+            "like",
+        )
+        exported = self.store.record_action_with_preference_details(
+            "android-a",
+            android.batch_id,
+            "android-export",
+            "android-details-item",
+            "export",
+        )
+        disliked = self.store.record_action_with_preference_details(
+            "android-a",
+            android.batch_id,
+            "android-dislike-details",
+            "android-details-item",
+            "dislike",
+        )
+        replayed_like = self.store.record_action_with_preference_details(
+            "desktop",
+            desktop.batch_id,
+            "desktop-like-details",
+            "desktop-details-item",
+            "like",
+        )
+        reliked = self.store.record_action_with_preference_details(
+            "desktop",
+            desktop.batch_id,
+            "desktop-relike-details",
+            "desktop-details-item",
+            "like",
+        )
+
+        self.assertEqual(
+            (opened.recorded, opened.preference, opened.preference_sequence),
+            (True, None, None),
+        )
+        self.assertFalse(opened.preference_changed)
+        self.assertEqual(first_disliked.preference, "dislike")
+        self.assertTrue(first_disliked.preference_changed)
+        self.assertTrue(liked.recorded)
+        self.assertEqual(liked.preference, "like")
+        self.assertIsInstance(liked.preference_sequence, int)
+        self.assertTrue(liked.preference_changed)
+        self.assertTrue(same_like.recorded)
+        self.assertEqual(same_like.preference, "like")
+        self.assertFalse(same_like.preference_changed)
+        self.assertGreater(
+            same_like.preference_sequence or 0, liked.preference_sequence or 0
+        )
+        self.assertEqual(exported.preference, "like")
+        self.assertEqual(exported.preference_sequence, same_like.preference_sequence)
+        self.assertFalse(exported.preference_changed)
+        self.assertEqual(disliked.preference, "dislike")
+        self.assertGreater(
+            disliked.preference_sequence or 0, same_like.preference_sequence or 0
+        )
+        self.assertTrue(disliked.preference_changed)
+        self.assertFalse(replayed_like.recorded)
+        self.assertEqual(replayed_like.preference, "dislike")
+        self.assertEqual(
+            replayed_like.preference_sequence, disliked.preference_sequence
+        )
+        self.assertFalse(replayed_like.preference_changed)
+        self.assertEqual(reliked.preference, "like")
+        self.assertGreater(
+            reliked.preference_sequence or 0, disliked.preference_sequence or 0
+        )
+        self.assertTrue(reliked.preference_changed)
+        with self.assertRaises(FrozenInstanceError):
+            liked.recorded = False  # type: ignore[misc]
+
+    def test_detailed_action_result_rejects_invalid_or_conflicting_events_atomically(
+        self,
+    ) -> None:
+        desktop = self.store.create_batch(
+            "desktop",
+            "desktop-invalid-details",
+            (_shared_item(1, item_id="desktop-invalid-item", sha256="shared-sha"),),
+        )
+        liked = self.store.record_action_with_preference_details(
+            "desktop",
+            desktop.batch_id,
+            "shared-event",
+            "desktop-invalid-item",
+            "like",
+        )
+
+        with self.assertRaises(ValueError):
+            self.store.record_action_with_preference_details(
+                "desktop",
+                desktop.batch_id,
+                "shown-through-action",
+                "desktop-invalid-item",
+                "shown",
+            )
+        with self.assertRaises(ValueError):
+            self.store.record_action_with_preference_details(
+                "other-viewer",
+                desktop.batch_id,
+                "wrong-viewer",
+                "desktop-invalid-item",
+                "dislike",
+            )
+        with self.assertRaises(ValueError):
+            self.store.record_action_with_preference_details(
+                "desktop",
+                desktop.batch_id,
+                "shared-event",
+                "desktop-invalid-item",
+                "dislike",
+            )
+
+        current = self.store.final_preferences(["shared-sha"])["shared-sha"]
+        self.assertEqual(current.action, "like")
+        self.assertEqual(current.sequence, liked.preference_sequence)
 
     def test_recent_preference_profile_uses_a_bounded_indexed_event_horizon(
         self,

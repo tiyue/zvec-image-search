@@ -44,6 +44,14 @@ class SharedPreference:
     sequence: int
 
 
+@dataclass(frozen=True, slots=True)
+class RecommendationActionResult:
+    recorded: bool
+    preference: str | None
+    preference_sequence: int | None
+    preference_changed: bool
+
+
 class RecommendationStore:
     """Persists opaque identifiers only; a generated batch is not an exposure."""
 
@@ -182,7 +190,7 @@ class RecommendationStore:
         normalized_action = _identifier(action, "action")
         if normalized_action == "shown":
             raise ValueError("shown must be recorded through mark_shown")
-        recorded, _preference = self._record_event(
+        result = self._record_event(
             viewer_id,
             batch_id,
             event_id,
@@ -190,7 +198,7 @@ class RecommendationStore:
             normalized_action,
             include_preference=False,
         )
-        return recorded
+        return result.recorded
 
     def record_action_with_preference(
         self,
@@ -201,6 +209,25 @@ class RecommendationStore:
         action: str,
     ) -> tuple[bool, str | None]:
         """Record an action and atomically return the current shared preference."""
+
+        result = self.record_action_with_preference_details(
+            viewer_id,
+            batch_id,
+            event_id,
+            item_id,
+            action,
+        )
+        return result.recorded, result.preference
+
+    def record_action_with_preference_details(
+        self,
+        viewer_id: str,
+        batch_id: str,
+        event_id: str,
+        item_id: str,
+        action: str,
+    ) -> RecommendationActionResult:
+        """Record an action and return its exact shared-preference effect."""
 
         normalized_action = _identifier(action, "action")
         if normalized_action == "shown":
@@ -366,7 +393,7 @@ class RecommendationStore:
         action: str,
         *,
         include_preference: bool,
-    ) -> tuple[bool, str | None]:
+    ) -> RecommendationActionResult:
         viewer = _identifier(viewer_id, "viewer_id")
         batch = _identifier(batch_id, "batch_id")
         event = _identifier(event_id, "event_id")
@@ -383,28 +410,51 @@ class RecommendationStore:
                 ).fetchone()
                 if row is None:
                     raise ValueError("batch item does not belong to viewer")
+                sha256 = str(row[0])
+                previous_preference = (
+                    self._latest_preference(connection, sha256)
+                    if include_preference and action in {"like", "dislike"}
+                    else None
+                )
                 inserted = self._insert_event(
                     connection, viewer, batch, event, item_id, action
                 )
                 if not include_preference:
                     connection.execute("COMMIT")
-                    return inserted, None
-                preference_row = connection.execute(
-                    "SELECT events.action FROM items "
-                    "JOIN events ON events.item_id = items.item_id "
-                    "WHERE items.sha256 = ? "
-                    "AND events.action IN ('like', 'dislike') "
-                    "ORDER BY events.sequence DESC LIMIT 1",
-                    (str(row[0]),),
-                ).fetchone()
+                    return RecommendationActionResult(inserted, None, None, False)
+                preference = self._latest_preference(connection, sha256)
                 connection.execute("COMMIT")
-                return (
-                    inserted,
-                    None if preference_row is None else str(preference_row[0]),
+                return RecommendationActionResult(
+                    recorded=inserted,
+                    preference=None if preference is None else preference[0],
+                    preference_sequence=None if preference is None else preference[1],
+                    preference_changed=(
+                        inserted
+                        and action in {"like", "dislike"}
+                        and preference is not None
+                        and (
+                            previous_preference is None
+                            or previous_preference[0] != preference[0]
+                        )
+                    ),
                 )
             except BaseException:
                 connection.execute("ROLLBACK")
                 raise
+
+    @staticmethod
+    def _latest_preference(
+        connection: sqlite3.Connection, sha256: str
+    ) -> tuple[str, int] | None:
+        row = connection.execute(
+            "SELECT events.action, events.sequence FROM items "
+            "JOIN events ON events.item_id = items.item_id "
+            "WHERE items.sha256 = ? "
+            "AND events.action IN ('like', 'dislike') "
+            "ORDER BY events.sequence DESC LIMIT 1",
+            (sha256,),
+        ).fetchone()
+        return None if row is None else (str(row[0]), int(row[1]))
 
     @staticmethod
     def _insert_event(

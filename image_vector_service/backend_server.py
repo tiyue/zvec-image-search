@@ -41,6 +41,7 @@ from .library_config import (
 from .models import SearchReport
 from .rank_fusion import confidence_candidate_limit
 from .recommendation_store import (
+    RecommendationActionResult,
     RecommendationBatch,
     RecommendationBatchItem,
     RecommendationStore,
@@ -49,9 +50,11 @@ from .recommendation_store import (
 from .recommendations import (
     SLOT_QUOTAS,
     PreferenceVector,
+    PreparedPersonalizationProfile,
     RecommendationCandidate,
     RecommendationSelection,
-    personalize_candidates,
+    apply_personalization_profile,
+    prepare_personalization_profile,
     select_recommendations,
 )
 from .result_exporter import search_report_payload
@@ -98,6 +101,8 @@ _DEFAULT_COOPERATIVE_BATCH_SIZE = 200
 _MAX_COOPERATIVE_BATCH_SIZE = 10_000
 _DEFAULT_COOPERATIVE_MAX_INTERVAL_SECONDS = 0.25
 _DEFAULT_COOPERATIVE_MAX_CALLS = 4
+_INITIAL_RECOMMENDATION_POOL_LIMIT = 100
+_EXPANDED_RECOMMENDATION_POOL_LIMIT = 256
 _DEFAULT_IDLE_MAINTENANCE_DELAY_SECONDS = 2.0
 _DEFAULT_RESULT_PREVIEW_PAGE_SIZE = 15
 _MAX_SEMANTIC_QUERIES = 8
@@ -869,6 +874,26 @@ class _LibraryWorker:
             self._cooperative_depth -= 1
 
 
+@dataclass(frozen=True, slots=True)
+class _RecommendationProfileCache:
+    profile: PreparedPersonalizationProfile
+    vector_spaces: tuple[dict[str, object], ...]
+    last_preference_sequence: int
+
+
+@dataclass(frozen=True, slots=True)
+class _RecommendationAttempt:
+    selection: RecommendationSelection
+    preferences: Mapping[str, SharedPreference]
+    diversity: Mapping[str, object]
+    personalization: Mapping[str, object]
+    candidate_read_ms: float
+    preference_profile_ms: float
+    selection_ms: float
+    request_count: int
+    profile_cache_hit: bool
+
+
 class BackendJobManager:
     """Coordinates jobs while each library service stays on its own worker thread."""
 
@@ -943,6 +968,7 @@ class BackendJobManager:
             self._config.config_home_path / "recommendations.sqlite3"
         )
         self._recommendation_store: RecommendationStore | None = None
+        self._recommendation_profile_cache: _RecommendationProfileCache | None = None
         self._recommendation_executor = ThreadPoolExecutor(
             max_workers=1,
             thread_name_prefix="zvec-recommendations",
@@ -1400,16 +1426,55 @@ class BackendJobManager:
             raise BackendRequestError(
                 "invalid_request", "Recommendation action is invalid."
             )
-        recorded, preference = self._recommendation_call(
-            lambda store: store.record_action_with_preference(
-                viewer, batch, event, item, action
+        result = self._recommendation_call(
+            lambda store: self._record_recommendation_action_on_worker(
+                store,
+                viewer,
+                batch,
+                event,
+                item,
+                action,
             )
         )
         return {
-            "recorded": recorded,
+            "recorded": result.recorded,
             "event_id": event,
-            "preference": preference,
+            "preference": result.preference,
         }
+
+    def _record_recommendation_action_on_worker(
+        self,
+        store: RecommendationStore,
+        viewer_id: str,
+        batch_id: str,
+        event_id: str,
+        item_id: str,
+        action: str,
+    ) -> RecommendationActionResult:
+        result = store.record_action_with_preference_details(
+            viewer_id,
+            batch_id,
+            event_id,
+            item_id,
+            action,
+        )
+        cache = self._recommendation_profile_cache
+        if result.preference_changed:
+            self._recommendation_profile_cache = None
+        elif (
+            cache is not None
+            and result.recorded
+            and action in {"like", "dislike"}
+            and result.preference_sequence is not None
+        ):
+            self._recommendation_profile_cache = replace(
+                cache,
+                last_preference_sequence=max(
+                    cache.last_preference_sequence,
+                    result.preference_sequence,
+                ),
+            )
+        return result
 
     def _recommendation_call(
         self,
@@ -1450,6 +1515,7 @@ class BackendJobManager:
         if store is not None:
             self._recommendation_executor.submit(close, store).result()
             self._recommendation_store = None
+        self._recommendation_profile_cache = None
 
     def _create_recommendations_on_worker(
         self,
@@ -1457,44 +1523,66 @@ class BackendJobManager:
         viewer_id: str,
         request_id: str,
     ) -> dict[str, Any]:
+        total_started = perf_counter()
         existing = store.batch_for_request(viewer_id, request_id)
         if existing is not None:
+            hydration_started = perf_counter()
             items = self._reload_recommendation_items(existing.items)
             preferences = _recommendation_final_preferences(
                 store, (item.sha256 for item in existing.items)
             )
-            return _recommendation_response(
+            response = _recommendation_response(
                 existing,
                 _recommendation_items_with_preferences(existing, items, preferences),
                 history_window=0,
                 diversity=_replayed_recommendation_diversity(),
                 personalization=_replayed_recommendation_personalization(),
             )
+            result_hydration_ms = (perf_counter() - hydration_started) * 1_000.0
+            response["performance"] = _recommendation_performance(
+                candidate_initial_read_ms=0.0,
+                candidate_expansion_read_ms=0.0,
+                preference_profile_ms=0.0,
+                selection_ms=0.0,
+                result_hydration_ms=result_hydration_ms,
+                total_ms=(perf_counter() - total_started) * 1_000.0,
+                initial_request_count=0,
+                expansion_request_count=0,
+                profile_cache_hit=False,
+            )
+            return response
 
-        candidates, vector_spaces = self._collect_recommendation_candidates(
+        history_started = perf_counter()
+        recent_sha256 = store.recent_sha256(viewer_id)
+        history_read_ms = (perf_counter() - history_started) * 1_000.0
+        rng_seed = _recommendation_seed(viewer_id, request_id)
+        initial = self._prepare_recommendation_attempt(
             store,
             viewer_id,
             request_id,
+            recent_sha256,
+            rng_seed,
+            limit_per_pool=_INITIAL_RECOMMENDATION_POOL_LIMIT,
         )
-        preferences = _recommendation_final_preferences(
-            store, (candidate.sha256 for candidate in candidates)
+        initial = replace(
+            initial,
+            candidate_read_ms=initial.candidate_read_ms + history_read_ms,
         )
-        diversity = _recommendation_diversity(vector_spaces, candidates)
-        candidates, personalization = self._personalize_recommendation_candidates(
-            store,
-            candidates,
-            diversity,
-        )
-        if not diversity["applied"]:
-            candidates = tuple(
-                replace(candidate, vector=None) for candidate in candidates
+        final_attempt = initial
+        expansion: _RecommendationAttempt | None = None
+        if _recommendation_requires_candidate_expansion(initial.selection):
+            expansion = self._prepare_recommendation_attempt(
+                store,
+                viewer_id,
+                request_id,
+                recent_sha256,
+                rng_seed,
+                limit_per_pool=_EXPANDED_RECOMMENDATION_POOL_LIMIT,
             )
-        selection = select_recommendations(
-            candidates,
-            recent_sha256=store.recent_sha256(viewer_id),
-            excluded_sha256=preferences,
-            rng_seed=_recommendation_seed(viewer_id, request_id),
-        )
+            final_attempt = expansion
+
+        hydration_started = perf_counter()
+        selection = final_attempt.selection
         selected_items = self._reload_recommendation_items(
             tuple(
                 RecommendationBatchItem(
@@ -1529,12 +1617,98 @@ class BackendJobManager:
         )
         batch = store.create_batch(viewer_id, request_id, persisted_items)
         response_items = self._reload_recommendation_items(batch.items)
-        return _recommendation_response(
+        response = _recommendation_response(
             batch,
-            _recommendation_items_with_preferences(batch, response_items, preferences),
+            _recommendation_items_with_preferences(
+                batch,
+                response_items,
+                final_attempt.preferences,
+            ),
             history_window=selection.history_window,
+            diversity=final_attempt.diversity,
+            personalization=final_attempt.personalization,
+        )
+        result_hydration_ms = (perf_counter() - hydration_started) * 1_000.0
+        response["performance"] = _recommendation_performance(
+            candidate_initial_read_ms=initial.candidate_read_ms,
+            candidate_expansion_read_ms=(
+                0.0 if expansion is None else expansion.candidate_read_ms
+            ),
+            preference_profile_ms=(
+                initial.preference_profile_ms
+                + (0.0 if expansion is None else expansion.preference_profile_ms)
+            ),
+            selection_ms=(
+                initial.selection_ms
+                + (0.0 if expansion is None else expansion.selection_ms)
+            ),
+            result_hydration_ms=result_hydration_ms,
+            total_ms=(perf_counter() - total_started) * 1_000.0,
+            initial_request_count=initial.request_count,
+            expansion_request_count=(
+                0 if expansion is None else expansion.request_count
+            ),
+            profile_cache_hit=initial.profile_cache_hit,
+        )
+        return response
+
+    def _prepare_recommendation_attempt(
+        self,
+        store: RecommendationStore,
+        viewer_id: str,
+        request_id: str,
+        recent_sha256: Sequence[str],
+        rng_seed: int,
+        *,
+        limit_per_pool: int,
+    ) -> _RecommendationAttempt:
+        candidate_started = perf_counter()
+        candidates, vector_spaces, request_count = (
+            self._collect_recommendation_candidates(
+                store,
+                viewer_id,
+                request_id,
+                limit_per_pool=limit_per_pool,
+            )
+        )
+        preferences = _recommendation_final_preferences(
+            store, (candidate.sha256 for candidate in candidates)
+        )
+        candidate_read_ms = (perf_counter() - candidate_started) * 1_000.0
+        diversity = _recommendation_diversity(vector_spaces, candidates)
+
+        profile_started = perf_counter()
+        candidates, personalization, profile_cache_hit = (
+            self._personalize_recommendation_candidates(
+                store,
+                candidates,
+                diversity,
+            )
+        )
+        preference_profile_ms = (perf_counter() - profile_started) * 1_000.0
+        if not diversity["applied"]:
+            candidates = tuple(
+                replace(candidate, vector=None) for candidate in candidates
+            )
+
+        selection_started = perf_counter()
+        selection = select_recommendations(
+            candidates,
+            recent_sha256=recent_sha256,
+            excluded_sha256=preferences,
+            rng_seed=rng_seed,
+        )
+        selection_ms = (perf_counter() - selection_started) * 1_000.0
+        return _RecommendationAttempt(
+            selection=selection,
+            preferences=preferences,
             diversity=diversity,
             personalization=personalization,
+            candidate_read_ms=candidate_read_ms,
+            preference_profile_ms=preference_profile_ms,
+            selection_ms=selection_ms,
+            request_count=request_count,
+            profile_cache_hit=profile_cache_hit,
         )
 
     def _personalize_recommendation_candidates(
@@ -1542,53 +1716,80 @@ class BackendJobManager:
         store: RecommendationStore,
         candidates: tuple[RecommendationCandidate, ...],
         diversity: Mapping[str, object],
-    ) -> tuple[tuple[RecommendationCandidate, ...], dict[str, object]]:
-        preferences = store.recent_final_preferences(limit=256)
-        if not preferences:
-            return candidates, {
-                "applied": False,
-                "effective_count": 0,
-                "reason": "insufficient_preferences",
-            }
-        try:
-            vectors, vector_spaces = self._load_recommendation_preference_vectors(
-                preferences
+    ) -> tuple[
+        tuple[RecommendationCandidate, ...],
+        dict[str, object],
+        bool,
+    ]:
+        cache = self._recommendation_profile_cache
+        cache_hit = cache is not None
+        if cache is None:
+            preferences = store.recent_final_preferences(limit=256)
+            last_sequence = max(
+                (preference.sequence for preference in preferences),
+                default=0,
             )
-        except Exception:
-            return candidates, {
-                "applied": False,
-                "effective_count": 0,
-                "reason": "vectors_unavailable",
-            }
-        effective_count = len(vectors)
-        if effective_count == 0:
-            return candidates, {
-                "applied": False,
-                "effective_count": 0,
-                "reason": "vectors_unavailable",
-            }
-        if effective_count < 10:
-            return candidates, {
-                "applied": False,
-                "effective_count": effective_count,
-                "reason": "insufficient_preferences",
-            }
+            try:
+                vectors, vector_spaces = (
+                    self._load_recommendation_preference_vectors(preferences)
+                    if preferences
+                    else ((), ())
+                )
+                profile = (
+                    PreparedPersonalizationProfile(
+                        None,
+                        None,
+                        0,
+                        "vectors_unavailable",
+                    )
+                    if preferences and not vectors
+                    else prepare_personalization_profile(vectors)
+                )
+            except Exception:
+                profile = PreparedPersonalizationProfile(
+                    None,
+                    None,
+                    0,
+                    "vectors_unavailable",
+                )
+                vector_spaces = ()
+            cache = _RecommendationProfileCache(
+                profile=profile,
+                vector_spaces=vector_spaces,
+                last_preference_sequence=last_sequence,
+            )
+            self._recommendation_profile_cache = cache
+
+        profile = cache.profile
         if (
-            space_reason := _recommendation_personalization_space_reason(
-                diversity, vector_spaces
+            profile.reason is None
+            and (
+                space_reason := _recommendation_personalization_space_reason(
+                    diversity,
+                    cache.vector_spaces,
+                )
             )
-        ) is not None:
-            return candidates, {
-                "applied": False,
-                "effective_count": effective_count,
-                "reason": space_reason,
-            }
-        result = personalize_candidates(candidates, vectors)
-        return result.candidates, {
-            "applied": result.applied,
-            "effective_count": result.effective_count,
-            "reason": result.reason,
-        }
+            is not None
+        ):
+            return (
+                candidates,
+                {
+                    "applied": False,
+                    "effective_count": profile.effective_count,
+                    "reason": space_reason,
+                },
+                cache_hit,
+            )
+        result = apply_personalization_profile(candidates, profile)
+        return (
+            result.candidates,
+            {
+                "applied": result.applied,
+                "effective_count": result.effective_count,
+                "reason": result.reason,
+            },
+            cache_hit,
+        )
 
     def _load_recommendation_preference_vectors(
         self,
@@ -1671,10 +1872,18 @@ class BackendJobManager:
         store: RecommendationStore,
         viewer_id: str,
         request_id: str,
+        *,
+        limit_per_pool: int,
     ) -> tuple[
         tuple[RecommendationCandidate, ...],
         tuple[dict[str, object] | None, ...],
+        int,
     ]:
+        if limit_per_pool not in {
+            _INITIAL_RECOMMENDATION_POOL_LIMIT,
+            _EXPANDED_RECOMMENDATION_POOL_LIMIT,
+        }:
+            raise ValueError("recommendation candidate limit is invalid")
         futures: list[tuple[LibraryDefinition, Future[Any]]] = []
         for library in self._catalog.enabled:
             cursor = hashlib.sha256(
@@ -1685,10 +1894,11 @@ class BackendJobManager:
                 service: Any,
                 *,
                 random_cursor: str = cursor,
+                candidate_limit: int = limit_per_pool,
             ) -> Any:
                 return service.collect_recommendation_candidates(
                     random_cursor=random_cursor,
-                    limit_per_pool=256,
+                    limit_per_pool=candidate_limit,
                 )
 
             submission = self._library_workers[library.library_id].submit(
@@ -1729,7 +1939,7 @@ class BackendJobManager:
             )
             is not None
         )
-        return candidates, tuple(vector_spaces)
+        return candidates, tuple(vector_spaces), len(futures)
 
     def _reload_recommendation_items(
         self,
@@ -4757,6 +4967,49 @@ def _recommendation_seed(viewer_id: str, request_id: str) -> int:
         f"{viewer_id}:{request_id}".encode(), digest_size=8
     ).digest()
     return int.from_bytes(digest, "big")
+
+
+def _recommendation_requires_candidate_expansion(
+    selection: RecommendationSelection,
+) -> bool:
+    if selection.status != "complete" or selection.history_window != 240:
+        return True
+    return any(
+        selection.counts_by_slot.get(slot, 0) < quota
+        for slot, quota in SLOT_QUOTAS.items()
+    )
+
+
+def _recommendation_performance(
+    *,
+    candidate_initial_read_ms: float,
+    candidate_expansion_read_ms: float,
+    preference_profile_ms: float,
+    selection_ms: float,
+    result_hydration_ms: float,
+    total_ms: float,
+    initial_request_count: int,
+    expansion_request_count: int,
+    profile_cache_hit: bool,
+) -> dict[str, object]:
+    initial_read = _recommendation_elapsed_ms(candidate_initial_read_ms)
+    expansion_read = _recommendation_elapsed_ms(candidate_expansion_read_ms)
+    return {
+        "candidate_read_ms": round(initial_read + expansion_read, 3),
+        "candidate_initial_read_ms": initial_read,
+        "candidate_expansion_read_ms": expansion_read,
+        "preference_profile_ms": _recommendation_elapsed_ms(preference_profile_ms),
+        "selection_ms": _recommendation_elapsed_ms(selection_ms),
+        "result_hydration_ms": _recommendation_elapsed_ms(result_hydration_ms),
+        "total_ms": _recommendation_elapsed_ms(total_ms),
+        "initial_request_count": max(0, initial_request_count),
+        "expansion_request_count": max(0, expansion_request_count),
+        "profile_cache_hit": profile_cache_hit,
+    }
+
+
+def _recommendation_elapsed_ms(value: float) -> float:
+    return round(value, 3) if math.isfinite(value) and value >= 0 else 0.0
 
 
 def _recommendation_exposure_counts(
