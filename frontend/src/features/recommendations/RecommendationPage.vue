@@ -281,32 +281,6 @@ onBeforeUnmount(() => {
             <img :src="item.thumbnailUrl" :alt="item.name" draggable="false" />
             <span>{{ bucketLabels[item.bucket] }}</span>
           </button>
-          <div class="recommendation-copy">
-            <strong :title="item.name">{{ item.name }}</strong>
-            <small>{{ item.libraryName }}</small>
-          </div>
-          <div class="recommendation-actions" :aria-label="`${item.name} 操作`">
-            <button type="button" :disabled="actionBusy(item.itemId)" @click="runNativeAction(item, 'open')">打开</button>
-            <button
-              type="button"
-              :class="{ active: recommendations.preferenceFor(item.itemId) === 'like' }"
-              :aria-pressed="recommendations.preferenceFor(item.itemId) === 'like'"
-              :disabled="actionBusy(item.itemId)"
-              @click="setPreference(item, 'like')"
-            >喜欢</button>
-            <button
-              type="button"
-              :disabled="props.exportBusy || actionBusy(item.itemId)"
-              @click="runNativeAction(item, 'export')"
-            >导出</button>
-            <button
-              type="button"
-              :class="{ active: recommendations.preferenceFor(item.itemId) === 'dislike' }"
-              :aria-pressed="recommendations.preferenceFor(item.itemId) === 'dislike'"
-              :disabled="actionBusy(item.itemId)"
-              @click="setPreference(item, 'dislike')"
-            >不喜欢</button>
-          </div>
         </article>
       </div>
       <div v-if="recommendations.loading.value" class="recommendation-loading" role="status">
@@ -466,33 +440,6 @@ onBeforeUnmount(() => {
   font-size: 11px;
   background: rgb(0 0 0 / 68%);
 }
-
-.recommendation-copy { display: grid; gap: 2px; padding: 10px 10px 8px; }
-.recommendation-copy strong,
-.recommendation-copy small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.recommendation-copy strong { font-size: 13px; font-weight: 600; }
-.recommendation-copy small { color: var(--recommendation-muted); font-size: 11px; }
-
-.recommendation-actions {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  border-top: 1px solid var(--recommendation-border);
-}
-
-.recommendation-actions button {
-  min-width: 0;
-  min-height: 32px;
-  padding: 0 4px;
-  border: 0;
-  border-right: 1px solid var(--recommendation-border);
-  color: var(--recommendation-muted);
-  font-size: 11px;
-  background: transparent;
-}
-
-.recommendation-actions button:last-child { border-right: 0; }
-.recommendation-actions button:hover:not(:disabled),
-.recommendation-actions button.active { color: var(--recommendation-text); background: var(--recommendation-surface-strong); }
 
 .recommendation-skeleton {
   aspect-ratio: 1;

@@ -113,12 +113,11 @@ describe("RecommendationPage", () => {
     expect(state.setVisible).toHaveBeenCalledWith(true);
   });
 
-  it("renders partial and vector diversity state and records successful actions", async () => {
+  it("renders image-only cards and records a successful image click", async () => {
     state.currentBatch.value = batch();
     const openImage = vi.fn().mockResolvedValue(true);
-    const exportImage = vi.fn().mockResolvedValue(true);
     const wrapper = mount(RecommendationPage, {
-      props: { visible: true, openImage, exportImage },
+      props: { visible: true, openImage },
     });
     mountedWrappers.push(wrapper);
 
@@ -126,21 +125,14 @@ describe("RecommendationPage", () => {
     expect(wrapper.get(".recommendation-status").text()).toContain("向量多样性已应用，2 张缺少向量");
     expect(wrapper.get(".recommendation-status").text()).toContain("个性化已应用（12 张有效偏好）");
     expect(wrapper.get(".recommendation-media span").text()).toBe("技术质量");
+    expect(wrapper.get(".recommendation-media img").attributes("alt")).toBe("雷电将军.jpg");
+    expect(wrapper.find(".recommendation-copy").exists()).toBe(false);
+    expect(wrapper.find(".recommendation-actions").exists()).toBe(false);
 
-    const buttons = wrapper.findAll(".recommendation-actions button");
-    await buttons[0].trigger("click");
+    await wrapper.get(".recommendation-media").trigger("click");
     await flushPromises();
     expect(openImage).toHaveBeenCalledWith("media-1");
     expect(state.recordAction).toHaveBeenCalledWith("item-1", "open");
-
-    await buttons[1].trigger("click");
-    await buttons[2].trigger("click");
-    await buttons[3].trigger("click");
-    await flushPromises();
-    expect(exportImage).toHaveBeenCalledWith("media-1");
-    expect(state.recordAction).toHaveBeenCalledWith("item-1", "like");
-    expect(state.recordAction).toHaveBeenCalledWith("item-1", "export");
-    expect(state.recordAction).toHaveBeenCalledWith("item-1", "dislike");
   });
 
   it("does not record open or export when the native operation fails", async () => {
@@ -153,10 +145,11 @@ describe("RecommendationPage", () => {
       },
     });
     mountedWrappers.push(wrapper);
-    const buttons = wrapper.findAll(".recommendation-actions button");
 
-    await buttons[0].trigger("click");
-    await buttons[2].trigger("click");
+    await wrapper.get(".recommendation-media").trigger("click");
+    openMenu(wrapper.element, 80, 80);
+    await wrapper.vm.$nextTick();
+    menuButton("导出到文件夹…").click();
     await flushPromises();
 
     expect(state.recordAction).not.toHaveBeenCalledWith("item-1", "open");

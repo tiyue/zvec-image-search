@@ -242,7 +242,7 @@ CLI 入口将配置创建、迁移/后端服务、需要 `ImageVectorService` �
 - LAN 契约为已认证的 `POST /api/v1/recommendations`（仅 `{request_id}`）、`POST /api/v1/recommendations/{batch_id}/shown`（仅 `{event_id}`）和 `POST /api/v1/recommendations/{batch_id}/actions`（`event_id`、`item_id`、`action`，export 可带 metadata）。`request_id` 使批次创建幂等；`event_id` 使 shown 与 action 幂等。
 - 推荐响应的每个 item 可含最终共享 `preference`（`like`、`dislike` 或 `null`），顶层 `personalization` 返回 `applied`、`effective_count` 和安全 `reason`。降级 reason 为 `insufficient_preferences`、`vectors_unavailable`、`incompatible_vector_spaces`；幂等批次回放使用 `replayed`，并仍重新读取 item 的当前最终偏好。action 成功响应也返回 `recorded` 与原子读取的当前最终 `preference`，客户端不得把较旧 event ID 的幂等回放误显示为新的跨设备偏好。响应不包含 viewer/device ID 或完整反馈历史。
 - Web 和 Android 都必须先完成缩略图预加载，且页面实际可见后才提交 shown。shown/action 同步失败时必须复用原 `event_id`；Android shown 使用有上限的指数退避自动重试。Android 仅在保存原图成功后提交 `export`（`metadata.channel=save`）；分享不记录 export 事件。
-- Windows 推荐图片右键菜单仅作用于当前单图，提供详情、系统打开、所在文件夹、喜欢/不喜欢、复制图片、复制文件、复制路径和导出；推荐反馈保持 `like/dislike`，搜索菜单仍使用“相关/不相关”且保留原多选语义。菜单受窗口边界约束，并在点击外部、Escape、窗口缩放或离开推荐页时收起。
+- Windows 推荐卡片仅显示图片及图片右下角的推荐来源角标，不显示文件名、图库名或“打开/喜欢/导出/不喜欢”底部按钮；单击图片继续打开当前图片。右键菜单仅作用于当前单图，推荐详情及既有操作保持可用，菜单提供详情、系统打开、所在文件夹、喜欢/不喜欢、复制图片、复制文件、复制路径和导出；推荐反馈保持 `like/dislike`，搜索菜单仍使用“相关/不相关”且保留原多选语义。菜单受窗口边界约束，并在点击外部、Escape、窗口缩放或离开推荐页时收起。
 
 本图片推荐章节不改变现有发布矩阵。
 
