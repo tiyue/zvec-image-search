@@ -7221,6 +7221,45 @@ class ImageVectorService:
             "candidates": candidates,
         }
 
+    def load_recommendation_vectors(self, doc_ids: Sequence[str]) -> dict[str, object]:
+        """Read at most 256 existing vectors on the Collection owner thread."""
+
+        if any(not isinstance(doc_id, str) or not doc_id.strip() for doc_id in doc_ids):
+            raise ValueError("recommendation vector reads accept at most 256 doc ids")
+        normalized = list(dict.fromkeys(doc_id.strip() for doc_id in doc_ids))
+        if len(normalized) > 256:
+            raise ValueError("recommendation vector reads accept at most 256 doc ids")
+        entries = self.state.get_many(normalized)
+        vectors: dict[str, list[float]] = {}
+        if normalized:
+            vectors, _failures = self.repository.fetch_vectors(normalized)
+        items: list[dict[str, object]] = []
+        for doc_id in normalized:
+            entry = entries.get(doc_id)
+            raw_vector = vectors.get(doc_id)
+            if (
+                entry is None
+                or raw_vector is None
+                or len(raw_vector) != int(self.config.dimension)
+            ):
+                continue
+            sha256 = str(entry.get("sha256") or "").strip()
+            if not sha256:
+                continue
+            try:
+                vector = tuple(float(value) for value in raw_vector)
+            except (TypeError, ValueError):
+                continue
+            items.append({"doc_id": doc_id, "sha256": sha256, "vector": vector})
+        return {
+            "vector_space": {
+                "model": self.config.model,
+                "dimension": self.config.dimension,
+                "metric": self.config.metric,
+            },
+            "items": items,
+        }
+
     def load_recommendation_items(
         self, doc_ids: Sequence[str]
     ) -> list[dict[str, object]]:

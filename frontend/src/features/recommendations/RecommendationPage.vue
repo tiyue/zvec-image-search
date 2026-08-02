@@ -1,18 +1,40 @@
 <script setup lang="ts">
-import { computed, ref, watch } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 
+import GalleryContextMenu from "../../components/GalleryContextMenu.vue";
+import RecommendationDetail from "./RecommendationDetail.vue";
 import type { RecommendationAction, RecommendationItem } from "./types";
 import { useRecommendations } from "./useRecommendations";
+
+type NativeRecommendationAction =
+  | "open"
+  | "reveal"
+  | "copyImage"
+  | "copyFile"
+  | "copyPath"
+  | "export";
+
+const MENU_MARGIN = 8;
+const MENU_WIDTH = 238;
+const MENU_HEIGHT = 400;
 
 const props = withDefaults(defineProps<{
   visible?: boolean;
   exportBusy?: boolean;
   openImage?: (mediaId: string) => Promise<boolean>;
+  revealImage?: (mediaId: string) => Promise<boolean>;
+  copyImage?: (mediaId: string) => Promise<boolean>;
+  copyFile?: (mediaId: string) => Promise<boolean>;
+  copyPath?: (mediaId: string) => Promise<boolean>;
   exportImage?: (mediaId: string) => Promise<boolean>;
 }>(), {
   visible: true,
   exportBusy: false,
   openImage: undefined,
+  revealImage: undefined,
+  copyImage: undefined,
+  copyFile: undefined,
+  copyPath: undefined,
   exportImage: undefined,
 });
 
@@ -24,6 +46,12 @@ const recommendations = useRecommendations(undefined, {
   onError: (title, message) => emit("toast", title, message, "error"),
 });
 const nativePending = ref<string[]>([]);
+const contextMenu = ref<{
+  item: RecommendationItem | null;
+  x: number;
+  y: number;
+}>({ item: null, x: MENU_MARGIN, y: MENU_MARGIN });
+const detailItem = ref<RecommendationItem | null>(null);
 
 const batch = computed(() => recommendations.currentBatch.value);
 const diversityLabel = computed(() => {
@@ -39,6 +67,26 @@ const diversityLabel = computed(() => {
   }
   return "向量多样性已应用";
 });
+const personalizationLabel = computed(() => {
+  const personalization = batch.value?.personalization;
+  if (!personalization) return "";
+  if (personalization.applied) {
+    return `个性化已应用（${personalization.effectiveCount} 张有效偏好）`;
+  }
+  if (personalization.reason === "insufficient_preferences") {
+    return `个性化将在累计 10 张有效偏好后启用（当前 ${personalization.effectiveCount} 张）`;
+  }
+  if (personalization.reason === "vectors_unavailable") {
+    return "个性化未应用：有效偏好暂无可用向量";
+  }
+  if (personalization.reason === "incompatible_vector_spaces") {
+    return "个性化未应用：图库向量空间不兼容";
+  }
+  if (personalization.reason === "replayed") {
+    return "当前批次为幂等回放，未重新计算个性化排序";
+  }
+  return "个性化未应用";
+});
 
 const bucketLabels: Record<RecommendationItem["bucket"], string> = {
   quality: "技术质量",
@@ -49,11 +97,17 @@ const bucketLabels: Record<RecommendationItem["bucket"], string> = {
 
 watch(
   () => props.visible,
-  (visible) => recommendations.setVisible(visible),
+  (visible) => {
+    recommendations.setVisible(visible);
+    if (!visible) {
+      closeContextMenu();
+      detailItem.value = null;
+    }
+  },
   { immediate: true },
 );
 
-function nativeKey(itemId: string, action: "open" | "export"): string {
+function nativeKey(itemId: string, action: NativeRecommendationAction): string {
   return `${itemId}:${action}`;
 }
 
@@ -63,16 +117,28 @@ function actionBusy(itemId: string, action?: RecommendationAction): boolean {
     recommendations.isActionPending(itemId, action);
 }
 
+function nativeHandler(
+  action: NativeRecommendationAction,
+): ((mediaId: string) => Promise<boolean>) | undefined {
+  if (action === "open") return props.openImage;
+  if (action === "reveal") return props.revealImage;
+  if (action === "copyImage") return props.copyImage;
+  if (action === "copyFile") return props.copyFile;
+  if (action === "copyPath") return props.copyPath;
+  return props.exportImage;
+}
+
 async function runNativeAction(
   item: RecommendationItem,
-  action: "open" | "export",
+  action: NativeRecommendationAction,
 ): Promise<void> {
-  const handler = action === "open" ? props.openImage : props.exportImage;
+  const handler = nativeHandler(action);
   if (!handler || actionBusy(item.itemId) || (action === "export" && props.exportBusy)) return;
   const key = nativeKey(item.itemId, action);
   nativePending.value = [...nativePending.value, key];
   try {
-    if (await handler(item.mediaId)) {
+    const succeeded = await handler(item.mediaId);
+    if (succeeded && (action === "open" || action === "export")) {
       await recommendations.recordAction(item.itemId, action);
     }
   } finally {
@@ -87,6 +153,77 @@ async function setPreference(
   if (recommendations.preferenceFor(item.itemId) === action || actionBusy(item.itemId)) return;
   await recommendations.recordAction(item.itemId, action);
 }
+
+function openContextMenu(item: RecommendationItem, event: MouseEvent): void {
+  event.preventDefault();
+  event.stopPropagation();
+  const maxX = Math.max(MENU_MARGIN, window.innerWidth - MENU_WIDTH - MENU_MARGIN);
+  const maxY = Math.max(MENU_MARGIN, window.innerHeight - MENU_HEIGHT - MENU_MARGIN);
+  contextMenu.value = {
+    item,
+    x: Math.max(MENU_MARGIN, Math.min(event.clientX, maxX)),
+    y: Math.max(MENU_MARGIN, Math.min(event.clientY, maxY)),
+  };
+}
+
+function closeContextMenu(): void {
+  contextMenu.value = { ...contextMenu.value, item: null };
+}
+
+function openContextDetail(): void {
+  const item = contextMenu.value.item;
+  if (!item) return;
+  detailItem.value = item;
+  closeContextMenu();
+}
+
+function runContextNative(action: NativeRecommendationAction): void {
+  const item = contextMenu.value.item;
+  if (item) void runNativeAction(item, action);
+}
+
+function setContextPreference(action: "like" | "dislike"): void {
+  const item = contextMenu.value.item;
+  if (item) void setPreference(item, action);
+}
+
+function runDetailNative(action: "open" | "reveal"): void {
+  const item = detailItem.value;
+  if (item) void runNativeAction(item, action);
+}
+
+function handleWindowPointerDown(event: PointerEvent): void {
+  const target = event.target;
+  if (target instanceof Element && target.closest(".gallery-context-menu")) return;
+  closeContextMenu();
+}
+
+function handleWindowKeydown(event: KeyboardEvent): void {
+  if (event.key !== "Escape") return;
+  if (contextMenu.value.item) {
+    event.preventDefault();
+    closeContextMenu();
+  } else if (detailItem.value) {
+    event.preventDefault();
+    detailItem.value = null;
+  }
+}
+
+function handleWindowResize(): void {
+  closeContextMenu();
+}
+
+onMounted(() => {
+  window.addEventListener("pointerdown", handleWindowPointerDown);
+  window.addEventListener("keydown", handleWindowKeydown);
+  window.addEventListener("resize", handleWindowResize);
+});
+
+onBeforeUnmount(() => {
+  window.removeEventListener("pointerdown", handleWindowPointerDown);
+  window.removeEventListener("keydown", handleWindowKeydown);
+  window.removeEventListener("resize", handleWindowResize);
+});
 </script>
 
 <template>
@@ -110,6 +247,7 @@ async function setPreference(
       <span>{{ batch.count }} 张</span>
       <span>已避开最近 {{ batch.historyWindow }} 张</span>
       <span>{{ diversityLabel }}</span>
+      <span>{{ personalizationLabel }}</span>
       <span v-if="batch.quotaDegraded">部分来源已由其他候选补足</span>
       <span v-if="batch.partial">本批数量不足 15 张</span>
     </div>
@@ -138,6 +276,7 @@ async function setPreference(
             :aria-label="`打开 ${item.name}`"
             :disabled="actionBusy(item.itemId)"
             @click="runNativeAction(item, 'open')"
+            @contextmenu="openContextMenu(item, $event)"
           >
             <img :src="item.thumbnailUrl" :alt="item.name" draggable="false" />
             <span>{{ bucketLabels[item.bucket] }}</span>
@@ -179,6 +318,48 @@ async function setPreference(
       <strong>当前没有可推荐的图片</strong>
       <p>图库完成索引后再试一次。</p>
     </div>
+
+    <GalleryContextMenu
+      :visible="contextMenu.item !== null"
+      :x="contextMenu.x"
+      :y="contextMenu.y"
+      :selection-count="contextMenu.item ? 1 : 0"
+      :exporting="props.exportBusy"
+      mode="recommendation"
+      :action-pending="contextMenu.item ? actionBusy(contextMenu.item.itemId) : false"
+      :feedback-available="true"
+      :feedback-pending="contextMenu.item
+        ? recommendations.isActionPending(contextMenu.item.itemId)
+        : false"
+      :feedback-action="contextMenu.item
+        ? recommendations.preferenceFor(contextMenu.item.itemId)
+        : ''"
+      @detail="openContextDetail"
+      @open="runContextNative('open')"
+      @reveal="runContextNative('reveal')"
+      @like="setContextPreference('like')"
+      @dislike="setContextPreference('dislike')"
+      @copy-image="runContextNative('copyImage')"
+      @copy-files="runContextNative('copyFile')"
+      @copy-paths="runContextNative('copyPath')"
+      @export="runContextNative('export')"
+      @close="closeContextMenu"
+    />
+
+    <div
+      v-if="detailItem"
+      class="recommendation-detail-backdrop"
+      role="presentation"
+      @click.self="detailItem = null"
+    >
+      <RecommendationDetail
+        :item="detailItem"
+        :pending="actionBusy(detailItem.itemId)"
+        @close="detailItem = null"
+        @open="runDetailNative('open')"
+        @reveal="runDetailNative('reveal')"
+      />
+    </div>
   </section>
 </template>
 
@@ -219,6 +400,8 @@ async function setPreference(
   color: var(--recommendation-bg);
   background: var(--recommendation-action);
 }
+
+.refresh-button { white-space: nowrap; }
 
 .recommendation-status,
 .sync-notice {
@@ -343,6 +526,16 @@ async function setPreference(
 .recommendation-empty strong { color: var(--recommendation-text); font-size: 16px; }
 .recommendation-empty p { max-width: 520px; margin: 0; }
 
+.recommendation-detail-backdrop {
+  position: fixed;
+  z-index: 1200;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgb(0 0 0 / 24%);
+}
+
 @keyframes recommendation-shimmer { to { background-position: -240% 0; } }
 
 @media (max-width: 1180px) {
@@ -355,6 +548,7 @@ async function setPreference(
   .recommendation-heading { align-items: flex-start; }
   .recommendation-heading p { max-width: 440px; }
   .recommendation-status span + span { padding-left: 0; border-left: 0; }
+  .recommendation-detail-backdrop { padding: 8px; }
 }
 
 @media (prefers-color-scheme: dark) {

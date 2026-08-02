@@ -145,10 +145,11 @@ class _RecommendationBackend:
         metadata: dict[str, str] | None,
         *,
         viewer_id: str | None = None,
-    ) -> None:
+    ) -> dict[str, object]:
         self.calls.append(
             ("action", viewer_id, batch_id, event_id, item_id, action, metadata)
         )
+        return {"recorded": False, "preference": "dislike"}
 
 
 class _Clock:
@@ -217,7 +218,7 @@ class PreviewLanAdapterTests(unittest.TestCase):
             client_id="session-a",
             device_id="android-install-a",
         )
-        adapter.record_recommendation_action(
+        action_status = adapter.record_recommendation_action(
             "batch-1",
             "action-1",
             "item-1",
@@ -231,6 +232,10 @@ class PreviewLanAdapterTests(unittest.TestCase):
         self.assertNotIn("android-install-a", str(viewer))
         self.assertEqual(backend.calls[1][1], viewer)
         self.assertEqual(backend.calls[2][1], viewer)
+        self.assertEqual(
+            action_status,
+            {"recorded": False, "preference": "dislike"},
+        )
         adapter.delete_client_session(client_id="session-a")
         self.assertIsNone(adapter.resolve_original(media_id, client_id="session-a"))
 

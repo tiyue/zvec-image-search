@@ -116,11 +116,17 @@ class RecommendationService:
         metadata: Mapping[str, str] | None = None,
         *,
         viewer_id: str | None = None,
-    ) -> None:
+    ) -> dict[str, Any]:
         viewer = viewer_id or self.desktop_viewer_id()
-        self._client_provider().record_recommendation_action(
+        response = self._client_provider().record_recommendation_action(
             viewer, batch_id, event_id, item_id, action, metadata
         )
+        if not isinstance(response, Mapping):
+            raise RecommendationServiceError("推荐服务返回无效操作状态。")
+        return {
+            "recorded": response.get("recorded") is True,
+            "preference": _preference(response.get("preference")),
+        }
 
 
 def _browser_batch(raw: Mapping[str, Any], registry: ImageRegistry) -> dict[str, Any]:
@@ -151,6 +157,7 @@ def _browser_batch(raw: Mapping[str, Any], registry: ImageRegistry) -> dict[str,
         "history_window": _non_negative_int(raw.get("history_window")),
         "quota": _quota(raw.get("quota")),
         "diversity": _diversity(raw.get("diversity")),
+        "personalization": _personalization(raw.get("personalization")),
         "items": items,
     }
 
@@ -191,6 +198,7 @@ def _browser_item(
             raw.get("size_bytes"), fallback=media.size_bytes
         ),
         "bucket": bucket,
+        "preference": _preference(raw.get("preference")),
         "thumbnail_url": f"api/image/{media.image_id}?variant=thumbnail",
         "preview_url": f"api/image/{media.image_id}?variant=preview",
     }
@@ -212,6 +220,28 @@ def _diversity(value: Any) -> dict[str, Any]:
         "missing_vectors": _non_negative_int(source.get("missing_vectors")),
         "vector_space": _vector_space(source.get("vector_space")),
     }
+
+
+def _personalization(value: Any) -> dict[str, Any]:
+    source = value if isinstance(value, Mapping) else {}
+    raw_reason = source.get("reason")
+    reason = raw_reason.strip() if isinstance(raw_reason, str) else None
+    if reason not in {
+        "insufficient_preferences",
+        "vectors_unavailable",
+        "incompatible_vector_spaces",
+        "replayed",
+    }:
+        reason = None
+    return {
+        "applied": source.get("applied") is True,
+        "effective_count": _non_negative_int(source.get("effective_count")),
+        "reason": reason or None,
+    }
+
+
+def _preference(value: Any) -> str | None:
+    return value if value in {"like", "dislike"} else None
 
 
 def _vector_space(value: Any) -> dict[str, Any]:

@@ -97,6 +97,10 @@ const RecommendationStub = defineComponent({
     visible: { type: Boolean, default: true },
     exportBusy: { type: Boolean, default: false },
     openImage: { type: Function, default: undefined },
+    revealImage: { type: Function, default: undefined },
+    copyImage: { type: Function, default: undefined },
+    copyFile: { type: Function, default: undefined },
+    copyPath: { type: Function, default: undefined },
     exportImage: { type: Function, default: undefined },
   },
   emits: ["toast"],
@@ -111,6 +115,26 @@ const RecommendationStub = defineComponent({
         "data-testid": "recommendation-open",
         onClick: () => props.openImage?.("recommendation-media-1"),
       }, "打开推荐图片"),
+      h("button", {
+        type: "button",
+        "data-testid": "recommendation-reveal",
+        onClick: () => props.revealImage?.("recommendation-media-1"),
+      }, "定位推荐图片"),
+      h("button", {
+        type: "button",
+        "data-testid": "recommendation-copy-image",
+        onClick: () => props.copyImage?.("recommendation-media-1"),
+      }, "复制推荐图片"),
+      h("button", {
+        type: "button",
+        "data-testid": "recommendation-copy-file",
+        onClick: () => props.copyFile?.("recommendation-media-1"),
+      }, "复制推荐文件"),
+      h("button", {
+        type: "button",
+        "data-testid": "recommendation-copy-path",
+        onClick: () => props.copyPath?.("recommendation-media-1"),
+      }, "复制推荐路径"),
       h("button", {
         type: "button",
         "data-testid": "recommendation-export",
@@ -394,7 +418,7 @@ describe("App page shell", () => {
     expect(wrapper.get("[data-testid='tasks-page']").attributes("data-visible")).toBe("false");
   });
 
-  it("mounts recommendations lazily and reuses the native open and export actions", async () => {
+  it("mounts recommendations lazily and reuses every single-image native action", async () => {
     wrapper = mountApp();
     await flushPromises();
 
@@ -403,8 +427,16 @@ describe("App page shell", () => {
     expect(wrapper.get("[data-testid='recommendation-page']").attributes("data-visible")).toBe("true");
 
     await wrapper.get("[data-testid='recommendation-open']").trigger("click");
+    await wrapper.get("[data-testid='recommendation-reveal']").trigger("click");
+    await wrapper.get("[data-testid='recommendation-copy-image']").trigger("click");
+    await wrapper.get("[data-testid='recommendation-copy-file']").trigger("click");
+    await wrapper.get("[data-testid='recommendation-copy-path']").trigger("click");
     await wrapper.get("[data-testid='recommendation-export']").trigger("click");
     expect(nativeActionMocks.open).toHaveBeenCalledWith("recommendation-media-1");
+    expect(nativeActionMocks.reveal).toHaveBeenCalledWith("recommendation-media-1");
+    expect(nativeActionMocks.copyImage).toHaveBeenCalledWith("recommendation-media-1");
+    expect(nativeActionMocks.copyFiles).toHaveBeenCalledWith(["recommendation-media-1"]);
+    expect(nativeActionMocks.copyPaths).toHaveBeenCalledWith(["recommendation-media-1"]);
     expect(nativeActionMocks.exportImages).toHaveBeenCalledWith(["recommendation-media-1"]);
   });
 

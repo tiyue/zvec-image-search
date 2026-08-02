@@ -19,7 +19,9 @@ import com.zvec.lanviewer.data.model.DiscoveredServer
 import com.zvec.lanviewer.data.model.OriginalMediaItem
 import com.zvec.lanviewer.data.model.RecommendationAction
 import com.zvec.lanviewer.data.model.RecommendationActionRequest
+import com.zvec.lanviewer.data.model.RecommendationActionResponse
 import com.zvec.lanviewer.data.model.RecommendationItem
+import com.zvec.lanviewer.data.model.RecommendationPreference
 import com.zvec.lanviewer.data.model.RecommendationRequest
 import com.zvec.lanviewer.data.model.RecommendationShownRequest
 import com.zvec.lanviewer.data.model.SearchItem
@@ -55,6 +57,63 @@ import java.util.UUID
 
 private const val RECOMMENDATION_SHOWN_RETRY_INITIAL_DELAY_MILLIS = 1_000L
 private const val RECOMMENDATION_SHOWN_RETRY_MAX_DELAY_MILLIS = 30_000L
+
+internal fun recommendationReactions(
+    items: List<RecommendationItem>,
+): Map<String, RecommendationAction> = items.mapNotNull { item ->
+    val action = when (item.preference) {
+        RecommendationPreference.LIKE -> RecommendationAction.LIKE
+        RecommendationPreference.DISLIKE -> RecommendationAction.DISLIKE
+        null -> null
+    }
+    action?.let { item.itemId to it }
+}.toMap()
+
+internal fun canSubmitRecommendationReaction(
+    reactions: Map<String, RecommendationAction>,
+    pendingItemIds: Set<String>,
+    itemId: String,
+    action: RecommendationAction,
+): Boolean = action in setOf(RecommendationAction.LIKE, RecommendationAction.DISLIKE) &&
+    itemId !in pendingItemIds && reactions[itemId] != action
+
+internal fun recommendationActionEventIdsAfterSuccess(
+    actionEventIds: Map<String, String>,
+    itemId: String,
+    action: RecommendationAction,
+): Map<String, String> {
+    if (action !in setOf(RecommendationAction.LIKE, RecommendationAction.DISLIKE)) {
+        return actionEventIds - "$itemId:${action.name}"
+    }
+    return actionEventIds -
+        "$itemId:${RecommendationAction.LIKE.name}" -
+        "$itemId:${RecommendationAction.DISLIKE.name}"
+}
+
+internal fun recommendationReactionsAfterActionSuccess(
+    reactions: Map<String, RecommendationAction>,
+    itemId: String,
+    requestedAction: RecommendationAction,
+    response: RecommendationActionResponse,
+): Map<String, RecommendationAction> {
+    if (requestedAction !in setOf(RecommendationAction.LIKE, RecommendationAction.DISLIKE)) {
+        return reactions
+    }
+    val confirmedAction = if (response.preferenceProvided) {
+        when (response.preference) {
+            RecommendationPreference.LIKE -> RecommendationAction.LIKE
+            RecommendationPreference.DISLIKE -> RecommendationAction.DISLIKE
+            null -> null
+        }
+    } else {
+        requestedAction
+    }
+    return if (confirmedAction == null) {
+        reactions - itemId
+    } else {
+        reactions + (itemId to confirmedAction)
+    }
+}
 
 internal suspend fun retryRecommendationShown(
     isCurrentBatch: () -> Boolean,
@@ -461,6 +520,7 @@ class AppViewModel(
                             items = response.items.toPersistentList(),
                             partial = response.partial,
                             partialReason = response.partialReason,
+                            reactions = recommendationReactions(response.items),
                         ),
                     )
                 }
@@ -523,8 +583,16 @@ class AppViewModel(
     }
 
     fun reactToRecommendation(itemId: String, action: RecommendationAction) {
-        if (action !in setOf(RecommendationAction.LIKE, RecommendationAction.DISLIKE)) return
-        val item = _state.value.recommendations.items.firstOrNull { it.itemId == itemId } ?: return
+        val recommendations = _state.value.recommendations
+        if (
+            !canSubmitRecommendationReaction(
+                reactions = recommendations.reactions,
+                pendingItemIds = recommendations.pendingReactionItemIds,
+                itemId = itemId,
+                action = action,
+            )
+        ) return
+        val item = recommendations.items.firstOrNull { it.itemId == itemId } ?: return
         recordRecommendationAction(item, action)
     }
 
@@ -551,7 +619,7 @@ class AppViewModel(
         }
         recommendationActionJob = viewModelScope.launch {
             try {
-                repository.recordRecommendationAction(
+                val response = repository.recordRecommendationAction(
                     batchId,
                     RecommendationActionRequest(eventId, item.itemId, action, metadata),
                 )
@@ -559,10 +627,17 @@ class AppViewModel(
                     if (current.recommendations.batchId != batchId) return@update current
                     current.copy(
                         recommendations = current.recommendations.copy(
-                            reactions = if (action in setOf(RecommendationAction.LIKE, RecommendationAction.DISLIKE)) {
-                                current.recommendations.reactions + (item.itemId to action)
-                            } else current.recommendations.reactions,
-                            actionEventIds = current.recommendations.actionEventIds - actionKey,
+                            reactions = recommendationReactionsAfterActionSuccess(
+                                current.recommendations.reactions,
+                                item.itemId,
+                                action,
+                                response,
+                            ),
+                            actionEventIds = recommendationActionEventIdsAfterSuccess(
+                                current.recommendations.actionEventIds,
+                                item.itemId,
+                                action,
+                            ),
                             pendingActionKeys = current.recommendations.pendingActionKeys - actionKey,
                             pendingReactionItemIds = if (action in setOf(RecommendationAction.LIKE, RecommendationAction.DISLIKE)) {
                                 current.recommendations.pendingReactionItemIds - item.itemId

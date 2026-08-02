@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import tempfile
 import threading
 import unittest
@@ -7,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from image_vector_service.recommendation_store import (
+    _MAX_PROFILE_EVENTS,
     RecommendationBatchItem,
     RecommendationStore,
 )
@@ -20,6 +22,23 @@ def _item(number: int, *, position: int = 0) -> RecommendationBatchItem:
         library_id="library-a",
         doc_id=f"doc-{number}",
         sha256=f"sha-{number}",
+        slot="random",
+    )
+
+
+def _shared_item(
+    number: int,
+    *,
+    item_id: str,
+    sha256: str,
+) -> RecommendationBatchItem:
+    return RecommendationBatchItem(
+        item_id=item_id,
+        position=0,
+        candidate_id=f"library-a:doc-{number}",
+        library_id="library-a",
+        doc_id=f"doc-{number}",
+        sha256=sha256,
         slot="random",
     )
 
@@ -57,25 +76,223 @@ class RecommendationStoreTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.store.create_batch("android-a", "request-2", (_item(1),))
 
-    def test_history_is_isolated_by_viewer_and_limited_to_sixty(self) -> None:
-        for number in range(65):
+    def test_history_is_isolated_by_viewer_and_limited_to_240(self) -> None:
+        for number in range(245):
             batch = self.store.create_batch(
                 "desktop", f"request-{number}", (_item(number),)
             )
             self.assertTrue(
                 self.store.mark_shown("desktop", batch.batch_id, f"shown-{number}")
             )
-        android = self.store.create_batch("android-a", "request-a", (_item(99),))
+        android = self.store.create_batch("android-a", "request-a", (_item(999),))
         self.assertTrue(
-            self.store.mark_shown("android-a", android.batch_id, "shown-99")
+            self.store.mark_shown("android-a", android.batch_id, "shown-999")
         )
 
-        desktop = self.store.recent_sha256("desktop", limit=60)
+        desktop = self.store.recent_sha256("desktop", limit=240)
 
-        self.assertEqual(len(desktop), 60)
-        self.assertEqual(desktop[0], "sha-64")
+        self.assertEqual(len(desktop), 240)
+        self.assertEqual(desktop[0], "sha-244")
         self.assertEqual(desktop[-1], "sha-5")
-        self.assertEqual(self.store.recent_sha256("android-a", limit=60), ("sha-99",))
+        self.assertEqual(self.store.recent_sha256("android-a", limit=240), ("sha-999",))
+        with self.assertRaises(ValueError):
+            self.store.recent_sha256("desktop", limit=241)
+
+    def test_final_preference_uses_latest_cross_viewer_sequence(self) -> None:
+        desktop = self.store.create_batch(
+            "desktop",
+            "desktop-request",
+            (_shared_item(1, item_id="desktop-item", sha256="shared-sha"),),
+        )
+        android = self.store.create_batch(
+            "android-a",
+            "android-request",
+            (_shared_item(2, item_id="android-item", sha256="shared-sha"),),
+        )
+
+        self.assertTrue(
+            self.store.record_action(
+                "desktop", desktop.batch_id, "desktop-like", "desktop-item", "like"
+            )
+        )
+        self.assertTrue(
+            self.store.record_action(
+                "android-a",
+                android.batch_id,
+                "android-dislike",
+                "android-item",
+                "dislike",
+            )
+        )
+        for sequence in range(100):
+            self.store.record_action(
+                "android-a",
+                android.batch_id,
+                f"android-history-{sequence}",
+                "android-item",
+                "like" if sequence % 2 == 0 else "dislike",
+            )
+        self.store.record_action(
+            "desktop", desktop.batch_id, "desktop-export", "desktop-item", "export"
+        )
+        self.store.close()
+        self.store = RecommendationStore(self.path)
+        latest = self.store.final_preferences(["shared-sha", "missing-sha"])
+
+        self.assertEqual(len(latest), 1)
+        self.assertEqual(set(latest), {"shared-sha"})
+        self.assertEqual(latest["shared-sha"].action, "dislike")
+        self.assertEqual(latest["shared-sha"].library_id, "library-a")
+        self.assertEqual(latest["shared-sha"].doc_id, "doc-2")
+        self.assertEqual(
+            self.store.record_action_with_preference(
+                "android-a",
+                android.batch_id,
+                "android-dislike",
+                "android-item",
+                "dislike",
+            ),
+            (False, "dislike"),
+        )
+        self.assertEqual(
+            self.store.final_preferences(["shared-sha"])["shared-sha"].action,
+            "dislike",
+        )
+
+        self.assertTrue(
+            self.store.record_action(
+                "desktop", desktop.batch_id, "desktop-like-2", "desktop-item", "like"
+            )
+        )
+        self.assertEqual(
+            self.store.final_preferences(["shared-sha"])["shared-sha"].action,
+            "like",
+        )
+
+    def test_recent_final_preferences_are_distinct_and_bounded(self) -> None:
+        for number, action in enumerate(("like", "dislike", "like"), 1):
+            batch = self.store.create_batch(
+                f"viewer-{number}",
+                f"request-{number}",
+                (
+                    _shared_item(
+                        number,
+                        item_id=f"preference-item-{number}",
+                        sha256="same-sha" if number < 3 else "new-sha",
+                    ),
+                ),
+            )
+            self.store.record_action(
+                f"viewer-{number}",
+                batch.batch_id,
+                f"preference-event-{number}",
+                f"preference-item-{number}",
+                action,
+            )
+
+        latest = self.store.recent_final_preferences(limit=1)
+        complete = self.store.recent_final_preferences(limit=256)
+
+        self.assertEqual(len(latest), 1)
+        self.assertEqual(latest[0].sha256, "new-sha")
+        self.assertEqual(latest[0].action, "like")
+        self.assertEqual([item.sha256 for item in complete], ["new-sha", "same-sha"])
+        self.assertEqual(complete[1].action, "dislike")
+        with self.assertRaises(ValueError):
+            self.store.recent_final_preferences(limit=257)
+
+    def test_recent_preference_profile_uses_a_bounded_indexed_event_horizon(
+        self,
+    ) -> None:
+        old_batch = self.store.create_batch(
+            "desktop",
+            "old-profile-request",
+            (_shared_item(1, item_id="old-profile-item", sha256="old-profile-sha"),),
+        )
+        hot_batch = self.store.create_batch(
+            "android-a",
+            "hot-profile-request",
+            (_shared_item(2, item_id="hot-profile-item", sha256="hot-profile-sha"),),
+        )
+        self.store.record_action(
+            "desktop",
+            old_batch.batch_id,
+            "old-profile-like",
+            "old-profile-item",
+            "like",
+        )
+        for number in range(_MAX_PROFILE_EVENTS + 1):
+            self.store.record_action(
+                "android-a",
+                hot_batch.batch_id,
+                f"hot-profile-event-{number}",
+                "hot-profile-item",
+                "like" if number % 2 == 0 else "dislike",
+            )
+
+        profile = self.store.recent_final_preferences(limit=256)
+
+        self.assertEqual(
+            [(preference.sha256, preference.action) for preference in profile],
+            [("hot-profile-sha", "like")],
+        )
+        self.assertEqual(
+            self.store.final_preferences(["old-profile-sha"])["old-profile-sha"].action,
+            "like",
+        )
+
+    def test_recent_preference_profile_query_uses_partial_covering_index(self) -> None:
+        connection = sqlite3.connect(self.path)
+        try:
+            details = [
+                str(row[3])
+                for row in connection.execute(
+                    "EXPLAIN QUERY PLAN "
+                    "SELECT items.sha256, events.action, items.library_id, "
+                    "items.doc_id, events.sequence "
+                    "FROM events INDEXED BY idx_events_preference_sequence "
+                    "JOIN items ON items.item_id = events.item_id "
+                    "WHERE events.action IN ('like', 'dislike') "
+                    "ORDER BY events.sequence DESC LIMIT ?",
+                    (_MAX_PROFILE_EVENTS,),
+                )
+            ]
+        finally:
+            connection.close()
+
+        self.assertTrue(
+            any("idx_events_preference_sequence" in detail for detail in details),
+            details,
+        )
+        self.assertFalse(any("TEMP B-TREE" in detail for detail in details), details)
+
+    def test_candidate_preference_query_is_not_limited_by_profile_window(self) -> None:
+        for number in range(260):
+            batch = self.store.create_batch(
+                "desktop",
+                f"profile-request-{number}",
+                (
+                    _shared_item(
+                        number,
+                        item_id=f"profile-item-{number}",
+                        sha256=f"profile-sha-{number}",
+                    ),
+                ),
+            )
+            self.store.record_action(
+                "desktop",
+                batch.batch_id,
+                f"profile-event-{number}",
+                f"profile-item-{number}",
+                "like",
+            )
+
+        profile = self.store.recent_final_preferences(limit=256)
+        oldest = self.store.final_preferences(["profile-sha-0"])
+
+        self.assertEqual(len(profile), 256)
+        self.assertNotIn("profile-sha-0", {item.sha256 for item in profile})
+        self.assertEqual(oldest["profile-sha-0"].action, "like")
 
     def test_shown_once_counts_every_batch_sha_and_actions_are_event_idempotent(
         self,

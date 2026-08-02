@@ -447,7 +447,7 @@ class PreviewLanAdapter:
         *,
         client_id: str,
         device_id: str,
-    ) -> None:
+    ) -> Mapping[str, object]:
         _client_id(client_id)
         backend = self._recommendation_backend
         if backend is None:
@@ -457,7 +457,7 @@ class PreviewLanAdapter:
                 status=503,
             )
         try:
-            backend.record_recommendation_action(
+            response = backend.record_recommendation_action(
                 batch_id,
                 event_id,
                 item_id,
@@ -467,6 +467,17 @@ class PreviewLanAdapter:
             )
         except Exception as exc:
             raise _adapter_failure(exc, "recommendations_unavailable", 503) from exc
+        if not isinstance(response, Mapping):
+            raise LanBackendError(
+                "recommendations_unavailable",
+                "图片推荐操作状态不可用。",
+                status=503,
+            )
+        preference = response.get("preference")
+        return {
+            "recorded": response.get("recorded") is True,
+            "preference": preference if preference in {"like", "dislike"} else None,
+        }
 
     def resolve_original(
         self,

@@ -32,12 +32,19 @@ class _State:
     def __init__(self, values: list[tuple[dict[str, Any], dict[str, Any] | None]]):
         self.values = values
         self.calls: list[tuple[str, int]] = []
+        self.get_many_calls: list[tuple[str, ...]] = []
 
     def sample_recommendation_entries(
         self, *, random_cursor: str, limit_per_pool: int
     ) -> list[tuple[dict[str, Any], dict[str, Any] | None]]:
         self.calls.append((random_cursor, limit_per_pool))
         return self.values
+
+    def get_many(self, doc_ids: list[str]) -> dict[str, dict[str, Any]]:
+        normalized = tuple(doc_ids)
+        self.get_many_calls.append(normalized)
+        entries = {str(entry["doc_id"]): entry for entry, _annotation in self.values}
+        return {doc_id: entries[doc_id] for doc_id in normalized if doc_id in entries}
 
 
 class _Repository:
@@ -113,6 +120,26 @@ class RecommendationServiceTests(unittest.TestCase):
         self.assertEqual(candidate["character"], "刻晴")
         self.assertEqual(candidate["album_id"], "root-a\0album")
         self.assertEqual(candidate["tags"], ["人工", "文件夹", "刻晴", "继承"])
+
+    def test_preference_vectors_are_bounded_and_read_existing_vectors_only(
+        self,
+    ) -> None:
+        values = [(_entry(index), None) for index in range(256)]
+        service, state, repository = self._service(values)
+        doc_ids = [str(entry["doc_id"]) for entry, _annotation in values]
+
+        result = service.load_recommendation_vectors(doc_ids)
+
+        self.assertEqual(state.get_many_calls, [tuple(doc_ids)])
+        self.assertEqual([len(call) for call in repository.calls], [256])
+        self.assertEqual(len(result["items"]), 256)
+        self.assertEqual(
+            result["vector_space"],
+            {"model": "embedding-v1", "dimension": 2, "metric": "COSINE"},
+        )
+        self.assertEqual(set(result["items"][0]), {"doc_id", "sha256", "vector"})
+        with self.assertRaises(ValueError):
+            service.load_recommendation_vectors([*doc_ids, "overflow"])
 
 
 if __name__ == "__main__":

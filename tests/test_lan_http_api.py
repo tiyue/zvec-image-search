@@ -169,10 +169,11 @@ class _FakeBackend:
         *,
         client_id: str,
         device_id: str,
-    ) -> None:
+    ) -> dict[str, object]:
         self.recommendation_actions.append(
             (batch_id, event_id, item_id, action, client_id, device_id, metadata)
         )
+        return {"recorded": False, "preference": "dislike"}
 
 
 class _FakeResolver:
@@ -984,7 +985,15 @@ class LanHttpApiTests(unittest.TestCase):
         self.assertEqual(shown.status, 200)
         self.assertEqual(shown.json(), {"ok": True, "event_id": "event-shown-1"})
         self.assertEqual(action.status, 200)
-        self.assertEqual(action.json(), {"ok": True, "event_id": "event-action-1"})
+        self.assertEqual(
+            action.json(),
+            {
+                "ok": True,
+                "event_id": "event-action-1",
+                "recorded": False,
+                "preference": "dislike",
+            },
+        )
         self.assertEqual(
             self.backend.recommendation_created,
             [("request-1", self.client_id, "android-install-main")],

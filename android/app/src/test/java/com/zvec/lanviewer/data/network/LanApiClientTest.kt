@@ -5,6 +5,7 @@ import com.zvec.lanviewer.data.local.SavedConnection
 import com.zvec.lanviewer.data.model.PairRequest
 import com.zvec.lanviewer.data.model.RecommendationAction
 import com.zvec.lanviewer.data.model.RecommendationActionRequest
+import com.zvec.lanviewer.data.model.RecommendationPreference
 import com.zvec.lanviewer.data.model.RecommendationRequest
 import com.zvec.lanviewer.data.model.RecommendationShownRequest
 import com.zvec.lanviewer.data.model.SearchPageResult
@@ -20,6 +21,7 @@ import okhttp3.mockwebserver.RecordedRequest
 import okhttp3.mockwebserver.SocketPolicy
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -248,5 +250,28 @@ class LanApiClientTest {
             "{\"event_id\":\"action-1\",\"item_id\":\"i1\",\"action\":\"export\",\"metadata\":{\"channel\":\"save\"}}",
             action.body.readUtf8(),
         )
+    }
+
+    @Test
+    fun recommendationActionResponseDistinguishesPreferenceFromLegacyAndClear() = runBlocking {
+        server.enqueue(MockResponse().setResponseCode(200).setBody("""{"preference":"dislike"}"""))
+        server.enqueue(MockResponse().setResponseCode(200).setBody("{}"))
+        server.enqueue(MockResponse().setResponseCode(200).setBody("""{"preference":null}"""))
+        val request = RecommendationActionRequest(
+            eventId = "action-1",
+            itemId = "i1",
+            action = RecommendationAction.LIKE,
+        )
+
+        val serverFinal = client.recordRecommendationAction("b1", request)
+        val legacy = client.recordRecommendationAction("b1", request)
+        val cleared = client.recordRecommendationAction("b1", request)
+
+        assertTrue(serverFinal.preferenceProvided)
+        assertEquals(RecommendationPreference.DISLIKE, serverFinal.preference)
+        assertFalse(legacy.preferenceProvided)
+        assertNull(legacy.preference)
+        assertTrue(cleared.preferenceProvided)
+        assertNull(cleared.preference)
     }
 }

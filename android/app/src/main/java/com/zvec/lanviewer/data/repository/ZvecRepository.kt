@@ -17,6 +17,7 @@ import com.zvec.lanviewer.data.model.PairRequest
 import com.zvec.lanviewer.data.model.PairStartResponse
 import com.zvec.lanviewer.data.model.QueryImageResponse
 import com.zvec.lanviewer.data.model.RecommendationActionRequest
+import com.zvec.lanviewer.data.model.RecommendationActionResponse
 import com.zvec.lanviewer.data.model.RecommendationRequest
 import com.zvec.lanviewer.data.model.RecommendationShownRequest
 import com.zvec.lanviewer.data.model.RecommendationsResponse
@@ -104,8 +105,10 @@ class ZvecRepository(
     suspend fun markRecommendationsShown(batchId: String, request: RecommendationShownRequest) =
         api.markRecommendationsShown(batchId, request)
 
-    suspend fun recordRecommendationAction(batchId: String, request: RecommendationActionRequest) =
-        api.recordRecommendationAction(batchId, request)
+    suspend fun recordRecommendationAction(
+        batchId: String,
+        request: RecommendationActionRequest,
+    ): RecommendationActionResponse = api.recordRecommendationAction(batchId, request)
 
     suspend fun uploadQueryImage(
         contentResolver: ContentResolver,

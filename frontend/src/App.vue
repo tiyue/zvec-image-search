@@ -419,6 +419,14 @@ async function exportRecommendedImage(mediaId: string): Promise<boolean> {
   return (nativeActions.exportJob.value?.exported ?? 0) > 0;
 }
 
+function copyRecommendedFile(mediaId: string): Promise<boolean> {
+  return nativeActions.copyFiles([mediaId]);
+}
+
+function copyRecommendedPath(mediaId: string): Promise<boolean> {
+  return nativeActions.copyPaths([mediaId]);
+}
+
 async function markContextFeedback(action: "relevant" | "not_relevant"): Promise<void> {
   const item = contextFeedbackItem.value;
   if (!item) return;
@@ -877,6 +885,10 @@ watch(
           :visible="activePage === 'recommendations'"
           :export-busy="nativeActions.exporting.value"
           :open-image="nativeActions.open"
+          :reveal-image="nativeActions.reveal"
+          :copy-image="nativeActions.copyImage"
+          :copy-file="copyRecommendedFile"
+          :copy-path="copyRecommendedPath"
           :export-image="exportRecommendedImage"
           @toast="handleFeatureToast"
         />

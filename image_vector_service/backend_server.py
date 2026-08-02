@@ -44,11 +44,14 @@ from .recommendation_store import (
     RecommendationBatch,
     RecommendationBatchItem,
     RecommendationStore,
+    SharedPreference,
 )
 from .recommendations import (
     SLOT_QUOTAS,
+    PreferenceVector,
     RecommendationCandidate,
     RecommendationSelection,
+    personalize_candidates,
     select_recommendations,
 )
 from .result_exporter import search_report_payload
@@ -1397,10 +1400,16 @@ class BackendJobManager:
             raise BackendRequestError(
                 "invalid_request", "Recommendation action is invalid."
             )
-        recorded = self._recommendation_call(
-            lambda store: store.record_action(viewer, batch, event, item, action)
+        recorded, preference = self._recommendation_call(
+            lambda store: store.record_action_with_preference(
+                viewer, batch, event, item, action
+            )
         )
-        return {"recorded": recorded, "event_id": event}
+        return {
+            "recorded": recorded,
+            "event_id": event,
+            "preference": preference,
+        }
 
     def _recommendation_call(
         self,
@@ -1451,11 +1460,15 @@ class BackendJobManager:
         existing = store.batch_for_request(viewer_id, request_id)
         if existing is not None:
             items = self._reload_recommendation_items(existing.items)
+            preferences = _recommendation_final_preferences(
+                store, (item.sha256 for item in existing.items)
+            )
             return _recommendation_response(
                 existing,
-                items,
+                _recommendation_items_with_preferences(existing, items, preferences),
                 history_window=0,
                 diversity=_replayed_recommendation_diversity(),
+                personalization=_replayed_recommendation_personalization(),
             )
 
         candidates, vector_spaces = self._collect_recommendation_candidates(
@@ -1463,7 +1476,15 @@ class BackendJobManager:
             viewer_id,
             request_id,
         )
+        preferences = _recommendation_final_preferences(
+            store, (candidate.sha256 for candidate in candidates)
+        )
         diversity = _recommendation_diversity(vector_spaces, candidates)
+        candidates, personalization = self._personalize_recommendation_candidates(
+            store,
+            candidates,
+            diversity,
+        )
         if not diversity["applied"]:
             candidates = tuple(
                 replace(candidate, vector=None) for candidate in candidates
@@ -1471,6 +1492,7 @@ class BackendJobManager:
         selection = select_recommendations(
             candidates,
             recent_sha256=store.recent_sha256(viewer_id),
+            excluded_sha256=preferences,
             rng_seed=_recommendation_seed(viewer_id, request_id),
         )
         selected_items = self._reload_recommendation_items(
@@ -1509,10 +1531,140 @@ class BackendJobManager:
         response_items = self._reload_recommendation_items(batch.items)
         return _recommendation_response(
             batch,
-            response_items,
+            _recommendation_items_with_preferences(batch, response_items, preferences),
             history_window=selection.history_window,
             diversity=diversity,
+            personalization=personalization,
         )
+
+    def _personalize_recommendation_candidates(
+        self,
+        store: RecommendationStore,
+        candidates: tuple[RecommendationCandidate, ...],
+        diversity: Mapping[str, object],
+    ) -> tuple[tuple[RecommendationCandidate, ...], dict[str, object]]:
+        preferences = store.recent_final_preferences(limit=256)
+        if not preferences:
+            return candidates, {
+                "applied": False,
+                "effective_count": 0,
+                "reason": "insufficient_preferences",
+            }
+        try:
+            vectors, vector_spaces = self._load_recommendation_preference_vectors(
+                preferences
+            )
+        except Exception:
+            return candidates, {
+                "applied": False,
+                "effective_count": 0,
+                "reason": "vectors_unavailable",
+            }
+        effective_count = len(vectors)
+        if effective_count == 0:
+            return candidates, {
+                "applied": False,
+                "effective_count": 0,
+                "reason": "vectors_unavailable",
+            }
+        if effective_count < 10:
+            return candidates, {
+                "applied": False,
+                "effective_count": effective_count,
+                "reason": "insufficient_preferences",
+            }
+        if (
+            space_reason := _recommendation_personalization_space_reason(
+                diversity, vector_spaces
+            )
+        ) is not None:
+            return candidates, {
+                "applied": False,
+                "effective_count": effective_count,
+                "reason": space_reason,
+            }
+        result = personalize_candidates(candidates, vectors)
+        return result.candidates, {
+            "applied": result.applied,
+            "effective_count": result.effective_count,
+            "reason": result.reason,
+        }
+
+    def _load_recommendation_preference_vectors(
+        self,
+        preferences: Sequence[SharedPreference],
+    ) -> tuple[tuple[PreferenceVector, ...], tuple[dict[str, object], ...]]:
+        by_library: dict[str, list[SharedPreference]] = {}
+        for preference in preferences:
+            by_library.setdefault(preference.library_id, []).append(preference)
+        futures: list[tuple[str, tuple[SharedPreference, ...], Future[Any]]] = []
+        for library_id, library_preferences in by_library.items():
+            worker = self._library_workers.get(library_id)
+            if worker is None:
+                continue
+            materialized = tuple(library_preferences)
+            selected_doc_ids = tuple(
+                dict.fromkeys(item.doc_id for item in materialized)
+            )
+
+            def load_vectors(
+                service: Any,
+                *,
+                doc_ids: tuple[str, ...] = selected_doc_ids,
+            ) -> Any:
+                return service.load_recommendation_vectors(list(doc_ids))
+
+            submission = worker.submit(
+                None,
+                load_vectors,
+                priority=_JobPriority.HIGH,
+            )
+            futures.append((library_id, materialized, submission.future))
+
+        vectors: list[PreferenceVector] = []
+        spaces: list[dict[str, object]] = []
+        for _library_id, materialized_preferences, future in futures:
+            result = future.result()
+            if not isinstance(result, Mapping):
+                continue
+            vector_space = _recommendation_vector_space(result.get("vector_space"))
+            values = result.get("items")
+            if vector_space is None or not isinstance(values, list):
+                continue
+            by_doc: dict[str, list[SharedPreference]] = {}
+            for preference in materialized_preferences:
+                by_doc.setdefault(preference.doc_id, []).append(preference)
+            loaded: list[PreferenceVector] = []
+            loaded_sha256: set[str] = set()
+            for value in values:
+                if not isinstance(value, Mapping):
+                    continue
+                doc_id = value.get("doc_id")
+                sha256 = value.get("sha256")
+                vector = _recommendation_existing_vector(value.get("vector"))
+                if (
+                    not isinstance(doc_id, str)
+                    or not isinstance(sha256, str)
+                    or vector is None
+                ):
+                    continue
+                for preference in by_doc.get(doc_id, ()):
+                    if (
+                        preference.sha256 == sha256
+                        and preference.sha256 not in loaded_sha256
+                    ):
+                        if preference.action not in {"like", "dislike"}:
+                            continue
+                        action: Literal["like", "dislike"] = (
+                            "like" if preference.action == "like" else "dislike"
+                        )
+                        loaded.append(PreferenceVector(action, vector))
+                        loaded_sha256.add(preference.sha256)
+                        break
+            if loaded:
+                vectors.extend(loaded)
+                spaces.append(vector_space)
+        return tuple(vectors), tuple(spaces)
 
     def _collect_recommendation_candidates(
         self,
@@ -1536,7 +1688,7 @@ class BackendJobManager:
             ) -> Any:
                 return service.collect_recommendation_candidates(
                     random_cursor=random_cursor,
-                    limit_per_pool=100,
+                    limit_per_pool=256,
                 )
 
             submission = self._library_workers[library.library_id].submit(
@@ -4619,6 +4771,17 @@ def _recommendation_exposure_counts(
     return result
 
 
+def _recommendation_final_preferences(
+    store: RecommendationStore,
+    sha256_values: Iterable[str],
+) -> dict[str, SharedPreference]:
+    values = tuple(dict.fromkeys(value for value in sha256_values if value))
+    result: dict[str, SharedPreference] = {}
+    for offset in range(0, len(values), 800):
+        result.update(store.final_preferences(values[offset : offset + 800]))
+    return result
+
+
 def _recommendation_vector_space(value: object) -> dict[str, object] | None:
     if not isinstance(value, Mapping):
         return None
@@ -4640,6 +4803,20 @@ def _recommendation_vector_space(value: object) -> dict[str, object] | None:
         "dimension": dimension,
         "metric": metric.strip(),
     }
+
+
+def _recommendation_existing_vector(value: object) -> tuple[float, ...] | None:
+    if not isinstance(value, (list, tuple)):
+        return None
+    try:
+        vector = tuple(float(item) for item in value)
+    except (TypeError, ValueError):
+        return None
+    if not vector or not all(math.isfinite(item) for item in vector):
+        return None
+    if not any(item != 0 for item in vector):
+        return None
+    return vector
 
 
 def _recommendation_candidate(
@@ -4752,12 +4929,59 @@ def _recommendation_diversity(
     }
 
 
+def _recommendation_personalization_space_reason(
+    diversity: Mapping[str, object],
+    preference_spaces: Sequence[dict[str, object]],
+) -> str | None:
+    if diversity.get("applied") is not True:
+        if diversity.get("reason") == "incompatible_vector_spaces":
+            return "incompatible_vector_spaces"
+        return "vectors_unavailable"
+    candidate_space = _recommendation_vector_space(diversity.get("vector_space"))
+    if candidate_space is None or not preference_spaces:
+        return "vectors_unavailable"
+    serialized = {
+        json.dumps(space, separators=(",", ":"), sort_keys=True)
+        for space in preference_spaces
+    }
+    if len(serialized) != 1:
+        return "incompatible_vector_spaces"
+    if next(iter(serialized)) != json.dumps(
+        candidate_space, separators=(",", ":"), sort_keys=True
+    ):
+        return "incompatible_vector_spaces"
+    return None
+
+
 def _replayed_recommendation_diversity() -> dict[str, object]:
     return {
         "applied": False,
         "reason": "replayed",
         "missing_vectors": 0,
     }
+
+
+def _replayed_recommendation_personalization() -> dict[str, object]:
+    return {
+        "applied": False,
+        "effective_count": 0,
+        "reason": "replayed",
+    }
+
+
+def _recommendation_items_with_preferences(
+    batch: RecommendationBatch,
+    items: Sequence[dict[str, object]],
+    preferences: Mapping[str, SharedPreference],
+) -> list[dict[str, object]]:
+    sha_by_item = {item.item_id: item.sha256 for item in batch.items}
+    result: list[dict[str, object]] = []
+    for item in items:
+        value = dict(item)
+        preference = preferences.get(sha_by_item.get(str(item.get("item_id")), ""))
+        value["preference"] = None if preference is None else preference.action
+        result.append(value)
+    return result
 
 
 def _recommendation_item_payload(
@@ -4767,6 +4991,9 @@ def _recommendation_item_payload(
 ) -> dict[str, object] | None:
     library = catalog.by_id.get(batch_item.library_id)
     if library is None:
+        return None
+    sha256 = value.get("sha256")
+    if not isinstance(sha256, str) or sha256.strip() != batch_item.sha256:
         return None
     source_path = value.get("source_path")
     if not isinstance(source_path, str) or not source_path.strip():
@@ -4811,6 +5038,7 @@ def _recommendation_response(
     *,
     history_window: int,
     diversity: Mapping[str, object],
+    personalization: Mapping[str, object],
     selection: RecommendationSelection | None = None,
 ) -> dict[str, Any]:
     counts = {slot: 0 for slot in SLOT_QUOTAS}
@@ -4823,8 +5051,13 @@ def _recommendation_response(
             }
         )
     else:
+        available_item_ids = {
+            str(item.get("item_id"))
+            for item in items
+            if isinstance(item.get("item_id"), str)
+        }
         for item in batch.items:
-            if item.slot in counts:
+            if item.item_id in available_item_ids and item.slot in counts:
                 counts[item.slot] += 1
     partial = len(items) < sum(SLOT_QUOTAS.values())
     quota_degraded = any(counts[slot] < quota for slot, quota in SLOT_QUOTAS.items())
@@ -4839,6 +5072,7 @@ def _recommendation_response(
         "items": list(items),
         "quota": counts,
         "diversity": dict(diversity),
+        "personalization": dict(personalization),
     }
 
 

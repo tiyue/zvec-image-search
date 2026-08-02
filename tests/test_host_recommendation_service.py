@@ -9,7 +9,7 @@ from typing import Any
 
 from PIL import Image
 
-from zvec_host.recommendation_service import RecommendationService
+from zvec_host.recommendation_service import RecommendationService, _personalization
 from zvec_webview.image_registry import ImageRegistry
 
 
@@ -34,6 +34,12 @@ class _Client:
                     "secret": "must-not-leak",
                 },
             },
+            "personalization": {
+                "applied": True,
+                "effective_count": 12,
+                "reason": None,
+                "viewer_id": "must-not-leak",
+            },
             "items": [
                 {
                     "item_id": "item-1",
@@ -43,6 +49,7 @@ class _Client:
                     "vector": [0.1, 0.2],
                     "width": 80,
                     "height": 120,
+                    "preference": "like",
                 }
             ],
         }
@@ -65,10 +72,23 @@ class _Client:
         self.calls.append(
             ("action", viewer_id, batch_id, event_id, item_id, action, metadata)
         )
-        return {"recorded": True}
+        return {"recorded": False, "preference": "dislike"}
 
 
 class RecommendationServiceTests(unittest.TestCase):
+    def test_personalization_forwards_only_safe_reason_codes(self) -> None:
+        self.assertEqual(
+            _personalization(
+                {"applied": False, "effective_count": 10, "reason": "replayed"}
+            ),
+            {"applied": False, "effective_count": 10, "reason": "replayed"},
+        )
+        self.assertIsNone(
+            _personalization(
+                {"applied": False, "effective_count": 10, "reason": "private-detail"}
+            )["reason"]
+        )
+
     def test_persists_viewer_and_hides_backend_details(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -89,6 +109,12 @@ class RecommendationServiceTests(unittest.TestCase):
             self.assertNotIn("source_path", item)
             self.assertNotIn("vector", item)
             self.assertNotIn(str(source), str(first))
+            self.assertEqual(item["preference"], "like")
+            self.assertEqual(
+                first["personalization"],
+                {"applied": True, "effective_count": 12, "reason": None},
+            )
+            self.assertNotIn("viewer_id", str(first["personalization"]))
             self.assertEqual(
                 first["diversity"]["vector_space"],
                 {"model": "clip-test", "dimension": 1024, "metric": "COSINE"},
@@ -96,11 +122,15 @@ class RecommendationServiceTests(unittest.TestCase):
 
             replacement = RecommendationService(lambda: client, registry, root)
             replacement.mark_recommendations_shown("batch-1", "shown-1")
-            replacement.record_recommendation_action(
+            action = replacement.record_recommendation_action(
                 "batch-1", "action-1", "item-1", "like"
             )
             self.assertEqual(client.calls[1][1], viewer)
             self.assertEqual(client.calls[2][1], viewer)
+            self.assertEqual(
+                action,
+                {"recorded": False, "preference": "dislike"},
+            )
 
     def test_concurrent_first_viewer_read_uses_one_persisted_value(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

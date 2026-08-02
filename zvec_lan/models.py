@@ -151,7 +151,7 @@ class RecommendationBackend(Protocol):
         *,
         client_id: str,
         device_id: str,
-    ) -> None:
+    ) -> Mapping[str, object]:
         """Record one explicit recommendation interaction."""
 
 

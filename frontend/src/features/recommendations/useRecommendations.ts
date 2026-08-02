@@ -16,6 +16,7 @@ import type {
   RecommendationBucket,
   RecommendationItem,
   RecommendationItemWire,
+  RecommendationPersonalizationReason,
   RecommendationPreference,
 } from "./types";
 
@@ -33,6 +34,12 @@ const DEFAULT_QUOTA: Record<RecommendationBucket, number> = {
   low_exposure: 4,
   random: 2,
 };
+const PERSONALIZATION_REASONS = new Set<RecommendationPersonalizationReason>([
+  "insufficient_preferences",
+  "vectors_unavailable",
+  "incompatible_vector_spaces",
+  "replayed",
+]);
 
 interface RecommendationEvents {
   idFactory?: () => string;
@@ -87,6 +94,17 @@ function normalizeBucket(value: unknown): RecommendationBucket {
   return bucket;
 }
 
+function normalizePreference(value: unknown): RecommendationPreference | null {
+  return value === "like" || value === "dislike" ? value : null;
+}
+
+function normalizePersonalizationReason(
+  value: unknown,
+): RecommendationPersonalizationReason | "" {
+  const reason = text(value) as RecommendationPersonalizationReason;
+  return PERSONALIZATION_REASONS.has(reason) ? reason : "";
+}
+
 function normalizeItem(raw: RecommendationItemWire): RecommendationItem {
   const itemId = text(raw.item_id);
   const mediaId = text(raw.media_id);
@@ -108,6 +126,7 @@ function normalizeItem(raw: RecommendationItemWire): RecommendationItem {
     bucket: normalizeBucket(raw.bucket),
     thumbnailUrl,
     previewUrl: safeLocalUrl(raw.preview_url),
+    preference: normalizePreference(raw.preference),
   };
 }
 
@@ -142,6 +161,11 @@ export function normalizeRecommendationBatch(raw: RecommendationBatchWire): Reco
       reason: text(raw.diversity?.reason),
       missingVectors: Math.max(0, integer(raw.diversity?.missing_vectors)),
       vectorSpace: vectorSpace(raw.diversity?.vector_space),
+    },
+    personalization: {
+      applied: raw.personalization?.applied === true,
+      effectiveCount: Math.max(0, integer(raw.personalization?.effective_count)),
+      reason: normalizePersonalizationReason(raw.personalization?.reason),
     },
   };
 }
@@ -266,7 +290,11 @@ export function useRecommendations(
     if (!batch || !visible.value || !documentVisible.value) return false;
     stagedBatch.value = null;
     currentBatch.value = batch;
-    preferences.value = {};
+    preferences.value = Object.fromEntries(
+      batch.items
+        .filter((item) => item.preference !== null)
+        .map((item) => [item.itemId, item.preference as RecommendationPreference]),
+    );
     pendingShown.value = batch.items.length
       ? { batchId: batch.batchId, eventId: idFactory() }
       : null;
@@ -313,17 +341,34 @@ export function useRecommendations(
   async function recordAction(itemId: string, action: RecommendationAction): Promise<boolean> {
     const batch = currentBatch.value;
     if (!batch || !batch.items.some((item) => item.itemId === itemId)) return false;
+    if (isActionPending(itemId)) return false;
     const key = `${batch.batchId}:${itemId}:${action}`;
-    if (pendingActionKeys.value.includes(key)) return false;
     const eventId = retryEventIds.get(key) ?? idFactory();
     const controller = new AbortController();
     actionControllers.add(controller);
     pendingActionKeys.value = [...pendingActionKeys.value, key];
     try {
-      await api.action(batch.batchId, eventId, itemId, action, controller.signal);
-      retryEventIds.delete(key);
-      if ((action === "like" || action === "dislike") && isCurrentBatch(batch.batchId)) {
-        preferences.value = { ...preferences.value, [itemId]: action };
+      const response = await api.action(
+        batch.batchId,
+        eventId,
+        itemId,
+        action,
+        controller.signal,
+      );
+      if (action === "like" || action === "dislike") {
+        retryEventIds.delete(`${batch.batchId}:${itemId}:like`);
+        retryEventIds.delete(`${batch.batchId}:${itemId}:dislike`);
+        if (isCurrentBatch(batch.batchId)) {
+          const preference = response.preference === undefined
+            ? action
+            : normalizePreference(response.preference);
+          const updated = { ...preferences.value };
+          if (preference === null) delete updated[itemId];
+          else updated[itemId] = preference;
+          preferences.value = updated;
+        }
+      } else {
+        retryEventIds.delete(key);
       }
       return true;
     } catch (caught) {

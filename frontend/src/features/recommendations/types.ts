@@ -1,6 +1,11 @@
 export type RecommendationBucket = "quality" | "recent" | "low_exposure" | "random";
 export type RecommendationAction = "open" | "like" | "export" | "dislike";
 export type RecommendationPreference = "like" | "dislike";
+export type RecommendationPersonalizationReason =
+  | "insufficient_preferences"
+  | "vectors_unavailable"
+  | "incompatible_vector_spaces"
+  | "replayed";
 
 export interface RecommendationItemWire {
   item_id?: unknown;
@@ -16,6 +21,7 @@ export interface RecommendationItemWire {
   bucket?: unknown;
   thumbnail_url?: unknown;
   preview_url?: unknown;
+  preference?: unknown;
 }
 
 export interface RecommendationDiversityWire {
@@ -23,6 +29,12 @@ export interface RecommendationDiversityWire {
   reason?: unknown;
   missing_vectors?: unknown;
   vector_space?: unknown;
+}
+
+export interface RecommendationPersonalizationWire {
+  applied?: unknown;
+  effective_count?: unknown;
+  reason?: unknown;
 }
 
 export interface RecommendationBatchWire {
@@ -36,6 +48,7 @@ export interface RecommendationBatchWire {
   items?: RecommendationItemWire[];
   quota?: Partial<Record<RecommendationBucket, unknown>>;
   diversity?: RecommendationDiversityWire;
+  personalization?: RecommendationPersonalizationWire;
 }
 
 export interface RecommendationItem {
@@ -52,6 +65,7 @@ export interface RecommendationItem {
   bucket: RecommendationBucket;
   thumbnailUrl: string;
   previewUrl: string;
+  preference: RecommendationPreference | null;
 }
 
 export interface RecommendationDiversity {
@@ -59,6 +73,12 @@ export interface RecommendationDiversity {
   reason: string;
   missingVectors: number;
   vectorSpace: string;
+}
+
+export interface RecommendationPersonalization {
+  applied: boolean;
+  effectiveCount: number;
+  reason: RecommendationPersonalizationReason | "";
 }
 
 export interface RecommendationBatch {
@@ -72,11 +92,14 @@ export interface RecommendationBatch {
   items: RecommendationItem[];
   quota: Record<RecommendationBucket, number>;
   diversity: RecommendationDiversity;
+  personalization: RecommendationPersonalization;
 }
 
 export interface RecommendationEventResponse {
   ok?: boolean;
   event_id?: string;
+  recorded?: boolean;
+  preference?: unknown;
 }
 
 export interface RecommendationApi {

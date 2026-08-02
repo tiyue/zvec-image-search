@@ -167,6 +167,19 @@ data class RecommendationDiversity(
 )
 
 @Serializable
+enum class RecommendationPreference {
+    @SerialName("like") LIKE,
+    @SerialName("dislike") DISLIKE,
+}
+
+@Serializable
+data class RecommendationPersonalization(
+    val applied: Boolean = false,
+    @SerialName("effective_count") val effectiveCount: Int = 0,
+    val reason: String? = null,
+)
+
+@Serializable
 data class RecommendationItem(
     @SerialName("item_id") val itemId: String,
     @SerialName("media_id") override val mediaId: String,
@@ -182,6 +195,7 @@ data class RecommendationItem(
     @SerialName("thumbnail_url") val thumbnailUrl: String,
     @SerialName("preview_url") val previewUrl: String,
     override val score: Double? = null,
+    val preference: RecommendationPreference? = null,
 ) : OriginalMediaItem
 
 @Serializable
@@ -196,6 +210,7 @@ data class RecommendationsResponse(
     val items: List<RecommendationItem>,
     val quota: RecommendationQuota,
     val diversity: RecommendationDiversity,
+    val personalization: RecommendationPersonalization = RecommendationPersonalization(),
 )
 
 @Serializable
@@ -217,6 +232,11 @@ data class RecommendationActionRequest(
     @SerialName("item_id") val itemId: String,
     val action: RecommendationAction,
     val metadata: Map<String, String>? = null,
+)
+
+data class RecommendationActionResponse(
+    val preferenceProvided: Boolean,
+    val preference: RecommendationPreference?,
 )
 
 @Serializable

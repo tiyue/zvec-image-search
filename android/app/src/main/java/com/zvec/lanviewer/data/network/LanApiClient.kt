@@ -11,6 +11,8 @@ import com.zvec.lanviewer.data.model.PairRequest
 import com.zvec.lanviewer.data.model.PairStartResponse
 import com.zvec.lanviewer.data.model.QueryImageResponse
 import com.zvec.lanviewer.data.model.RecommendationActionRequest
+import com.zvec.lanviewer.data.model.RecommendationActionResponse
+import com.zvec.lanviewer.data.model.RecommendationPreference
 import com.zvec.lanviewer.data.model.RecommendationRequest
 import com.zvec.lanviewer.data.model.RecommendationShownRequest
 import com.zvec.lanviewer.data.model.RecommendationsResponse
@@ -29,6 +31,9 @@ import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.Dispatcher
@@ -134,13 +139,17 @@ class LanApiClient(
         )
     }
 
-    suspend fun recordRecommendationAction(batchId: String, request: RecommendationActionRequest) {
-        executeUnit(
+    suspend fun recordRecommendationAction(
+        batchId: String,
+        request: RecommendationActionRequest,
+    ): RecommendationActionResponse {
+        val payload = executeJson<JsonObject>(
             Request.Builder()
                 .url(currentEndpoint("api", "v1", "recommendations", batchId, "actions"))
                 .post(json.encodeToString(request).jsonBody())
                 .build(),
         )
+        return recommendationActionResponse(payload)
     }
 
     suspend fun uploadQueryImage(
@@ -307,6 +316,26 @@ class LanApiClient(
         private const val MAX_ERROR_BYTES = 64 * 1024
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaTypeOrNull()
     }
+}
+
+internal fun recommendationActionResponse(payload: JsonObject): RecommendationActionResponse {
+    if (!payload.containsKey("preference")) {
+        return RecommendationActionResponse(preferenceProvided = false, preference = null)
+    }
+    val preference = when (val value = payload["preference"]) {
+        null, JsonNull -> null
+        is JsonPrimitive -> if (value.isString) {
+            when (value.content) {
+                "like" -> RecommendationPreference.LIKE
+                "dislike" -> RecommendationPreference.DISLIKE
+                else -> throw IOException("服务器响应格式不兼容")
+            }
+        } else {
+            throw IOException("服务器响应格式不兼容")
+        }
+        else -> throw IOException("服务器响应格式不兼容")
+    }
+    return RecommendationActionResponse(preferenceProvided = true, preference = preference)
 }
 
 internal suspend fun Call.awaitResponse(onCancel: () -> Unit = {}): Response =

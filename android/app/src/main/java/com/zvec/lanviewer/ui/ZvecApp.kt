@@ -38,6 +38,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyGridState
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.itemsIndexed
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
@@ -74,6 +75,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -84,6 +86,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
@@ -119,6 +122,19 @@ fun ZvecApp(viewModel: AppViewModel) {
     val context = LocalContext.current
     val snackbarHostState = remember { SnackbarHostState() }
     val currentItem = state.currentViewerItem()
+    var selectedTab by rememberSaveable { mutableStateOf(MobileTab.SEARCH) }
+    val recommendationGridState = rememberLazyGridState()
+
+    LaunchedEffect(state.activeSearchId, state.results.size) {
+        selectedTab = mobileTabAfterSearchUpdate(
+            selectedTab = selectedTab,
+            hasActiveSearch = state.activeSearchId != null,
+            hasResults = state.results.isNotEmpty(),
+        )
+    }
+    LaunchedEffect(state.phase) {
+        selectedTab = mobileTabAfterPhaseChange(selectedTab, state.phase)
+    }
 
     val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
         uri?.let {
@@ -192,8 +208,11 @@ fun ZvecApp(viewModel: AppViewModel) {
             )
             ConnectionPhase.READY -> SearchScreen(
                 state = state,
+                selectedTab = selectedTab,
+                recommendationGridState = recommendationGridState,
                 modifier = Modifier.padding(padding),
                 mediaUrl = viewModel::mediaUrl,
+                onSelectedTab = { selectedTab = it },
                 onMode = viewModel::setSearchMode,
                 onText = viewModel::setSearchText,
                 onTopK = viewModel::setTopK,
@@ -208,7 +227,6 @@ fun ZvecApp(viewModel: AppViewModel) {
                 onLoadRecommendations = viewModel::loadRecommendations,
                 onRecommendationsVisible = viewModel::onRecommendationsVisible,
                 onOpenRecommendation = viewModel::openRecommendation,
-                onReaction = viewModel::reactToRecommendation,
                 onDisconnect = viewModel::disconnect,
             )
         }
@@ -348,10 +366,13 @@ private fun CenterStatus(title: String, detail: String, modifier: Modifier) {
 }
 
 @Composable
-private fun SearchScreen(
+internal fun SearchScreen(
     state: AppUiState,
+    selectedTab: MobileTab,
+    recommendationGridState: LazyGridState,
     modifier: Modifier,
     mediaUrl: (OriginalMediaItem) -> String,
+    onSelectedTab: (MobileTab) -> Unit,
     onMode: (SearchMode) -> Unit,
     onText: (String) -> Unit,
     onTopK: (String) -> Unit,
@@ -366,14 +387,8 @@ private fun SearchScreen(
     onLoadRecommendations: () -> Unit,
     onRecommendationsVisible: () -> Unit,
     onOpenRecommendation: (Int) -> Unit,
-    onReaction: (String, RecommendationAction) -> Unit,
     onDisconnect: () -> Unit,
 ) {
-    var selectedTab by remember { mutableStateOf(MobileTab.SEARCH) }
-    LaunchedEffect(state.activeSearchId, state.results.size) {
-        if (state.activeSearchId != null && state.results.isNotEmpty()) selectedTab = MobileTab.RESULTS
-    }
-
     Column(modifier.fillMaxSize().statusBarsPadding()) {
         Box(Modifier.weight(1f).fillMaxWidth()) {
             when (selectedTab) {
@@ -410,17 +425,34 @@ private fun SearchScreen(
                     onLoad = onLoadRecommendations,
                     onVisible = onRecommendationsVisible,
                     onOpen = onOpenRecommendation,
-                    onReaction = onReaction,
+                    gridState = recommendationGridState,
                 )
                 MobileTab.DEVICE -> DevicePanel(state = state, onDisconnect = onDisconnect)
             }
         }
 
-        MobileBottomBar(selected = selectedTab, onSelected = { selectedTab = it })
+        MobileBottomBar(selected = selectedTab, onSelected = onSelectedTab)
     }
 }
 
-private enum class MobileTab { SEARCH, RESULTS, RECOMMENDATIONS, DEVICE }
+internal enum class MobileTab { SEARCH, RESULTS, RECOMMENDATIONS, DEVICE }
+
+internal fun mobileTabAfterSearchUpdate(
+    selectedTab: MobileTab,
+    hasActiveSearch: Boolean,
+    hasResults: Boolean,
+): MobileTab = if (
+    selectedTab != MobileTab.RECOMMENDATIONS && hasActiveSearch && hasResults
+) {
+    MobileTab.RESULTS
+} else {
+    selectedTab
+}
+
+internal fun mobileTabAfterPhaseChange(
+    selectedTab: MobileTab,
+    phase: ConnectionPhase,
+): MobileTab = if (phase == ConnectionPhase.READY) selectedTab else MobileTab.SEARCH
 
 @Composable
 private fun MobileBottomBar(selected: MobileTab, onSelected: (MobileTab) -> Unit) {
@@ -443,12 +475,12 @@ private fun MobileBottomBar(selected: MobileTab, onSelected: (MobileTab) -> Unit
 }
 
 @Composable
-private fun RecommendationPanel(
+internal fun RecommendationPanel(
     state: AppUiState,
     onLoad: () -> Unit,
     onVisible: () -> Unit,
     onOpen: (Int) -> Unit,
-    onReaction: (String, RecommendationAction) -> Unit,
+    gridState: LazyGridState,
 ) {
     val recommendations = state.recommendations
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -490,7 +522,8 @@ private fun RecommendationPanel(
         when {
             recommendations.items.isNotEmpty() -> LazyVerticalGrid(
                 columns = GridCells.Fixed(2),
-                modifier = Modifier.fillMaxSize(),
+                state = gridState,
+                modifier = Modifier.fillMaxSize().testTag(RECOMMENDATION_GRID_TAG),
                 contentPadding = PaddingValues(8.dp),
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
                 verticalArrangement = Arrangement.spacedBy(6.dp),
@@ -499,11 +532,7 @@ private fun RecommendationPanel(
                     RecommendationCard(
                         item = item,
                         url = item.thumbnailUrl,
-                        reaction = recommendations.reactions[item.itemId],
-                        reactionPending = item.itemId in recommendations.pendingReactionItemIds,
                         onOpen = { onOpen(index) },
-                        onLike = { onReaction(item.itemId, RecommendationAction.LIKE) },
-                        onDislike = { onReaction(item.itemId, RecommendationAction.DISLIKE) },
                     )
                 }
             }
@@ -518,14 +547,10 @@ private fun RecommendationPanel(
 }
 
 @Composable
-private fun RecommendationCard(
+internal fun RecommendationCard(
     item: RecommendationItem,
     url: String,
-    reaction: RecommendationAction?,
-    reactionPending: Boolean,
     onOpen: () -> Unit,
-    onLike: () -> Unit,
-    onDislike: () -> Unit,
 ) {
     val context = LocalContext.current
     Card(
@@ -547,14 +572,6 @@ private fun RecommendationCard(
                 overflow = TextOverflow.Ellipsis,
                 color = MaterialTheme.colorScheme.secondary,
             )
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-                TextButton(onClick = onDislike, enabled = !reactionPending) {
-                    Text(if (reaction == RecommendationAction.DISLIKE) "已跳过" else "不喜欢")
-                }
-                TextButton(onClick = onLike, enabled = !reactionPending) {
-                    Text(if (reaction == RecommendationAction.LIKE) "已喜欢" else "喜欢")
-                }
-            }
         }
     }
 }
@@ -854,7 +871,7 @@ private fun ResultCard(item: SearchItem, url: String, onClick: () -> Unit) {
 }
 
 @Composable
-private fun OriginalViewer(
+internal fun OriginalViewer(
     state: AppUiState,
     mediaUrl: (OriginalMediaItem) -> String,
     onIndexChanged: (Int) -> Unit,
@@ -928,14 +945,36 @@ private fun OriginalViewer(
                     modifier = Modifier.fillMaxWidth(),
                 ) { Text("分享", modifier = Modifier.fillMaxWidth(), style = MaterialTheme.typography.bodyLarge) }
                 (item as? RecommendationItem)?.let { recommendation ->
+                    val reactionPending = recommendation.itemId in state.recommendations.pendingReactionItemIds
+                    val reaction = state.recommendations.reactions[recommendation.itemId]
                     TextButton(
-                        onClick = { onReaction(recommendation.itemId, RecommendationAction.LIKE) },
+                        onClick = {
+                            sheetItem = null
+                            onReaction(recommendation.itemId, RecommendationAction.LIKE)
+                        },
+                        enabled = !reactionPending && reaction != RecommendationAction.LIKE,
                         modifier = Modifier.fillMaxWidth(),
-                    ) { Text("喜欢", modifier = Modifier.fillMaxWidth(), style = MaterialTheme.typography.bodyLarge) }
+                    ) {
+                        Text(
+                            if (reaction == RecommendationAction.LIKE) "已喜欢" else "喜欢",
+                            modifier = Modifier.fillMaxWidth(),
+                            style = MaterialTheme.typography.bodyLarge,
+                        )
+                    }
                     TextButton(
-                        onClick = { onReaction(recommendation.itemId, RecommendationAction.DISLIKE) },
+                        onClick = {
+                            sheetItem = null
+                            onReaction(recommendation.itemId, RecommendationAction.DISLIKE)
+                        },
+                        enabled = !reactionPending && reaction != RecommendationAction.DISLIKE,
                         modifier = Modifier.fillMaxWidth(),
-                    ) { Text("不喜欢", modifier = Modifier.fillMaxWidth(), style = MaterialTheme.typography.bodyLarge) }
+                    ) {
+                        Text(
+                            if (reaction == RecommendationAction.DISLIKE) "已不喜欢" else "不喜欢",
+                            modifier = Modifier.fillMaxWidth(),
+                            style = MaterialTheme.typography.bodyLarge,
+                        )
+                    }
                 }
                 TextButton(
                     onClick = {
@@ -990,6 +1029,7 @@ private fun ZoomableOriginalImage(url: String, contentDescription: String, rotat
         contentScale = ContentScale.Fit,
         modifier = Modifier
             .fillMaxSize()
+            .testTag(ORIGINAL_VIEWER_IMAGE_TAG)
             .onSizeChanged { viewport = it }
             .graphicsLayer {
                 scaleX = scale
@@ -1070,3 +1110,6 @@ private fun formatBytes(bytes: Long): String {
 
 private fun formatTime(millis: Long): String =
     SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.getDefault()).format(java.util.Date(millis))
+
+internal const val ORIGINAL_VIEWER_IMAGE_TAG = "original-viewer-image"
+internal const val RECOMMENDATION_GRID_TAG = "recommendation-grid"

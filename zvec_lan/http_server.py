@@ -818,7 +818,7 @@ class _LanRequestHandler(BaseHTTPRequestHandler):
         action = _validated_recommendation_action(payload.get("action"))
         metadata = _validated_recommendation_metadata(payload.get("metadata"))
         backend = self._recommendation_backend_or_problem()
-        self._backend_call(
+        action_status = self._backend_call(
             backend.record_recommendation_action,
             batch_id,
             event_id,
@@ -829,7 +829,18 @@ class _LanRequestHandler(BaseHTTPRequestHandler):
             device_id=client.device_id,
         )
         self._require_active_session(client)
-        self._send_json(HTTPStatus.OK, {"ok": True, "event_id": event_id})
+        preference = action_status.get("preference")
+        self._send_json(
+            HTTPStatus.OK,
+            {
+                "ok": True,
+                "event_id": event_id,
+                "recorded": action_status.get("recorded") is True,
+                "preference": (
+                    preference if preference in {"like", "dislike"} else None
+                ),
+            },
+        )
 
     def _recommendation_backend_or_problem(self) -> RecommendationBackend:
         backend = self.gateway._recommendation_backend

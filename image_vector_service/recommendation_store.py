@@ -1,4 +1,4 @@
-"""Device-scoped recommendation batches and successful-display history."""
+"""Device-scoped recommendation history and shared explicit preferences."""
 
 from __future__ import annotations
 
@@ -10,7 +10,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 _MAX_IDENTIFIER_LENGTH = 256
-_MAX_HISTORY = 60
+_MAX_HISTORY = 240
+_MAX_PREFERENCE_QUERY = 900
+_MAX_PROFILE_PREFERENCES = 256
+_MAX_PROFILE_EVENTS = _MAX_PROFILE_PREFERENCES * 16
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,6 +33,15 @@ class RecommendationBatch:
     viewer_id: str
     request_id: str
     items: tuple[RecommendationBatchItem, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class SharedPreference:
+    sha256: str
+    action: str
+    library_id: str
+    doc_id: str
+    sequence: int
 
 
 class RecommendationStore:
@@ -170,8 +182,36 @@ class RecommendationStore:
         normalized_action = _identifier(action, "action")
         if normalized_action == "shown":
             raise ValueError("shown must be recorded through mark_shown")
+        recorded, _preference = self._record_event(
+            viewer_id,
+            batch_id,
+            event_id,
+            item_id,
+            normalized_action,
+            include_preference=False,
+        )
+        return recorded
+
+    def record_action_with_preference(
+        self,
+        viewer_id: str,
+        batch_id: str,
+        event_id: str,
+        item_id: str,
+        action: str,
+    ) -> tuple[bool, str | None]:
+        """Record an action and atomically return the current shared preference."""
+
+        normalized_action = _identifier(action, "action")
+        if normalized_action == "shown":
+            raise ValueError("shown must be recorded through mark_shown")
         return self._record_event(
-            viewer_id, batch_id, event_id, item_id, normalized_action
+            viewer_id,
+            batch_id,
+            event_id,
+            item_id,
+            normalized_action,
+            include_preference=True,
         )
 
     def recent_sha256(
@@ -210,6 +250,81 @@ class RecommendationStore:
             result.update({str(row[0]): int(row[1]) for row in rows})
         return result
 
+    def final_preferences(self, shas: Iterable[str]) -> dict[str, SharedPreference]:
+        """Return the latest explicit preference per SHA across all viewers."""
+
+        normalized = tuple(
+            dict.fromkeys(_identifier(value, "sha256") for value in shas)
+        )
+        if len(normalized) > _MAX_PREFERENCE_QUERY:
+            raise ValueError("at most 900 SHA values are supported")
+        if not normalized:
+            return {}
+        placeholders = ", ".join("?" for _ in normalized)
+        with self._lock:
+            rows = self._connection.execute(
+                "WITH ranked AS ("
+                "SELECT items.sha256, events.action, items.library_id, "
+                "items.doc_id, events.sequence, "
+                "ROW_NUMBER() OVER ("
+                "PARTITION BY items.sha256 ORDER BY events.sequence DESC"
+                ") AS preference_rank "
+                "FROM items JOIN events ON events.item_id = items.item_id "
+                f"WHERE items.sha256 IN ({placeholders}) "
+                "AND events.action IN ('like', 'dislike') "
+                ") "
+                "SELECT sha256, action, library_id, doc_id, sequence "
+                "FROM ranked WHERE preference_rank = 1",
+                normalized,
+            )
+            return {
+                str(row[0]): SharedPreference(
+                    sha256=sha256,
+                    action=str(row[1]),
+                    library_id=str(row[2]),
+                    doc_id=str(row[3]),
+                    sequence=int(row[4]),
+                )
+                for row in rows
+                if (sha256 := str(row[0]))
+            }
+
+    def recent_final_preferences(
+        self, *, limit: int = _MAX_PROFILE_PREFERENCES
+    ) -> tuple[SharedPreference, ...]:
+        """Load a bounded newest-first shared preference profile."""
+
+        _preference_limit(limit)
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT items.sha256, events.action, items.library_id, "
+                "items.doc_id, events.sequence "
+                "FROM events INDEXED BY idx_events_preference_sequence "
+                "JOIN items ON items.item_id = events.item_id "
+                "WHERE events.action IN ('like', 'dislike') "
+                "ORDER BY events.sequence DESC LIMIT ?",
+                (_MAX_PROFILE_EVENTS,),
+            )
+            preferences: list[SharedPreference] = []
+            seen_sha256: set[str] = set()
+            for row in rows:
+                sha256 = str(row[0])
+                if not sha256 or sha256 in seen_sha256:
+                    continue
+                seen_sha256.add(sha256)
+                preferences.append(
+                    SharedPreference(
+                        sha256=sha256,
+                        action=str(row[1]),
+                        library_id=str(row[2]),
+                        doc_id=str(row[3]),
+                        sequence=int(row[4]),
+                    )
+                )
+                if len(preferences) == limit:
+                    break
+            return tuple(preferences)
+
     def batch_for_request(
         self, viewer_id: str, request_id: str
     ) -> RecommendationBatch | None:
@@ -243,8 +358,15 @@ class RecommendationStore:
             }
 
     def _record_event(
-        self, viewer_id: str, batch_id: str, event_id: str, item_id: str, action: str
-    ) -> bool:
+        self,
+        viewer_id: str,
+        batch_id: str,
+        event_id: str,
+        item_id: str,
+        action: str,
+        *,
+        include_preference: bool,
+    ) -> tuple[bool, str | None]:
         viewer = _identifier(viewer_id, "viewer_id")
         batch = _identifier(batch_id, "batch_id")
         event = _identifier(event_id, "event_id")
@@ -253,7 +375,7 @@ class RecommendationStore:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 row = connection.execute(
-                    "SELECT 1 FROM items "
+                    "SELECT items.sha256 FROM items "
                     "JOIN batches ON batches.batch_id = items.batch_id "
                     "WHERE batches.viewer_id = ? AND items.batch_id = ? "
                     "AND items.item_id = ?",
@@ -264,8 +386,22 @@ class RecommendationStore:
                 inserted = self._insert_event(
                     connection, viewer, batch, event, item_id, action
                 )
+                if not include_preference:
+                    connection.execute("COMMIT")
+                    return inserted, None
+                preference_row = connection.execute(
+                    "SELECT events.action FROM items "
+                    "JOIN events ON events.item_id = items.item_id "
+                    "WHERE items.sha256 = ? "
+                    "AND events.action IN ('like', 'dislike') "
+                    "ORDER BY events.sequence DESC LIMIT 1",
+                    (str(row[0]),),
+                ).fetchone()
                 connection.execute("COMMIT")
-                return inserted
+                return (
+                    inserted,
+                    None if preference_row is None else str(preference_row[0]),
+                )
             except BaseException:
                 connection.execute("ROLLBACK")
                 raise
@@ -369,6 +505,13 @@ class RecommendationStore:
             );
             CREATE INDEX IF NOT EXISTS idx_events_viewer_action_sequence
                 ON events(viewer_id, action, sequence DESC);
+            CREATE INDEX IF NOT EXISTS idx_items_sha256
+                ON items(sha256);
+            CREATE INDEX IF NOT EXISTS idx_events_item_action_sequence
+                ON events(item_id, action, sequence DESC);
+            CREATE INDEX IF NOT EXISTS idx_events_preference_sequence
+                ON events(sequence DESC, item_id, action)
+                WHERE action IN ('like', 'dislike');
                 """
             )
 
@@ -392,7 +535,16 @@ def _history_limit(limit: int) -> None:
         or not isinstance(limit, int)
         or not 1 <= limit <= _MAX_HISTORY
     ):
-        raise ValueError("limit must be an integer between 1 and 60")
+        raise ValueError("limit must be an integer between 1 and 240")
+
+
+def _preference_limit(limit: int) -> None:
+    if (
+        isinstance(limit, bool)
+        or not isinstance(limit, int)
+        or not 1 <= limit <= _MAX_PROFILE_PREFERENCES
+    ):
+        raise ValueError("limit must be an integer between 1 and 256")
 
 
 def _items(

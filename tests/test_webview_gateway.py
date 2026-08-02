@@ -570,7 +570,7 @@ class GatewayTests(unittest.TestCase):
                 self.calls.append(
                     ("action", viewer_id, batch_id, event_id, item_id, action, metadata)
                 )
-                return {"recorded": True}
+                return {"recorded": False, "preference": "dislike"}
 
         client = Client()
         self.facade.config_home = self.root
@@ -592,18 +592,25 @@ class GatewayTests(unittest.TestCase):
             )[0],
             200,
         )
+        action_status, _headers, action_response = _json(
+            self.server.url + "api/recommendations/batch-1/actions",
+            method="POST",
+            body={
+                "event_id": "action-1",
+                "item_id": "item-1",
+                "action": "like",
+                "metadata": {"surface": "grid"},
+            },
+        )
+        self.assertEqual(action_status, 200)
         self.assertEqual(
-            _json(
-                self.server.url + "api/recommendations/batch-1/actions",
-                method="POST",
-                body={
-                    "event_id": "action-1",
-                    "item_id": "item-1",
-                    "action": "like",
-                    "metadata": {"surface": "grid"},
-                },
-            )[0],
-            200,
+            action_response,
+            {
+                "ok": True,
+                "event_id": "action-1",
+                "recorded": False,
+                "preference": "dislike",
+            },
         )
         self.assertTrue((self.root / "desktop-recommendation-viewer.json").exists())
         viewer = client.calls[0][1]

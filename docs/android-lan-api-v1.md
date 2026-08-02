@@ -212,6 +212,111 @@ returns the same metadata headers as `GET` and no body. Only one byte range is
 accepted; an invalid or unsatisfiable range returns `416` with
 `Content-Range: bytes */<length>`.
 
+## Recommendations
+
+The authenticated recommendation routes are:
+
+```text
+POST /api/v1/recommendations
+POST /api/v1/recommendations/{batch_id}/shown
+POST /api/v1/recommendations/{batch_id}/actions
+```
+
+Batch creation accepts exactly one opaque request identifier:
+
+```json
+{
+  "request_id": "installation-scoped idempotency id"
+}
+```
+
+A successful response includes the device-scoped batch and exposure metadata,
+plus the computer-wide explicit preference state:
+
+```json
+{
+  "request_id": "request id",
+  "batch_id": "opaque batch id",
+  "count": 15,
+  "partial": false,
+  "partial_reason": "",
+  "quota_degraded": false,
+  "history_window": 240,
+  "quota": {
+    "quality": 5,
+    "recent": 4,
+    "low_exposure": 4,
+    "random": 2
+  },
+  "diversity": {
+    "applied": true,
+    "reason": null,
+    "missing_vectors": 0,
+    "vector_space": {
+      "model": "configured embedding model",
+      "dimension": 1024,
+      "metric": "COSINE"
+    }
+  },
+  "personalization": {
+    "applied": true,
+    "effective_count": 12,
+    "reason": null
+  },
+  "items": [
+    {
+      "item_id": "opaque item id",
+      "media_id": "client-scoped media capability",
+      "name": "image.jpg",
+      "tags": ["原神", "雷电将军"],
+      "library_id": "library-id",
+      "library_name": "人物图库",
+      "content_type": "image/jpeg",
+      "size_bytes": 1234567,
+      "width": 1800,
+      "height": 2400,
+      "bucket": "quality",
+      "preference": "like",
+      "thumbnail_url": "http://private-host/api/v1/media/.../original",
+      "preview_url": "http://private-host/api/v1/media/.../original"
+    }
+  ]
+}
+```
+
+`preference` is the latest successfully recorded `like` or `dislike` for the
+item SHA-256 across the desktop viewer and every authorized Android viewer. It
+may be `null` when no explicit preference exists. Conflicts use the largest
+computer-side event sequence. New batches exclude every explicitly preferred
+original image; replaying an existing idempotent batch still returns its current
+shared preference.
+
+`personalization.reason` is `null` when personalization was applied. Safe
+non-applied values are `insufficient_preferences`, `vectors_unavailable`,
+`incompatible_vector_spaces`, and `replayed`. `replayed` means that an existing
+idempotent batch was returned without claiming that its original ranking was
+recomputed. `effective_count` counts final explicit preferences with usable
+existing vectors; at least 10 are required. No response exposes another device
+identifier or a complete feedback history. The vector profile scans at most the
+latest 4096 explicit preference events, keeps the first event per SHA-256 in
+that newest-first window, and loads vectors for at most 256 images. Older
+preferences outside an unusually duplicate-heavy profile window still retain
+their exact shared state and remain excluded from new batches.
+
+The shown request accepts exactly `{ "event_id": "..." }`. It increments
+exposure only once, only after the client has successfully displayed the batch.
+Batch, shown history, and exposure counts remain isolated by Android installation
+and are never merged with desktop browsing history.
+
+The action request contains `event_id`, `item_id`, and one of `open`, `like`,
+`dislike`, or `export`. `export` may also contain bounded string metadata. Only
+`like/dislike` change the shared explicit preference. Identical event IDs are
+idempotent; a failed request is not visible as a successful shared preference.
+The success body returns `ok`, `event_id`, `recorded`, and the current
+server-final `preference` (`like`, `dislike`, or `null`). Clients must use that
+returned preference instead of assuming that an idempotently replayed old event
+is still the latest cross-device event.
+
 ## Session cleanup
 
 `DELETE /api/v1/session` revokes the bearer token and releases that client's

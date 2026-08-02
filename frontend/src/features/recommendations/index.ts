@@ -8,5 +8,7 @@ export type {
   RecommendationBucket,
   RecommendationDiversity,
   RecommendationItem,
+  RecommendationPersonalization,
+  RecommendationPersonalizationReason,
   RecommendationPreference,
 } from "./types";

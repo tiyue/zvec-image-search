@@ -1,15 +1,15 @@
 # 技术改动清单
 
-本文档记录已讨论、尚待实施的技术改动。每项改动独立编号；实现完成并通过验证后，再同步更新现行产品 Spec。
+本文档记录已讨论的技术改动及其实施状态。TC-001～TC-004 已于 2026-08-03 完成实现和验证，最终行为已同步到现行产品 Spec。
 
 ## 改动索引
 
 | 编号 | 标题 | 状态 |
 | --- | --- | --- |
-| TC-001 | 扩大推荐去重历史并修正“最近入库”重复 | 待实施 |
-| TC-002 | 为图片推荐增加单张右键菜单 | 待实施 |
-| TC-003 | 修正 Android 推荐查看与反馈交互 | 待实施 |
-| TC-004 | 跨桌面与 Android 共享个性化推荐偏好 | 待实施 |
+| TC-001 | 扩大推荐去重历史并修正“最近入库”重复 | 已实施并验证（2026-08-03） |
+| TC-002 | 为图片推荐增加单张右键菜单 | 已实施并验证（2026-08-03） |
+| TC-003 | 修正 Android 推荐查看与反馈交互 | 已实施并验证（2026-08-03） |
+| TC-004 | 跨桌面与 Android 共享个性化推荐偏好 | 已实施并验证（2026-08-03） |
 
 ## TC-001：扩大推荐去重历史并修正“最近入库”重复
 
@@ -40,8 +40,8 @@
 
 1. 将推荐历史读取上限从 60 调整为 240。
 2. 将历史排除窗口调整为 `240 → 210 → 180 → 150 → 120 → 90 → 60 → 30 → 0`，仅在候选不足以组成完整批次时逐级放宽。
-3. `recent` 槽位在最近候选集合内先按 viewer 展示次数升序，再按 `mtime_ns` 降序和稳定候选 ID 排序。
-4. `random` 槽位先按 viewer 展示次数升序，再使用现有请求种子执行稳定随机排序。
+3. `recent` 槽位每次选择严格限定在当前最低 viewer 展示次数层级，再按 `mtime_ns` 降序和稳定候选 ID 排序，避免后续多样性评分越级选回高曝光候选。
+4. `random` 槽位每次选择严格限定在当前最低 viewer 展示次数层级，再使用现有请求种子执行稳定随机排序。
 5. 将每个候选池的采样上限从 100 调整为 256，避免扩大历史窗口后候选池本身被完全排除。继续保持有界采样，不执行全库随机排序或全量加载。
 6. 继续复用现有 `events` 和 `content_stats` 数据，不修改 SQLite 表结构，不迁移或清空既有推荐历史。
 
@@ -158,8 +158,8 @@ Android 推荐页存在三个关联的交互问题：
 
 ### 技术方案
 
-1. 将 `MobileTab` 选择状态提升到不会因全屏查看器提前返回而离开组合的位置，例如 `ZvecApp` 根级的 `rememberSaveable` 状态；`SearchScreen` 改为接收当前 Tab 和切换回调。
-2. 打开推荐查看器时保留当前 `RECOMMENDATIONS` Tab；`closeViewer` 仍只清理 viewer source、index 和传输状态，不通过推荐数据存在与否猜测返回页。
+1. 将 `MobileTab` 选择状态提升到不会因全屏查看器提前返回而离开组合的位置，即 `ZvecApp` 根级的 `rememberSaveable` 状态；`SearchScreen` 改为接收当前 Tab 和切换回调。
+2. 将推荐网格 `LazyGridState` 同样提升到 `ZvecApp`，打开推荐查看器时保留当前 `RECOMMENDATIONS` Tab、原批次和滚动位置；`closeViewer` 仍只清理 viewer source、index 和传输状态，不通过推荐数据存在与否猜测返回页。
 3. 从 `RecommendationCard` 删除 reaction、pending、`onLike`、`onDislike` 参数和按钮区域；`RecommendationPanel` 不再向卡片传递列表内反馈回调。
 4. 全屏查看器继续只为 `RecommendationItem` 在长按菜单显示“喜欢/不喜欢”。两个按钮均先将 `sheetItem` 设为 `null` 关闭 `ModalBottomSheet`，随后调用现有 `onReaction`。
 5. 继续复用 `AppViewModel.reactToRecommendation` 的 pending、幂等 event ID 和错误恢复逻辑，不新增 action、接口或持久化字段。
@@ -220,28 +220,32 @@ Android 推荐页存在三个关联的交互问题：
 4. 从有可用现有向量的喜欢图片生成正向偏好画像，从不喜欢图片生成负向偏好画像；已删除、向量缺失或向量空间不兼容的反馈仍保留最终状态，但不参与向量画像。
 5. 个性化仅在 `quality`、`recent` 和 `low_exposure` 候选内部提供有上限的排序加减分，再继续执行现有相册/角色配额和向量多样性惩罚。`random` 保持稳定随机排序。
 6. 有效反馈不足 10 张、没有可用偏好向量或跨图库向量空间不兼容时，回退到现行非个性化排序，并在响应中给出不含隐私数据的原因。
-7. 个性化最大权重以最终排序的 25% 为上限；具体归一化必须由确定性测试固定，不能用未验证的常量让偏好覆盖基础质量与多样性规则。
+7. 个性化强度固定为 `min(0.25, effective_count × 0.005)`：10 条有效向量反馈时为 5%，50 条起达到 25% 上限。喜欢与不喜欢分别生成单位向量均值画像，候选 affinity 为可用正向相似度与负向相似度取反后的均值，最终调整严格限制在 `[-0.25, +0.25]`，并由确定性测试固定。
 
 ### 数据与接口方案
 
 - 继续以现有 `events` 和 `items` 为事实来源，通过 `item_id` 关联 SHA-256、library ID 和 doc ID，并按事件 sequence 计算每张图片的最终共享偏好。
-- 不新增偏好表，不改变现有四表 Schema；仅在实测查询计划需要时增加直接服务于最终偏好查询的 SQLite 索引。
-- 推荐生成时只加载有界数量的最新不同偏好及其现有向量，所有读取按图库 worker 分派，不能跨线程直接访问 Collection。
-- 推荐响应为每个当前批次项增加可选最终偏好字段，并返回个性化是否应用、有效反馈数和安全原因码；不得返回其他设备 ID 或完整反馈历史。
+- 不新增偏好表，不改变现有四表 Schema。实测 `EXPLAIN QUERY PLAN` 后增加精确候选偏好查询使用的 `idx_items_sha256`、`idx_events_item_action_sequence`，以及有界画像事件倒序读取使用的部分覆盖索引 `idx_events_preference_sequence`；未被 planner 使用的候选索引不保留。
+- 推荐画像按 sequence 倒序最多扫描最近 4096 条 `like/dislike` 事件，在该有界窗口内按 SHA-256 首次出现取最终状态并最多保留 256 张，再按图库 worker 读取现有向量，不能跨线程直接访问 Collection。禁止新增偏好表意味着无法同时保证固定读取工作量与任意重复历史下始终凑满全历史最新 256 个不同 SHA；极端重复反馈只让较旧图片退出画像并安全降级，不影响全历史最终偏好、原图排除或批次回放的精确性。
+- 推荐响应为每个当前批次项增加可选最终偏好字段，并返回个性化是否应用、有效反馈数和安全原因码。降级码为 `insufficient_preferences`、`vectors_unavailable`、`incompatible_vector_spaces`；幂等批次回放使用 `replayed` 且仍读取 item 当前最终偏好。action 成功响应同样返回与事件写入原子读取的当前最终偏好，避免较旧 event ID 在跨设备冲突后回放时覆盖客户端显示。不得返回其他设备 ID 或完整反馈历史。
 - Windows 与 Android 均以服务端偏好为准恢复显示状态。手机不另建一套独立偏好数据库，成功提交到电脑后即对所有设备生效。
 - 相同 `event_id` 继续保持幂等；网络失败不得提前在客户端永久显示成功状态。
 
 ### 修改范围
 
-实现时仅允许修改以下范围：
+实施核验发现，backend 已返回 action 幂等结果，但 Windows 与 LAN 两层 facade
+会丢弃该结果；若不贯通 action 最终偏好，旧 event ID 在跨设备冲突后回放时
+客户端会显示错误状态。因此在不改变路由、action 集合或授权边界的前提下，
+将范围最小扩展到现有 action 响应转发链路：
 
 - `image_vector_service/recommendation_store.py`：跨 viewer 最终偏好查询及必要索引。
 - `image_vector_service/recommendations.py`：有界个性化评分、冷启动回退和显式偏好原图排除。
 - `image_vector_service/backend_server.py`：加载共享偏好、按图库读取偏好向量并扩展推荐响应。
 - `image_vector_service/service.py`：仅增加按已知 doc ID 有界读取现有向量所需的图库 worker 接口；不得重新生成嵌入。
 - `zvec_host/recommendation_service.py`：安全转发偏好与个性化响应字段。
+- `zvec_webview/server.py`、`zvec_webview/lan_access.py`、`zvec_lan/http_server.py`、`zvec_lan/models.py`：仅贯通并过滤 action 响应中的 `recorded/preference`，不改变路由或鉴权。
 - `frontend/src/features/recommendations/`：解析并显示服务端最终偏好与个性化状态。
-- `android/app/src/main/java/com/zvec/lanviewer/data/model/Models.kt`、`AppViewModel.kt` 和推荐相关 UI：解析并恢复共享偏好状态。
+- `android/app/src/main/java/com/zvec/lanviewer/data/model/Models.kt`、`data/network/LanApiClient.kt`、`data/repository/ZvecRepository.kt`、`AppViewModel.kt` 和推荐相关 UI：解析 action 最终偏好并恢复共享状态；网络层只把现有 Unit 响应改为安全解析返回值。
 - 对应 Python、Windows 前端和 Android 推荐测试。
 - `docs/spec.md`、`docs/android-lan-api-v1.md`：实现完成后同步共享偏好及响应契约。
 

@@ -491,6 +491,7 @@ def _handler_type(gateway: GatewayServer) -> type[BaseHTTPRequestHandler]:
                     {"batch_id": segments[1]}, "batch_id", maximum=160
                 )
                 body = self._read_json()
+                action_status: dict[str, object] = {}
                 if segments[2] == "shown":
                     if set(body) != {"event_id"}:
                         raise FacadeError("invalid_request", "推荐展示记录字段无效。")
@@ -509,10 +510,15 @@ def _handler_type(gateway: GatewayServer) -> type[BaseHTTPRequestHandler]:
                     if action not in {"open", "like", "export", "dislike"}:
                         raise FacadeError("invalid_request", "推荐操作无效。")
                     metadata = _recommendation_metadata(body.get("metadata"))
-                    gateway._recommendation_service().record_recommendation_action(
-                        batch_id, event_id, item_id, action, metadata
+                    action_status = (
+                        gateway._recommendation_service().record_recommendation_action(
+                            batch_id, event_id, item_id, action, metadata
+                        )
                     )
-                self._json(HTTPStatus.OK, {"ok": True, "event_id": event_id})
+                self._json(
+                    HTTPStatus.OK,
+                    {"ok": True, "event_id": event_id, **action_status},
+                )
                 return
             if method == "POST" and segments == ("diagnostics", "frontend"):
                 self._json(
