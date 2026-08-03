@@ -32,6 +32,7 @@ from zvec_lan import (
     SearchPending,
     SearchRequest,
     SearchResultItem,
+    ThumbnailPayload,
 )
 
 from .image_registry import ImageRegistry, ImageRegistryError
@@ -91,7 +92,7 @@ class _MediaBinding:
     source_version: tuple[Path, int, int]
     owner: str
     search_id: str
-    sha256: str
+    sha256: str | None
     content_type: str | None = None
     digest_verified: bool = False
 
@@ -105,6 +106,14 @@ class _DigestVerificationFlight:
 
     event: threading.Event
     verified: bool = False
+
+
+@dataclass(slots=True)
+class _OriginalDigestFlight:
+    """Share one lazily computed strong digest between original requests."""
+
+    event: threading.Event
+    digest: str | None = None
 
 
 class PreviewLanAdapter:
@@ -153,7 +162,7 @@ class PreviewLanAdapter:
         self._media: dict[str, _MediaBinding] = {}
         self._media_keys: dict[tuple[str, str, str, str], str] = {}
         self._recommendation_media: dict[str, _MediaBinding] = {}
-        self._recommendation_media_keys: dict[tuple[str, str, str], str] = {}
+        self._recommendation_media_keys: dict[tuple[str, str, int, int], str] = {}
         self._recommendation_media_origin = ""
         # Indexed SHA-256 values still need one content check before an original
         # is exposed. Cache that proof by the exact file version so repeated
@@ -165,6 +174,10 @@ class PreviewLanAdapter:
         )
         self._digest_verification_flights: dict[
             _DigestVerificationKey, _DigestVerificationFlight
+        ] = {}
+        self._original_digests: OrderedDict[tuple[Path, int, int], str] = OrderedDict()
+        self._original_digest_flights: dict[
+            tuple[Path, int, int], _OriginalDigestFlight
         ] = {}
         self._lock = threading.RLock()
 
@@ -395,7 +408,7 @@ class PreviewLanAdapter:
             item.pop("source_path", None)
             item.pop("vector", None)
             original_url = f"{origin}/api/v1/media/{media_id}/original"
-            item["thumbnail_url"] = original_url
+            item["thumbnail_url"] = f"{origin}/api/v1/media/{media_id}/thumbnail"
             item["preview_url"] = original_url
             public_items.append(item)
         public = {
@@ -521,7 +534,12 @@ class PreviewLanAdapter:
             or (resolved, status.st_mtime_ns, status.st_size) != source_version
         ):
             return None
-        if not digest_verified:
+        if digest is None:
+            digest = self._compute_original_digest(source_version)
+            if digest is None:
+                return None
+            digest_verified = True
+        elif not digest_verified:
             verification_key = (
                 resolved,
                 status.st_mtime_ns,
@@ -548,7 +566,122 @@ class PreviewLanAdapter:
                 return None
             if not digest_verified:
                 current.digest_verified = True
+            if current.sha256 is None:
+                current.sha256 = digest
+                current.digest_verified = True
         return MediaSource(path=resolved, sha256=digest, content_type=content_type)
+
+    def resolve_thumbnail(
+        self,
+        media_id: str,
+        *,
+        client_id: str,
+    ) -> ThumbnailPayload | None:
+        owner = _client_id(client_id)
+        self._cleanup_expired_searches()
+        normalized_id = _safe_text(media_id, maximum=160)
+        with self._lock:
+            binding = self._media.get(normalized_id)
+            recommendation_media = binding is None
+            if binding is None:
+                binding = self._recommendation_media.get(normalized_id)
+            if (
+                binding is None
+                or binding.owner != owner
+                or (
+                    not recommendation_media
+                    and self._search_owners.get(binding.search_id) != owner
+                )
+            ):
+                return None
+            if not recommendation_media:
+                self._search_last_access[binding.search_id] = self._clock()
+            source_image_id = binding.source_image_id
+            source_path = binding.source_path
+            source_version = binding.source_version
+        try:
+            resolved = source_path.resolve(strict=True)
+            status = resolved.stat()
+            if (
+                resolved != source_path
+                or resolved.is_symlink()
+                or not resolved.is_file()
+                or (resolved, status.st_mtime_ns, status.st_size) != source_version
+            ):
+                return None
+            payload = self._facade.image_registry.payload(
+                source_image_id,
+                "thumbnail",
+            )
+            after = resolved.stat()
+        except (ImageRegistryError, OSError):
+            return None
+        if (resolved, after.st_mtime_ns, after.st_size) != source_version:
+            return None
+        with self._lock:
+            current = self._media.get(normalized_id)
+            if recommendation_media:
+                current = self._recommendation_media.get(normalized_id)
+            if (
+                current is not binding
+                or current.owner != owner
+                or (
+                    not recommendation_media
+                    and self._search_owners.get(current.search_id) != owner
+                )
+            ):
+                return None
+        return ThumbnailPayload(
+            content=payload.content,
+            content_type=payload.content_type,
+            etag=payload.etag,
+        )
+
+    def _compute_original_digest(
+        self,
+        source_version: tuple[Path, int, int],
+    ) -> str | None:
+        with self._lock:
+            cached = self._original_digests.get(source_version)
+            if cached is not None:
+                self._original_digests.move_to_end(source_version)
+                return cached
+            flight = self._original_digest_flights.get(source_version)
+            owner = flight is None
+            if flight is None:
+                flight = _OriginalDigestFlight(threading.Event())
+                self._original_digest_flights[source_version] = flight
+
+        if not owner:
+            flight.event.wait()
+            return flight.digest
+
+        digest: str | None = None
+        path, mtime_ns, size = source_version
+        try:
+            candidate = _sha256_file(path)
+            after = path.stat()
+            if (after.st_mtime_ns, after.st_size) == (mtime_ns, size):
+                digest = candidate
+            return digest
+        except OSError:
+            return None
+        finally:
+            with self._lock:
+                current_flight = self._original_digest_flights.pop(
+                    source_version,
+                    None,
+                )
+                if digest is not None:
+                    self._original_digests[source_version] = digest
+                    self._original_digests.move_to_end(source_version)
+                    while (
+                        len(self._original_digests) > _DIGEST_VERIFICATION_CACHE_ENTRIES
+                    ):
+                        self._original_digests.popitem(last=False)
+                completed = current_flight or flight
+                completed.digest = digest
+                completed.event.set()
 
     def _verify_indexed_digest(
         self,
@@ -675,15 +808,16 @@ class PreviewLanAdapter:
             binding = self._media.pop(media_id, None)
             if binding is None:
                 continue
-            self._media_keys.pop(
-                (
-                    binding.owner,
-                    binding.search_id,
-                    binding.source_image_id,
-                    binding.sha256,
-                ),
-                None,
-            )
+            if binding.sha256 is not None:
+                self._media_keys.pop(
+                    (
+                        binding.owner,
+                        binding.search_id,
+                        binding.source_image_id,
+                        binding.sha256,
+                    ),
+                    None,
+                )
 
     def _remember_recommendation_media(
         self,
@@ -695,14 +829,10 @@ class PreviewLanAdapter:
         try:
             source_path = self._facade.image_registry.resolve(source_image_id)
             status = source_path.stat()
-            digest = _sha256_file(source_path)
-            after = source_path.stat()
         except (ImageRegistryError, OSError):
             return None
-        if (after.st_mtime_ns, after.st_size) != (status.st_mtime_ns, status.st_size):
-            return None
         source_version = (source_path, status.st_mtime_ns, status.st_size)
-        key = (owner, source_image_id, digest)
+        key = (owner, source_image_id, status.st_mtime_ns, status.st_size)
         with self._lock:
             existing = self._recommendation_media_keys.get(key)
             if existing is not None and existing in self._recommendation_media:
@@ -718,9 +848,9 @@ class PreviewLanAdapter:
                 source_version=source_version,
                 owner=owner,
                 search_id="",
-                sha256=digest,
+                sha256=None,
                 content_type=content_type,
-                digest_verified=True,
+                digest_verified=False,
             )
             self._recommendation_media_keys[key] = media_id
             return media_id
@@ -734,7 +864,13 @@ class PreviewLanAdapter:
         for media_id in released:
             binding = self._recommendation_media.pop(media_id)
             self._recommendation_media_keys.pop(
-                (binding.owner, binding.source_image_id, binding.sha256), None
+                (
+                    binding.owner,
+                    binding.source_image_id,
+                    binding.source_version[1],
+                    binding.source_version[2],
+                ),
+                None,
             )
 
     def _begin_client_search(self, owner: str) -> tuple[int, tuple[str, ...]]:

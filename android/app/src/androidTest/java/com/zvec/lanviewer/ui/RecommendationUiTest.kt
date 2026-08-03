@@ -37,6 +37,7 @@ import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollToIndex
 import androidx.compose.ui.test.performTouchInput
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
 import androidx.test.espresso.Espresso.pressBack
 import com.zvec.lanviewer.data.model.RecommendationAction
 import com.zvec.lanviewer.data.model.RecommendationItem
@@ -48,6 +49,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import java.io.File
+import java.util.concurrent.CopyOnWriteArrayList
 
 class RecommendationUiTest {
     @get:Rule
@@ -186,6 +188,28 @@ class RecommendationUiTest {
     @Test
     fun recommendationCardsHaveNoFeedbackControlsInDarkNarrowLayout() {
         renderNarrowRecommendationPanel(dark = true, screenshotName = "recommendations-dark-320.png")
+    }
+
+    @Test
+    fun recommendationPanelReportsStopAndResumeForPreloadCancellation() {
+        val visibility = CopyOnWriteArrayList<Boolean>()
+        composeRule.setContent {
+            MaterialTheme(colorScheme = lightColorScheme()) {
+                RecommendationPanel(
+                    state = readyState(),
+                    onLoad = {},
+                    onVisible = { visibility += it },
+                    onOpen = {},
+                    gridState = rememberLazyGridState(),
+                )
+            }
+        }
+        composeRule.waitUntil { visibility.lastOrNull() == true }
+
+        composeRule.activityRule.scenario.moveToState(Lifecycle.State.CREATED)
+        composeRule.waitUntil { visibility.lastOrNull() == false }
+        composeRule.activityRule.scenario.moveToState(Lifecycle.State.RESUMED)
+        composeRule.waitUntil { visibility.lastOrNull() == true }
     }
 
     private fun setRecommendationViewer(

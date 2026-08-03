@@ -236,7 +236,7 @@ onBeforeUnmount(() => {
       <button
         class="refresh-button"
         type="button"
-        :disabled="recommendations.loading.value || recommendations.shownPending.value"
+        :disabled="recommendations.loading.value"
         @click="recommendations.refresh"
       >
         {{ recommendations.loading.value ? "正在刷新" : "换一批" }}
@@ -282,9 +282,6 @@ onBeforeUnmount(() => {
             <span>{{ bucketLabels[item.bucket] }}</span>
           </button>
         </article>
-      </div>
-      <div v-if="recommendations.loading.value" class="recommendation-loading" role="status">
-        正在准备下一批，当前图片会继续保留。
       </div>
     </div>
 
@@ -449,17 +446,6 @@ onBeforeUnmount(() => {
   animation: recommendation-shimmer 1.2s linear infinite;
 }
 
-.recommendation-loading {
-  position: absolute;
-  inset: 0;
-  display: grid;
-  place-items: center;
-  padding: 24px;
-  color: var(--recommendation-text);
-  font-size: 13px;
-  background: rgb(255 255 255 / 68%);
-}
-
 .recommendation-empty {
   display: grid;
   min-height: 280px;
@@ -509,7 +495,6 @@ onBeforeUnmount(() => {
     --recommendation-border: rgb(255 255 255 / 10%);
     --recommendation-action: #efefe9;
   }
-  .recommendation-loading { background: rgb(23 24 22 / 72%); }
 }
 
 @media (prefers-reduced-motion: reduce) {

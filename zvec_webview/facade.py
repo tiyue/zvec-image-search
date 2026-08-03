@@ -347,7 +347,8 @@ class PreviewFacade:
         )
         self._credentials = credential_store or default_credential_store()
         self._registry = image_registry or ImageRegistry(
-            cache_directory=self._configuration.config_home / "cache"
+            cache_directory=self._configuration.config_home / "cache",
+            max_render_workers=4,
         )
         self._host = backend_host or BackendHost(config_path)
         activity_redactions: list[str] = []

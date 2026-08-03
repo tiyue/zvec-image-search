@@ -21,6 +21,7 @@ import type {
 } from "./types";
 
 const RECOMMENDATION_COUNT = 15;
+const CRITICAL_PRELOAD_COUNT = 6;
 const THUMBNAIL_TIMEOUT_MS = 15_000;
 const BUCKETS = new Set<RecommendationBucket>([
   "quality",
@@ -45,6 +46,21 @@ interface RecommendationEvents {
   idFactory?: () => string;
   preloadImage?: (url: string, signal: AbortSignal) => Promise<void>;
   onError?: (title: string, message: string) => void;
+}
+
+interface PreparedBatchTask {
+  requestId: string;
+  source: "foreground" | "prefetch";
+  controller: AbortController;
+  batch: RecommendationBatch | null;
+  createSucceeded: boolean;
+  criticalReady: boolean;
+  allSettled: boolean;
+  invalid: boolean;
+  preloadErrors: unknown[];
+  tailFailureReported: boolean;
+  critical: Promise<RecommendationBatch>;
+  all: Promise<void>;
 }
 
 function text(value: unknown): string {
@@ -239,9 +255,15 @@ export function useRecommendations(
   const shownPending = computed(() => pendingShown.value !== null || shownSyncing.value);
 
   let initialized = false;
+  let destroyed = false;
   let createRequestId = "";
-  let generationController: AbortController | null = null;
+  let foregroundTask: PreparedBatchTask | null = null;
+  let stagedTask: PreparedBatchTask | null = null;
+  let currentTask: PreparedBatchTask | null = null;
+  let prefetchTask: PreparedBatchTask | null = null;
+  let shownCompletedBatchId = "";
   let shownController: AbortController | null = null;
+  let shownRequest: Promise<boolean> | null = null;
   const actionControllers = new Set<AbortController>();
   const retryEventIds = new Map<string, string>();
   const idFactory = events.idFactory ?? defaultIdFactory;
@@ -255,41 +277,205 @@ export function useRecommendations(
     return currentBatch.value?.batchId === batchId;
   }
 
-  async function syncShown({ quiet = false }: { quiet?: boolean } = {}): Promise<boolean> {
+  function isTaskActive(task: PreparedBatchTask): boolean {
+    return !destroyed && !task.invalid;
+  }
+
+  function discardTask(task: PreparedBatchTask, abort = true): void {
+    if (task.invalid) return;
+    task.invalid = true;
+    if (abort) task.controller.abort();
+    if (foregroundTask === task) foregroundTask = null;
+    if (stagedTask === task) {
+      stagedTask = null;
+      stagedBatch.value = null;
+    }
+    if (currentTask === task) currentTask = null;
+    if (prefetchTask === task) prefetchTask = null;
+  }
+
+  function discardPrefetch(): void {
+    if (prefetchTask) discardTask(prefetchTask);
+  }
+
+  function reportTailFailure(task: PreparedBatchTask): void {
+    if (
+      task.tailFailureReported ||
+      !task.criticalReady ||
+      !task.preloadErrors.length ||
+      currentTask !== task
+    ) return;
+    task.tailFailureReported = true;
+    const message = `${task.preloadErrors.length} 张非关键缩略图加载失败。`;
+    error.value = message;
+    reportError("部分缩略图加载失败", message);
+  }
+
+  function canPrefetch(): boolean {
+    const batch = currentBatch.value;
+    return Boolean(
+      batch?.items.length &&
+      currentTask?.allSettled &&
+      shownCompletedBatchId === batch.batchId &&
+      visible.value &&
+      documentVisible.value &&
+      !loading.value &&
+      !createRequestId &&
+      !foregroundTask &&
+      !stagedTask &&
+      !prefetchTask &&
+      !pendingShown.value &&
+      !shownSyncing.value,
+    );
+  }
+
+  function handleTaskSettled(task: PreparedBatchTask): void {
+    if (!isTaskActive(task)) return;
+    if (prefetchTask === task) {
+      if (task.preloadErrors.length) {
+        discardTask(task);
+      }
+      return;
+    }
+    if (currentTask === task) {
+      reportTailFailure(task);
+      maybeStartPrefetch();
+    }
+  }
+
+  function createPreparedTask(
+    requestId: string,
+    source: PreparedBatchTask["source"],
+  ): PreparedBatchTask {
+    const controller = new AbortController();
+    const task: PreparedBatchTask = {
+      requestId,
+      source,
+      controller,
+      batch: null,
+      createSucceeded: false,
+      criticalReady: false,
+      allSettled: false,
+      invalid: false,
+      preloadErrors: [],
+      tailFailureReported: false,
+      critical: Promise.resolve(null as unknown as RecommendationBatch),
+      all: Promise.resolve(),
+    };
+    const initializedPreloads = (async () => {
+      const payload = await api.create(requestId, controller.signal);
+      if (!isTaskActive(task) || controller.signal.aborted) throw abortError();
+      task.createSucceeded = true;
+      if (source === "foreground" && createRequestId === requestId) createRequestId = "";
+      const batch = normalizeRecommendationBatch(payload);
+      task.batch = batch;
+      const preloads = batch.items.map((item) => preloadImage(
+        item.thumbnailUrl,
+        controller.signal,
+      ));
+      const outcomes = preloads.map((preload) => preload.then(
+        () => null,
+        (caught: unknown) => caught,
+      ));
+      return { batch, preloads, outcomes };
+    })();
+    task.critical = initializedPreloads.then(async ({ batch, preloads }) => {
+      const criticalCount = Math.min(CRITICAL_PRELOAD_COUNT, preloads.length);
+      await Promise.all(preloads.slice(0, criticalCount));
+      if (!isTaskActive(task) || controller.signal.aborted) throw abortError();
+      task.criticalReady = true;
+      return batch;
+    });
+    task.all = initializedPreloads.then(async ({ outcomes }) => {
+      const preloadOutcomes = await Promise.all(outcomes);
+      task.preloadErrors = preloadOutcomes.filter((caught) => caught !== null);
+      task.allSettled = true;
+      handleTaskSettled(task);
+    }).catch((caught: unknown) => {
+      task.allSettled = true;
+      if (!isTaskActive(task)) return;
+      if (prefetchTask === task) {
+        if (!isAbortError(caught) && !task.createSucceeded && !createRequestId) {
+          createRequestId = task.requestId;
+        }
+        discardTask(task);
+      }
+    });
+    void task.critical.catch((caught: unknown) => {
+      if (!isTaskActive(task) || prefetchTask !== task) return;
+      if (!isAbortError(caught) && !task.createSucceeded && !createRequestId) {
+        createRequestId = task.requestId;
+      }
+      discardTask(task);
+    });
+    return task;
+  }
+
+  function maybeStartPrefetch(): void {
+    if (!canPrefetch()) return;
+    const task = createPreparedTask(idFactory(), "prefetch");
+    prefetchTask = task;
+  }
+
+  function syncShown({ quiet = false }: { quiet?: boolean } = {}): Promise<boolean> {
     const pending = pendingShown.value;
+    if (shownRequest) return shownRequest;
     if (
       !pending ||
-      shownSyncing.value ||
       !visible.value ||
       !documentVisible.value ||
       !isCurrentBatch(pending.batchId)
-    ) return pending === null;
+    ) return Promise.resolve(pending === null);
     shownSyncing.value = true;
     shownController?.abort();
     const controller = new AbortController();
     shownController = controller;
-    try {
-      await api.shown(pending.batchId, pending.eventId, controller.signal);
-      if (pendingShown.value?.eventId === pending.eventId) pendingShown.value = null;
-      shownError.value = "";
-      return true;
-    } catch (caught) {
-      if (!isAbortError(caught)) {
-        shownError.value = errorMessage(caught);
-        if (!quiet) reportError("展示记录待同步", caught);
+    const request = Promise.resolve().then(async () => {
+      let succeeded = false;
+      try {
+        await api.shown(pending.batchId, pending.eventId, controller.signal);
+        if (destroyed || controller.signal.aborted) throw abortError();
+        if (pendingShown.value?.eventId === pending.eventId) pendingShown.value = null;
+        if (isCurrentBatch(pending.batchId)) shownCompletedBatchId = pending.batchId;
+        shownError.value = "";
+        succeeded = true;
+        return true;
+      } catch (caught) {
+        if (!isAbortError(caught)) {
+          shownError.value = errorMessage(caught);
+          if (!quiet) reportError("展示记录待同步", caught);
+        }
+        return false;
+      } finally {
+        if (shownController === controller) shownController = null;
+        if (shownRequest === request) shownRequest = null;
+        shownSyncing.value = false;
+        if (succeeded) maybeStartPrefetch();
       }
-      return false;
-    } finally {
-      if (shownController === controller) shownController = null;
-      shownSyncing.value = false;
-    }
+    });
+    shownRequest = request;
+    return request;
   }
 
-  async function commitStaged(): Promise<boolean> {
-    const batch = stagedBatch.value;
-    if (!batch || !visible.value || !documentVisible.value) return false;
+  async function commitPrepared(task: PreparedBatchTask): Promise<boolean> {
+    const batch = task.batch;
+    if (!batch || !isTaskActive(task)) return false;
+    if (!visible.value || !documentVisible.value) {
+      stagedTask = task;
+      stagedBatch.value = batch;
+      if (foregroundTask === task) foregroundTask = null;
+      return true;
+    }
+    if (stagedTask && stagedTask !== task) discardTask(stagedTask);
     stagedBatch.value = null;
+    stagedTask = null;
+    if (currentTask && currentTask !== task && !currentTask.allSettled) {
+      discardTask(currentTask);
+    }
+    if (foregroundTask === task) foregroundTask = null;
+    currentTask = task;
     currentBatch.value = batch;
+    shownCompletedBatchId = "";
     preferences.value = Object.fromEntries(
       batch.items
         .filter((item) => item.preference !== null)
@@ -299,42 +485,66 @@ export function useRecommendations(
       ? { batchId: batch.batchId, eventId: idFactory() }
       : null;
     shownError.value = "";
+    reportTailFailure(task);
     await nextTick();
     if (!visible.value || !documentVisible.value || !isCurrentBatch(batch.batchId)) return true;
-    await syncShown();
+    void syncShown();
     return true;
+  }
+
+  async function commitStaged(): Promise<boolean> {
+    const task = stagedTask;
+    if (!task || !visible.value || !documentVisible.value) return false;
+    return commitPrepared(task);
   }
 
   async function refresh(): Promise<boolean> {
     if (loading.value) return false;
-    if (pendingShown.value && !(await syncShown())) return false;
     initialized = true;
-    const controller = new AbortController();
-    generationController = controller;
-    const requestId = createRequestId || idFactory();
-    createRequestId = requestId;
     loading.value = true;
-    error.value = "";
+    let task: PreparedBatchTask | null = null;
     try {
-      const payload = await api.create(requestId, controller.signal);
-      createRequestId = "";
-      const batch = normalizeRecommendationBatch(payload);
-      await Promise.all(
-        batch.items.map((item) => preloadImage(item.thumbnailUrl, controller.signal)),
-      );
-      if (generationController !== controller) return false;
-      stagedBatch.value = batch;
-      if (visible.value && documentVisible.value) await commitStaged();
-      return true;
-    } catch (caught) {
-      if (!isAbortError(caught)) {
-        error.value = errorMessage(caught);
-        reportError("无法刷新推荐", caught);
+      if (pendingShown.value && !(await syncShown())) return false;
+      error.value = "";
+      if (stagedTask) discardTask(stagedTask);
+      task = prefetchTask;
+      if (task) {
+        prefetchTask = null;
+      } else {
+        if (currentTask && !currentTask.allSettled) discardTask(currentTask);
+        const requestId = createRequestId || idFactory();
+        createRequestId = requestId;
+        task = createPreparedTask(requestId, "foreground");
       }
-      return false;
+      foregroundTask = task;
+      for (;;) {
+        try {
+          await task.critical;
+          if (!isTaskActive(task) || foregroundTask !== task) return false;
+          if (createRequestId === task.requestId) createRequestId = "";
+          return await commitPrepared(task);
+        } catch (caught) {
+          const shouldFallback = task.source === "prefetch" && !isAbortError(caught);
+          if (!task.createSucceeded && !isAbortError(caught)) createRequestId = task.requestId;
+          discardTask(task);
+          if (shouldFallback && !destroyed) {
+            const requestId = createRequestId || idFactory();
+            createRequestId = requestId;
+            task = createPreparedTask(requestId, "foreground");
+            foregroundTask = task;
+            continue;
+          }
+          if (!isAbortError(caught)) {
+            error.value = errorMessage(caught);
+            reportError("无法刷新推荐", caught);
+          }
+          return false;
+        }
+      }
     } finally {
-      if (generationController === controller) generationController = null;
+      if (task && foregroundTask === task) foregroundTask = null;
       loading.value = false;
+      maybeStartPrefetch();
     }
   }
 
@@ -344,6 +554,7 @@ export function useRecommendations(
     if (isActionPending(itemId)) return false;
     const key = `${batch.batchId}:${itemId}:${action}`;
     const eventId = retryEventIds.get(key) ?? idFactory();
+    const previousPreference = preferences.value[itemId] ?? null;
     const controller = new AbortController();
     actionControllers.add(controller);
     pendingActionKeys.value = [...pendingActionKeys.value, key];
@@ -355,17 +566,25 @@ export function useRecommendations(
         action,
         controller.signal,
       );
+      if (destroyed || controller.signal.aborted) throw abortError();
       if (action === "like" || action === "dislike") {
         retryEventIds.delete(`${batch.batchId}:${itemId}:like`);
         retryEventIds.delete(`${batch.batchId}:${itemId}:dislike`);
+        const preference = response.preference === undefined
+          ? action
+          : normalizePreference(response.preference);
         if (isCurrentBatch(batch.batchId)) {
-          const preference = response.preference === undefined
-            ? action
-            : normalizePreference(response.preference);
           const updated = { ...preferences.value };
           if (preference === null) delete updated[itemId];
           else updated[itemId] = preference;
           preferences.value = updated;
+        }
+        if (preference !== previousPreference) {
+          createRequestId = "";
+          discardPrefetch();
+          if (foregroundTask) discardTask(foregroundTask);
+          if (stagedTask) discardTask(stagedTask);
+          maybeStartPrefetch();
         }
       } else {
         retryEventIds.delete(key);
@@ -398,7 +617,11 @@ export function useRecommendations(
 
   function setVisible(nextVisible: boolean): void {
     visible.value = nextVisible;
-    if (!nextVisible || !documentVisible.value) return;
+    if (!nextVisible || !documentVisible.value) {
+      createRequestId = "";
+      discardPrefetch();
+      return;
+    }
     if (stagedBatch.value) {
       void commitStaged();
       return;
@@ -407,14 +630,26 @@ export function useRecommendations(
     if (!initialized) {
       initialized = true;
       void refresh();
+      return;
     }
+    maybeStartPrefetch();
   }
 
   function handleDocumentVisibilityChange(): void {
     documentVisible.value = document.visibilityState !== "hidden";
-    if (!documentVisible.value || !visible.value) return;
+    if (!documentVisible.value || !visible.value) {
+      if (!documentVisible.value) createRequestId = "";
+      discardPrefetch();
+      return;
+    }
+    if (!initialized) {
+      initialized = true;
+      void refresh();
+      return;
+    }
     if (stagedBatch.value) void commitStaged();
     else if (pendingShown.value) void syncShown({ quiet: true });
+    else maybeStartPrefetch();
   }
 
   onMounted(() => {
@@ -422,8 +657,12 @@ export function useRecommendations(
   });
 
   onBeforeUnmount(() => {
+    destroyed = true;
     document.removeEventListener("visibilitychange", handleDocumentVisibilityChange);
-    generationController?.abort();
+    if (foregroundTask) discardTask(foregroundTask);
+    if (stagedTask) discardTask(stagedTask);
+    if (currentTask) discardTask(currentTask);
+    discardPrefetch();
     shownController?.abort();
     actionControllers.forEach((controller) => controller.abort());
     actionControllers.clear();

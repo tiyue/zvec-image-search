@@ -31,6 +31,7 @@ from .models import (
     SearchProgress,
     SearchRequest,
     SearchResultItem,
+    ThumbnailPayload,
 )
 from .pairing import (
     MAX_PAIRING_RECORDS,
@@ -130,6 +131,7 @@ __all__ = [
     "SearchProgress",
     "SearchRequest",
     "SearchResultItem",
+    "ThumbnailPayload",
     "UploadCancelled",
     "UploadError",
     "UploadStorageError",

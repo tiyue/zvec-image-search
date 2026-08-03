@@ -205,6 +205,47 @@ class RecommendationResponseStateTest {
         assertFalse("item-1" in cleared)
     }
 
+    @Test
+    fun onlyAnActualFinalPreferenceChangeInvalidatesPreparedRecommendations() {
+        val confirmedLike = RecommendationActionResponse(
+            preferenceProvided = true,
+            preference = RecommendationPreference.LIKE,
+        )
+        val confirmedDislike = RecommendationActionResponse(
+            preferenceProvided = true,
+            preference = RecommendationPreference.DISLIKE,
+        )
+
+        assertFalse(
+            recommendationPreferenceChangedAfterAction(
+                previous = RecommendationAction.LIKE,
+                requestedAction = RecommendationAction.LIKE,
+                response = confirmedLike,
+            ),
+        )
+        assertTrue(
+            recommendationPreferenceChangedAfterAction(
+                previous = RecommendationAction.LIKE,
+                requestedAction = RecommendationAction.DISLIKE,
+                response = confirmedDislike,
+            ),
+        )
+        assertFalse(
+            recommendationPreferenceChangedAfterAction(
+                previous = RecommendationAction.LIKE,
+                requestedAction = RecommendationAction.OPEN,
+                response = confirmedDislike,
+            ),
+        )
+        assertFalse(
+            recommendationPreferenceChangedAfterAction(
+                previous = RecommendationAction.LIKE,
+                requestedAction = RecommendationAction.EXPORT,
+                response = confirmedDislike,
+            ),
+        )
+    }
+
     @Test(expected = SerializationException::class)
     fun rejectsUnsupportedPreferenceValue() {
         json.decodeFromString<RecommendationsResponse>(responseJson(preference = "\"open\""))

@@ -101,6 +101,8 @@ Vue 3 + TypeScript + Vite SPA：
 - 原生桥接（`native_bridge.py`）
 - LAN 访问集成（`lan_access.py`）
 - 运行时管理（`runtime.py`）
+- production `ImageRegistry` 使用 4 个有界 render slot；通用 registry 默认值仍为 2。2/3/4/6/8/12/16 的同输入压力矩阵中，4 是首个通过冷前 6 张 1.5 秒门禁且没有让搜索缩略图、preview 或 bootstrap P95 回退超过 10% 的档位；6 对关键 P95 只再改善 2.96%，却显著增加 CPU/RSS，因此不采用更高值。4 档压力峰值 RSS 比 2 档高 231.191 MiB（58.33%），真实源码版联合冒烟必须继续检查这一明确瞬时内存代价。
+- Windows UI 大批量导出由 `NativeBridge._export_worker` 后台逐项执行 capability 解析、重名避让、`copy2`、错误清单和进度更新，production 复制并发保持 1。当前同盘 SATA SSD 的 1/2/4 矩阵中，2 虽提高中位吞吐约 61%，但搜索缩略图、preview、bootstrap 和纯推荐选择 worst P95 均回退超过 10%，因此不得启用；`copy_files` 只写 CF_HDROP 剪贴板列表，不属于应用内复制并发。
 
 ### Windows 登录后常驻生命周期
 
@@ -242,10 +244,14 @@ CLI 入口将配置创建、迁移/后端服务、需要 `ImageVectorService` �
 - LAN 契约为已认证的 `POST /api/v1/recommendations`（仅 `{request_id}`）、`POST /api/v1/recommendations/{batch_id}/shown`（仅 `{event_id}`）和 `POST /api/v1/recommendations/{batch_id}/actions`（`event_id`、`item_id`、`action`，export 可带 metadata）。`request_id` 使批次创建幂等；`event_id` 使 shown 与 action 幂等。
 - 推荐响应的每个 item 可含最终共享 `preference`（`like`、`dislike` 或 `null`），顶层 `personalization` 返回 `applied`、`effective_count` 和安全 `reason`。降级 reason 为 `insufficient_preferences`、`vectors_unavailable`、`incompatible_vector_spaces`；幂等批次回放使用 `replayed`，并仍重新读取 item 的当前最终偏好。action 成功响应也返回 `recorded` 与原子读取的当前最终 `preference`，客户端不得把较旧 event ID 的幂等回放误显示为新的跨设备偏好。响应不包含 viewer/device ID 或完整反馈历史。
 - 升级前已经持久化的批次允许在幂等回放时继续返回 `bucket=recent`，不得删除或迁移旧批次；Windows 将该旧来源显示为通用“推荐”，Android 继续安全读取，不再向用户显示“最近入库”。
-- Web 和 Android 都必须先完成缩略图预加载，且页面实际可见后才提交 shown。shown/action 同步失败时必须复用原 `event_id`；Android shown 使用有上限的指数退避自动重试。Android 仅在保存原图成功后提交 `export`（`metadata.channel=save`）；分享不记录 export 事件。
+- Windows 同时启动一批全部 15 张缩略图预载，固定前 6 张成功后即可把含 15 个图片槽位的批次提交为可见并同步 shown；Android 的固定关键组为前 4 张。关键组失败时保留旧批次且不得 shown；尾部失败只汇总一次，不回滚已可见批次。隐藏期间不得提交新批次，恢复可见后同一批只 shown 一次。shown/action 同步失败时必须复用原 `event_id`；Android shown 使用有上限的指数退避自动重试。
+- 当前批 shown 成功且全部缩略图 settle 后，两端都只允许在内存中静默准备一个下一批。未消费的预热批次不算展示、不增加曝光、不进入 240 条历史；点击消费完整或在途预热不得重复 create/preload。推荐页或 document/Activity 隐藏、断开/重新配对和卸载会取消并丢弃预热；最终 `like/dislike` 状态相对操作前实际变化时也会失效，open/export、最终状态相同的反馈和幂等回放不失效。跨设备偏好在页面持续可见期间变化时，最多影响这一批已生成快照，不新增轮询 API。Android 仅在保存原图成功后提交 `export`（`metadata.channel=save`）；分享不记录 export 事件。
+- LAN 推荐 item 的 `thumbnail_url` 使用经 Bearer、session owner capability 和撤销校验的 `/api/v1/media/{media_id}/thumbnail`，返回共享 `ImageRegistry` 的 640px 持久化 JPEG 缩略图并支持 GET/HEAD、private cache、ETag/304；`preview_url` 与详情、保存、分享继续走 `/original`。推荐 capability 创建只绑定 registry ID 与精确文件版本，不为列表逐项读取完整原图；首次 original 请求才按稳定版本 single-flight 计算并缓存强 SHA-256。响应不泄露路径、token 或内部 registry ID。
 - Windows 推荐卡片仅显示图片及图片右下角的推荐来源角标，不显示文件名、图库名或“打开/喜欢/导出/不喜欢”底部按钮；单击图片继续打开当前图片。右键菜单仅作用于当前单图，推荐详情及既有操作保持可用，菜单提供详情、系统打开、所在文件夹、喜欢/不喜欢、复制图片、复制文件、复制路径和导出；推荐反馈保持 `like/dislike`，搜索菜单仍使用“相关/不相关”且保留原多选语义。菜单受窗口边界约束，并在点击外部、Escape、窗口缩放或离开推荐页时收起。
 - 新批次在后端记录候选首轮/扩容读取、偏好画像、选择、结果回填和总耗时，以及候选读取次数和画像缓存命中。Windows 本地 bridge 仅白名单透传这些非负数值和布尔诊断字段；字段不得含路径、viewer/device ID、请求/批次/图库标识或偏好内容，LAN/Android 推荐契约保持不变。后端阶段耗时不含 HTTP 与缩略图预载；Windows 端到端性能测量另包含 create HTTP、15 张缩略图预载和 shown 同步，DOM commit/paint 只做独立视觉冒烟，不计入计时。
-- 2026-08-03 当前机器验证中，768×1024 纯选择 P95 为 615.905 ms，真实图库冷启动首批为 2662.453 ms，均通过各自门禁；连续真实新批次虽已做到推荐后端 P95 536.604 ms、20/20 首轮 100 命中且画像缓存命中，端到端 P95 仍为 2995.028 ms，未达到 2 秒目标。约 2371.225 ms 位于本推荐改动范围外的共享缩略图生成/HTTP 预载；不得以同一批次幂等重放的全热缓存结果替代真实换批结果，也不得在推荐性能项中擅自改变共享图片服务或前端预载策略。
+- TC-006 的 2026-08-03 历史基线为：768×1024 纯选择 P95 615.905 ms、真实图库冷启动首批 2662.453 ms、连续真实新批次后端 P95 536.604 ms，但包含 15 张首次缩略图的 Windows 端到端 P95 仍为 2995.028 ms，其中约 2371.225 ms 位于共享缩略图生成/HTTP 预载。该 `2.995 s` 只作为 TC-007 前值，不再描述当前交付路径。
+- TC-007 production 采用共享 render=4、Android HTTP=10；扫描保持 4，Windows 导出复制保持串行 1。Windows 20 个非预热真实新批次的 create、前 6、全 15、shown P95 分别为 601.126/1751.808/2130.634/39.687 ms；20 个完整预热命中点击提交/全就绪 P95 为 317/341 ms。相对历史 2995.028 ms，前 6 原始口径减少 41.51%（1.71x），加 shown 的保守口径减少 40.18%（1.67x），全 15 减少 28.86%（1.41x），预热点击减少 89.42%（9.45x）。冷首批前 6/全 15 为 1510/1850 ms；冷首批和预热门禁通过，非预热前 6 `<=1.5 s` 与全 15 `<=2 s` 未通过。
+- API 34 模拟器连接真实 LAN、production 10x4 的 20 个非预热批次 create/t4/t15 P95 为 856.960/2427.430/2601.598 ms，预热命中状态提交 P95 为 0.087 ms（不含 Compose paint）；600 张缩略图合计 27,601,611 bytes，即使保守对比历史 300 张原图 1,634,786,151 bytes 仍减少 98.31%。预热点击与网络字节门禁通过，非预热 t4 `<=1.5 s`、t15 `<=2.2 s` 未通过；剩余瓶颈为首次原图 decode、640px render 与模拟器 Coil 解码，不得用全热或预热结果冒充冷路径达标，也不得启用已被公平性/资源矩阵淘汰的更高并发。
 
 本图片推荐章节不改变现有发布矩阵。
 
@@ -272,6 +278,12 @@ CLI 入口将配置创建、迁移/后端服务、需要 `ImageVectorService` �
 - **兜底机制**：watchdog buffer 溢出 → 标记需全量扫描；程序关闭期间变化 → 下次启动 watcher 接管，提供手动全量索引兜底
 - **配置项**：`watcher_debounce_seconds`（默认 5 秒）、`watcher_overflow_triggers_full_scan`（默认 True）
 - **持久化约束**：保存图库设置后，`auto_index_enabled` 必须在接口返回值和 `config.json` 重载结果中保持一致
+
+### 全量图片扫描并发
+
+- 全量扫描继续使用 `scan_concurrency=4` 的有界 `ThreadPoolExecutor`，默认 in-flight 上限为 worker 的两倍。发现 sequence 在提交 worker 前分配；worker 可以乱序完成，但结果和 staging 消费继续按稳定 sequence/path/SHA 契约输出，不能因并发改变去重、错误事实或进度。
+- 当前 D: `CT2000MX500SSD1` SATA SSD 上，对同一 340 张、1,846,689,211 bytes 隔离真实图片快照做 4/6/8/12 各三轮扫描，P50 吞吐分别为 185.113/194.882/197.106/194.808 images/s。6 相对 4 只提高 5.28%，却使搜索缩略图和 preview worst P95 回退 12.17%/20.13%；更高档 CPU/RSS 继续增加，因此 production 保持 4。该结果受一次性 snapshot 复制和内容摘要预热 Windows 文件缓存影响，不泛化到 HDD、其他 SSD 或严格冷盘。
+- 中途取消会等待当前有界 inspection 集合收尾；本机 4 档实测约 777.961 ms，随后无 scanner thread 或 staging 残留。若取消恰在 final drain 完成后到达，scanner 会正常返回 ready staging，service 紧接着的 `cancel_check` 再终止任务并清理；不得声称 scanner 在已经完成的 final drain 内观察到了取消。
 
 ### 任务历史
 

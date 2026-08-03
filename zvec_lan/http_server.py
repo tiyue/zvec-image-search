@@ -36,6 +36,7 @@ from .models import (
     SearchPage,
     SearchPending,
     SearchRequest,
+    ThumbnailPayload,
     libraries_payload,
     search_page_payload,
 )
@@ -65,6 +66,7 @@ DEFAULT_STREAM_CHUNK_BYTES = 256 * 1024
 DEFAULT_CONNECTION_IDLE_TIMEOUT_SECONDS = 60.0
 DEFAULT_MAX_CONNECTIONS = 64
 _MAX_JSON_BYTES = 64 * 1024
+_MAX_THUMBNAIL_BYTES = 32 * 1024 * 1024
 _MAX_CHUNK_LINE_BYTES = 8192
 _MAX_TRAILER_BYTES = 64 * 1024
 _OPAQUE_ID = re.compile(r"^[A-Za-z0-9._~-]{1,256}$")
@@ -550,14 +552,18 @@ class _LanRequestHandler(BaseHTTPRequestHandler):
                 return
 
             media_match = re.fullmatch(
-                r"/api/v1/media/([^/]+)/original",
+                r"/api/v1/media/([^/]+)/(original|thumbnail)",
                 path,
             )
             if media_match is not None:
                 self._require_method("GET", "HEAD")
                 self._require_no_query(target.query)
                 client, _token = self._authenticate()
-                self._serve_original(_opaque_segment(media_match.group(1)), client)
+                media_id = _opaque_segment(media_match.group(1))
+                if media_match.group(2) == "thumbnail":
+                    self._serve_thumbnail(media_id, client)
+                else:
+                    self._serve_original(media_id, client)
                 return
 
             if path == "/api/v1/session":
@@ -1109,6 +1115,50 @@ class _LanRequestHandler(BaseHTTPRequestHandler):
                     byte_range.length,
                     session_id=client.session_id,
                 )
+
+    def _serve_thumbnail(
+        self,
+        media_id: str,
+        client: AuthenticatedClient,
+    ) -> None:
+        self._require_active_session(client)
+        payload = self._backend_call(
+            self.gateway._media_resolver.resolve_thumbnail,
+            media_id,
+            client_id=client.session_id,
+        )
+        if payload is None:
+            raise _ApiProblem(404, "media_not_found", "Thumbnail media was not found.")
+        self._require_active_session(client)
+        if (
+            not isinstance(payload, ThumbnailPayload)
+            or not isinstance(payload.content, bytes)
+            or not 0 < len(payload.content) <= _MAX_THUMBNAIL_BYTES
+            or payload.content_type not in {"image/jpeg", "image/png"}
+            or not _valid_thumbnail_etag(payload.etag)
+        ):
+            raise _ApiProblem(
+                500,
+                "invalid_thumbnail_payload",
+                "Thumbnail media is unavailable.",
+            )
+        common_headers = (
+            ("ETag", payload.etag),
+            ("Cache-Control", "private, max-age=300"),
+        )
+        if _if_none_match(self.headers.get("If-None-Match"), payload.etag):
+            self.send_response(HTTPStatus.NOT_MODIFIED)
+            self._send_headers(common_headers)
+            self.end_headers()
+            return
+        self.send_response(HTTPStatus.OK)
+        self._send_headers(common_headers)
+        self.send_header("Content-Type", payload.content_type)
+        self.send_header("Content-Length", str(len(payload.content)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(payload.content)
 
     def _range_not_satisfiable(self, size: int, etag: str) -> NoReturn:
         raise _ApiProblem(
@@ -1754,6 +1804,17 @@ def _range_problem(size: int, etag: str) -> _ApiProblem:
 
 def _invalid_chunked_body() -> _ApiProblem:
     return _ApiProblem(400, "invalid_chunked_body", "Chunked body is invalid.")
+
+
+def _valid_thumbnail_etag(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and re.fullmatch(
+            r'"[A-Za-z0-9._~-]{1,192}"',
+            value,
+        )
+        is not None
+    )
 
 
 def _if_none_match(value: str | None, etag: str) -> bool:

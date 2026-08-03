@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import tempfile
 import threading
 import time
@@ -198,19 +199,41 @@ class PreviewLanAdapterTests(unittest.TestCase):
         adapter = PreviewLanAdapter(self.facade, recommendation_backend=backend)  # type: ignore[arg-type]
         adapter.set_recommendation_media_origin("http://192.168.1.20:39000")
 
-        payload = adapter.create_recommendations(
-            "request-1", client_id="session-a", device_id="android-install-a"
-        )
+        with patch("zvec_webview.lan_access._sha256_file") as digest_file:
+            payload = adapter.create_recommendations(
+                "request-1", client_id="session-a", device_id="android-install-a"
+            )
+        digest_file.assert_not_called()
         media_id = payload["items"][0]["media_id"]  # type: ignore[index]
         self.assertNotEqual(media_id, self.facade.image_id)
         self.assertEqual(
             payload["items"][0]["thumbnail_url"],
+            f"http://192.168.1.20:39000/api/v1/media/{media_id}/thumbnail",
+        )
+        self.assertEqual(
+            payload["items"][0]["preview_url"],
             f"http://192.168.1.20:39000/api/v1/media/{media_id}/original",
         )
         self.assertNotIn("source_path", str(payload))
         self.assertNotIn("vector", str(payload))
-        resolved = adapter.resolve_original(media_id, client_id="session-a")
+        thumbnail = adapter.resolve_thumbnail(media_id, client_id="session-a")
+        self.assertIsNotNone(thumbnail)
+        assert thumbnail is not None
+        self.assertNotEqual(thumbnail.content, self.source.read_bytes())
+        with Image.open(io.BytesIO(thumbnail.content)) as rendered:
+            self.assertLessEqual(max(rendered.size), 640)
+        self.assertIsNone(adapter.resolve_thumbnail(media_id, client_id="session-b"))
+
+        with patch(
+            "zvec_webview.lan_access._sha256_file",
+            wraps=lambda path: hashlib.sha256(path.read_bytes()).hexdigest(),
+        ) as digest_file:
+            resolved = adapter.resolve_original(media_id, client_id="session-a")
+            repeated = adapter.resolve_original(media_id, client_id="session-a")
+        self.assertEqual(digest_file.call_count, 1)
         self.assertEqual(resolved.path, self.source.resolve())
+        self.assertEqual(resolved.sha256, self.digest)
+        self.assertEqual(repeated, resolved)
 
         adapter.mark_recommendations_shown(
             "batch-1",
@@ -238,6 +261,81 @@ class PreviewLanAdapterTests(unittest.TestCase):
         )
         adapter.delete_client_session(client_id="session-a")
         self.assertIsNone(adapter.resolve_original(media_id, client_id="session-a"))
+        self.assertIsNone(adapter.resolve_thumbnail(media_id, client_id="session-a"))
+
+    def test_recommendation_original_digest_is_lazy_single_flight(self) -> None:
+        backend = _RecommendationBackend(self.facade.image_id)
+        adapter = PreviewLanAdapter(self.facade, recommendation_backend=backend)  # type: ignore[arg-type]
+        adapter.set_recommendation_media_origin("http://192.168.1.20:39000")
+        started = threading.Event()
+        release = threading.Event()
+        calls = 0
+        calls_lock = threading.Lock()
+
+        def counted_digest(path: Path) -> str:
+            nonlocal calls
+            with calls_lock:
+                calls += 1
+            started.set()
+            release.wait(timeout=5)
+            return hashlib.sha256(path.read_bytes()).hexdigest()
+
+        with patch("zvec_webview.lan_access._sha256_file", side_effect=counted_digest):
+            payload = adapter.create_recommendations(
+                "request-1",
+                client_id="session-a",
+                device_id="android-install-a",
+            )
+            self.assertEqual(calls, 0)
+            media_id = payload["items"][0]["media_id"]  # type: ignore[index]
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                futures = tuple(
+                    executor.submit(
+                        adapter.resolve_original,
+                        media_id,
+                        client_id="session-a",
+                    )
+                    for _index in range(8)
+                )
+                self.assertTrue(started.wait(timeout=2))
+                release.set()
+                resolved = tuple(future.result(timeout=5) for future in futures)
+
+        self.assertEqual(calls, 1)
+        self.assertTrue(all(item is not None for item in resolved))
+        self.assertTrue(all(item.sha256 == self.digest for item in resolved if item))
+
+    def test_recommendation_source_change_revokes_old_thumbnail_and_original(
+        self,
+    ) -> None:
+        backend = _RecommendationBackend(self.facade.image_id)
+        adapter = PreviewLanAdapter(self.facade, recommendation_backend=backend)  # type: ignore[arg-type]
+        adapter.set_recommendation_media_origin("http://192.168.1.20:39000")
+        first = adapter.create_recommendations(
+            "request-1", client_id="session-a", device_id="android-install-a"
+        )
+        first_media = first["items"][0]["media_id"]  # type: ignore[index]
+        self.assertIsNotNone(
+            adapter.resolve_thumbnail(first_media, client_id="session-a")
+        )
+
+        Image.new("RGB", (96, 128), (140, 60, 80)).save(self.source)
+        self.facade.image_id = self.registry.register(self.source).image_id
+        backend.media_id = self.facade.image_id
+        second = adapter.create_recommendations(
+            "request-2", client_id="session-a", device_id="android-install-a"
+        )
+        second_media = second["items"][0]["media_id"]  # type: ignore[index]
+
+        self.assertNotEqual(first_media, second_media)
+        self.assertIsNone(adapter.resolve_thumbnail(first_media, client_id="session-a"))
+        self.assertIsNone(adapter.resolve_original(first_media, client_id="session-a"))
+        self.assertIsNotNone(
+            adapter.resolve_thumbnail(second_media, client_id="session-a")
+        )
+        self.assertIsNotNone(
+            adapter.resolve_original(second_media, client_id="session-a")
+        )
 
     def test_recommendation_media_filter_marks_batch_partial(self) -> None:
         adapter = PreviewLanAdapter(

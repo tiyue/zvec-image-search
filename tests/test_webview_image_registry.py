@@ -180,25 +180,34 @@ class ImageRegistryTests(unittest.TestCase):
         image_id = registry.register(source).image_id
         render_count = 0
         count_lock = threading.Lock()
+        callers_ready = threading.Barrier(9)
+        render_started = threading.Event()
+        release_render = threading.Event()
         real_render = image_registry_module._render_image
 
-        def slow_render(path, variant, mtime_ns):
+        def blocked_render(path, variant, mtime_ns):
             nonlocal render_count
             with count_lock:
                 render_count += 1
-            time.sleep(0.05)
+            render_started.set()
+            self.assertTrue(release_render.wait(timeout=2))
             return real_render(path, variant, mtime_ns)
 
+        def request_payload(_index):
+            callers_ready.wait(timeout=2)
+            return registry.payload(image_id, "thumbnail")
+
         with (
-            patch.object(image_registry_module, "_render_image", slow_render),
+            patch.object(image_registry_module, "_render_image", blocked_render),
             ThreadPoolExecutor(max_workers=8) as executor,
         ):
-            payloads = tuple(
-                executor.map(
-                    lambda _index: registry.payload(image_id, "thumbnail"),
-                    range(8),
-                )
+            futures = tuple(
+                executor.submit(request_payload, index) for index in range(8)
             )
+            callers_ready.wait(timeout=2)
+            self.assertTrue(render_started.wait(timeout=2))
+            release_render.set()
+            payloads = tuple(future.result(timeout=2) for future in futures)
 
         self.assertEqual(render_count, 1)
         self.assertEqual(len({payload.content for payload in payloads}), 1)
@@ -219,6 +228,8 @@ class ImageRegistryTests(unittest.TestCase):
         active = 0
         maximum_active = 0
         active_lock = threading.Lock()
+        two_renders_started = threading.Event()
+        release_renders = threading.Event()
         real_render = image_registry_module._render_image
 
         def tracked_render(path, variant, mtime_ns):
@@ -226,8 +237,10 @@ class ImageRegistryTests(unittest.TestCase):
             with active_lock:
                 active += 1
                 maximum_active = max(maximum_active, active)
+                if active == 2:
+                    two_renders_started.set()
             try:
-                time.sleep(0.04)
+                self.assertTrue(release_renders.wait(timeout=2))
                 return real_render(path, variant, mtime_ns)
             finally:
                 with active_lock:
@@ -237,12 +250,16 @@ class ImageRegistryTests(unittest.TestCase):
             patch.object(image_registry_module, "_render_image", tracked_render),
             ThreadPoolExecutor(max_workers=4) as executor,
         ):
-            tuple(
-                executor.map(
-                    lambda image_id: registry.payload(image_id, "thumbnail"),
-                    image_ids,
-                )
+            futures = tuple(
+                executor.submit(registry.payload, image_id, "thumbnail")
+                for image_id in image_ids
             )
+            self.assertTrue(two_renders_started.wait(timeout=2))
+            with active_lock:
+                self.assertEqual(active, 2)
+                self.assertEqual(maximum_active, 2)
+            release_renders.set()
+            tuple(future.result(timeout=2) for future in futures)
 
         self.assertEqual(maximum_active, 2)
         self.assertEqual(len(tuple(cache.rglob("*.cache"))), 4)
@@ -253,19 +270,27 @@ class ImageRegistryTests(unittest.TestCase):
         source = _image(self.root / "retry.jpg", size=(800, 600))
         registry = ImageRegistry(max_render_workers=2)
         image_id = registry.register(source).image_id
+        callers_ready = threading.Barrier(7)
+        render_started = threading.Event()
+        release_render = threading.Event()
 
         def fail_render(_path, _variant, _mtime_ns):
-            time.sleep(0.04)
+            render_started.set()
+            self.assertTrue(release_render.wait(timeout=2))
             raise ImageRegistryError("temporary render failure")
+
+        def request_payload():
+            callers_ready.wait(timeout=2)
+            return registry.payload(image_id, "thumbnail")
 
         with (
             patch.object(image_registry_module, "_render_image", fail_render),
             ThreadPoolExecutor(max_workers=6) as executor,
         ):
-            futures = [
-                executor.submit(registry.payload, image_id, "thumbnail")
-                for _index in range(6)
-            ]
+            futures = [executor.submit(request_payload) for _index in range(6)]
+            callers_ready.wait(timeout=2)
+            self.assertTrue(render_started.wait(timeout=2))
+            release_render.set()
             for future in futures:
                 with self.assertRaisesRegex(
                     ImageRegistryError, "temporary render failure"

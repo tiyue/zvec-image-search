@@ -94,6 +94,7 @@ describe("RecommendationPage", () => {
     state.loading.value = false;
     state.error.value = "";
     state.shownError.value = "";
+    state.shownPending.value = false;
     state.preferenceFor.mockReturnValue("");
     Object.defineProperty(window, "innerWidth", { configurable: true, value: 800 });
     Object.defineProperty(window, "innerHeight", { configurable: true, value: 600 });
@@ -111,6 +112,27 @@ describe("RecommendationPage", () => {
 
     expect(wrapper.findAll(".recommendation-skeleton")).toHaveLength(15);
     expect(state.setVisible).toHaveBeenCalledWith(true);
+  });
+
+  it("keeps an existing grid unobscured while the next batch reaches its critical preload", () => {
+    state.currentBatch.value = batch();
+    state.loading.value = true;
+    const wrapper = mount(RecommendationPage, { props: { visible: true } });
+    mountedWrappers.push(wrapper);
+
+    expect(wrapper.find(".recommendation-grid").attributes("aria-busy")).toBe("true");
+    expect(wrapper.find(".recommendation-media img").exists()).toBe(true);
+    expect(wrapper.find(".recommendation-loading").exists()).toBe(false);
+  });
+
+  it("keeps refresh available while shown synchronization finishes in the background", () => {
+    state.currentBatch.value = batch();
+    state.shownPending.value = true;
+    const wrapper = mount(RecommendationPage, { props: { visible: true } });
+    mountedWrappers.push(wrapper);
+
+    expect(wrapper.get(".refresh-button").attributes("disabled")).toBeUndefined();
+    expect(wrapper.get(".refresh-button").text()).toBe("换一批");
   });
 
   it("renders image-only cards and records a successful image click", async () => {

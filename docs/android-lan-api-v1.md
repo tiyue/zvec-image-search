@@ -107,6 +107,8 @@ GET    /api/v1/searches/{search_id}?page=1&page_size=30
 DELETE /api/v1/searches/{search_id}
 GET    /api/v1/media/{media_id}/original
 HEAD   /api/v1/media/{media_id}/original
+GET    /api/v1/media/{media_id}/thumbnail
+HEAD   /api/v1/media/{media_id}/thumbnail
 DELETE /api/v1/session
 ```
 
@@ -207,10 +209,31 @@ Opaque `media_id` values never reveal an absolute Windows path. YaoLens Android
 may run multiple transfers concurrently; the app prioritizes visible items and
 prefetches the next viewport while preserving all results.
 
-`ETag` is the quoted lowercase SHA-256 recorded for the indexed source. `HEAD`
-returns the same metadata headers as `GET` and no body. Only one byte range is
-accepted; an invalid or unsatisfiable range returns `416` with
+For a search capability, `ETag` is the quoted lowercase SHA-256 recorded for
+the indexed source. Creating a recommendation capability does not read the
+source file solely to calculate this digest; the first `/original` request
+calculates and caches the same strong SHA-256 for the exact stable file version.
+`HEAD` returns the same metadata headers as `GET` and no body. Only one byte
+range is accepted; an invalid or unsatisfiable range returns `416` with
 `Content-Range: bytes */<length>`.
+
+### Thumbnail media
+
+The authenticated thumbnail route returns the shared ImageRegistry 640-pixel
+thumbnail rather than the source file. It has the same client/session owner
+capability and revocation checks as `/original`; a media ID owned by another
+session, a changed source version, or a revoked capability returns the same
+safe `404` without revealing a path.
+
+Successful responses include an image `Content-Type`, exact `Content-Length`,
+a quoted opaque `ETag`, `Cache-Control: private, max-age=300`, and
+`X-Content-Type-Options: nosniff`. `If-None-Match` may return `304`; `HEAD`
+returns the same metadata without a body. The payload is size bounded and uses
+the existing persistent cache, per-image single-flight and bounded renderer.
+The route never returns a path, token, internal registry ID or original bytes.
+Search result payloads keep their existing media URL behavior; TC-007 changes
+only recommendation items so that `thumbnail_url` uses `/thumbnail` while
+`preview_url` remains `/original`.
 
 ## Recommendations
 
@@ -276,7 +299,7 @@ plus the computer-wide explicit preference state:
       "height": 2400,
       "bucket": "quality",
       "preference": "like",
-      "thumbnail_url": "http://private-host/api/v1/media/.../original",
+      "thumbnail_url": "http://private-host/api/v1/media/.../thumbnail",
       "preview_url": "http://private-host/api/v1/media/.../original"
     }
   ]
@@ -307,10 +330,24 @@ that newest-first window, and loads vectors for at most 256 images. Older
 preferences outside an unusually duplicate-heavy profile window still retain
 their exact shared state and remain excluded from new batches.
 
-The shown request accepts exactly `{ "event_id": "..." }`. It increments
-exposure only once, only after the client has successfully displayed the batch.
-Batch, shown history, and exposure counts remain isolated by Android installation
-and are never merged with desktop browsing history.
+The shown request accepts exactly `{ "event_id": "..." }`. Android starts all
+batch thumbnail loads together and may commit the batch after its fixed first
+four thumbnails are ready. At that point the grid containing all 15 image slots
+is visible and the batch counts as displayed, so shown is submitted exactly
+once while the remaining thumbnails settle in the background. A generated or
+fully preloaded next batch that has not been committed is never shown and does
+not affect exposure or the 240-item history. Batch, shown history, and exposure
+counts remain isolated by Android installation and are never merged with
+desktop browsing history.
+
+After the current visible batch is shown and all its thumbnails settle, the
+client may prepare at most one next batch in memory. Consuming that batch does
+not create a duplicate request. Leaving the Recommendation tab, stopping the
+Activity, disconnecting or re-pairing discards it. A successful explicit
+preference change also discards it; open/export, a repeated final preference and
+idempotent replay do not. A cross-device preference change while the page stays
+continuously visible may affect at most that one already generated snapshot;
+v1 adds no polling endpoint for this boundary.
 
 The action request contains `event_id`, `item_id`, and one of `open`, `like`,
 `dislike`, or `export`. `export` may also contain bounded string metadata. Only

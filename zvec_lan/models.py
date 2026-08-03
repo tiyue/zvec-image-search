@@ -88,6 +88,15 @@ class MediaSource:
     content_type: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class ThumbnailPayload:
+    """Path-free encoded thumbnail bytes and cache metadata."""
+
+    content: bytes
+    content_type: str
+    etag: str
+
+
 class LanSearchBackend(Protocol):
     """Narrow search callback surface implemented by a desktop adapter."""
 
@@ -165,6 +174,14 @@ class MediaResolver(Protocol):
         client_id: str,
     ) -> MediaSource | None:
         """Return the indexed source or ``None`` when it is unavailable."""
+
+    def resolve_thumbnail(
+        self,
+        media_id: str,
+        *,
+        client_id: str,
+    ) -> ThumbnailPayload | None:
+        """Return a bounded encoded thumbnail without exposing its path."""
 
 
 class LanBackendError(RuntimeError):

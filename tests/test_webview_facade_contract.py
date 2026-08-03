@@ -31,6 +31,7 @@ from zvec_webview.facade import (
     _library_request,
     _search_request,
 )
+from zvec_webview.image_registry import ImageRegistry
 
 
 class _IdleHost:
@@ -255,6 +256,24 @@ class FacadeContractTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
+
+    def test_production_image_registry_uses_four_render_workers(self) -> None:
+        with patch(
+            "zvec_webview.facade.ImageRegistry",
+            wraps=ImageRegistry,
+        ) as registry_factory:
+            facade = PreviewFacade(
+                self.root / "config.json",
+                backend_host=_IdleHost(),  # type: ignore[arg-type]
+                credential_store=SessionCredentialStore(),
+            )
+        try:
+            registry_factory.assert_called_once_with(
+                cache_directory=facade.config_home / "cache",
+                max_render_workers=4,
+            )
+        finally:
+            facade.close()
 
     def test_bootstrap_without_config_reports_first_use_state(self) -> None:
         facade = PreviewFacade(

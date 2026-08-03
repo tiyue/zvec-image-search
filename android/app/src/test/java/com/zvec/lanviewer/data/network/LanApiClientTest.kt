@@ -11,8 +11,13 @@ import com.zvec.lanviewer.data.model.RecommendationShownRequest
 import com.zvec.lanviewer.data.model.SearchPageResult
 import com.zvec.lanviewer.data.repository.applyPairingPollResponse
 import com.zvec.lanviewer.data.security.InMemoryTokenStore
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
+import okhttp3.Call
+import okhttp3.Callback
 import okhttp3.Interceptor
+import okhttp3.Request
 import okhttp3.Response
 import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.MockResponse
@@ -29,6 +34,12 @@ import org.junit.Assert.fail
 import org.junit.Before
 import org.junit.Test
 import java.net.Proxy
+import java.io.IOException
+import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 class LanApiClientTest {
     private lateinit var server: MockWebServer
@@ -218,6 +229,219 @@ class LanApiClientTest {
     }
 
     @Test
+    fun dispatcherStrictlyAppliesConfiguredGlobalAndPerHostLimits() {
+        listOf(10, 15, 16).forEach { limit ->
+            val limitedClient = clientWithConcurrency(limit)
+            val entered = CountDownLatch(limit)
+            val release = CountDownLatch(1)
+            val running = AtomicInteger()
+            val maxRunning = AtomicInteger()
+            server.dispatcher = object : Dispatcher() {
+                override fun dispatch(request: RecordedRequest): MockResponse {
+                    val current = running.incrementAndGet()
+                    maxRunning.updateAndGet { previous -> maxOf(previous, current) }
+                    entered.countDown()
+                    try {
+                        assertTrue("timed out releasing dispatcher probe", release.await(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS))
+                    } finally {
+                        running.decrementAndGet()
+                    }
+                    return MockResponse().setResponseCode(200).setBody("ok")
+                }
+            }
+            val callbacks = RecordingCallback(limit + 2)
+            val idle = CountDownLatch(1)
+            limitedClient.httpClient.dispatcher.idleCallback = Runnable(idle::countDown)
+            val calls = List(limit + 2) { index -> rawCall(limitedClient, "/limit-$limit/$index") }
+            try {
+                calls.forEach { it.enqueue(callbacks) }
+
+                assertTrue("configured requests never reached the server", entered.await(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS))
+                assertEquals(limit, limitedClient.httpClient.dispatcher.maxRequests)
+                assertEquals(limit, limitedClient.httpClient.dispatcher.maxRequestsPerHost)
+                assertEquals(limit, limitedClient.httpClient.dispatcher.runningCallsCount())
+                assertEquals(2, limitedClient.httpClient.dispatcher.queuedCallsCount())
+                assertEquals(limit, maxRunning.get())
+            } finally {
+                release.countDown()
+            }
+            callbacks.await()
+            assertTrue("dispatcher did not become idle", idle.await(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS))
+            assertTrue(callbacks.failures.isEmpty())
+            assertEquals(0, limitedClient.httpClient.dispatcher.runningCallsCount())
+            assertEquals(0, limitedClient.httpClient.dispatcher.queuedCallsCount())
+        }
+    }
+
+    @Test
+    fun cancellingAQueuedCallDoesNotBlockTheFollowingRequest() {
+        val limitedClient = clientWithConcurrency(1)
+        val runningEntered = CountDownLatch(1)
+        val releaseRunning = CountDownLatch(1)
+        val successorEntered = CountDownLatch(1)
+        val cancelledReachedServer = AtomicBoolean(false)
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse = when (request.path) {
+                "/running" -> {
+                    runningEntered.countDown()
+                    assertTrue(releaseRunning.await(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS))
+                    MockResponse().setResponseCode(200).setBody("running")
+                }
+                "/cancelled" -> {
+                    cancelledReachedServer.set(true)
+                    MockResponse().setResponseCode(500)
+                }
+                "/successor" -> {
+                    successorEntered.countDown()
+                    MockResponse().setResponseCode(200).setBody("success")
+                }
+                else -> MockResponse().setResponseCode(404)
+            }
+        }
+        val callbacks = RecordingCallback(3)
+        val running = rawCall(limitedClient, "/running")
+        val cancelled = rawCall(limitedClient, "/cancelled")
+        val successor = rawCall(limitedClient, "/successor")
+        try {
+            running.enqueue(callbacks)
+            cancelled.enqueue(callbacks)
+            successor.enqueue(callbacks)
+            assertTrue(runningEntered.await(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS))
+            assertEquals(1, limitedClient.httpClient.dispatcher.runningCallsCount())
+            assertEquals(2, limitedClient.httpClient.dispatcher.queuedCallsCount())
+
+            cancelled.cancel()
+            releaseRunning.countDown()
+
+            assertTrue(successorEntered.await(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS))
+            callbacks.await()
+            assertFalse(cancelledReachedServer.get())
+            assertEquals(1, callbacks.failures.size)
+        } finally {
+            releaseRunning.countDown()
+            running.cancel()
+            successor.cancel()
+        }
+    }
+
+    @Test
+    fun cancellingARunningCallImmediatelyReleasesItsDispatcherSlot() {
+        val limitedClient = clientWithConcurrency(1)
+        val runningEntered = CountDownLatch(1)
+        val releaseServerHandler = CountDownLatch(1)
+        val successorEntered = CountDownLatch(1)
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse = when (request.path) {
+                "/running" -> {
+                    runningEntered.countDown()
+                    assertTrue(releaseServerHandler.await(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS))
+                    MockResponse().setResponseCode(200).setBody("late")
+                }
+                "/successor" -> {
+                    successorEntered.countDown()
+                    MockResponse().setResponseCode(200).setBody("success")
+                }
+                else -> MockResponse().setResponseCode(404)
+            }
+        }
+        val callbacks = RecordingCallback(2)
+        val running = rawCall(limitedClient, "/running")
+        val successor = rawCall(limitedClient, "/successor")
+        try {
+            running.enqueue(callbacks)
+            successor.enqueue(callbacks)
+            assertTrue(runningEntered.await(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS))
+            assertEquals(1, limitedClient.httpClient.dispatcher.queuedCallsCount())
+
+            running.cancel()
+
+            assertTrue(
+                "successor remained starved after the running call was cancelled",
+                successorEntered.await(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS),
+            )
+        } finally {
+            releaseServerHandler.countDown()
+        }
+        callbacks.await()
+        assertEquals(1, callbacks.failures.size)
+    }
+
+    @Test
+    fun failedApiCallReleasesTheNextQueuedRequest() = runBlocking {
+        val limitedClient = clientWithConcurrency(1)
+        val failureEntered = CountDownLatch(1)
+        val releaseFailure = CountDownLatch(1)
+        val dispatchCount = AtomicInteger()
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                return if (dispatchCount.getAndIncrement() == 0) {
+                    failureEntered.countDown()
+                    assertTrue(releaseFailure.await(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS))
+                    MockResponse().setResponseCode(500).setBody(
+                        """{"error":{"code":"probe_failure","message":"failed"}}""",
+                    )
+                } else {
+                    MockResponse().setResponseCode(200)
+                        .setHeader("Content-Type", "application/json")
+                        .setBody("""{"protocol":1,"instance_id":"desktop","name":"Zvec PC"}""")
+                }
+            }
+        }
+        val failed = async(start = CoroutineStart.UNDISPATCHED) { runCatching { limitedClient.status() } }
+        assertTrue(failureEntered.await(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS))
+        val succeeded = async(start = CoroutineStart.UNDISPATCHED) { limitedClient.status() }
+        assertEquals(1, limitedClient.httpClient.dispatcher.queuedCallsCount())
+
+        releaseFailure.countDown()
+
+        assertTrue(failed.await().exceptionOrNull() is ApiException)
+        assertEquals("desktop", succeeded.await().instanceId)
+        assertEquals(0, limitedClient.httpClient.dispatcher.runningCallsCount())
+        assertEquals(0, limitedClient.httpClient.dispatcher.queuedCallsCount())
+    }
+
+    @Test
+    fun controlRequestIsNotPermanentlyStarvedBehindFifteenImages() {
+        val limitedClient = clientWithConcurrency(10)
+        val initialImagesEntered = CountDownLatch(10)
+        val imagePermits = java.util.concurrent.Semaphore(0)
+        val controlEntered = CountDownLatch(1)
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                return if (request.path?.startsWith("/image/") == true) {
+                    initialImagesEntered.countDown()
+                    assertTrue(imagePermits.tryAcquire(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS))
+                    MockResponse().setResponseCode(200).setBody("image")
+                } else {
+                    controlEntered.countDown()
+                    MockResponse().setResponseCode(200).setBody("control")
+                }
+            }
+        }
+        val callbacks = RecordingCallback(16)
+        val images = List(15) { index -> rawCall(limitedClient, "/image/$index") }
+        val control = rawCall(limitedClient, "/control")
+        try {
+            images.forEach { it.enqueue(callbacks) }
+            control.enqueue(callbacks)
+            assertTrue(initialImagesEntered.await(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS))
+            assertEquals(10, limitedClient.httpClient.dispatcher.runningCallsCount())
+            assertEquals(6, limitedClient.httpClient.dispatcher.queuedCallsCount())
+
+            imagePermits.release(6)
+
+            assertTrue(
+                "control request remained starved after all earlier queued images advanced",
+                controlEntered.await(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS),
+            )
+        } finally {
+            imagePermits.release(15)
+        }
+        callbacks.await()
+        assertTrue(callbacks.failures.isEmpty())
+    }
+
+    @Test
     fun recommendationRoutesUseTheSpecifiedPayloads() = runBlocking {
         server.enqueue(
             MockResponse().setResponseCode(200).setBody(
@@ -276,5 +500,38 @@ class LanApiClientTest {
         assertNull(legacy.preference)
         assertTrue(cleared.preferenceProvided)
         assertNull(cleared.preference)
+    }
+
+    private fun clientWithConcurrency(limit: Int): LanApiClient = LanApiClient(
+        connectionReader = ConnectionReader { SavedConnection(baseUrl, "instance", "test") },
+        tokenStore = InMemoryTokenStore("top-secret-token"),
+        maxConcurrentRequests = limit,
+    )
+
+    private fun rawCall(client: LanApiClient, path: String): Call = client.httpClient.newCall(
+        Request.Builder().url(server.url(path)).get().build(),
+    )
+
+    private class RecordingCallback(expectedCalls: Int) : Callback {
+        private val completed = CountDownLatch(expectedCalls)
+        val failures = ConcurrentLinkedQueue<IOException>()
+
+        override fun onFailure(call: Call, e: IOException) {
+            failures += e
+            completed.countDown()
+        }
+
+        override fun onResponse(call: Call, response: Response) {
+            response.close()
+            completed.countDown()
+        }
+
+        fun await() {
+            assertTrue("calls did not complete", completed.await(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS))
+        }
+    }
+
+    companion object {
+        private const val TEST_TIMEOUT_SECONDS = 10L
     }
 }

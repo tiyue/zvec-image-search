@@ -12,6 +12,31 @@ import java.io.IOException
 @OptIn(ExperimentalCoroutinesApi::class)
 class RecommendationShownRetryTest {
     @Test
+    fun activeShownJobsOnlyBlockTheirOwnBatches() {
+        assertEquals(
+            RecommendationShownJobDecision.KEEP_ACTIVE,
+            recommendationShownJobDecision(
+                requestedBatchId = "batch-1",
+                activeBatchIds = setOf("batch-1"),
+            ),
+        )
+        assertEquals(
+            RecommendationShownJobDecision.START,
+            recommendationShownJobDecision(
+                requestedBatchId = "batch-2",
+                activeBatchIds = setOf("batch-1"),
+            ),
+        )
+        assertEquals(
+            RecommendationShownJobDecision.START,
+            recommendationShownJobDecision(
+                requestedBatchId = "batch-2",
+                activeBatchIds = emptySet(),
+            ),
+        )
+    }
+
+    @Test
     fun retriesTheSameEventUntilShownIsRecorded() = runTest {
         val eventId = "shown-event"
         val submittedEventIds = mutableListOf<String>()

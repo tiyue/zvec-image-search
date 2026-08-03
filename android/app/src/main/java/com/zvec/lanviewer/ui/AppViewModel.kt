@@ -24,6 +24,7 @@ import com.zvec.lanviewer.data.model.RecommendationItem
 import com.zvec.lanviewer.data.model.RecommendationPreference
 import com.zvec.lanviewer.data.model.RecommendationRequest
 import com.zvec.lanviewer.data.model.RecommendationShownRequest
+import com.zvec.lanviewer.data.model.RecommendationsResponse
 import com.zvec.lanviewer.data.model.SearchItem
 import com.zvec.lanviewer.data.model.SearchMode
 import com.zvec.lanviewer.data.model.SearchRequest
@@ -57,6 +58,19 @@ import java.util.UUID
 
 private const val RECOMMENDATION_SHOWN_RETRY_INITIAL_DELAY_MILLIS = 1_000L
 private const val RECOMMENDATION_SHOWN_RETRY_MAX_DELAY_MILLIS = 30_000L
+
+internal enum class RecommendationShownJobDecision {
+    START,
+    KEEP_ACTIVE,
+}
+
+internal fun recommendationShownJobDecision(
+    requestedBatchId: String,
+    activeBatchIds: Set<String>,
+): RecommendationShownJobDecision = when {
+    requestedBatchId in activeBatchIds -> RecommendationShownJobDecision.KEEP_ACTIVE
+    else -> RecommendationShownJobDecision.START
+}
 
 internal fun recommendationReactions(
     items: List<RecommendationItem>,
@@ -115,6 +129,24 @@ internal fun recommendationReactionsAfterActionSuccess(
     }
 }
 
+internal fun recommendationPreferenceChangedAfterAction(
+    previous: RecommendationAction?,
+    requestedAction: RecommendationAction,
+    response: RecommendationActionResponse,
+): Boolean {
+    if (requestedAction !in setOf(RecommendationAction.LIKE, RecommendationAction.DISLIKE)) return false
+    val confirmedAction = if (response.preferenceProvided) {
+        when (response.preference) {
+            RecommendationPreference.LIKE -> RecommendationAction.LIKE
+            RecommendationPreference.DISLIKE -> RecommendationAction.DISLIKE
+            null -> null
+        }
+    } else {
+        requestedAction
+    }
+    return confirmedAction != previous
+}
+
 internal suspend fun retryRecommendationShown(
     isCurrentBatch: () -> Boolean,
     submit: suspend () -> Unit,
@@ -162,8 +194,16 @@ class AppViewModel(
     private var searchJob: Job? = null
     private var actionJob: Job? = null
     private var recommendationJob: Job? = null
-    private var recommendationShownJob: Job? = null
+    private val recommendationShownJobs = mutableMapOf<String, Job>()
     private var recommendationActionJob: Job? = null
+    private var recommendationTailJob: Job? = null
+    private var recommendationPreparationMonitorJob: Job? = null
+    private var pendingRecommendationPreload: RecommendationPreloadTask<RecommendationsResponse>? = null
+    private var currentRecommendationPreload: RecommendationPreloadTask<RecommendationsResponse>? = null
+    private var preparedRecommendation: RecommendationPreloadTask<RecommendationsResponse>? = null
+    private var recommendationGeneration = 0L
+    private var recommendationsVisible = false
+    private var settledRecommendationBatchId: String? = null
 
     init {
         _state.update { it.copy(savedFiles = savedFilesStore.list()) }
@@ -502,16 +542,38 @@ class AppViewModel(
 
     fun loadRecommendations() {
         if (_state.value.recommendations.isLoading) return
-        val requestId = UUID.randomUUID().toString()
+        val prefetched = preparedRecommendation
+        preparedRecommendation = null
+        recommendationPreparationMonitorJob?.cancel()
+        recommendationPreparationMonitorJob = null
+        cancelCurrentRecommendationTail()
+        val generation = recommendationGeneration
         recommendationJob?.cancel()
-        recommendationJob = viewModelScope.launch {
+        val next = viewModelScope.launch(start = CoroutineStart.LAZY) {
             _state.update { current ->
                 current.copy(recommendations = current.recommendations.copy(isLoading = true, errorMessage = null))
             }
+            var preload = prefetched ?: startRecommendationPreload(generation)
+            pendingRecommendationPreload = preload
             try {
-                val response = repository.recommendations(RecommendationRequest(requestId))
-                if (response.requestId != requestId) throw IOException("推荐响应与请求不一致")
-                preloadRecommendationThumbnails(response.items)
+                var response = try {
+                    preload.awaitCritical()
+                } catch (error: Throwable) {
+                    if (error is CancellationException) throw error
+                    if (prefetched == null || !isRecommendationGenerationCurrent(generation)) throw error
+                    preload.cancel()
+                    preload = startRecommendationPreload(generation)
+                    pendingRecommendationPreload = preload
+                    preload.awaitCritical()
+                }
+                if (!isRecommendationGenerationCurrent(generation)) {
+                    preload.cancel()
+                    return@launch
+                }
+                if (response.requestId != preload.requestId) throw IOException("推荐响应与请求不一致")
+                pendingRecommendationPreload = null
+                currentRecommendationPreload = preload
+                settledRecommendationBatchId = null
                 _state.update {
                     it.copy(
                         recommendations = RecommendationUiState(
@@ -524,6 +586,8 @@ class AppViewModel(
                         ),
                     )
                 }
+                observeCurrentRecommendationPreload(preload, response.batchId)
+                onRecommendationsVisible()
             } catch (error: Throwable) {
                 if (error is CancellationException) throw error
                 _state.update { current ->
@@ -534,16 +598,57 @@ class AppViewModel(
                         ),
                     )
                 }
+            } finally {
+                if (pendingRecommendationPreload === preload) pendingRecommendationPreload = null
+            }
+        }
+        recommendationJob = next
+        next.invokeOnCompletion {
+            if (recommendationJob === next) recommendationJob = null
+        }
+        next.start()
+    }
+
+    fun onRecommendationsVisibilityChanged(visible: Boolean) {
+        if (recommendationsVisible == visible) return
+        recommendationsVisible = visible
+        if (!visible) {
+            cancelRecommendationDelivery()
+            return
+        }
+        recommendationGeneration += 1
+        val recommendation = _state.value.recommendations
+        when {
+            recommendation.batchId == null && !recommendation.isLoading -> loadRecommendations()
+            recommendation.batchId != null -> {
+                onRecommendationsVisible()
+                if (settledRecommendationBatchId == recommendation.batchId) {
+                    maybePrepareNextRecommendations()
+                } else if (currentRecommendationPreload == null) {
+                    resumeCurrentRecommendationPreload()
+                }
             }
         }
     }
 
     fun onRecommendationsVisible() {
+        if (!recommendationsVisible) return
         val recommendation = _state.value.recommendations
         val batchId = recommendation.batchId ?: return
         if (recommendation.preloadedBatchId != batchId || recommendation.items.isEmpty() ||
-            recommendation.shownBatchId == batchId || recommendationShownJob?.isActive == true
+            recommendation.shownBatchId == batchId
         ) return
+        when (
+            recommendationShownJobDecision(
+                requestedBatchId = batchId,
+                activeBatchIds = recommendationShownJobs
+                    .filterValues { it.isActive }
+                    .keys,
+            )
+        ) {
+            RecommendationShownJobDecision.KEEP_ACTIVE -> return
+            RecommendationShownJobDecision.START -> Unit
+        }
         val eventId = recommendation.shownEventId ?: UUID.randomUUID().toString().also { generatedId ->
             _state.update { current ->
                 if (current.recommendations.batchId == batchId) {
@@ -551,11 +656,10 @@ class AppViewModel(
                 } else current
             }
         }
-        recommendationShownJob = viewModelScope.launch {
+        val next = viewModelScope.launch(start = CoroutineStart.LAZY) {
             val recorded = retryRecommendationShown(
                 isCurrentBatch = {
-                    val current = _state.value.recommendations
-                    current.batchId == batchId && current.shownBatchId != batchId
+                    recommendationsVisible
                 },
                 submit = {
                     repository.markRecommendationsShown(batchId, RecommendationShownRequest(eventId))
@@ -572,8 +676,16 @@ class AppViewModel(
                         )
                     } else current
                 }
+                maybePrepareNextRecommendations()
             }
         }
+        recommendationShownJobs[batchId] = next
+        next.invokeOnCompletion {
+            if (recommendationShownJobs[batchId] === next) {
+                recommendationShownJobs.remove(batchId)
+            }
+        }
+        next.start()
     }
 
     fun openRecommendation(index: Int) {
@@ -604,6 +716,7 @@ class AppViewModel(
         val batchId = _state.value.recommendations.batchId ?: return
         val actionKey = "${item.itemId}:${action.name}"
         val eventId = _state.value.recommendations.actionEventIds[actionKey] ?: UUID.randomUUID().toString()
+        val previousReaction = _state.value.recommendations.reactions[item.itemId]
         if (actionKey in _state.value.recommendations.pendingActionKeys) return
         _state.update { current ->
             if (current.recommendations.batchId != batchId) return@update current
@@ -623,16 +736,23 @@ class AppViewModel(
                     batchId,
                     RecommendationActionRequest(eventId, item.itemId, action, metadata),
                 )
+                var preferenceChanged = false
                 _state.update { current ->
                     if (current.recommendations.batchId != batchId) return@update current
+                    val updatedReactions = recommendationReactionsAfterActionSuccess(
+                        current.recommendations.reactions,
+                        item.itemId,
+                        action,
+                        response,
+                    )
+                    preferenceChanged = recommendationPreferenceChangedAfterAction(
+                        previous = previousReaction,
+                        requestedAction = action,
+                        response = response,
+                    )
                     current.copy(
                         recommendations = current.recommendations.copy(
-                            reactions = recommendationReactionsAfterActionSuccess(
-                                current.recommendations.reactions,
-                                item.itemId,
-                                action,
-                                response,
-                            ),
+                            reactions = updatedReactions,
                             actionEventIds = recommendationActionEventIdsAfterSuccess(
                                 current.recommendations.actionEventIds,
                                 item.itemId,
@@ -645,6 +765,7 @@ class AppViewModel(
                         ),
                     )
                 }
+                if (preferenceChanged) invalidatePreparedRecommendations()
             } catch (error: Throwable) {
                 if (error is CancellationException) throw error
                 _state.update { current ->
@@ -662,18 +783,165 @@ class AppViewModel(
         }
     }
 
-    private suspend fun preloadRecommendationThumbnails(items: List<RecommendationItem>) = coroutineScope {
-        val loaded = items.map { item ->
-            async {
-                runCatching {
-                    appContext.imageLoader.execute(
-                        ImageRequest.Builder(appContext).data(item.thumbnailUrl).size(640).build(),
-                    )
-                }.getOrNull() is SuccessResult
-            }
-        }.awaitAll()
-        if (loaded.any { !it }) throw IOException("推荐缩略图预载失败")
+    private fun startRecommendationPreload(generation: Long): RecommendationPreloadTask<RecommendationsResponse> {
+        val requestId = UUID.randomUUID().toString()
+        return viewModelScope.startRecommendationPreload(
+            requestId = requestId,
+            generation = generation,
+            criticalCount = RECOMMENDATION_CRITICAL_THUMBNAIL_COUNT,
+            create = { generatedRequestId ->
+                repository.recommendations(RecommendationRequest(generatedRequestId)).also { response ->
+                    if (response.requestId != generatedRequestId) {
+                        throw IOException("推荐响应与请求不一致")
+                    }
+                }
+            },
+            thumbnailUrls = { response -> response.items.map(RecommendationItem::thumbnailUrl) },
+            preload = ::preloadRecommendationThumbnail,
+        )
     }
+
+    private suspend fun preloadRecommendationThumbnail(url: String): Boolean = try {
+        appContext.imageLoader.execute(
+            ImageRequest.Builder(appContext).data(url).size(640).build(),
+        ) is SuccessResult
+    } catch (error: CancellationException) {
+        throw error
+    } catch (_: Throwable) {
+        false
+    }
+
+    private fun observeCurrentRecommendationPreload(
+        preload: RecommendationPreloadTask<RecommendationsResponse>,
+        batchId: String,
+    ) {
+        recommendationTailJob?.cancel()
+        val next = viewModelScope.launch {
+            val outcome = preload.awaitSettled()
+            if (currentRecommendationPreload !== preload || _state.value.recommendations.batchId != batchId) {
+                return@launch
+            }
+            currentRecommendationPreload = null
+            settledRecommendationBatchId = batchId
+            if (outcome.failedCount > 0) {
+                _state.update { current ->
+                    if (current.recommendations.batchId == batchId) {
+                        current.copy(
+                            recommendations = current.recommendations.copy(
+                                errorMessage = "部分缩略图加载失败",
+                            ),
+                        )
+                    } else current
+                }
+            }
+            maybePrepareNextRecommendations()
+        }
+        recommendationTailJob = next
+        next.invokeOnCompletion {
+            if (recommendationTailJob === next) recommendationTailJob = null
+        }
+    }
+
+    private fun resumeCurrentRecommendationPreload() {
+        val recommendation = _state.value.recommendations
+        val batchId = recommendation.batchId ?: return
+        if (!recommendationsVisible || recommendation.items.isEmpty() || recommendationTailJob?.isActive == true) return
+        val items = recommendation.items.toList()
+        val next = viewModelScope.launch {
+            val results = coroutineScope {
+                items.map { item -> async { preloadRecommendationThumbnail(item.thumbnailUrl) } }.awaitAll()
+            }
+            if (!recommendationsVisible || _state.value.recommendations.batchId != batchId) return@launch
+            settledRecommendationBatchId = batchId
+            if (results.any { !it }) {
+                _state.update { current ->
+                    if (current.recommendations.batchId == batchId) {
+                        current.copy(
+                            recommendations = current.recommendations.copy(
+                                errorMessage = "部分缩略图加载失败",
+                            ),
+                        )
+                    } else current
+                }
+            }
+            maybePrepareNextRecommendations()
+        }
+        recommendationTailJob = next
+        next.invokeOnCompletion {
+            if (recommendationTailJob === next) recommendationTailJob = null
+        }
+    }
+
+    private fun maybePrepareNextRecommendations() {
+        val recommendation = _state.value.recommendations
+        val batchId = recommendation.batchId ?: return
+        if (!recommendationsVisible || recommendation.items.isEmpty() || recommendation.isLoading ||
+            recommendation.shownBatchId != batchId || settledRecommendationBatchId != batchId ||
+            preparedRecommendation != null || pendingRecommendationPreload != null ||
+            currentRecommendationPreload != null || recommendationJob?.isActive == true
+        ) return
+        val preload = startRecommendationPreload(recommendationGeneration)
+        preparedRecommendation = preload
+        val monitor = viewModelScope.launch {
+            try {
+                val outcome = preload.awaitSettled()
+                if (outcome.failedCount > 0 && preparedRecommendation === preload) {
+                    preparedRecommendation = null
+                }
+            } catch (error: Throwable) {
+                if (error is CancellationException) throw error
+                if (preparedRecommendation === preload) preparedRecommendation = null
+            }
+        }
+        recommendationPreparationMonitorJob = monitor
+        monitor.invokeOnCompletion {
+            if (recommendationPreparationMonitorJob === monitor) recommendationPreparationMonitorJob = null
+        }
+    }
+
+    private fun invalidatePreparedRecommendations() {
+        recommendationGeneration += 1
+        preparedRecommendation?.cancel()
+        preparedRecommendation = null
+        recommendationPreparationMonitorJob?.cancel()
+        recommendationPreparationMonitorJob = null
+        pendingRecommendationPreload?.cancel()
+        pendingRecommendationPreload = null
+        recommendationJob?.cancel()
+        recommendationJob = null
+        _state.update { current ->
+            current.copy(recommendations = current.recommendations.copy(isLoading = false))
+        }
+        maybePrepareNextRecommendations()
+    }
+
+    private fun cancelCurrentRecommendationTail() {
+        currentRecommendationPreload?.cancel()
+        currentRecommendationPreload = null
+        recommendationTailJob?.cancel()
+        recommendationTailJob = null
+    }
+
+    private fun cancelRecommendationDelivery() {
+        recommendationGeneration += 1
+        preparedRecommendation?.cancel()
+        preparedRecommendation = null
+        recommendationPreparationMonitorJob?.cancel()
+        recommendationPreparationMonitorJob = null
+        pendingRecommendationPreload?.cancel()
+        pendingRecommendationPreload = null
+        recommendationJob?.cancel()
+        recommendationJob = null
+        cancelCurrentRecommendationTail()
+        recommendationShownJobs.values.forEach(Job::cancel)
+        recommendationShownJobs.clear()
+        _state.update { current ->
+            current.copy(recommendations = current.recommendations.copy(isLoading = false))
+        }
+    }
+
+    private fun isRecommendationGenerationCurrent(generation: Long): Boolean =
+        recommendationsVisible && recommendationGeneration == generation
 
     fun saveCurrent(destination: Uri) {
         val item = currentViewerItem() ?: return
@@ -734,8 +1002,8 @@ class AppViewModel(
         pageJob?.cancel()
         searchJob?.cancel()
         actionJob?.cancel()
-        recommendationJob?.cancel()
-        recommendationShownJob?.cancel()
+        recommendationsVisible = false
+        cancelRecommendationDelivery()
         recommendationActionJob?.cancel()
         viewModelScope.launch {
             activeSearchId?.let { runCatching { repository.deleteSearch(it) } }
@@ -975,6 +1243,13 @@ class AppViewModel(
         return if (digits.length == 6) "${digits.take(3)} ${digits.takeLast(3)}" else raw.take(12)
     }
 
+    override fun onCleared() {
+        recommendationsVisible = false
+        cancelRecommendationDelivery()
+        recommendationActionJob?.cancel()
+        super.onCleared()
+    }
+
     class Factory(
         private val context: Context,
         private val repository: ZvecRepository,
@@ -991,6 +1266,7 @@ class AppViewModel(
         private const val POLL_INTERVAL_MS = 2_000L
         private const val CONNECTION_RETRY_DELAY_MS = 350L
         private const val SEARCH_TIMEOUT_MS = 5 * 60 * 1000L
+        private const val RECOMMENDATION_CRITICAL_THUMBNAIL_COUNT = 4
     }
 }
 

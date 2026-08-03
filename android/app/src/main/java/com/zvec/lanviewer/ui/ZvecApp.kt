@@ -225,7 +225,7 @@ fun ZvecApp(viewModel: AppViewModel) {
                 onLoadMore = viewModel::loadNextPage,
                 onOpen = viewModel::openViewer,
                 onLoadRecommendations = viewModel::loadRecommendations,
-                onRecommendationsVisible = viewModel::onRecommendationsVisible,
+                onRecommendationsVisible = viewModel::onRecommendationsVisibilityChanged,
                 onOpenRecommendation = viewModel::openRecommendation,
                 onDisconnect = viewModel::disconnect,
             )
@@ -385,7 +385,7 @@ internal fun SearchScreen(
     onLoadMore: () -> Unit,
     onOpen: (Int) -> Unit,
     onLoadRecommendations: () -> Unit,
-    onRecommendationsVisible: () -> Unit,
+    onRecommendationsVisible: (Boolean) -> Unit,
     onOpenRecommendation: (Int) -> Unit,
     onDisconnect: () -> Unit,
 ) {
@@ -478,7 +478,7 @@ private fun MobileBottomBar(selected: MobileTab, onSelected: (MobileTab) -> Unit
 internal fun RecommendationPanel(
     state: AppUiState,
     onLoad: () -> Unit,
-    onVisible: () -> Unit,
+    onVisible: (Boolean) -> Unit,
     onOpen: (Int) -> Unit,
     gridState: LazyGridState,
 ) {
@@ -492,12 +492,13 @@ internal fun RecommendationPanel(
             isResumed = lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)
         }
         lifecycleOwner.lifecycle.addObserver(observer)
-        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            onVisible(false)
+        }
     }
-    LaunchedEffect(recommendations.batchId, recommendations.items.size, isResumed) {
-        if (!isResumed) return@LaunchedEffect
-        if (recommendations.batchId == null && !recommendations.isLoading) onLoad()
-        if (recommendations.batchId != null && recommendations.items.isNotEmpty()) onVisible()
+    LaunchedEffect(lifecycleOwner, isResumed) {
+        onVisible(isResumed)
     }
     Column(Modifier.fillMaxSize()) {
         Row(

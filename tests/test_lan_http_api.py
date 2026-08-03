@@ -29,6 +29,7 @@ from zvec_lan import (
     SearchPending,
     SearchRequest,
     SearchResultItem,
+    ThumbnailPayload,
 )
 from zvec_lan.http_server import _validated_host_header
 
@@ -177,9 +178,15 @@ class _FakeBackend:
 
 
 class _FakeResolver:
-    def __init__(self, sources: dict[str, MediaSource]) -> None:
+    def __init__(
+        self,
+        sources: dict[str, MediaSource],
+        thumbnails: dict[str, ThumbnailPayload] | None = None,
+    ) -> None:
         self.sources = sources
+        self.thumbnails = dict(thumbnails or {})
         self.calls: list[tuple[str, str]] = []
+        self.thumbnail_calls: list[tuple[str, str]] = []
 
     def resolve_original(
         self,
@@ -189,6 +196,15 @@ class _FakeResolver:
     ) -> MediaSource | None:
         self.calls.append((media_id, client_id))
         return self.sources.get(media_id)
+
+    def resolve_thumbnail(
+        self,
+        media_id: str,
+        *,
+        client_id: str,
+    ) -> ThumbnailPayload | None:
+        self.thumbnail_calls.append((media_id, client_id))
+        return self.thumbnails.get(media_id)
 
 
 class LanHttpApiTests(unittest.TestCase):
@@ -201,6 +217,8 @@ class LanHttpApiTests(unittest.TestCase):
         self.media_path.write_bytes(self.media_body)
         self.media_sha256 = hashlib.sha256(self.media_body).hexdigest()
         self.backend = _FakeBackend()
+        self.thumbnail_body = b"thumbnail-body"
+        self.thumbnail_etag = '"thumb-v1"'
         self.resolver = _FakeResolver(
             {
                 "media-1": MediaSource(
@@ -208,7 +226,14 @@ class LanHttpApiTests(unittest.TestCase):
                     sha256=self.media_sha256,
                     content_type="application/octet-stream",
                 )
-            }
+            },
+            {
+                "media-1": ThumbnailPayload(
+                    content=self.thumbnail_body,
+                    content_type="image/jpeg",
+                    etag=self.thumbnail_etag,
+                )
+            },
         )
         self.pairing = PairingManager()
         pairing = self.pairing.create_request(
@@ -923,6 +948,8 @@ class LanHttpApiTests(unittest.TestCase):
             ("POST", "/api/v1/recommendations/batch-1/actions", b"{}"),
             ("GET", "/api/v1/media/media-1/original", None),
             ("HEAD", "/api/v1/media/media-1/original", None),
+            ("GET", "/api/v1/media/media-1/thumbnail", None),
+            ("HEAD", "/api/v1/media/media-1/thumbnail", None),
             ("DELETE", "/api/v1/session", None),
         )
 
@@ -1401,6 +1428,51 @@ class LanHttpApiTests(unittest.TestCase):
                 f"bytes */{len(self.media_body)}",
             )
             self.assertEqual(response.headers["etag"], etag)
+
+    def test_thumbnail_get_head_etag_and_private_cache_contract(self) -> None:
+        full = self.request("GET", "/api/v1/media/media-1/thumbnail")
+        head = self.request("HEAD", "/api/v1/media/media-1/thumbnail")
+        not_modified = self.request(
+            "GET",
+            "/api/v1/media/media-1/thumbnail",
+            headers={"If-None-Match": self.thumbnail_etag},
+        )
+
+        self.assertEqual(full.status, 200)
+        self.assertEqual(full.body, self.thumbnail_body)
+        self.assertEqual(full.headers["content-type"], "image/jpeg")
+        self.assertEqual(full.headers["content-length"], str(len(self.thumbnail_body)))
+        self.assertEqual(full.headers["etag"], self.thumbnail_etag)
+        self.assertEqual(full.headers["cache-control"], "private, max-age=300")
+        self.assertEqual(head.status, 200)
+        self.assertEqual(head.body, b"")
+        self.assertEqual(head.headers["content-length"], str(len(self.thumbnail_body)))
+        self.assertEqual(not_modified.status, 304)
+        self.assertEqual(not_modified.body, b"")
+        self.assertEqual(
+            self.resolver.thumbnail_calls,
+            [("media-1", self.client_id)] * 3,
+        )
+
+    def test_thumbnail_missing_and_oversized_payloads_fail_without_details(
+        self,
+    ) -> None:
+        missing = self.request("GET", "/api/v1/media/missing/thumbnail")
+        self.resolver.thumbnails["oversized"] = ThumbnailPayload(
+            content=b"x" * (32 * 1024 * 1024 + 1),
+            content_type="image/jpeg",
+            etag='"too-large"',
+        )
+        oversized = self.request("GET", "/api/v1/media/oversized/thumbnail")
+
+        self.assertEqual(missing.status, 404)
+        self.assertEqual(missing.json()["error"]["code"], "media_not_found")
+        self.assertEqual(oversized.status, 500)
+        self.assertEqual(
+            oversized.json()["error"]["code"],
+            "invalid_thumbnail_payload",
+        )
+        self.assertNotIn("thumbnail-body", oversized.body.decode(errors="ignore"))
 
     def test_if_range_and_head_range_follow_single_range_semantics(self) -> None:
         etag = f'"{self.media_sha256}"'
