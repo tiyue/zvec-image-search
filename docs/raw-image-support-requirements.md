@@ -501,3 +501,63 @@ raw-selection/
 10. 相对实施基线审查完整 diff，确认无无关改动后创建一个独立提交；不 push，除非用户另行要求。
 
 若真实 A7M4 文件、rawpy/LibRaw 能力或当前 WebView 架构与本方案冲突，实施者必须基于证据选择最小可靠实现，并明确记录未达门禁和限制；不得用占位解码、已缓存结果或假想 benchmark 宣称完成。
+
+## 16. 开发进度
+
+### 允许修改的精确文件范围
+
+**新增文件（后端 Python）：**
+- `image_vector_service/raw_selection/__init__.py`
+- `image_vector_service/raw_selection/db.py` — 独立 SQLite 持久化
+- `image_vector_service/raw_selection/importer.py` — 文件/文件夹导入登记
+- `image_vector_service/raw_selection/decoder.py` — ARW/JPG/PNG 解码
+- `image_vector_service/raw_selection/cache.py` — 派生缓存管理
+- `image_vector_service/raw_selection/scheduler.py` — 任务优先级调度
+- `image_vector_service/raw_selection/service.py` — 高层服务编排
+- `image_vector_service/raw_selection/exporter.py` — 统一导出
+- `image_vector_service/raw_selection/deleter.py` — 永久删除两阶段日志
+- `image_vector_service/raw_selection/creative_look.py` — Sony 创意外观（阻断中）
+
+**新增文件（前端 Vue）：**
+- `frontend/src/features/raw-selection/` 目录下所有文件
+
+**修改文件（集成接入点）：**
+- `zvec_webview/server.py` — 新增 ARW 选片 API 路由
+- `zvec_webview/app.py` — 初始化 raw_selection 服务
+- `frontend/src/App.vue` — 新增左侧导航入口
+- `pyproject.toml` — 新增 rawpy 可选依赖
+- `requirements.txt` — 新增 rawpy 依赖
+
+**绝不修改：**
+- `android/` 目录任何文件
+- `zvec_lan/` 目录任何文件
+- `image_vector_service/backend_server.py` 的现有路由和命令
+- `image_vector_service/service.py` 的现有逻辑
+- 现有图库、搜索、推荐相关模块
+- 发布矩阵（`.github/workflows/release.yml`）
+
+### 进度记录
+
+| 日期时间 | 状态 | 功能 |
+|----------|------|------|
+| 2026-08-03 12:00 | 已完成 | 基线提交（commit 57f4210） |
+| 2026-08-03 12:15 | 已完成 | Phase 1: 后端独立 SQLite 持久化层 (db.py) |
+| 2026-08-03 12:20 | 已完成 | Phase 1: 后端导入逻辑 (importer.py) |
+| 2026-08-03 12:25 | 已完成 | Phase 1: 后端服务编排 (service.py) |
+| 2026-08-03 12:30 | 已完成 | Phase 1: WebView 网关路由接入 (server.py) |
+| 2026-08-03 12:40 | 已完成 | Phase 2: 前端项目页 + 导航入口 (RawSelectionPage.vue) |
+| 2026-08-03 12:45 | 已完成 | Phase 2: 前端选片工作区 (RawSelectionWorkspace.vue) |
+| 2026-08-03 12:50 | 已完成 | Phase 3: RAW 解码器 (decoder.py) + 图像服务路由 |
+| 2026-08-03 12:50 | 已完成 | Phase 4: 星级/色标/筛选/排序 UI |
+| 2026-08-03 12:50 | 已完成 | Phase 5: 统一导出 + 移出项目 + 永久删除 |
+| 2026-08-03 12:50 | 待开始 | Phase 6: 双图对比 |
+| 2026-08-03 12:50 | 阻断 | Phase 7: Sony 创意外观（需先完成官方能力/许可调查） |
+
+### 已知限制
+
+1. **rawpy 未安装**：ARW 文件解码需要 rawpy/LibRaw 依赖。当前环境未安装，ARW 缩略图/预览将报告“解码器不可用”。JPG/PNG 通过 Pillow 正常工作。
+2. **缩略图缓存未实现**：当前每次请求都重新解码，未实现磁盘缓存。性能门禁未验证。
+3. **虚拟化未实现**：胶片栏当前渲染所有成员节点，未实现虚拟化。在 1000+ 张项目中可能有性能问题。
+4. **双图对比未实现**：仅单图预览。
+5. **Sony 创意外观阻断**：需先完成官方能力/许可调查和 A7M4 预置集合实机核对。
+6. **性能门禁未验证**：未进行真实 300～1000 张性能测试。

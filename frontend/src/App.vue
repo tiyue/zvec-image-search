@@ -12,6 +12,7 @@ import { useNativeImageActions } from "./composables/useNativeImageActions";
 import { useSearch } from "./composables/useSearch";
 import { installGlobalDiagnostics, reportFrontendDiagnostic } from "./diagnostics";
 import { OrganizePage } from "./features/organize";
+import { RawSelectionPage } from "./features/raw-selection";
 import { RecommendationPage } from "./features/recommendations";
 import { canRecordFeedback, useSearchFeedback } from "./features/search-learning";
 import { SettingsPage } from "./features/settings";
@@ -25,7 +26,7 @@ import type {
   ToastMessage,
 } from "./types/contracts";
 
-type PageName = "search" | "tasks" | "batch" | "groups" | "learning" | "recommendations" | "settings";
+type PageName = "search" | "tasks" | "batch" | "groups" | "learning" | "recommendations" | "raw-selection" | "settings";
 
 const pageDefinitions: Array<{
   id: PageName;
@@ -75,6 +76,13 @@ const pageDefinitions: Array<{
     description: "多样发现与随机探索",
     icon: "image",
     shortcut: "Alt+6",
+  },
+  {
+    id: "raw-selection",
+    label: "ARW 选片",
+    description: "导入、评级与导出",
+    icon: "image",
+    shortcut: "Alt+7",
   },
 ];
 
@@ -548,6 +556,26 @@ function handleFeatureToast(
   addToast(title, message, kind);
 }
 
+function handleRawSelectionSelectFolder(callback: (path: string) => void): void {
+  const bridge = window.pywebview?.api;
+  if (!bridge || typeof bridge.select_directory !== "function") {
+    addToast("无法选择文件夹", "桌面桥接尚未就绪，请稍后重试。", "error");
+    return;
+  }
+  void bridge.select_directory().then((result: { ok?: boolean; path?: string; error?: string }) => {
+    if (!result || result.ok !== true) {
+      addToast("无法选择文件夹", result?.error ?? "文件夹选择失败。", "error");
+      callback("");
+      return;
+    }
+    callback(result.path ?? "");
+  }).catch(() => {
+    addToast("无法选择文件夹", "文件夹选择失败。", "error");
+    callback("");
+  });
+}
+
+
 function handleLibrariesUpdated(libraries: SettingsLibrary[]): void {
   search.libraries.value = libraries.map((library) => ({
     id: library.id,
@@ -568,12 +596,12 @@ function handleLibrariesUpdated(libraries: SettingsLibrary[]): void {
 function handleGlobalKeydown(event: KeyboardEvent): void {
   // Use the physical digit code as a fallback so Alt shortcuts work under
   // keyboard layouts that transform event.key. Ignore AltGr (Ctrl+Alt).
-  const shortcutKey = /^Digit([1-6])$/u.exec(event.code)?.[1] ?? event.key;
+  const shortcutKey = /^Digit([1-7])$/u.exec(event.code)?.[1] ?? event.key;
   if (
     event.altKey &&
     !event.ctrlKey &&
     !event.metaKey &&
-    ["1", "2", "3", "4", "5", "6"].includes(shortcutKey)
+    ["1", "2", "3", "4", "5", "6", "7"].includes(shortcutKey)
   ) {
     event.preventDefault();
     const page = pageDefinitions[Number(shortcutKey) - 1]?.id;
@@ -891,6 +919,13 @@ watch(
           :copy-path="copyRecommendedPath"
           :export-image="exportRecommendedImage"
           @toast="handleFeatureToast"
+        />
+      </div>
+
+      <div v-if="visitedPages.includes('raw-selection')" v-show="activePage === 'raw-selection'" class="feature-page" data-page-section="raw-selection">
+        <RawSelectionPage
+          @toast="handleFeatureToast"
+          @select-folder="handleRawSelectionSelectFolder"
         />
       </div>
 

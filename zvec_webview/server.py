@@ -19,6 +19,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from PIL import Image, UnidentifiedImageError
 
+from image_vector_service.raw_selection import RawSelectionService
 from zvec_host.recommendation_service import (
     RecommendationService,
     RecommendationServiceError,
@@ -141,6 +142,7 @@ class GatewayServer:
         self._query_images: tempfile.TemporaryDirectory[str] | None = None
         self._query_image_ids: set[str] = set()
         self._recommendations: RecommendationService | None = None
+        self._raw_selection: RawSelectionService | None = None
 
     def _record_frontend_diagnostic(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         """Validate and persist a browser event without endangering the UI."""
@@ -281,6 +283,11 @@ class GatewayServer:
                 continue
         if query_images is not None:
             query_images.cleanup()
+        raw_selection = self._raw_selection
+        self._raw_selection = None
+        if raw_selection is not None:
+            with suppress(Exception):
+                raw_selection.close()
 
     def _store_query_image(
         self,
@@ -359,6 +366,22 @@ class GatewayServer:
                 config_home,
             )
             return self._recommendations
+
+    def _raw_selection_service(self) -> RawSelectionService:
+        with self._lock:
+            if self._raw_selection is not None:
+                return self._raw_selection
+            config_home = getattr(self._facade, "config_home", None)
+            if not isinstance(config_home, str | Path):
+                raise FacadeError(
+                    "raw_selection_unavailable",
+                    "ARW 选片暂不可用，请确认本地服务已经就绪。",
+                    status=503,
+                )
+            data_dir = Path(config_home) / "raw-selection"
+            self._raw_selection = RawSelectionService(data_dir)
+            self._raw_selection.recover_pending_deletes()
+            return self._raw_selection
 
     def _asset(self, relative: str) -> tuple[bytes, str]:
         decoded = unquote(relative).replace("\\", "/")
@@ -1177,6 +1200,362 @@ def _handler_type(gateway: GatewayServer) -> type[BaseHTTPRequestHandler]:
                     etag=payload.etag,
                 )
                 return
+            # ------------------------------------------------------------------
+            # ARW Selection module routes
+            # ------------------------------------------------------------------
+            if segments and segments[0] == "raw-selection":
+                self._route_raw_selection(method, segments[1:], query_values)
+                return
+            raise FacadeError("route_not_found", "接口不存在。", status=404)
+
+        def _route_raw_selection(
+            self,
+            method: str,
+            segments: tuple[str, ...],
+            query_values: dict[str, list[str]],
+        ) -> None:
+            svc = gateway._raw_selection_service()
+
+            # GET raw-selection/projects — list projects
+            if method == "GET" and segments == ("projects",):
+                self._json(HTTPStatus.OK, {"projects": svc.list_projects()})
+                return
+
+            # POST raw-selection/projects — create project
+            if method == "POST" and segments == ("projects",):
+                body = self._read_json()
+                name = body.get("name", "")
+                if not isinstance(name, str) or not name.strip():
+                    raise FacadeError(
+                        "invalid_request",
+                        "项目名称不能为空。",
+                        status=400,
+                    )
+                self._json(HTTPStatus.CREATED, svc.create_project(name))
+                return
+
+            # GET raw-selection/projects/{id} — get project
+            if method == "GET" and len(segments) == 2 and segments[0] == "projects":
+                project = svc.get_project(segments[1])
+                if project is None:
+                    raise FacadeError(
+                        "not_found", "项目不存在。", status=404
+                    )
+                self._json(HTTPStatus.OK, project)
+                return
+
+            # PATCH raw-selection/projects/{id} — rename project
+            if method == "PATCH" and len(segments) == 2 and segments[0] == "projects":
+                body = self._read_json()
+                name = body.get("name", "")
+                if not isinstance(name, str) or not name.strip():
+                    raise FacadeError(
+                        "invalid_request",
+                        "项目名称不能为空。",
+                        status=400,
+                    )
+                project = svc.rename_project(segments[1], name)
+                if project is None:
+                    raise FacadeError(
+                        "not_found", "项目不存在。", status=404
+                    )
+                self._json(HTTPStatus.OK, project)
+                return
+
+            # DELETE raw-selection/projects/{id} — delete project
+            if method == "DELETE" and len(segments) == 2 and segments[0] == "projects":
+                if not svc.delete_project(segments[1]):
+                    raise FacadeError(
+                        "not_found", "项目不存在。", status=404
+                    )
+                self._json(HTTPStatus.OK, {"ok": True})
+                return
+
+            # POST raw-selection/projects/{id}/import-folder
+            if (
+                method == "POST"
+                and len(segments) == 3
+                and segments[0] == "projects"
+                and segments[2] == "import-folder"
+            ):
+                body = self._read_json()
+                folder = body.get("path", "")
+                if not isinstance(folder, str) or not folder.strip():
+                    raise FacadeError(
+                        "invalid_request",
+                        "文件夹路径不能为空。",
+                        status=400,
+                    )
+                self._json(
+                    HTTPStatus.OK,
+                    svc.import_folder(segments[1], folder),
+                )
+                return
+
+            # POST raw-selection/projects/{id}/import-files
+            if (
+                method == "POST"
+                and len(segments) == 3
+                and segments[0] == "projects"
+                and segments[2] == "import-files"
+            ):
+                body = self._read_json()
+                paths = body.get("paths", [])
+                if not isinstance(paths, list) or not paths:
+                    raise FacadeError(
+                        "invalid_request",
+                        "文件路径列表不能为空。",
+                        status=400,
+                    )
+                self._json(
+                    HTTPStatus.OK,
+                    svc.import_files(segments[1], paths),
+                )
+                return
+
+            # GET raw-selection/projects/{id}/members
+            if (
+                method == "GET"
+                and len(segments) == 3
+                and segments[0] == "projects"
+                and segments[2] == "members"
+            ):
+                self._json(
+                    HTTPStatus.OK,
+                    svc.list_members(
+                        segments[1],
+                        offset=_query_int(query_values, "offset", 0, 0, 1_000_000),
+                        limit=_query_int(query_values, "limit", 1000, 1, 10_000),
+                        star_mode=_query_optional_text(
+                            query_values, "star_mode", "", maximum=20
+                        ) or "none",
+                        star_value=_query_int(query_values, "star_value", 0, 0, 5),
+                        color_labels=_query_optional_text(
+                            query_values, "color_labels", "", maximum=200
+                        ) or "",
+                        filename_contains=_query_optional_text(
+                            query_values, "filename", "", maximum=500
+                        ) or "",
+                        rated_filter=_query_optional_text(
+                            query_values, "rated", "", maximum=20
+                        ) or "all",
+                        sort_field=_query_optional_text(
+                            query_values, "sort", "", maximum=30
+                        ) or "filename",
+                        sort_direction=_query_optional_text(
+                            query_values, "dir", "", maximum=10
+                        ) or "asc",
+                    ),
+                )
+                return
+
+            # GET raw-selection/members/{id}
+            if method == "GET" and len(segments) == 2 and segments[0] == "members":
+                member = svc.get_member(segments[1])
+                if member is None:
+                    raise FacadeError(
+                        "not_found", "图片不存在。", status=404
+                    )
+                self._json(HTTPStatus.OK, member)
+                return
+
+            # GET raw-selection/members/{id}/thumbnail
+            if (
+                method == "GET"
+                and len(segments) == 3
+                and segments[0] == "members"
+                and segments[2] == "thumbnail"
+            ):
+                result = svc.get_thumbnail_bytes(segments[1])
+                if result.error:
+                    raise FacadeError(
+                        "decode_failed",
+                        result.error,
+                        status=500,
+                    )
+                self._bytes(
+                    HTTPStatus.OK,
+                    result.data,
+                    result.content_type,
+                    cache="private, max-age=300",
+                )
+                return
+
+            # GET raw-selection/members/{id}/preview
+            if (
+                method == "GET"
+                and len(segments) == 3
+                and segments[0] == "members"
+                and segments[2] == "preview"
+            ):
+                result = svc.get_preview_bytes(
+                    segments[1],
+                    display_width=_query_int(query_values, "dw", 0, 0, 10_000),
+                    display_height=_query_int(query_values, "dh", 0, 0, 10_000),
+                )
+                if result.error:
+                    raise FacadeError(
+                        "decode_failed",
+                        result.error,
+                        status=500,
+                    )
+                self._bytes(
+                    HTTPStatus.OK,
+                    result.data,
+                    result.content_type,
+                    cache="private, max-age=300",
+                )
+                return
+
+            # PATCH raw-selection/members/{id}/rating
+            if (
+                method == "PATCH"
+                and len(segments) == 3
+                and segments[0] == "members"
+                and segments[2] == "rating"
+            ):
+                body = self._read_json()
+                star = body.get("star_rating")
+                color = body.get("color_label", "none")
+                if not isinstance(star, int) or not (0 <= star <= 5):
+                    raise FacadeError(
+                        "invalid_request",
+                        "星级必须为 0-5 的整数。",
+                        status=400,
+                    )
+                if not svc.update_rating(segments[1], star, color):
+                    raise FacadeError(
+                        "not_found", "图片不存在。", status=404
+                    )
+                self._json(HTTPStatus.OK, {"ok": True})
+                return
+
+            # PATCH raw-selection/members/{id}/creative-look
+            if (
+                method == "PATCH"
+                and len(segments) == 3
+                and segments[0] == "members"
+                and segments[2] == "creative-look"
+            ):
+                body = self._read_json()
+                look = body.get("creative_look", "as_shot")
+                if not svc.update_creative_look(segments[1], look):
+                    raise FacadeError(
+                        "not_found", "图片不存在。", status=404
+                    )
+                self._json(HTTPStatus.OK, {"ok": True})
+                return
+
+            # GET raw-selection/projects/{id}/workspace
+            if (
+                method == "GET"
+                and len(segments) == 3
+                and segments[0] == "projects"
+                and segments[2] == "workspace"
+            ):
+                ws = svc.get_workspace_state(segments[1])
+                self._json(HTTPStatus.OK, ws or {})
+                return
+
+            # PUT raw-selection/projects/{id}/workspace
+            if (
+                method == "PUT"
+                and len(segments) == 3
+                and segments[0] == "projects"
+                and segments[2] == "workspace"
+            ):
+                body = self._read_json()
+                svc.save_workspace_state(
+                    segments[1],
+                    last_member_id=body.get("last_member_id"),
+                    filter_star_mode=body.get("filter_star_mode", "none"),
+                    filter_star_value=body.get("filter_star_value", 0),
+                    filter_color_labels=body.get("filter_color_labels", ""),
+                    filter_filename=body.get("filter_filename", ""),
+                    filter_rated=body.get("filter_rated", "all"),
+                    sort_field=body.get("sort_field", "filename"),
+                    sort_direction=body.get("sort_direction", "asc"),
+                    filmstrip_scroll=body.get("filmstrip_scroll", 0.0),
+                )
+                self._json(HTTPStatus.OK, {"ok": True})
+                return
+
+            # POST raw-selection/projects/{id}/export
+            if (
+                method == "POST"
+                and len(segments) == 3
+                and segments[0] == "projects"
+                and segments[2] == "export"
+            ):
+                body = self._read_json()
+                member_ids = body.get("member_ids", [])
+                destination = body.get("destination", "")
+                if not isinstance(member_ids, list) or not member_ids:
+                    raise FacadeError(
+                        "invalid_request",
+                        "请选择要导出的图片。",
+                        status=400,
+                    )
+                if not isinstance(destination, str) or not destination.strip():
+                    raise FacadeError(
+                        "invalid_request",
+                        "请选择导出目标目录。",
+                        status=400,
+                    )
+                self._json(
+                    HTTPStatus.OK,
+                    svc.export_files(member_ids, destination),
+                )
+                return
+
+            # POST raw-selection/members/remove
+            if method == "POST" and segments == ("members", "remove"):
+                body = self._read_json()
+                member_ids = body.get("member_ids", [])
+                if not isinstance(member_ids, list) or not member_ids:
+                    raise FacadeError(
+                        "invalid_request",
+                        "请选择要移出的图片。",
+                        status=400,
+                    )
+                removed = svc.remove_members(member_ids)
+                self._json(HTTPStatus.OK, {"removed": removed})
+                return
+
+            # POST raw-selection/members/delete-permanent
+            if method == "POST" and segments == ("members", "delete-permanent"):
+                body = self._read_json()
+                member_ids = body.get("member_ids", [])
+                confirmed = body.get("confirmed", False)
+                if not isinstance(member_ids, list) or not member_ids:
+                    raise FacadeError(
+                        "invalid_request",
+                        "请选择要删除的图片。",
+                        status=400,
+                    )
+                if not confirmed:
+                    raise FacadeError(
+                        "invalid_request",
+                        "永久删除需要明确确认。",
+                        status=400,
+                    )
+                self._json(
+                    HTTPStatus.OK,
+                    svc.permanent_delete(member_ids, confirmed=True),
+                )
+                return
+
+            # POST raw-selection/projects/{id}/clear-cache
+            if (
+                method == "POST"
+                and len(segments) == 3
+                and segments[0] == "projects"
+                and segments[2] == "clear-cache"
+            ):
+                svc.clear_project_cache(segments[1])
+                self._json(HTTPStatus.OK, {"ok": True})
+                return
+
             raise FacadeError("route_not_found", "接口不存在。", status=404)
 
         def _validate_authority(self) -> None:

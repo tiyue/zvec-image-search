@@ -104,6 +104,18 @@ Vue 3 + TypeScript + Vite SPA：
 - production `ImageRegistry` 使用 4 个有界 render slot；通用 registry 默认值仍为 2。2/3/4/6/8/12/16 的同输入压力矩阵中，4 是首个通过冷前 6 张 1.5 秒门禁且没有让搜索缩略图、preview 或 bootstrap P95 回退超过 10% 的档位；6 对关键 P95 只再改善 2.96%，却显著增加 CPU/RSS，因此不采用更高值。4 档压力峰值 RSS 比 2 档高 231.191 MiB（58.33%），真实源码版联合冒烟必须继续检查这一明确瞬时内存代价。
 - Windows UI 大批量导出由 `NativeBridge._export_worker` 后台逐项执行 capability 解析、重名避让、`copy2`、错误清单和进度更新，production 复制并发保持 1。当前同盘 SATA SSD 的 1/2/4 矩阵中，2 虽提高中位吞吐约 61%，但搜索缩略图、preview、bootstrap 和纯推荐选择 worst P95 均回退超过 10%，因此不得启用；`copy_files` 只写 CF_HDROP 剪贴板列表，不属于应用内复制并发。
 
+### ARW 选片模块（raw_selection）
+
+独立于现有图库索引、向量生成、搜索、推荐、偏好、曝光或模型调用的 Sony A7M4 ARW 选片模块：
+- 后端包：`image_vector_service/raw_selection/`（db.py、importer.py、decoder.py、service.py）
+- 前端模块：`frontend/src/features/raw-selection/`
+- 独立 SQLite 数据库存储于 `raw-selection/projects.sqlite3`，不触及现有图库状态库
+- 支持 .jpg/.jpeg/.png（通过 Pillow）和 .arw（需要 rawpy/LibRaw，当前可选依赖）
+- 三级渐进加载：缩略图（ARW 内嵌 JPEG）→ 快速预览（内嵌预览）→ 完整解码
+- 项目管理：创建/重命名/删除项目、导入文件/文件夹、评级/色标、筛选/排序、统一导出、永久删除
+- WebView 网关路由：`api/raw-selection/*`（项目 CRUD、成员列表、缩略图/预览、评级、导出、删除）
+- 当前限制：rawpy 未安装时 ARW 解码不可用；缩略图缓存、虚拟化、双图对比、Sony 创意外观尚未实现
+
 ### Windows 登录后常驻生命周期
 
 - NSIS 安装版为当前用户注册 `AtLogon` 计划任务。任务使用 `InteractiveToken` 登录类型、`LeastPrivilege` 运行级别、`IgnoreNew` 多实例策略、无限执行时间，并只配置固定有限次数的失败重启；不得保存用户密码、切换到 SYSTEM 或请求管理员权限。

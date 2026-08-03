@@ -3,6 +3,7 @@
 ## Spec 索引
 
 - 项目架构、模块职责与发布约束：`docs/spec.md`
+- Sony A7M4 ARW 选片模块需求规格：`docs/raw-image-support-requirements.md`
 
 ## 发布矩阵
 
