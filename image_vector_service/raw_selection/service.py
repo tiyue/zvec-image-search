@@ -31,6 +31,7 @@ from .decoder import (
     is_rawpy_available,
 )
 from .importer import AssetImporter, ImportResult
+from .scheduler import DecodeScheduler
 
 _CACHE_DIR_NAME = "cache"
 _DB_NAME = "projects.sqlite3"
@@ -74,6 +75,7 @@ class RawSelectionService:
         self._db = RawSelectionDB(self._db_path)
         self._importer = AssetImporter(self._db)
         self._derived_cache = DerivedCache(self._cache_dir)
+        self._scheduler = DecodeScheduler()
         self._lock = threading.RLock()
 
     @property
@@ -86,6 +88,7 @@ class RawSelectionService:
 
     def close(self) -> None:
         with self._lock:
+            self._scheduler.shutdown(wait=False)
             self._db.close()
 
     # ------------------------------------------------------------------
@@ -519,6 +522,8 @@ class RawSelectionService:
         look selections.
         """
         removed = self._derived_cache.clear()
+        # Invalidate any in-flight late writes (8.1 generation token).
+        self._scheduler.bump_generation()
         return removed
 
     # ------------------------------------------------------------------
@@ -537,13 +542,22 @@ class RawSelectionService:
     # ------------------------------------------------------------------
 
     def get_thumbnail_bytes(self, member_id: str) -> ImageBytesResult:
-        """Generate and return thumbnail JPEG bytes for HTTP response."""
+        """Generate and return thumbnail JPEG bytes for HTTP response.
+
+        Concurrent identical requests decode once via single-flight (8.3).
+        """
         member = self._db.get_member(member_id)
         if member is None:
             return ImageBytesResult(b"", "", error="Member not found")
         if not os.path.isfile(member.normalized_path):
             return ImageBytesResult(b"", "", error="Source file missing")
 
+        key = ("thumb", member.normalized_path, member.file_size, member.mtime_ns)
+        return self._scheduler.run_single_flight(
+            key, member.extension, "thumb", lambda: self._thumb(member)
+        )
+
+    def _thumb(self, member: MemberRecord) -> ImageBytesResult:
         # Check persistent derived cache first (8.4 source-version keyed).
         cached = self._derived_cache.get(
             normalized_path=member.normalized_path,

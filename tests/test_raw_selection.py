@@ -26,6 +26,7 @@ from image_vector_service.raw_selection.decoder import (
     decode_preview,
     decode_thumbnail,
 )
+from image_vector_service.raw_selection.scheduler import DecodeScheduler
 from image_vector_service.raw_selection.service import RawSelectionService
 
 
@@ -252,6 +253,68 @@ class CreativeLookTest(unittest.TestCase):
         r, g, b = out.getpixel((0, 0))
         self.assertEqual(r, g)
         self.assertEqual(g, b)
+
+
+class DecodeSchedulerTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.sched = DecodeScheduler()
+        self.addCleanup(self.sched.shutdown)
+
+    def test_single_flight_decodes_once(self) -> None:
+        import threading
+        import time
+        from concurrent.futures import ThreadPoolExecutor
+
+        calls = {"n": 0}
+        gate = threading.Event()
+
+        def work() -> int:
+            calls["n"] += 1
+            time.sleep(0.05)
+            return 42
+
+        def caller() -> int:
+            gate.wait()  # launch all four calls concurrently
+            return self.sched.run_single_flight(("k",), ".jpg", "thumb", work)
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [pool.submit(caller) for _ in range(4)]
+            gate.set()
+            results = [f.result() for f in futures]
+
+        self.assertEqual(results, [42, 42, 42, 42])
+        self.assertEqual(calls["n"], 1)  # decoded exactly once
+
+    def test_distinct_keys_decode_separately(self) -> None:
+        calls = {"n": 0}
+
+        def work() -> int:
+            calls["n"] += 1
+            return calls["n"]
+
+        a = self.sched.run_single_flight(("a",), ".jpg", "thumb", work)
+        b = self.sched.run_single_flight(("b",), ".jpg", "thumb", work)
+        self.assertEqual((a, b), (1, 2))
+
+    def test_failure_releases_waiters_and_allows_retry(self) -> None:
+        state = {"fail": True}
+
+        def work() -> int:
+            if state["fail"]:
+                raise ValueError("boom")
+            return 7
+
+        with self.assertRaises(ValueError):
+            self.sched.run_single_flight(("f",), ".jpg", "thumb", work)
+        state["fail"] = False
+        self.assertEqual(
+            self.sched.run_single_flight(("f",), ".jpg", "thumb", work), 7
+        )
+
+    def test_generation_bump(self) -> None:
+        g0 = self.sched.generation
+        self.sched.bump_generation()
+        self.assertEqual(self.sched.generation, g0 + 1)
 
 
 class DecoderTest(unittest.TestCase):
