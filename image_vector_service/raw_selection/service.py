@@ -358,6 +358,9 @@ class RawSelectionService:
                 # Delete the physical file (no recycle bin)
                 os.unlink(item.normalized_path)
                 self._db.update_operation_item(item.id, "deleted")
+                # Clean up references now that the file is gone.
+                self._db.remove_members_by_asset_path(item.normalized_path)
+                self._db.delete_asset_by_path(item.normalized_path)
                 deleted += 1
                 details.append({
                     "path": item.normalized_path,
@@ -372,12 +375,6 @@ class RawSelectionService:
                     "result": "failed",
                     "error": error_msg,
                 })
-
-        # Clean up references for successfully deleted files
-        for item in log_items:
-            if item.result in ("deleted", "already_missing"):
-                self._db.remove_members_by_asset_path(item.normalized_path)
-                self._db.delete_asset_by_path(item.normalized_path)
 
         self._db.set_operation_log_status(log_id, "completed")
 
