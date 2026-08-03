@@ -1,4 +1,5 @@
 numpy==2.2.6; python_version < "3.11"
 numpy==2.3.5; python_version >= "3.11"
 Pillow==12.3.0
+rawpy==0.27.0
 zvec==0.5.1

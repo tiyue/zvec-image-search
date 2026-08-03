@@ -94,6 +94,9 @@ def _scan_image_files(
                     entry.path, _seen_dirs=_seen_dirs
                 )
             elif entry.is_file(follow_symlinks=False):
+                # Skip macOS metadata/resource-fork artifacts (._NAME).
+                if entry.name.startswith("._"):
+                    continue
                 ext = Path(entry.name).suffix.casefold()
                 if ext in SUPPORTED_EXTENSIONS:
                     norm = normalize_path(entry.path)

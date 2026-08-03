@@ -428,6 +428,9 @@ def _handler_type(gateway: GatewayServer) -> type[BaseHTTPRequestHandler]:
         def do_PUT(self) -> None:  # noqa: N802
             self._dispatch("PUT")
 
+        def do_PATCH(self) -> None:  # noqa: N802
+            self._dispatch("PATCH")
+
         def do_DELETE(self) -> None:  # noqa: N802
             self._dispatch("DELETE")
 
@@ -1359,6 +1362,11 @@ def _handler_type(gateway: GatewayServer) -> type[BaseHTTPRequestHandler]:
                 self._json(HTTPStatus.OK, member)
                 return
 
+            # GET raw-selection/looks — list A7M4 creative looks
+            if method == "GET" and segments == ("looks",):
+                self._json(HTTPStatus.OK, {"looks": svc.list_creative_looks()})
+                return
+
             # GET raw-selection/members/{id}/thumbnail
             if (
                 method == "GET"
@@ -1392,6 +1400,9 @@ def _handler_type(gateway: GatewayServer) -> type[BaseHTTPRequestHandler]:
                     segments[1],
                     display_width=_query_int(query_values, "dw", 0, 0, 10_000),
                     display_height=_query_int(query_values, "dh", 0, 0, 10_000),
+                    look=_query_optional_text(
+                        query_values, "look", "as_shot", maximum=20
+                    ) or "as_shot",
                 )
                 if result.error:
                     raise FacadeError(

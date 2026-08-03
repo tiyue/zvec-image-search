@@ -2,7 +2,8 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 
 import AppIcon from "../../components/AppIcon.vue";
-import { listMembers, updateRating, getWorkspaceState, saveWorkspaceState, exportFiles, removeMembers, permanentDelete } from "./api";
+import { listMembers, updateRating, updateCreativeLook, getWorkspaceState, saveWorkspaceState, exportFiles, removeMembers, permanentDelete, listCreativeLooks } from "./api";
+import type { CreativeLook } from "./api";
 import type { RawMember } from "./types";
 
 const props = defineProps<{
@@ -43,6 +44,52 @@ const isPanning = ref(false);
 const lastPanX = ref(0);
 const lastPanY = ref(0);
 const previewError = ref(false);
+
+// Permanent delete confirmation modal state (requirement 11.2)
+const showDeleteModal = ref(false);
+const deleteConfirmed = ref(false);
+const deleteBusy = ref(false);
+const deleteTargets = ref<RawMember[]>([]);
+
+const deleteTotalSize = computed(() =>
+  deleteTargets.value.reduce((sum, m) => sum + m.file_size, 0),
+);
+
+// Film strip virtualization (4.4): only render viewport ± 2 screens.
+const FILM_ITEM_WIDTH = 86; // 84px thumb + 2px gap
+const FILM_OVERSCAN_SCREENS = 2;
+const filmStripEl = ref<HTMLElement | null>(null);
+const filmScrollLeft = ref(0);
+const filmViewportWidth = ref(800);
+
+const filmVisibleRange = computed(() => {
+  const total = members.value.length;
+  if (total === 0) return { start: 0, end: 0 };
+  const screenItems = Math.max(1, Math.ceil(filmViewportWidth.value / FILM_ITEM_WIDTH));
+  const overscan = screenItems * FILM_OVERSCAN_SCREENS;
+  const firstVisible = Math.floor(filmScrollLeft.value / FILM_ITEM_WIDTH);
+  const start = Math.max(0, firstVisible - overscan);
+  const end = Math.min(total, firstVisible + screenItems + overscan);
+  return { start, end };
+});
+
+const filmVisibleItems = computed(() =>
+  members.value
+    .slice(filmVisibleRange.value.start, filmVisibleRange.value.end)
+    .map((m, i) => ({ member: m, index: filmVisibleRange.value.start + i })),
+);
+
+const filmInnerWidth = computed(() => members.value.length * FILM_ITEM_WIDTH);
+
+// Dual image comparison mode (Section 6)
+const compareMode = ref(false);
+const compareItems = ref<[RawMember, RawMember] | null>(null);
+const compareSync = ref(true);
+const compareZoomA = ref(1);
+const compareZoomB = ref(1);
+const comparePanA = ref({ x: 0, y: 0 });
+const comparePanB = ref({ x: 0, y: 0 });
+const compareRestore = ref<{ index: number; scroll: number } | null>(null);
 
 let abortController: AbortController | null = null;
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
@@ -135,6 +182,7 @@ function navigate(delta: number) {
     zoom.value = 1;
     panX.value = 0;
     panY.value = 0;
+    previewError.value = false;
     scheduleSaveState();
   }
 }
@@ -232,7 +280,11 @@ function handleKeydown(event: KeyboardEvent) {
     case "4": setRating(4); break;
     case "5": setRating(5); break;
     case "Escape":
-      if (showFilters.value || showSortMenu.value) {
+      if (showDeleteModal.value) {
+        closeDeleteModal();
+      } else if (compareMode.value) {
+        exitCompare();
+      } else if (showFilters.value || showSortMenu.value) {
         showFilters.value = false;
         showSortMenu.value = false;
       } else {
@@ -244,7 +296,118 @@ function handleKeydown(event: KeyboardEvent) {
 
 function handleFilmStripScroll(event: Event) {
   const target = event.target as HTMLElement;
-  filmStripScroll.value = target.scrollTop;
+  filmScrollLeft.value = target.scrollLeft;
+  filmViewportWidth.value = target.clientWidth;
+  filmStripScroll.value = target.scrollLeft;
+}
+
+function scrollFilmStripToActive() {
+  const el = filmStripEl.value;
+  if (!el) return;
+  const left = currentIndex.value * FILM_ITEM_WIDTH;
+  const visibleLeft = el.scrollLeft;
+  const visibleRight = visibleLeft + el.clientWidth;
+  if (left < visibleLeft || left + FILM_ITEM_WIDTH > visibleRight) {
+    el.scrollLeft = Math.max(0, left - el.clientWidth / 2 + FILM_ITEM_WIDTH / 2);
+  }
+}
+
+function enterCompare() {
+  if (selectedIds.value.size !== 2) {
+    emit(
+      "toast",
+      "无法对比",
+      "请先选中恰好两张图片（双击胶片缩略图可切换选择）。",
+      "info",
+    );
+    return;
+  }
+  const idSet = new Set(selectedIds.value);
+  const picked = members.value.filter((m) => idSet.has(m.id));
+  if (picked.length !== 2) return;
+  compareRestore.value = {
+    index: currentIndex.value,
+    scroll: filmStripEl.value?.scrollLeft ?? 0,
+  };
+  compareItems.value = [picked[0], picked[1]];
+  compareZoomA.value = 1;
+  compareZoomB.value = 1;
+  comparePanA.value = { x: 0, y: 0 };
+  comparePanB.value = { x: 0, y: 0 };
+  compareSync.value = true;
+  compareMode.value = true;
+}
+
+function exitCompare() {
+  compareMode.value = false;
+  compareItems.value = null;
+  const restore = compareRestore.value;
+  compareRestore.value = null;
+  if (restore) {
+    currentIndex.value = restore.index;
+    nextTick(() => {
+      const el = filmStripEl.value;
+      if (el) {
+        el.scrollLeft = restore.scroll;
+        filmScrollLeft.value = restore.scroll;
+      }
+    });
+  }
+}
+
+function handleCompareWheel(event: WheelEvent) {
+  if (!event.ctrlKey) return;
+  event.preventDefault();
+  const delta = event.deltaY > 0 ? -0.1 : 0.1;
+  const target = event.target as HTMLElement;
+  const sideB = target.closest(".rs-compare-side-b") !== null;
+  const nextA = Math.max(0.1, Math.min(8, compareZoomA.value + delta));
+  const nextB = Math.max(0.1, Math.min(8, compareZoomB.value + delta));
+  if (compareSync.value) {
+    const shared = sideB ? nextB : nextA;
+    compareZoomA.value = shared;
+    compareZoomB.value = shared;
+  } else if (sideB) {
+    compareZoomB.value = nextB;
+  } else {
+    compareZoomA.value = nextA;
+  }
+}
+
+async function compareSetRating(side: 0 | 1, star: number) {
+  const items = compareItems.value;
+  if (!items) return;
+  const m = items[side];
+  try {
+    await updateRating(m.id, star, m.color_label);
+    m.star_rating = star;
+    const main = members.value.find((x) => x.id === m.id);
+    if (main) main.star_rating = star;
+  } catch {
+    emit("toast", "评级失败", "无法保存星级", "error");
+  }
+}
+
+async function compareSetColor(side: 0 | 1, color: string) {
+  const items = compareItems.value;
+  if (!items) return;
+  const m = items[side];
+  try {
+    await updateRating(m.id, m.star_rating, color);
+    m.color_label = color;
+    const main = members.value.find((x) => x.id === m.id);
+    if (main) main.color_label = color;
+  } catch {
+    emit("toast", "评级失败", "无法保存色标", "error");
+  }
+}
+
+function compareStyle(side: 0 | 1) {
+  const zoom = side === 0 ? compareZoomA.value : compareZoomB.value;
+  const pan = side === 0 ? comparePanA.value : comparePanB.value;
+  return {
+    transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
+  };
 }
 
 function handleExport() {
@@ -281,16 +444,40 @@ async function handleRemove() {
 async function handlePermanentDelete() {
   const ids = selectedMemberIds.value;
   if (!ids.length) return;
-  const count = ids.length;
-  if (!confirm(`警告：将永久删除 ${count} 张源文件。\n\n此操作不进入回收站，无法恢复！`)) return;
-  if (!confirm(`再次确认：永久删除 ${count} 张源文件？`)) return;
+  // Collect target members with sizes for the confirmation dialog.
+  const idSet = new Set(ids);
+  deleteTargets.value = members.value.filter((m) => idSet.has(m.id));
+  deleteConfirmed.value = false;
+  showDeleteModal.value = true;
+}
+
+function closeDeleteModal() {
+  if (deleteBusy.value) return;
+  showDeleteModal.value = false;
+  deleteTargets.value = [];
+  deleteConfirmed.value = false;
+}
+
+async function confirmPermanentDelete() {
+  if (!deleteConfirmed.value || deleteBusy.value) return;
+  deleteBusy.value = true;
+  const ids = deleteTargets.value.map((m) => m.id);
   try {
     const result = await permanentDelete(ids, true);
-    emit("toast", "删除完成", `已删除 ${result.deleted}，缺失 ${result.already_missing}，失败 ${result.failed}`, result.failed > 0 ? "error" : "success");
+    emit(
+      "toast",
+      "删除完成",
+      `已删除 ${result.deleted}，缺失 ${result.already_missing}，失败 ${result.failed}`,
+      result.failed > 0 ? "error" : "success",
+    );
     clearSelection();
+    showDeleteModal.value = false;
+    deleteTargets.value = [];
     await loadMembers();
   } catch {
     emit("toast", "删除失败", "无法执行永久删除", "error");
+  } finally {
+    deleteBusy.value = false;
   }
 }
 
@@ -313,16 +500,52 @@ const thumbnailUrl = computed(() => {
 
 const previewUrl = computed(() => {
   if (!currentMember.value) return "";
-  return `api/raw-selection/members/${currentMember.value.id}/preview`;
+  const look = currentMember.value.creative_look || "as_shot";
+  return `api/raw-selection/members/${currentMember.value.id}/preview?look=${encodeURIComponent(look)}`;
 });
 
 const imageUrl = computed(() => {
   if (!currentMember.value) return "";
   // For ARW without rawpy, show placeholder
   if (isRawFile.value) return previewUrl.value;
-  // For JPG/PNG, use preview endpoint
+  // For JPG/PNG, use preview endpoint (no creative look re-render)
   return previewUrl.value;
 });
+
+// Creative look selector state (7.4)
+const creativeLooks = ref<CreativeLook[]>([]);
+const showLookMenu = ref(false);
+
+const currentLookLabel = computed(() => {
+  const look = currentMember.value?.creative_look || "as_shot";
+  const found = creativeLooks.value.find((l) => l.id === look);
+  return found ? found.label : look;
+});
+
+async function loadLooks() {
+  try {
+    const result = await listCreativeLooks();
+    creativeLooks.value = result.looks;
+  } catch {
+    creativeLooks.value = [];
+  }
+}
+
+async function setCreativeLook(lookId: string) {
+  showLookMenu.value = false;
+  if (!currentMember.value) return;
+  // JPG/PNG pixels are final — do not re-render.
+  if (!isRawFile.value) return;
+  const memberId = currentMember.value.id;
+  try {
+    await updateCreativeLook(memberId, lookId);
+    currentMember.value.creative_look = lookId;
+    // Force preview reload with the new look by busting the img src.
+    previewError.value = false;
+  } catch {
+    emit("toast", "外观切换失败", "无法保存创意外观", "error");
+  }
+}
 
 const imageStyle = computed(() => ({
   transform: `translate(${panX.value}px, ${panY.value}px) scale(${zoom.value})`,
@@ -344,7 +567,10 @@ const sortOptions = [
   { value: "star_rating", label: "星级" },
 ];
 
-watch(currentIndex, () => scheduleSaveState());
+watch(currentIndex, () => {
+  scheduleSaveState();
+  nextTick(() => scrollFilmStripToActive());
+});
 watch([filterStarMode, filterStarValue, filterColorLabels, filterFilename, filterRated, sortField, sortDirection], () => {
   void loadMembers();
 });
@@ -355,9 +581,14 @@ onMounted(async () => {
   window.addEventListener("mouseup", handleMouseUp);
   await loadMembers();
   await loadWorkspaceState();
+  await loadLooks();
   await nextTick();
-  const strip = document.querySelector(".rs-film-strip");
-  if (strip) strip.scrollTop = filmStripScroll.value;
+  const strip = filmStripEl.value;
+  if (strip) {
+    filmViewportWidth.value = strip.clientWidth;
+    strip.scrollLeft = filmStripScroll.value;
+    filmScrollLeft.value = strip.scrollLeft;
+  }
 });
 
 onBeforeUnmount(() => {
@@ -420,6 +651,29 @@ onBeforeUnmount(() => {
           />
         </div>
 
+        <!-- Creative look selector (7.4) — ARW only -->
+        <div class="rs-look-wrap">
+          <button
+            type="button"
+            class="rs-look-btn"
+            :disabled="!isRawFile"
+            :title="isRawFile ? 'Sony 创意外观' : 'JPG/PNG 不适用创意外观'"
+            @click="showLookMenu = !showLookMenu"
+          >
+            {{ isRawFile ? currentLookLabel : '外观不适用' }}
+          </button>
+          <div v-if="showLookMenu && isRawFile" class="rs-dropdown">
+            <button
+              v-for="look in creativeLooks"
+              :key="look.id"
+              type="button"
+              :class="{ active: currentMember && currentMember.creative_look === look.id }"
+              :title="look.calibration"
+              @click="setCreativeLook(look.id)"
+            >{{ look.label }}</button>
+          </div>
+        </div>
+
         <!-- Sort menu -->
         <div class="rs-sort-wrap">
           <button type="button" @click="showSortMenu = !showSortMenu">
@@ -440,14 +694,76 @@ onBeforeUnmount(() => {
         </div>
 
         <button type="button" title="全选筛选结果" @click="selectAllFiltered">全选</button>
+        <button
+          type="button"
+          title="双图对比（需选中恰好两张）"
+          :disabled="selectedCount !== 2"
+          @click="enterCompare"
+        >对比</button>
         <button type="button" title="导出" @click="handleExport">导出</button>
         <button type="button" title="移出项目" @click="handleRemove">移出</button>
         <button type="button" class="rs-danger-btn" title="永久删除源文件" @click="handlePermanentDelete">永久删除</button>
       </div>
     </header>
 
+    <!-- Dual image comparison view (Section 6) -->
+    <div v-if="compareMode && compareItems" class="rs-compare" @wheel="handleCompareWheel">
+      <div class="rs-compare-bar">
+        <button type="button" @click="exitCompare">返回</button>
+        <label class="rs-compare-sync">
+          <input v-model="compareSync" type="checkbox" />
+          <span>同步缩放</span>
+        </label>
+        <span class="rs-compare-hint">Ctrl+滚轮缩放 · Esc 退出</span>
+      </div>
+      <div class="rs-compare-panes">
+        <div
+          v-for="(item, side) in compareItems"
+          :key="item.id"
+          class="rs-compare-side"
+          :class="side === 1 ? 'rs-compare-side-b' : 'rs-compare-side-a'"
+        >
+          <div class="rs-compare-image-wrap">
+            <img
+              :src="`api/raw-selection/members/${item.id}/preview`"
+              :alt="item.file_name"
+              class="rs-compare-img"
+              :style="compareStyle(side as 0 | 1)"
+              draggable="false"
+            />
+          </div>
+          <div class="rs-compare-side-bar">
+            <span class="rs-compare-name">{{ item.file_name }}</span>
+            <div class="rs-stars">
+              <button
+                v-for="s in 5"
+                :key="s"
+                type="button"
+                class="rs-star"
+                :class="{ active: item.star_rating >= s }"
+                @click="compareSetRating(side as 0 | 1, s)"
+              >★</button>
+            </div>
+            <div class="rs-colors">
+              <button
+                v-for="opt in colorLabelOptions"
+                :key="opt.value"
+                type="button"
+                class="rs-color-btn"
+                :class="{ active: item.color_label === opt.value }"
+                :style="{ '--dot-color': opt.color }"
+                :title="opt.label"
+                @click="compareSetColor(side as 0 | 1, opt.value)"
+              />
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- Central preview -->
     <div
+      v-else
       class="rs-preview-area"
       @wheel="handleWheel"
       @dblclick="handleDoubleClick"
@@ -473,19 +789,20 @@ onBeforeUnmount(() => {
       </div>
     </div>
 
-    <!-- Film strip -->
-    <div class="rs-film-strip" @scroll="handleFilmStripScroll">
-      <div class="rs-film-strip-inner">
+    <!-- Film strip (virtualized) -->
+    <div ref="filmStripEl" class="rs-film-strip" @scroll="handleFilmStripScroll">
+      <div class="rs-film-strip-inner" :style="{ width: filmInnerWidth + 'px' }">
         <button
-          v-for="(m, i) in members"
+          v-for="{ member: m, index: i } in filmVisibleItems"
           :key="m.id"
           type="button"
           class="rs-thumb"
+          :style="{ left: i * FILM_ITEM_WIDTH + 'px' }"
           :class="{
             active: i === currentIndex,
             selected: selectedIds.has(m.id),
           }"
-          @click="currentIndex = i; zoom = 1; panX = 0; panY = 0"
+          @click="currentIndex = i; zoom = 1; panX = 0; panY = 0; previewError = false"
           @dblclick="toggleSelect(m.id)"
         >
           <img
@@ -498,6 +815,47 @@ onBeforeUnmount(() => {
           <span class="rs-thumb-name">{{ m.file_name }}</span>
           <span v-if="m.star_rating > 0" class="rs-thumb-stars">{{ '★'.repeat(m.star_rating) }}</span>
         </button>
+      </div>
+    </div>
+
+    <!-- Permanent delete confirmation modal (11.2) -->
+    <div
+      v-if="showDeleteModal"
+      class="rs-delete-backdrop"
+      role="presentation"
+      @click.self="closeDeleteModal"
+    >
+      <div class="rs-delete-modal" role="alertdialog" aria-modal="true" aria-labelledby="rs-delete-title">
+        <h3 id="rs-delete-title">永久删除源文件</h3>
+        <p class="rs-delete-summary">
+          将永久删除 <strong>{{ deleteTargets.length }}</strong> 个源文件，
+          总大小 <strong>{{ formatSize(deleteTotalSize) }}</strong>。
+        </p>
+        <p class="rs-delete-warning">
+          这些文件不会进入回收站，删除后无法恢复。
+        </p>
+        <label class="rs-delete-check">
+          <input
+            v-model="deleteConfirmed"
+            type="checkbox"
+            :disabled="deleteBusy"
+          />
+          <span>我理解这些源文件将被永久删除</span>
+        </label>
+        <div class="rs-delete-actions">
+          <button
+            type="button"
+            class="rs-delete-cancel"
+            :disabled="deleteBusy"
+            @click="closeDeleteModal"
+          >取消</button>
+          <button
+            type="button"
+            class="rs-delete-confirm"
+            :disabled="!deleteConfirmed || deleteBusy"
+            @click="confirmPermanentDelete"
+          >{{ deleteBusy ? '删除中…' : '永久删除' }}</button>
+        </div>
       </div>
     </div>
   </div>
@@ -623,6 +981,17 @@ onBeforeUnmount(() => {
   position: relative;
 }
 
+.rs-look-wrap {
+  position: relative;
+}
+
+.rs-look-btn {
+  max-width: 110px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .rs-dropdown {
   position: absolute;
   top: 32px;
@@ -697,20 +1066,20 @@ onBeforeUnmount(() => {
 }
 
 .rs-film-strip-inner {
-  display: flex;
-  gap: 2px;
-  padding: 6px;
+  position: relative;
   height: 100%;
 }
 
 .rs-thumb {
+  position: absolute;
+  top: 6px;
+  bottom: 6px;
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
   gap: 2px;
-  min-width: 80px;
-  height: 100%;
+  width: 84px;
   padding: 4px 6px;
   border: 2px solid transparent;
   border-radius: 6px;
@@ -719,7 +1088,6 @@ onBeforeUnmount(() => {
   font-size: 11px;
   overflow: hidden;
   cursor: pointer;
-  flex-shrink: 0;
 }
 
 .rs-thumb.active {
@@ -750,5 +1118,185 @@ onBeforeUnmount(() => {
 .rs-thumb-stars {
   font-size: 10px;
   color: #e8a800;
+}
+
+/* Dual image comparison */
+.rs-compare {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--surface-soft);
+}
+
+.rs-compare-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.rs-compare-bar button {
+  padding: 0 10px;
+  min-height: 28px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface);
+  font-size: 12px;
+}
+
+.rs-compare-sync {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.rs-compare-hint {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--faint);
+}
+
+.rs-compare-panes {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1px;
+  flex: 1;
+  min-height: 0;
+  background: var(--border);
+}
+
+.rs-compare-side {
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) auto;
+  min-width: 0;
+  min-height: 0;
+  background: var(--surface-soft);
+}
+
+.rs-compare-image-wrap {
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  min-height: 0;
+}
+
+.rs-compare-img {
+  max-width: 100%;
+  max-height: 100%;
+  pointer-events: none;
+  transition: transform 0.05s linear;
+}
+
+.rs-compare-side-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.rs-compare-name {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+/* Permanent delete confirmation modal */
+.rs-delete-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1100;
+  display: grid;
+  place-items: center;
+  background: rgb(0 0 0 / 35%);
+}
+
+.rs-delete-modal {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: min(400px, calc(100vw - 32px));
+  padding: 20px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--surface);
+  box-shadow: var(--shadow-float);
+}
+
+.rs-delete-modal h3 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 500;
+  color: var(--danger);
+}
+
+.rs-delete-summary {
+  margin: 0;
+  font-size: 13px;
+  color: var(--text);
+}
+
+.rs-delete-warning {
+  margin: 0;
+  font-size: 12px;
+  color: var(--danger);
+}
+
+.rs-delete-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--surface-soft);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.rs-delete-check input {
+  width: 16px;
+  height: 16px;
+}
+
+.rs-delete-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.rs-delete-cancel,
+.rs-delete-confirm {
+  padding: 0 14px;
+  min-height: 32px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  font-size: 13px;
+}
+
+.rs-delete-cancel {
+  background: var(--surface);
+  color: var(--text);
+}
+
+.rs-delete-confirm {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: #fff;
+}
+
+.rs-delete-confirm:disabled {
+  opacity: 0.45;
 }
 </style>

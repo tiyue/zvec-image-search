@@ -100,9 +100,9 @@ def decode_thumbnail(
         try:
             import rawpy
 
-            with rawpy.ImRaw(file_path) as raw:
+            with rawpy.imread(str(file_path)) as raw:
                 thumb = raw.extract_thumb()
-                if thumb.format == "jpeg":
+                if thumb.format == rawpy.ThumbFormat.JPEG:
                     img = Image.open(io.BytesIO(thumb.data))
                     img = _apply_exif_orientation(img)
                     img = _fit_to_max_edge(img, THUMBNAIL_MAX_EDGE)
@@ -193,22 +193,11 @@ def decode_preview(
         try:
             import rawpy
 
-            with rawpy.ImRaw(file_path) as raw:
+            with rawpy.imread(str(file_path)) as raw:
                 # Try to extract the embedded preview
                 thumb = raw.extract_thumb()
-                if thumb.format in ("jpeg", "rgb"):
-                    if thumb.format == "jpeg":
-                        img = Image.open(io.BytesIO(thumb.data))
-                    else:
-                        # Non-JPEG embedded preview not supported
-                        return DecodeResult(
-                            image=None,
-                            width=0,
-                            height=0,
-                            level="preview",
-                            source="embedded_preview",
-                            error="Non-JPEG embedded preview not supported",
-                        )
+                if thumb.format == rawpy.ThumbFormat.JPEG:
+                    img = Image.open(io.BytesIO(thumb.data))
                     img = _apply_exif_orientation(img)
                     # Check if embedded preview is large enough
                     if (
@@ -306,8 +295,8 @@ def decode_full(
         try:
             import rawpy
 
-            with rawpy.ImRaw(path) as raw:
-                # Use camera white balance
+            with rawpy.imread(path) as raw:
+                # Use camera white balance, 8-bit sRGB output
                 rgb = raw.postprocess(
                     use_camera_wb=True,
                     output_bps=8,
@@ -339,6 +328,36 @@ def decode_full(
 
     # JPG/PNG — same as preview
     return decode_preview(path, extension)
+
+
+def decode_full_with_look(
+    path: str,
+    extension: str,
+    look_id: str,
+) -> DecodeResult:
+    """Full RAW decode then apply a creative look.
+
+    For ``as_shot`` or non-ARW files this behaves like :func:`decode_full` /
+    :func:`decode_preview` (no re-render). For ARW with a non-default look,
+    the full decode is transformed by the calibrated look configuration.
+    """
+    from .creative_look import DEFAULT_LOOK, apply_creative_look, is_valid_look
+
+    ext = extension.casefold()
+    if look_id == DEFAULT_LOOK or not is_valid_look(look_id) or ext != ".arw":
+        return decode_full(path, extension)
+
+    result = decode_full(path, extension)
+    if result.image is None:
+        return result
+    looked = apply_creative_look(result.image, look_id)
+    return DecodeResult(
+        image=looked,
+        width=looked.width,
+        height=looked.height,
+        level="full",
+        source="full_decode",
+    )
 
 
 def image_to_jpeg_bytes(

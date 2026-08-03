@@ -162,3 +162,14 @@ export async function clearProjectCache(projectId: string, signal?: AbortSignal)
     { method: "POST", signal },
   );
 }
+
+export interface CreativeLook {
+  id: string;
+  label: string;
+  description: string;
+  calibration: string;
+}
+
+export async function listCreativeLooks(signal?: AbortSignal) {
+  return requestJson<{ looks: CreativeLook[] }>(`${BASE}/looks`, { signal });
+}

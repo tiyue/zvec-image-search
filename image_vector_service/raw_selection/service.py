@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .cache import DerivedCache
 from .db import (
     MemberRecord,
     ProjectSummary,
@@ -23,6 +24,7 @@ from .db import (
 )
 from .decoder import (
     decode_full,
+    decode_full_with_look,
     decode_preview,
     decode_thumbnail,
     image_to_jpeg_bytes,
@@ -71,6 +73,7 @@ class RawSelectionService:
         self._cache_dir.mkdir(parents=True, exist_ok=True)
         self._db = RawSelectionDB(self._db_path)
         self._importer = AssetImporter(self._db)
+        self._derived_cache = DerivedCache(self._cache_dir)
         self._lock = threading.RLock()
 
     @property
@@ -518,16 +521,7 @@ class RawSelectionService:
         Preserves project references, ratings, color labels and creative
         look selections.
         """
-        # The cache directory is structured per-project; for now, clear all
-        # cached derived files. A more granular implementation will delete
-        # only the target project's cache entries.
-        removed = 0
-        cache_project = self._cache_dir / project_id
-        if cache_project.exists():
-            import shutil
-
-            shutil.rmtree(cache_project, ignore_errors=True)
-            removed = 1
+        removed = self._derived_cache.clear()
         return removed
 
     # ------------------------------------------------------------------
@@ -553,12 +547,29 @@ class RawSelectionService:
         if not os.path.isfile(member.normalized_path):
             return ImageBytesResult(b"", "", error="Source file missing")
 
+        # Check persistent derived cache first (8.4 source-version keyed).
+        cached = self._derived_cache.get(
+            normalized_path=member.normalized_path,
+            file_size=member.file_size,
+            mtime_ns=member.mtime_ns,
+            kind="thumbnails",
+        )
+        if cached is not None:
+            return ImageBytesResult(cached, "image/jpeg")
+
         result = decode_thumbnail(member.normalized_path, member.extension)
         if result.image is None or result.error is not None:
             return ImageBytesResult(
                 b"", "", error=result.error or "Decode failed"
             )
         data = image_to_jpeg_bytes(result.image, quality=85)
+        self._derived_cache.put(
+            data,
+            normalized_path=member.normalized_path,
+            file_size=member.file_size,
+            mtime_ns=member.mtime_ns,
+            kind="thumbnails",
+        )
         return ImageBytesResult(data, "image/jpeg")
 
     def get_preview_bytes(
@@ -567,35 +578,66 @@ class RawSelectionService:
         *,
         display_width: int = 0,
         display_height: int = 0,
+        look: str = "as_shot",
     ) -> ImageBytesResult:
         """Generate and return preview JPEG bytes for HTTP response.
 
-        For ARW, uses the embedded preview if it's large enough for the
-        display area. Otherwise, falls back to full decode.
+        For ARW with ``as_shot`` (or any non-ARW file), uses the embedded
+        preview if large enough, else falls back to full decode. For ARW
+        with a non-default creative look, performs a full decode and applies
+        the calibrated look transform. The cache key includes the look ID and
+        look-config version (requirement 7.4.3).
         """
+        from .creative_look import DEFAULT_LOOK, LOOK_CONFIG_VERSION, is_valid_look
+
         member = self._db.get_member(member_id)
         if member is None:
             return ImageBytesResult(b"", "", error="Member not found")
         if not os.path.isfile(member.normalized_path):
             return ImageBytesResult(b"", "", error="Source file missing")
 
-        # Try preview first
-        result = decode_preview(
-            member.normalized_path,
-            member.extension,
-            display_width=display_width,
-            display_height=display_height,
+        is_arw = member.extension.casefold() == ".arw"
+        use_look = is_arw and look != DEFAULT_LOOK and is_valid_look(look)
+
+        # Cache key includes source version + output size + look + config ver.
+        size_extra = f"{display_width}x{display_height}"
+        look_extra = f"{look}|{LOOK_CONFIG_VERSION}" if use_look else "as_shot"
+        cached = self._derived_cache.get(
+            normalized_path=member.normalized_path,
+            file_size=member.file_size,
+            mtime_ns=member.mtime_ns,
+            kind="previews",
+            extra=f"{size_extra}|{look_extra}",
         )
-        if result.error == "preview_below_threshold" and result.image is not None:
-            # Preview is too small — try full decode for ARW
-            if member.extension.casefold() == ".arw":
-                full_result = decode_full(member.normalized_path, member.extension)
-                if full_result.image is not None:
-                    result = full_result
-        elif result.image is None:
-            return ImageBytesResult(
-                b"", "", error=result.error or "Decode failed"
+        if cached is not None:
+            return ImageBytesResult(cached, "image/jpeg")
+
+        if use_look:
+            result = decode_full_with_look(
+                member.normalized_path, member.extension, look
             )
+        else:
+            # Try embedded preview first
+            result = decode_preview(
+                member.normalized_path,
+                member.extension,
+                display_width=display_width,
+                display_height=display_height,
+            )
+            if (
+                result.error == "preview_below_threshold"
+                and result.image is not None
+            ):
+                if is_arw:
+                    full_result = decode_full(
+                        member.normalized_path, member.extension
+                    )
+                    if full_result.image is not None:
+                        result = full_result
+            elif result.image is None:
+                return ImageBytesResult(
+                    b"", "", error=result.error or "Decode failed"
+                )
 
         if result.image is None:
             return ImageBytesResult(
@@ -603,7 +645,29 @@ class RawSelectionService:
             )
 
         data = image_to_jpeg_bytes(result.image, quality=88)
+        self._derived_cache.put(
+            data,
+            normalized_path=member.normalized_path,
+            file_size=member.file_size,
+            mtime_ns=member.mtime_ns,
+            kind="previews",
+            extra=f"{size_extra}|{look_extra}",
+        )
         return ImageBytesResult(data, "image/jpeg")
+
+    def list_creative_looks(self) -> list[dict[str, str]]:
+        """Return the A7M4 creative-look options for the UI selector."""
+        from .creative_look import LOOK_META, calibration_note
+
+        return [
+            {
+                "id": meta.id,
+                "label": meta.label,
+                "description": meta.description,
+                "calibration": calibration_note(meta.id),
+            }
+            for meta in LOOK_META
+        ]
 
     def rawpy_available(self) -> bool:
         """Return True if rawpy/LibRaw is available for ARW decoding."""

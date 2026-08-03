@@ -107,14 +107,16 @@ Vue 3 + TypeScript + Vite SPA：
 ### ARW 选片模块（raw_selection）
 
 独立于现有图库索引、向量生成、搜索、推荐、偏好、曝光或模型调用的 Sony A7M4 ARW 选片模块：
-- 后端包：`image_vector_service/raw_selection/`（db.py、importer.py、decoder.py、service.py）
+- 后端包：`image_vector_service/raw_selection/`（db.py、importer.py、decoder.py、cache.py、creative_look.py、service.py）
 - 前端模块：`frontend/src/features/raw-selection/`
 - 独立 SQLite 数据库存储于 `raw-selection/projects.sqlite3`，不触及现有图库状态库
-- 支持 .jpg/.jpeg/.png（通过 Pillow）和 .arw（需要 rawpy/LibRaw，当前可选依赖）
-- 三级渐进加载：缩略图（ARW 内嵌 JPEG）→ 快速预览（内嵌预览）→ 完整解码
-- 项目管理：创建/重命名/删除项目、导入文件/文件夹、评级/色标、筛选/排序、统一导出、永久删除
-- WebView 网关路由：`api/raw-selection/*`（项目 CRUD、成员列表、缩略图/预览、评级、导出、删除）
-- 当前限制：rawpy 未安装时 ARW 解码不可用；缩略图缓存、虚拟化、双图对比、Sony 创意外观尚未实现
+- 支持 .jpg/.jpeg/.png（通过 Pillow）和 .arw（rawpy==0.27.0，已锁定）
+- 三级渐进加载：缩略图（ARW 内嵌 JPEG）→ 快速预览（内嵌预览）→ 完整解码；派生缓存原子写入 + 源版本校验
+- 项目管理：创建/重命名/删除项目、导入文件/文件夹、评级/色标、筛选/排序、统一导出、永久删除（两阶段确认模态）
+- 胶片栏虚拟化（仅渲染视口 ± 2 屏）、双图对比（同步缩放/平移、双侧评级）
+- Sony 创意外观：as_shot 用内嵌 JPEG；ST/PT/NT/VV/VV2/FL/IN/SH/BW/SE 为真实 A7M4 样片校准的近似渲染（非 Sony 像素级复刻），JPG/PNG 不应用外观
+- WebView 网关路由：`api/raw-selection/*`（项目 CRUD、成员列表、缩略图/预览、评级、外观、导出、删除）
+- 未完整验证：20 组冷缓存首 24 张、各并发档 RAW 解码 P50/P95 等正式性能基准
 
 ### Windows 登录后常驻生命周期
 

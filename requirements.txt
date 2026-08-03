@@ -1,3 +1,5 @@
 zvec==0.5.1
 Pillow>=10.0
 watchdog>=4.0
+# ARW 选片模块可选依赖（MIT；内置 LibRaw LGPL-2.1）。缺失时 ARW 解码降级为不可用，JPG/PNG 不受影响。
+rawpy==0.27.0
