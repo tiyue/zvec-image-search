@@ -202,13 +202,9 @@ onBeforeUnmount(() => {
         class="rs-card"
         @dblclick="openProject(p)"
       >
-        <div
-          class="rs-card-thumb"
-          :class="`has-${Math.min(p.cover_member_ids.length, 4)}`"
-          aria-hidden="true"
-        >
+        <div class="rs-card-thumb" aria-hidden="true">
           <img
-            v-for="memberId in p.cover_member_ids"
+            v-for="memberId in p.cover_member_ids.slice(0, 1)"
             :key="memberId"
             :src="projectCoverUrl(memberId, p.updated_at)"
             alt=""
@@ -358,9 +354,6 @@ onBeforeUnmount(() => {
 
 .rs-card-thumb {
   position: relative;
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  grid-template-rows: repeat(2, minmax(0, 1fr));
   height: 120px;
   overflow: hidden;
   background: var(--surface-soft);
@@ -370,16 +363,11 @@ onBeforeUnmount(() => {
 }
 
 .rs-card-thumb img {
+  display: block;
   width: 100%;
   height: 100%;
-  min-width: 0;
-  min-height: 0;
   object-fit: cover;
 }
-
-.rs-card-thumb.has-1 img { grid-area: 1 / 1 / 3 / 3; }
-.rs-card-thumb.has-2 img { grid-row: 1 / 3; }
-.rs-card-thumb.has-3 img:first-child { grid-row: 1 / 3; }
 
 .rs-card-count {
   position: absolute;

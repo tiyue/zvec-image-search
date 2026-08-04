@@ -49,12 +49,39 @@ class RawSelectionDBTest(unittest.TestCase):
         p = self.svc.create_project("Session")
         self.assertEqual(p["name"], "Session")
         self.assertEqual(self.svc.get_project(p["id"])["member_count"], 0)
+        self.assertEqual(self.svc.get_project(p["id"])["cover_member_ids"], [])
 
         renamed = self.svc.rename_project(p["id"], "Renamed")
         self.assertEqual(renamed["name"], "Renamed")
 
         self.assertTrue(self.svc.delete_project(p["id"]))
         self.assertIsNone(self.svc.get_project(p["id"]))
+
+    def test_project_cover_uses_only_first_imported_member(self) -> None:
+        p = self.svc.create_project("Cover")
+        folder = Path(self._tmp.name) / "cover"
+        folder.mkdir()
+        first_path = folder / "z-first.jpg"
+        second_path = folder / "a-second.jpg"
+        _write_jpg(first_path)
+        _write_jpg(second_path)
+
+        self.svc.import_files(p["id"], [first_path, second_path])
+        members = self.svc.list_members(
+            p["id"], sort_field="import_order"
+        )["members"]
+        self.assertEqual(
+            [member["file_name"] for member in members],
+            ["z-first.jpg", "a-second.jpg"],
+        )
+
+        expected_cover = [members[0]["id"]]
+        self.assertEqual(
+            self.svc.get_project(p["id"])["cover_member_ids"], expected_cover
+        )
+        self.assertEqual(
+            self.svc.list_projects()[0]["cover_member_ids"], expected_cover
+        )
 
     def test_project_name_validation(self) -> None:
         with self.assertRaises(ValueError):

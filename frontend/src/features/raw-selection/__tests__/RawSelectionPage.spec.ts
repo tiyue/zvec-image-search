@@ -84,20 +84,17 @@ describe("RawSelectionPage", () => {
     wrapper.unmount();
   });
 
-  it("renders the bounded project cover mosaic from cover member IDs", async () => {
+  it("renders only the first project member thumbnail as the cover", async () => {
     const wrapper = mount(RawSelectionPage);
     await flushPromises();
 
     const covers = wrapper.findAll<HTMLImageElement>(".rs-card-thumb img");
-    expect(covers).toHaveLength(2);
-    expect(covers.map((cover) => cover.attributes("src"))).toEqual([
-      expect.stringContaining("members/member-cover-1/thumbnail?"),
-      expect.stringContaining("members/member-cover-2/thumbnail?"),
-    ]);
-    expect(covers.every((cover) =>
-      (cover.attributes("src") ?? "").includes("priority=background"),
-    )).toBe(true);
-    expect(wrapper.get(".rs-card-thumb").classes()).toContain("has-2");
+    expect(covers).toHaveLength(1);
+    expect(covers[0]?.attributes("src")).toContain(
+      "members/member-cover-1/thumbnail?",
+    );
+    expect(covers[0]?.attributes("src")).toContain("priority=background");
+    expect(covers[0]?.attributes("src")).not.toContain("member-cover-2");
     wrapper.unmount();
   });
 });

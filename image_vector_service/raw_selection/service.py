@@ -180,7 +180,7 @@ class RawSelectionService:
     def _project_with_cover(self, project: ProjectSummary) -> dict[str, Any]:
         payload = _project_to_dict(project)
         payload["cover_member_ids"] = [
-            member.id for member in self._db.list_members(project.id, offset=0, limit=4)
+            member.id for member in self._db.list_members(project.id, offset=0, limit=1)
         ]
         return payload
 
