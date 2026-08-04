@@ -4,6 +4,7 @@
 
 - 项目架构、模块职责与发布约束：`docs/spec.md`
 - Sony A7M4 ARW 选片模块需求规格：`docs/raw-image-support-requirements.md`
+- 软件开发全流程、需求约束、原型、测试与发布实践：`docs/development-workflow-guide.md`
 
 ## 发布矩阵
 

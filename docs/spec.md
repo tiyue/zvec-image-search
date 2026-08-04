@@ -334,6 +334,7 @@ CLI 入口将配置创建、迁移/后端服务、需要 `ImageVectorService` �
 
 ## 开发规范
 
+- 端到端开发流程、需求就绪标准、原型冻结、测试验收、变更管理与发布检查统一参考 `docs/development-workflow-guide.md`；新功能和中型以上变更应在编码前明确目标、非目标、未知项、可测试验收标准、修改范围与不得修改范围，小缺陷可按手册中的轻量流程执行
 - Python 代码风格：Ruff，行宽 88 字符
 - 类型检查：mypy（Python 3.10 target）
 - 前端类型检查：vue-tsc + tsc
