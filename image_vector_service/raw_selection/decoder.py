@@ -173,7 +173,9 @@ def read_arw_orientation(path: str | Path) -> int:
             if struct.unpack(f"{endian}H", entry[:2])[0] != _TIFF_ORIENTATION_TAG:
                 continue
             orientation = _tiff_scalar(entry, endian)
-            return orientation if orientation in range(1, 9) else 1
+            if orientation is not None and 1 <= orientation <= 8:
+                return orientation
+            return 1
     return 1
 
 

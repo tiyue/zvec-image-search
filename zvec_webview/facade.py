@@ -4956,7 +4956,7 @@ def _package_version() -> str:
     try:
         return metadata.version("zvec-image-search")
     except metadata.PackageNotFoundError:
-        return "0.2.0"
+        return "0.3.0"
 
 
 def _operation_id(value: str) -> str:

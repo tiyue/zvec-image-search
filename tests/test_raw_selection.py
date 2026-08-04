@@ -67,9 +67,7 @@ class RawSelectionDBTest(unittest.TestCase):
         _write_jpg(second_path)
 
         self.svc.import_files(p["id"], [first_path, second_path])
-        members = self.svc.list_members(
-            p["id"], sort_field="import_order"
-        )["members"]
+        members = self.svc.list_members(p["id"], sort_field="import_order")["members"]
         self.assertEqual(
             [member["file_name"] for member in members],
             ["z-first.jpg", "a-second.jpg"],

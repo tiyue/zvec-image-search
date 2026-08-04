@@ -164,7 +164,7 @@ _CAPABILITIES = {
 try:
     _APP_VERSION = version("zvec-image-search")
 except PackageNotFoundError:
-    _APP_VERSION = "0.2.0"
+    _APP_VERSION = "0.3.0"
 
 
 def _utc_now() -> str:

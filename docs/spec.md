@@ -1,6 +1,6 @@
 # 曜镜（YaoLens）项目规格文档
 
-> 版本：0.2（机器 SemVer：0.2.0）| 最后更新：2026-08-03
+> 版本：0.3（机器 SemVer：0.3.0）| 最后更新：2026-08-04
 
 ## 概述
 
@@ -314,10 +314,10 @@ CLI 入口将配置创建、迁移/后端服务、需要 `ImageVectorService` �
 - **安装版常驻**：NSIS 注册当前用户登录任务；卸载时移除该任务
 - **portable 常驻**：不注册计划任务，仅手工启动后的当前登录会话内常驻
 - **安卓端**：Gradle 构建 .apk
-- **发布版本**：机器版本 `0.2.0`，公开展示版本 `0.2`，稳定标签 `v0.2.0`
-- **Windows 版本资源**：发布载荷内三个可执行文件的产品名均为 `YaoLens`，文件版本与产品版本均展示为 `0.2.0`，固定数值版本为 `0.2.0.0`
+- **发布版本**：机器版本 `0.3.0`，公开展示版本 `0.3`，稳定标签 `v0.3.0`
+- **Windows 版本资源**：发布载荷内三个可执行文件的产品名均为 `YaoLens`，文件版本与产品版本均展示为 `0.3.0`，固定数值版本为 `0.3.0.0`
 - **发布矩阵**：仅发布 YaoLens Windows、Android 及对应校验、验证报告和策略元数据
-- **公开附件**：`YaoLens-0.2-win-x64-portable.zip`、`YaoLens-0.2-win-x64-setup.exe`、`YaoLens-0.2-android.apk`
+- **公开附件**：`YaoLens-0.3-win-x64-portable.zip`、`YaoLens-0.3-win-x64-setup.exe`、`YaoLens-0.3-android.apk`
 - **矩阵约束**：登录常驻不新增独立附件或产品，现有 GitHub Release 资产矩阵保持不变
 - **禁止产物**：不发布 Zvec-Desktop 安装包、便携包或 Python wheel
 - **内部组件**：`zvec.exe`、`zvec-backend.exe` 仅随 WebView 包交付

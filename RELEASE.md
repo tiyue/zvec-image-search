@@ -1,10 +1,17 @@
-# YaoLens 0.2
+# YaoLens 0.3
 
 本版提供 Windows x64 原生 Python 后端和 Vue 3 桌面界面。发布包冻结 Python、WebView2 桥接和前端静态资源；用户运行时不需要 Node.js、PowerShell、.NET、Docker、WSL 或单独安装 Python。
 
-本次使用机器版本 `0.2.0`、公开展示版本 `0.2` 和稳定标签 `v0.2.0`。
+本次使用机器版本 `0.3.0`、公开展示版本 `0.3` 和稳定标签 `v0.3.0`。
 
 ## 本版更新
+
+### Sony A7M4 ARW 快速选片
+
+- Windows 新增独立「ARW 选片」模块，支持由 Sony ILCE-7M4 产生的 ARW，以及 JPG/JPEG/PNG；项目、筛选、排序和派生缓存独立存储，不接管或改写源文件。
+- 缩略图、按显示尺寸生成的内嵌 JPEG 和完整最佳预览采用三级原位渐进加载；同一图片只升不降，修复高清替换闪帧、循环重载和方向不一致。
+- 支持星级、色标、虚拟化胶片栏、双图对比、统一导出、移出项目和两阶段永久删除；项目卡片使用导入顺序第一张图片的缩略图作为封面。
+- Sony 创意外观当前仅开放「拍摄时（As Shot）」并使用相机内嵌 JPEG；未经可信 A7M4 同场景参考输出校准的预置继续阻断，不用近似滤镜冒充原厂效果。
 
 ### 图片推荐与向量多样性
 
@@ -183,14 +190,14 @@
 以下是完成最终构建和校验后采用的文件名。本说明不代表这些文件已经由当前源码重新生成；实际交付必须同时提供 SHA-256 和验证报告。
 
 ```text
-YaoLens-0.2-win-x64-portable.zip
-YaoLens-0.2-win-x64-setup.exe
-YaoLens-0.2-android.apk
+YaoLens-0.3-win-x64-portable.zip
+YaoLens-0.3-win-x64-setup.exe
+YaoLens-0.3-android.apk
 ```
 
 登录常驻没有新增独立发布资产；GitHub Release 资产矩阵仍为上述 Windows 安装包、便携包、Android APK 及对应校验和、验证报告和策略元数据。
 
-GitHub Release 标题固定为 `YaoLens 0.2`，并从精确指向工作流提交的稳定标签 `v0.2.0` 发布。
+GitHub Release 标题固定为 `YaoLens 0.3`，并从精确指向工作流提交的稳定标签 `v0.3.0` 发布。
 
 Windows 应用入口：
 

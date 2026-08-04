@@ -145,13 +145,13 @@ YaoLens 仅提供 Windows x64 版本，推荐使用 Windows 10 或 Windows 11。
 
 ### 安装版
 
-运行 `YaoLens-0.2-win-x64-setup.exe` 并按照提示完成安装。安装版会为当前用户注册登录任务；下次登录后 YaoLens 以普通权限隐藏常驻，再次启动会唤醒已有窗口，不会重复启动后台实例。
+运行 `YaoLens-0.3-win-x64-setup.exe` 并按照提示完成安装。安装版会为当前用户注册登录任务；下次登录后 YaoLens 以普通权限隐藏常驻，再次启动会唤醒已有窗口，不会重复启动后台实例。
 
 关闭窗口只会隐藏界面，后台任务、Android LAN 服务和自动增量索引 watcher 会继续运行。需要完全停止时，使用“设置 → 应用 → 退出 YaoLens”；存在活动任务时会拒绝退出，请先等待任务完成或安全取消。
 
 ### 便携版
 
-将 `YaoLens-0.2-win-x64-portable.zip` 完整解压到固定目录，然后运行其中的 `YaoLens.exe`。
+将 `YaoLens-0.3-win-x64-portable.zip` 完整解压到固定目录，然后运行其中的 `YaoLens.exe`。
 
 不要直接在压缩包内启动，也不要只单独复制 EXE 文件，否则软件可能找不到前端资源或本地运行组件。
 
@@ -162,7 +162,7 @@ YaoLens 仅提供 Windows x64 版本，推荐使用 Windows 10 或 Windows 11。
 Android 平板或手机可以在同一局域网内搜索 Windows 电脑上的图库、翻页查看结果，并打开或保存原图。电脑继续负责图库、索引和模型，Android 端不会修改桌面设置、建立索引或删除图库。
 
 1. 在 Windows YaoLens 的“设置 → 局域网访问”中选择私网 IP，保存并启用服务。
-2. 安装 `YaoLens-0.2-android.apk`，让设备与电脑连接同一 Wi-Fi。
+2. 安装 `YaoLens-0.3-android.apk`，让设备与电脑连接同一 Wi-Fi。
 3. Android 端通常会自动发现电脑；发现失败时可手工填写电脑的私网 IP 和端口 `38522`。
 4. 两端核对相同的 6 位验证码，再在 Windows 上批准配对。
 5. 在 Android 端选择图库并搜索。查询图片采用流式上传，原图采用流式并发传输。

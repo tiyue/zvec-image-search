@@ -3,11 +3,22 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="description" content="曜镜（YaoLens）是面向 Windows 的本地优先智能图片库，支持多模态搜索、跨图库检索、AI 标注、批量整理与 Android 局域网查看。">
+  <meta name="description" content="曜镜（YaoLens）是面向 Windows 的本地优先智能图片库，支持 Sony A7M4 ARW 快速选片、多模态搜索、AI 标注、批量整理与 Android 局域网查看。">
+  <link rel="canonical" href="https://www.yubanyuban.com/">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://www.yubanyuban.com/">
+  <meta property="og:title" content="曜镜 YaoLens 0.3 — Sony A7M4 ARW 选片">
+  <meta property="og:description" content="本地优先的 A7M4 ARW 快速选片、评级、对比与智能图片库。">
+  <meta property="og:image" content="https://www.yubanyuban.com/assets/images/og.png">
+  <meta property="og:image:alt" content="曜镜 YaoLens 0.3 的 Sony A7M4 ARW 选片界面">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="曜镜 YaoLens 0.3 — Sony A7M4 ARW 选片">
+  <meta name="twitter:description" content="本地优先的 A7M4 ARW 快速选片、评级、对比与智能图片库。">
+  <meta name="twitter:image" content="https://www.yubanyuban.com/assets/images/og.png">
   <meta name="theme-color" content="#f7f7f5" media="(prefers-color-scheme: light)">
   <meta name="theme-color" content="#14181b" media="(prefers-color-scheme: dark)">
   <link rel="icon" type="image/png" href="assets/images/yaolens-logo.png">
-  <title>曜镜 YaoLens — 本地优先，搜索、标注与整理</title>
+  <title>曜镜 YaoLens 0.3 — A7M4 ARW 选片与本地智能图片库</title>
   <style>
     :root{
       color-scheme:light;
@@ -51,6 +62,7 @@
     /* Hero */
     .hero{padding:120px 24px 80px;text-align:center}
     .hero-inner{max-width:720px;margin:0 auto}
+    .release-badge{display:inline-flex;align-items:center;min-height:30px;margin-bottom:18px;padding:4px 12px;border-radius:999px;background:var(--accent-soft);color:var(--accent-2);font-size:12px;font-weight:700;letter-spacing:.01em}
     .hero h1{font-size:34px;line-height:1.15;letter-spacing:-.03em;font-weight:750;margin-bottom:14px}
     .hero p{color:var(--muted);font-size:16px;max-width:560px;margin:0 auto 28px;line-height:1.65}
     .hero-btns{display:flex;flex-direction:column;gap:10px;align-items:center;justify-content:center}
@@ -339,10 +351,11 @@
 <!-- Hero -->
 <section class="hero">
   <div class="hero-inner">
-    <h1>看懂图片内容，<br>把大图库管起来</h1>
-    <p>面向人物摄影、Cosplay、写真、动漫角色和二次元收藏的本地智能图片库。用文字、图片、标签或图文组合搜索，在后台完成索引、标注与批量整理。</p>
+    <span class="release-badge">YaoLens 0.3 · Sony A7M4 ARW 选片</span>
+    <h1>快速选片，也看懂图片内容，<br>把大图库管起来</h1>
+    <p>面向人物摄影、Cosplay、写真和二次元收藏的本地智能图片库。直接导入 Sony A7M4 ARW 快速浏览、评级和对比，也可用文字、图片与标签搜索完整图库。</p>
     <div class="hero-btns">
-      <a href="https://github.com/tiyue/zvec-image-search/releases/latest/download/YaoLens-0.2-win-x64-setup.exe" class="btn btn-primary" target="_blank" rel="noopener noreferrer">
+      <a href="https://github.com/tiyue/zvec-image-search/releases/latest/download/YaoLens-0.3-win-x64-setup.exe" class="btn btn-primary" target="_blank" rel="noopener noreferrer">
         <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>
         下载 Windows 版
       </a>
@@ -360,7 +373,7 @@
     <div><div class="stat-num">5 种</div><div class="stat-label">图片检索方式</div></div>
     <div><div class="stat-num">15 张</div><div class="stat-label">每页按需加载</div></div>
     <div><div class="stat-num">本地</div><div class="stat-label">向量与标签存储</div></div>
-    <div><div class="stat-num">0 次</div><div class="stat-label">本地学习额外调用</div></div>
+    <div><div class="stat-num">A7M4</div><div class="stat-label">ARW 快速选片</div></div>
   </div>
 </div>
 
@@ -372,6 +385,11 @@
       <p>不是另一个文件浏览器，而是一套覆盖检索、标注、审核、整理和迁移的完整桌面工作流</p>
     </div>
     <div class="cards">
+      <div class="card reveal">
+        <div class="card-icon" style="background:var(--accent-soft);color:var(--accent)">▧</div>
+        <h3>Sony A7M4 ARW 快速选片</h3>
+        <p>项目化导入 ARW、JPG 与 PNG，使用缩略图、相机内嵌 JPEG 和完整预览渐进加载。支持评级、色标、筛选、双图对比和原文件导出，不改写源图。</p>
+      </div>
       <div class="card reveal">
         <div class="card-icon" style="background:var(--accent-soft);color:var(--accent)">⌕</div>
         <h3>多模态与跨图库搜索</h3>
@@ -471,6 +489,10 @@
               <div class="mini-nav-item" data-mini-nav="organize">
                 <span class="mini-nav-icon" aria-hidden="true">◉</span>
                 <span class="mini-nav-copy"><strong>待学习样本</strong><small>反馈与质量门禁</small></span>
+              </div>
+              <div class="mini-nav-item" data-mini-nav="raw">
+                <span class="mini-nav-icon" aria-hidden="true">▧</span>
+                <span class="mini-nav-copy"><strong>ARW 选片</strong><small>导入、评级与导出</small></span>
               </div>
             </nav>
             <div class="mini-recents">
@@ -800,13 +822,13 @@
 <section class="cta" id="download">
   <div class="section-inner reveal">
     <h2>先用一小批图片<br>验证你的工作流</h2>
-    <p>当前项目面向 Windows 10/11 x64，配套局域网查看端支持 Android 8.0 及以上。建议首次先处理 10～50 张图片，确认检索效果、标签策略和模型费用后，再扩大到完整图库。</p>
+    <p>当前项目面向 Windows 10/11 x64，配套局域网查看端支持 Android 8.0 及以上。A7M4 ARW 选片不修改源文件；建议首次先导入一个小项目，确认预览、评级和导出流程后再处理完整拍摄批次。</p>
     <div class="hero-btns" style="justify-content:center">
-      <a href="https://github.com/tiyue/zvec-image-search/releases/latest/download/YaoLens-0.2-win-x64-setup.exe" class="btn btn-primary" target="_blank" rel="noopener noreferrer">
+      <a href="https://github.com/tiyue/zvec-image-search/releases/latest/download/YaoLens-0.3-win-x64-setup.exe" class="btn btn-primary" target="_blank" rel="noopener noreferrer">
         <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>
         下载 Windows 版
       </a>
-      <a href="https://github.com/tiyue/zvec-image-search/releases/latest/download/YaoLens-0.2-android.apk" class="btn btn-secondary" target="_blank" rel="noopener noreferrer">
+      <a href="https://github.com/tiyue/zvec-image-search/releases/latest/download/YaoLens-0.3-android.apk" class="btn btn-secondary" target="_blank" rel="noopener noreferrer">
         <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="5" y="2" width="14" height="20" rx="2"/><path d="M9 18h6"/></svg>
         下载 Android 版
       </a>

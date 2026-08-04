@@ -400,6 +400,7 @@ class NativeBridge:
         ) or getattr(webview, "OPEN_DIALOG", None)
         if dialog_type is None:
             raise RuntimeError("当前 pywebview 不支持文件选择。")
+        file_types: tuple[str, ...]
         if kind == "json":
             file_types = ("JSON 文件 (*.json)", "所有文件 (*.*)")
             allow_multiple = False

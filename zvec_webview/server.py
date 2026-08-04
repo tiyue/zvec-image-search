@@ -1479,19 +1479,19 @@ def _handler_type(gateway: GatewayServer) -> type[BaseHTTPRequestHandler]:
                 _reject_unknown_query(query_values, {"priority", "v"})
                 _query_optional_text(query_values, "v", "", maximum=300)
                 priority = _raw_image_priority(query_values, "visible")
-                result = svc.get_thumbnail_bytes(segments[1], priority=priority)
-                if result.error:
+                image_result = svc.get_thumbnail_bytes(segments[1], priority=priority)
+                if image_result.error:
                     raise FacadeError(
                         "decode_failed",
-                        result.error,
-                        status=503 if result.retryable else 500,
+                        image_result.error,
+                        status=503 if image_result.retryable else 500,
                     )
                 self._bytes(
                     HTTPStatus.OK,
-                    result.data,
-                    result.content_type,
+                    image_result.data,
+                    image_result.content_type,
                     cache="private, max-age=300",
-                    warning=result.warning,
+                    warning=image_result.warning,
                 )
                 return
 
@@ -1508,7 +1508,7 @@ def _handler_type(gateway: GatewayServer) -> type[BaseHTTPRequestHandler]:
                 )
                 _query_optional_text(query_values, "v", "", maximum=300)
                 try:
-                    result = svc.get_preview_bytes(
+                    preview_result = svc.get_preview_bytes(
                         segments[1],
                         display_width=_query_int(query_values, "dw", 0, 0, 10_000),
                         display_height=_query_int(query_values, "dh", 0, 0, 10_000),
@@ -1528,18 +1528,18 @@ def _handler_type(gateway: GatewayServer) -> type[BaseHTTPRequestHandler]:
                         "预览参数无效。",
                         status=400,
                     ) from exc
-                if result.error:
+                if preview_result.error:
                     raise FacadeError(
                         "decode_failed",
-                        result.error,
-                        status=503 if result.retryable else 500,
+                        preview_result.error,
+                        status=503 if preview_result.retryable else 500,
                     )
                 self._bytes(
                     HTTPStatus.OK,
-                    result.data,
-                    result.content_type,
+                    preview_result.data,
+                    preview_result.content_type,
                     cache="private, max-age=300",
-                    warning=result.warning,
+                    warning=preview_result.warning,
                 )
                 return
 
