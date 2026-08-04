@@ -154,11 +154,19 @@ class PreloadImage {
     PreloadImage.instances.push(this);
   }
 
-  static completeWhere(fragment: string): number {
+  static completeWhere(fragment: string, naturalSize?: [number, number]): number {
     const matches = PreloadImage.instances.filter((item) =>
       item.src.includes(fragment) && item.onload !== null,
     );
-    matches.forEach((item) => item.onload?.());
+    matches.forEach((item) => {
+      if (naturalSize) {
+        Object.defineProperties(item, {
+          naturalWidth: { configurable: true, value: naturalSize[0] },
+          naturalHeight: { configurable: true, value: naturalSize[1] },
+        });
+      }
+      item.onload?.();
+    });
     return matches.length;
   }
 
@@ -334,6 +342,49 @@ describe("RawSelectionWorkspace", () => {
 
     expect(preview().attributes("src")).toContain("quality=embedded");
     expect(preview().attributes("src")).not.toContain("/thumbnail?");
+  });
+
+  it("keeps a best preview stable after image load and while a resized replacement loads", async () => {
+    const wrapper = await mountWorkspace();
+    const preview = () => wrapper.get<HTMLImageElement>(".rs-preview-img");
+
+    expect(PreloadImage.completeWhere("quality=embedded", [1074, 716])).toBeGreaterThan(0);
+    await flushPromises();
+    await wrapper.vm.$nextTick();
+    const embeddedScale = Number(
+      preview().attributes("style")?.match(/scale\(([^)]+)\)/)?.[1],
+    );
+
+    expect(PreloadImage.completeWhere("quality=best", [7008, 4672])).toBeGreaterThan(0);
+    await flushPromises();
+    await wrapper.vm.$nextTick();
+    expect(preview().attributes("src")).toContain("quality=best");
+    const bestScale = Number(
+      preview().attributes("style")?.match(/scale\(([^)]+)\)/)?.[1],
+    );
+    expect(embeddedScale * 1074).toBeCloseTo(bestScale * 7008, 5);
+    expect(embeddedScale * 716).toBeCloseTo(bestScale * 4672, 5);
+
+    await preview().trigger("load");
+    await flushPromises();
+    PreloadImage.completeWhere("quality=embedded");
+    await flushPromises();
+    await wrapper.vm.$nextTick();
+    expect(preview().attributes("src")).toContain("quality=best");
+
+    width.mockReturnValue(760);
+    window.dispatchEvent(new Event("resize"));
+    await flushPromises();
+    expect(PreloadImage.completeWhere("quality=embedded")).toBeGreaterThan(0);
+    await flushPromises();
+    await wrapper.vm.$nextTick();
+    expect(preview().attributes("src")).toContain("quality=best");
+
+    expect(PreloadImage.completeWhere("quality=best")).toBeGreaterThan(0);
+    await flushPromises();
+    await wrapper.vm.$nextTick();
+    expect(preview().attributes("src")).toContain("quality=best");
+    expect(preview().attributes("src")).toContain("dw=760");
   });
 
   it("keeps preview, filter, controls and filmstrip in independent rows at narrow width", async () => {
@@ -576,6 +627,20 @@ describe("RawSelectionWorkspace", () => {
     expect(images[1]?.attributes("src")).toContain("members/member-1/thumbnail");
     expect(wrapper.find(".rs-compare-pane button").exists()).toBe(false);
     expect(wrapper.findAll(".rs-compare-pane")[0]?.classes()).toContain("is-active");
+
+    expect(PreloadImage.completeWhere("quality=embedded")).toBeGreaterThan(0);
+    await flushPromises();
+    expect(PreloadImage.completeWhere("quality=best")).toBeGreaterThan(0);
+    await flushPromises();
+    await wrapper.vm.$nextTick();
+    expect(images.every((image) => image.attributes("src")?.includes("quality=best") === true)).toBe(true);
+
+    await Promise.all(images.map((image) => image.trigger("load")));
+    await flushPromises();
+    PreloadImage.completeWhere("quality=embedded");
+    await flushPromises();
+    await wrapper.vm.$nextTick();
+    expect(images.every((image) => image.attributes("src")?.includes("quality=best") === true)).toBe(true);
 
     await wrapper.findAll(".rs-compare-pane")[1]?.trigger("click");
     expect(wrapper.findAll(".rs-compare-pane")[1]?.classes()).toContain("is-active");

@@ -828,15 +828,27 @@ function setCompareImage(side: number, element: unknown): void {
 
 function measurePreviewContainers(): void {
   if (singleContainer.value) {
-    singleDisplaySize.value = {
+    const nextSingleSize = {
       width: singleContainer.value.clientWidth,
       height: singleContainer.value.clientHeight,
     };
+    if (
+      nextSingleSize.width !== singleDisplaySize.value.width
+      || nextSingleSize.height !== singleDisplaySize.value.height
+    ) {
+      singleDisplaySize.value = nextSingleSize;
+    }
   }
-  compareDisplaySizes.value = compareContainers.value.map((container) => ({
+  const nextCompareSizes = compareContainers.value.map((container) => ({
     width: container?.clientWidth ?? 0,
     height: container?.clientHeight ?? 0,
-  }));
+  })) as [{ width: number; height: number }, { width: number; height: number }];
+  if (nextCompareSizes.some((size, side) => (
+    size.width !== compareDisplaySizes.value[side].width
+    || size.height !== compareDisplaySizes.value[side].height
+  ))) {
+    compareDisplaySizes.value = nextCompareSizes;
+  }
   viewport.handleResize("single", elementsFor("single"));
   viewport.handleResize(0, elementsFor(0));
   viewport.handleResize(1, elementsFor(1));
@@ -851,12 +863,10 @@ function setCompareError(side: number, failed: boolean): void {
 function handleSingleImageLoad(): void {
   singlePreviewError.value = false;
   singlePreviewMessage.value = "";
-  void nextTick(() => {
-    measurePreviewContainers();
-    if (singleDisplayedStage.value === "thumbnail") {
-      viewport.fit("single", elementsFor("single"));
-    }
-  });
+  measurePreviewContainers();
+  if (singleDisplayedStage.value === "thumbnail") {
+    viewport.fit("single", elementsFor("single"));
+  }
 }
 
 function handleCompareImageLoad(side: number): void {
@@ -864,12 +874,10 @@ function handleCompareImageLoad(side: number): void {
   const messages = [...comparePreviewMessages.value] as [string, string];
   messages[side] = "";
   comparePreviewMessages.value = messages;
-  void nextTick(() => {
-    measurePreviewContainers();
-    if (compareDisplayedStages.value[side] === "thumbnail") {
-      viewport.fit(side as 0 | 1, elementsFor(side as 0 | 1));
-    }
-  });
+  measurePreviewContainers();
+  if (compareDisplayedStages.value[side] === "thumbnail") {
+    viewport.fit(side as 0 | 1, elementsFor(side as 0 | 1));
+  }
 }
 
 function handleSingleDisplayedError(): void {
@@ -1128,7 +1136,11 @@ function handleKeydown(event: KeyboardEvent): void {
   }
 }
 
-function preloadImage(url: string, signal: AbortSignal, priority: "high" | "low"): Promise<void> {
+function preloadImage(
+  url: string,
+  signal: AbortSignal,
+  priority: "high" | "low",
+): Promise<HTMLImageElement> {
   if (signal.aborted) return Promise.reject(new DOMException("Aborted", "AbortError"));
   return new Promise((resolve, reject) => {
     const image = new Image();
@@ -1141,7 +1153,7 @@ function preloadImage(url: string, signal: AbortSignal, priority: "high" | "low"
       image.onload = null;
       image.onerror = null;
       if (error) reject(error);
-      else resolve();
+      else resolve(image);
     };
     const abort = () => {
       image.src = "";
@@ -1152,6 +1164,33 @@ function preloadImage(url: string, signal: AbortSignal, priority: "high" | "low"
     signal.addEventListener("abort", abort, { once: true });
     image.src = url;
   });
+}
+
+function fitPreloadedSingle(image: HTMLImageElement): void {
+  if (
+    viewport.single.mode !== "fit"
+    || !Number.isFinite(image.naturalWidth)
+    || !Number.isFinite(image.naturalHeight)
+    || image.naturalWidth <= 0
+    || image.naturalHeight <= 0
+  ) return;
+  viewport.fit("single", { container: singleContainer.value, image });
+}
+
+function fitPreloadedCompare(side: 0 | 1, image: HTMLImageElement): void {
+  if (
+    viewport.compare[side].mode !== "fit"
+    || !Number.isFinite(image.naturalWidth)
+    || !Number.isFinite(image.naturalHeight)
+    || image.naturalWidth <= 0
+    || image.naturalHeight <= 0
+  ) return;
+  const peer = side === 0 ? 1 : 0;
+  viewport.fit(
+    side,
+    { container: compareContainers.value[side], image },
+    { container: compareContainers.value[peer], image: compareImages.value[peer] },
+  );
 }
 
 async function progressSinglePreview(
@@ -1174,18 +1213,22 @@ async function progressSinglePreview(
     "embedded",
   );
   try {
-    await preloadImage(embedded, controller.signal, "high");
+    const embeddedImage = await preloadImage(embedded, controller.signal, "high");
     if (controller.signal.aborted || generation !== progressiveGeneration) return;
-    singleDisplayedStage.value = "embedded";
-    singleDisplayedUrl.value = embedded;
+    if (singleDisplayedStage.value !== "best") {
+      fitPreloadedSingle(embeddedImage);
+      singleDisplayedStage.value = "embedded";
+      singleDisplayedUrl.value = embedded;
+    }
   } catch (error) {
     if (isAbortError(error)) return;
   }
 
   const best = previewUrl(member, "current", singleDisplaySize.value, "best");
   try {
-    await preloadImage(best, controller.signal, "high");
+    const bestImage = await preloadImage(best, controller.signal, "high");
     if (controller.signal.aborted || generation !== progressiveGeneration) return;
+    fitPreloadedSingle(bestImage);
     singleDisplayedStage.value = "best";
     singleDisplayedUrl.value = best;
   } catch (error) {
@@ -1225,14 +1268,17 @@ async function progressComparePreview(
     "embedded",
   );
   try {
-    await preloadImage(embedded, controller.signal, "high");
+    const embeddedImage = await preloadImage(embedded, controller.signal, "high");
     if (controller.signal.aborted || generation !== progressiveGeneration) return;
-    const nextStages = [...compareDisplayedStages.value] as typeof stages;
-    const nextUrls = [...compareDisplayedUrls.value] as [string, string];
-    nextStages[side] = "embedded";
-    nextUrls[side] = embedded;
-    compareDisplayedStages.value = nextStages;
-    compareDisplayedUrls.value = nextUrls;
+    if (compareDisplayedStages.value[side] !== "best") {
+      fitPreloadedCompare(side, embeddedImage);
+      const nextStages = [...compareDisplayedStages.value] as typeof stages;
+      const nextUrls = [...compareDisplayedUrls.value] as [string, string];
+      nextStages[side] = "embedded";
+      nextUrls[side] = embedded;
+      compareDisplayedStages.value = nextStages;
+      compareDisplayedUrls.value = nextUrls;
+    }
   } catch (error) {
     if (isAbortError(error)) return;
   }
@@ -1244,8 +1290,9 @@ async function progressComparePreview(
     "best",
   );
   try {
-    await preloadImage(best, controller.signal, "high");
+    const bestImage = await preloadImage(best, controller.signal, "high");
     if (controller.signal.aborted || generation !== progressiveGeneration) return;
+    fitPreloadedCompare(side, bestImage);
     const nextStages = [...compareDisplayedStages.value] as typeof stages;
     const nextUrls = [...compareDisplayedUrls.value] as [string, string];
     nextStages[side] = "best";
@@ -1979,7 +2026,6 @@ onBeforeUnmount(() => {
   flex: 0 0 auto;
   pointer-events: none;
   transform-origin: center;
-  transition: transform 50ms linear;
 }
 
 .rs-preview-empty,

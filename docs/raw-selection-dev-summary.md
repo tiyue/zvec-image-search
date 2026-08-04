@@ -189,3 +189,11 @@ requirements.txt / requirements-lock.txt  # 已锁定 rawpy==0.27.0
 - 最终非正式基准报告为 `%TEMP%/raw-selection-py312-final.json`，SHA-256 `D6CCF275134F1217DA09F81CA897ABE62B0510AFAEC8534F991B02C6D2E6B30E`；冷内嵌预览由历史完整图误测路径修正为 98.971ms，300ms 门禁通过。报告退出码 0、`failed_scenarios=[]`、`source_unchanged=true`、`matches_target_closure=true`，仅因样本覆盖不足仍为 `not_formal`。
 - 最终回归：Python `120 passed, 63 subtests passed`；前端 `41 files, 303 tests passed`；Ruff format/check、TypeScript typecheck、production build 与基准自检通过。最终构建产物为 `index-BIChQNRN.js` 和 `index-Bi_V06CG.css`。
 - 最终视觉证据位于 `%TEMP%/raw-selection-final-evidence/`：`raw-webview-arw-light-final.png`、`raw-webview-arw-dark-final.png`、`raw-webview-workspace-dark-final.png`。另在 1280×720 与 720×680 的真实浏览器 DOM 中检查项目封面、空状态、窄工作区、对比模式、禁用外观选择器和菜单收起行为。
+
+### 8.10 ARW 预览闪烁缺陷修复（2026-08-04 10:04）
+
+- 真实 production 页面复现到同一 ARW 在 10 秒内发生 54 次状态切换：`embedded` 1074×716 与 `best` 7008×4672 互相覆盖，显示框在约 121×80 与 788×525 间跳变。
+- 根因是图片 `load` 回调每次都写入数值相同的新尺寸对象，误触发渐进预览 watcher；新一轮流程又无条件把已显示的 `best` 降回 `embedded`，形成自激循环。
+- 修复后容器尺寸只在宽高数值实际变化时更新；同成员 `best` 不再回退；替换 `src` 前使用预加载图片自然尺寸预先计算 fit，并移除跨自然分辨率的 transform 插值。
+- 高频真实页面复验以 20ms 采样切换另一张竖幅 ARW，只出现 `embedded` → `best` 两个单向状态，两者显示框始终为 350×525；随后持续采样不再出现任何回退。
+- 前端完整回归更新为 41 文件 / 304 项；最终构建产物更新为 `index-C481BcIg.js` 和 `index-8j2k_u6s.css`。
