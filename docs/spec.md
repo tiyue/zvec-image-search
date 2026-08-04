@@ -107,16 +107,17 @@ Vue 3 + TypeScript + Vite SPA：
 ### ARW 选片模块（raw_selection）
 
 独立于现有图库索引、向量生成、搜索、推荐、偏好、曝光或模型调用的 Sony A7M4 ARW 选片模块：
-- 后端包：`image_vector_service/raw_selection/`（db.py、importer.py、decoder.py、cache.py、creative_look.py、service.py）
+- 后端包：`image_vector_service/raw_selection/`（db.py、importer.py、decoder.py、cache.py、scheduler.py、jobs.py、creative_look.py、service.py）
 - 前端模块：`frontend/src/features/raw-selection/`
 - 独立 SQLite 数据库存储于 `raw-selection/projects.sqlite3`，不触及现有图库状态库
-- 支持 .jpg/.jpeg/.png（通过 Pillow）和 .arw（rawpy==0.27.0，已锁定）
-- 三级渐进加载：缩略图（ARW 内嵌 JPEG）→ 快速预览（内嵌预览）→ 完整解码；派生缓存原子写入 + 源版本校验
-- 项目管理：创建/重命名/删除项目、导入文件/文件夹、评级/色标、筛选/排序、统一导出、永久删除（两阶段确认模态）
+- 支持 .jpg/.jpeg/.png（通过 Pillow）和仅由 Sony ILCE-7M4 产生的 .arw；ARW 导入先通过轻量 TIFF 身份读取做型号门禁，`rawpy==0.27.0` 作为受控回退/完整解码依赖
+- 三级原位渐进加载：缩略图 → 按实际显示尺寸快速生成的 ARW 内嵌 JPEG → 完整最佳预览；高清替换保留缩放/平移，派生缓存原子写入并校验源版本。ARW 内嵌 JPEG 缺少 EXIF 方向时使用 TIFF 容器方向，元数据、缩略图和预览一致，历史方向缓存通过管线版本失效
+- 项目管理：创建/重命名/删除项目、封面拼图、空项目双导入入口、评级/色标、筛选/排序、统一导出、永久删除（两阶段确认模态）
+- 文件夹导入渐进登记并在后台生成缩略图；导入/导出使用可查询、可取消的后台任务，逐项记录进度、错误和操作日志
 - 胶片栏虚拟化（仅渲染视口 ± 2 屏）、双图对比（同步缩放/平移、双侧评级）
-- Sony 创意外观：as_shot 用内嵌 JPEG；ST/PT/NT/VV/VV2/FL/IN/SH/BW/SE 为真实 A7M4 样片校准的近似渲染（非 Sony 像素级复刻），JPG/PNG 不应用外观
-- WebView 网关路由：`api/raw-selection/*`（项目 CRUD、成员列表、缩略图/预览、评级、外观、导出、删除）
-- 未完整验证：20 组冷缓存首 24 张、各并发档 RAW 解码 P50/P95 等正式性能基准
+- Sony 创意外观：当前只开放 `as_shot` 并使用相机内嵌 JPEG；未经可信 A7M4 参考输出校准的 ST/PT/NT/VV/VV2/FL/IN/SH/BW/SE 明确阻断，禁止用近似滤镜占位；JPG/PNG 不应用外观
+- WebView 网关路由：`api/raw-selection/*`（项目 CRUD、成员列表、任务查询/取消、源状态、缩略图/预览、评级、导出、删除）
+- 目标 Python 3.12 锁定闭包已经验证一致；该环境下的非正式基准（384 项：192 ARW + 192 JPG，无 PNG）当前可测硬门禁通过：冷首 24/100 张为 525.142/2067.703ms，冷内嵌预览为 98.971ms，重启热首 24 张为 43.538ms。由于未满足至少 300 ARW、1000 项、PNG 和完整 A7M4 RAW 模式清单，仍不能视为正式性能验收
 
 ### Windows 登录后常驻生命周期
 

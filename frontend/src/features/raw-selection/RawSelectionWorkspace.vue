@@ -1,10 +1,54 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import {
+  computed,
+  nextTick,
+  onBeforeUnmount,
+  onMounted,
+  ref,
+  watch,
+} from "vue";
 
 import AppIcon from "../../components/AppIcon.vue";
-import { listMembers, updateRating, updateCreativeLook, getWorkspaceState, saveWorkspaceState, exportFiles, removeMembers, permanentDelete, listCreativeLooks } from "./api";
+import {
+  cancelJob,
+  cancelProjectWork,
+  exportFiles,
+  getJob,
+  getMember,
+  getSourceStatus,
+  getWorkspaceState,
+  importFiles,
+  importFolder,
+  listCreativeLooks,
+  listMembers,
+  permanentDelete,
+  removeMembers,
+  saveWorkspaceState,
+  updateCreativeLook,
+  updateRating,
+} from "./api";
 import type { CreativeLook } from "./api";
-import type { RawMember } from "./types";
+import RawSelectionFilmstrip from "./RawSelectionFilmstrip.vue";
+import type {
+  ColorLabel,
+  ExportResult,
+  FilterExported,
+  FilterRated,
+  FilterStarMode,
+  ImportResult,
+  OrientationFilter,
+  RawFormatFilter,
+  RawMember,
+  RawSelectionJob,
+  SortDirection,
+  SortField,
+  StarRating,
+} from "./types";
+import {
+  type RawViewportElements,
+  type RawViewportTarget,
+  useRawSelectionViewport,
+} from "./useRawSelectionViewport";
 
 const props = defineProps<{
   projectId: string;
@@ -15,402 +59,917 @@ const emit = defineEmits<{
   toast: [title: string, message: string, kind: "info" | "success" | "error"];
   back: [];
   selectFolder: [callback: (path: string) => void];
+  selectFiles: [callback: (paths: string[]) => void];
 }>();
+
+type StarFilterKind = "none" | "exact" | "at_least" | "unrated";
+type MenuName = "import" | "sort" | "look" | "selection";
+
+interface FilmstripRange {
+  start: number;
+  end: number;
+  visibleStart: number;
+  visibleEnd: number;
+}
+
+interface FilmstripController {
+  scrollByWheel(delta: number): void;
+  scrollToActive(): void;
+  setScrollLeft(left: number): void;
+}
+
+interface CompareRestore {
+  memberId: string | null;
+  selectedIds: Set<string>;
+  scroll: number;
+}
+
+const colorLabelOptions: Array<{ value: ColorLabel; label: string; color: string }> = [
+  { value: "none", label: "无色标", color: "transparent" },
+  { value: "red", label: "红", color: "#d94a52" },
+  { value: "yellow", label: "黄", color: "#c99416" },
+  { value: "green", label: "绿", color: "#328262" },
+  { value: "blue", label: "蓝", color: "#3f70a8" },
+  { value: "purple", label: "紫", color: "#80579f" },
+];
+
+const sortOptions: Array<{ value: SortField; label: string }> = [
+  { value: "shot_time", label: "拍摄时间" },
+  { value: "mtime_ns", label: "修改时间" },
+  { value: "star_rating", label: "星级" },
+  { value: "extension", label: "文件类型" },
+  { value: "file_size", label: "文件大小" },
+  { value: "filename", label: "文件名" },
+  { value: "import_order", label: "导入顺序" },
+];
+
+const formatOptions: Array<{ value: RawFormatFilter; label: string }> = [
+  { value: "arw", label: "ARW" },
+  { value: "jpeg", label: "JPG/JPEG" },
+  { value: "png", label: "PNG" },
+];
+
+const orientationOptions: Array<{ value: OrientationFilter; label: string }> = [
+  { value: "landscape", label: "横图" },
+  { value: "portrait", label: "竖图" },
+  { value: "square", label: "方图" },
+];
 
 const members = ref<RawMember[]>([]);
 const currentIndex = ref(0);
 const total = ref(0);
 const filtered = ref(0);
 const loading = ref(false);
+const importing = ref(false);
+const importJob = ref<RawSelectionJob | null>(null);
+const exportJob = ref<RawSelectionJob | null>(null);
 const selectedIds = ref<Set<string>>(new Set());
 const filmStripScroll = ref(0);
+const filmstrip = ref<FilmstripController | null>(null);
+const filmRange = ref<FilmstripRange>({ start: 0, end: 0, visibleStart: 0, visibleEnd: 0 });
 
-// Filter state
-const filterStarMode = ref("none");
-const filterStarValue = ref(0);
-const filterColorLabels = ref("");
+const filterStarMode = ref<FilterStarMode>("none");
+const filterStarValue = ref<StarRating>(0);
+const filterColorLabels = ref<ColorLabel[]>([]);
 const filterFilename = ref("");
-const filterRated = ref("all");
-const sortField = ref("filename");
-const sortDirection = ref("asc");
+const filterRated = ref<FilterRated>("all");
+const filterExported = ref<FilterExported>("all");
+const filterFormats = ref<RawFormatFilter[]>([]);
+const filterOrientations = ref<OrientationFilter[]>([]);
+const sortField = ref<SortField>("filename");
+const sortDirection = ref<SortDirection>("asc");
 
-// UI state
+const rootElement = ref<HTMLElement | null>(null);
 const showFilters = ref(false);
-const showSortMenu = ref(false);
-const zoom = ref(1);
-const panX = ref(0);
-const panY = ref(0);
-const isPanning = ref(false);
-const lastPanX = ref(0);
-const lastPanY = ref(0);
-const previewError = ref(false);
+const openMenu = ref<MenuName | null>(null);
+let transientTrigger: HTMLElement | null = null;
 
-// Permanent delete confirmation modal state (requirement 11.2)
 const showDeleteModal = ref(false);
 const deleteConfirmed = ref(false);
 const deleteBusy = ref(false);
 const deleteTargets = ref<RawMember[]>([]);
+const deleteCheck = ref<HTMLInputElement | null>(null);
+const deleteTrigger = ref<HTMLButtonElement | null>(null);
 
-const deleteTotalSize = computed(() =>
-  deleteTargets.value.reduce((sum, m) => sum + m.file_size, 0),
-);
-
-// Film strip virtualization (4.4): only render viewport ± 2 screens.
-const FILM_ITEM_WIDTH = 86; // 84px thumb + 2px gap
-const FILM_OVERSCAN_SCREENS = 2;
-const filmStripEl = ref<HTMLElement | null>(null);
-const filmScrollLeft = ref(0);
-const filmViewportWidth = ref(800);
-
-const filmVisibleRange = computed(() => {
-  const total = members.value.length;
-  if (total === 0) return { start: 0, end: 0 };
-  const screenItems = Math.max(1, Math.ceil(filmViewportWidth.value / FILM_ITEM_WIDTH));
-  const overscan = screenItems * FILM_OVERSCAN_SCREENS;
-  const firstVisible = Math.floor(filmScrollLeft.value / FILM_ITEM_WIDTH);
-  const start = Math.max(0, firstVisible - overscan);
-  const end = Math.min(total, firstVisible + screenItems + overscan);
-  return { start, end };
-});
-
-const filmVisibleItems = computed(() =>
-  members.value
-    .slice(filmVisibleRange.value.start, filmVisibleRange.value.end)
-    .map((m, i) => ({ member: m, index: filmVisibleRange.value.start + i })),
-);
-
-const filmInnerWidth = computed(() => members.value.length * FILM_ITEM_WIDTH);
-
-// Dual image comparison mode (Section 6)
 const compareMode = ref(false);
 const compareItems = ref<[RawMember, RawMember] | null>(null);
-const compareSync = ref(true);
-const compareZoomA = ref(1);
-const compareZoomB = ref(1);
-const comparePanA = ref({ x: 0, y: 0 });
-const comparePanB = ref({ x: 0, y: 0 });
-const compareRestore = ref<{ index: number; scroll: number } | null>(null);
+const compareRestore = ref<CompareRestore | null>(null);
+const singlePreviewError = ref(false);
+const singlePreviewMessage = ref("");
+const comparePreviewErrors = ref<[boolean, boolean]>([false, false]);
+const comparePreviewMessages = ref<[string, string]>(["", ""]);
+const singleDisplayedUrl = ref("");
+const singleDisplayedStage = ref<"thumbnail" | "embedded" | "best">("thumbnail");
+const singleDisplayedMemberId = ref("");
+const compareDisplayedUrls = ref<[string, string]>(["", ""]);
+const compareDisplayedStages = ref<
+  ["thumbnail" | "embedded" | "best", "thumbnail" | "embedded" | "best"]
+>(["thumbnail", "thumbnail"]);
+const compareDisplayedMemberIds = ref<[string, string]>(["", ""]);
+const viewport = useRawSelectionViewport();
+
+const singleContainer = ref<HTMLElement | null>(null);
+const singleImage = ref<HTMLImageElement | null>(null);
+const compareContainers = ref<[HTMLElement | null, HTMLElement | null]>([null, null]);
+const compareImages = ref<[HTMLImageElement | null, HTMLImageElement | null]>([null, null]);
+const singleDisplaySize = ref({ width: 0, height: 0 });
+const compareDisplaySizes = ref([{ width: 0, height: 0 }, { width: 0, height: 0 }]);
+
+const creativeLooks = ref<CreativeLook[]>([]);
 
 let abortController: AbortController | null = null;
+let loadSequence = 0;
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
+let hydrating = true;
+let previewResizeObserver: ResizeObserver | null = null;
+let intersectionObserver: IntersectionObserver | null = null;
+let workspaceIntersecting = true;
+const workspaceVisible = ref(true);
+let prefetchController: AbortController | null = null;
+let prefetchGeneration = 0;
+let progressiveController: AbortController | null = null;
+let progressiveGeneration = 0;
+let cancelWorkPromise: Promise<unknown> | null = null;
+let destroyed = false;
 
 const currentMember = computed(() => members.value[currentIndex.value] ?? null);
-
+const activeMember = computed(() => {
+  if (!compareMode.value || !compareItems.value) return currentMember.value;
+  return compareItems.value[viewport.activeCompareSide.value];
+});
+const activeMemberIndex = computed(() => {
+  const member = activeMember.value;
+  if (!member) return -1;
+  return members.value.findIndex((candidate) => candidate.id === member.id);
+});
 const selectedCount = computed(() => selectedIds.value.size);
+const compareAvailable = computed(() => selectedIds.value.size === 2);
+const activeIsRaw = computed(() => activeMember.value?.extension.toLowerCase() === ".arw");
+const deleteTotalSize = computed(() => deleteTargets.value.reduce(
+  (sum, member) => sum + member.file_size,
+  0,
+));
 
 const selectedMemberIds = computed(() => {
   if (selectedIds.value.size > 0) return [...selectedIds.value];
-  return currentMember.value ? [currentMember.value.id] : [];
+  return activeMember.value ? [activeMember.value.id] : [];
 });
 
-function buildQueryParams(): Record<string, string> {
-  const params: Record<string, string> = {};
-  if (filterStarMode.value !== "none") {
-    params["star_mode"] = filterStarMode.value;
-    params["star_value"] = String(filterStarValue.value);
+const starFilterKind = computed<StarFilterKind>({
+  get() {
+    if (filterRated.value === "unrated") return "unrated";
+    return filterStarMode.value;
+  },
+  set(value) {
+    if (value === "unrated") {
+      filterRated.value = "unrated";
+      filterStarMode.value = "none";
+      filterStarValue.value = 0;
+      return;
+    }
+    filterRated.value = "all";
+    filterStarMode.value = value;
+    if (value === "none") filterStarValue.value = 0;
+    else if (filterStarValue.value === 0) filterStarValue.value = 1;
+  },
+});
+
+const activeFilterCount = computed(() => [
+  starFilterKind.value !== "none",
+  filterColorLabels.value.length > 0,
+  filterExported.value !== "all",
+  filterFormats.value.length > 0,
+  filterOrientations.value.length > 0,
+  filterFilename.value.trim().length > 0,
+].filter(Boolean).length);
+
+const filterSummary = computed(() => activeFilterCount.value > 0
+  ? `已筛选 ${filtered.value}/${total.value}`
+  : "未筛选");
+
+const sortSummary = computed(() => {
+  const option = sortOptions.find((candidate) => candidate.value === sortField.value);
+  return `${option?.label ?? "排序"} ${sortDirection.value === "asc" ? "升序" : "降序"}`;
+});
+
+const activeLookLabel = computed(() => {
+  const look = activeMember.value?.creative_look || "as_shot";
+  return creativeLooks.value.find((candidate) => candidate.id === look)?.label ?? look;
+});
+
+const importProgressText = computed(() => {
+  const job = importJob.value;
+  if (!job) return "";
+  const registered = job.progress.registered ?? 0;
+  const complete = job.progress.thumbnails_completed ?? 0;
+  const totalThumbnails = job.progress.thumbnails_total ?? registered;
+  if (job.phase === "thumbnails") {
+    return `已登记 ${registered} 张 · 缩略图 ${complete}/${totalThumbnails}`;
   }
-  if (filterColorLabels.value) params["color_labels"] = filterColorLabels.value;
-  if (filterFilename.value) params["filename"] = filterFilename.value;
-  if (filterRated.value !== "all") params["rated"] = filterRated.value;
-  params["sort"] = sortField.value;
-  params["dir"] = sortDirection.value;
+  return `正在扫描 · 已登记 ${registered} 张`;
+});
+
+const exportBusy = computed(() => {
+  const status = exportJob.value?.status;
+  return status === "queued" || status === "running";
+});
+
+const exportProgressText = computed(() => {
+  const job = exportJob.value;
+  if (!job) return "";
+  const completed = job.progress.completed ?? 0;
+  const totalFiles = job.progress.total ?? selectedCount.value;
+  return `正在导出 ${completed}/${totalFiles}`;
+});
+
+function isActiveJob(job: RawSelectionJob): boolean {
+  return job.status === "queued" || job.status === "running";
+}
+
+function jobStorageKey(kind: "import" | "export"): string {
+  return `zvec-raw-${kind}-job:${props.projectId}`;
+}
+
+function rememberJob(kind: "import" | "export", jobId: string | null): void {
+  try {
+    if (jobId) sessionStorage.setItem(jobStorageKey(kind), jobId);
+    else sessionStorage.removeItem(jobStorageKey(kind));
+  } catch {
+    // Session storage is optional; the backend job remains authoritative.
+  }
+}
+
+function waitForPoll(): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, 350));
+}
+
+async function monitorImportJob(initial: RawSelectionJob): Promise<void> {
+  importing.value = true;
+  rememberJob("import", initial.id);
+  let job = initial;
+  let lastRegistered = -1;
+  while (!destroyed) {
+    importJob.value = job;
+    const registered = job.progress.registered ?? 0;
+    if (registered > 0 && registered !== lastRegistered) {
+      lastRegistered = registered;
+      await loadMembers(currentMember.value?.id ?? null);
+    }
+    if (!isActiveJob(job)) break;
+    await waitForPoll();
+    try {
+      job = await getJob(job.id);
+    } catch {
+      importJob.value = null;
+      importing.value = false;
+      rememberJob("import", null);
+      emit("toast", "导入状态丢失", "后台任务已停止或应用已重启。", "error");
+      return;
+    }
+  }
+  if (destroyed) return;
+  importJob.value = job;
+  importing.value = false;
+  rememberJob("import", null);
+  await loadMembers(currentMember.value?.id ?? null);
+  if (job.status === "failed") {
+    emit("toast", "导入失败", job.error || "无法导入文件夹", "error");
+    return;
+  }
+  const result = job.result as ImportResult | null;
+  if (job.status === "cancelled") {
+    emit("toast", "导入已取消", `已登记 ${result?.registered ?? 0} 张`, "info");
+    return;
+  }
+  if (result) {
+    const skipped = result.skipped_unsupported
+      + result.skipped_raw_formats
+      + result.skipped_unsupported_camera;
+    emit(
+      "toast",
+      "导入完成",
+      `已登记 ${result.registered} 张，跳过 ${skipped} 张，失败 ${result.errors} 张`,
+      result.errors > 0 ? "error" : result.registered > 0 ? "success" : "info",
+    );
+  }
+}
+
+async function monitorExportJob(initial: RawSelectionJob): Promise<void> {
+  exportJob.value = initial;
+  rememberJob("export", initial.id);
+  let job = initial;
+  while (!destroyed && isActiveJob(job)) {
+    await waitForPoll();
+    try {
+      job = await getJob(job.id);
+      exportJob.value = job;
+    } catch {
+      exportJob.value = null;
+      rememberJob("export", null);
+      emit("toast", "导出状态丢失", "后台任务已停止或应用已重启。", "error");
+      return;
+    }
+  }
+  if (destroyed) return;
+  rememberJob("export", null);
+  if (job.status === "failed") {
+    emit("toast", "导出失败", job.error || "无法导出文件", "error");
+    return;
+  }
+  const result = job.result as ExportResult | null;
+  if (job.status === "cancelled") {
+    emit("toast", "导出已取消", `已完成 ${result?.exported ?? 0} 张`, "info");
+  } else if (result) {
+    emit(
+      "toast",
+      "导出完成",
+      `成功 ${result.exported} 张，跳过 ${result.skipped} 张，失败 ${result.failed} 张`,
+      result.failed > 0 ? "error" : "success",
+    );
+  }
+  await loadMembers(currentMember.value?.id ?? null);
+}
+
+async function resumeRememberedJob(kind: "import" | "export"): Promise<void> {
+  let jobId: string | null = null;
+  try {
+    jobId = sessionStorage.getItem(jobStorageKey(kind));
+  } catch {
+    return;
+  }
+  if (!jobId) return;
+  try {
+    const job = await getJob(jobId);
+    if (job.project_id !== props.projectId || job.kind !== kind) {
+      rememberJob(kind, null);
+      return;
+    }
+    if (kind === "import") void monitorImportJob(job);
+    else void monitorExportJob(job);
+  } catch {
+    rememberJob(kind, null);
+  }
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === "AbortError";
+}
+
+function sourceVersion(member: RawMember): string {
+  return `${member.file_size}-${member.mtime_ns}-${member.file_identity ?? ""}`;
+}
+
+function isRaw(member: RawMember | null): boolean {
+  return member?.extension.toLowerCase() === ".arw";
+}
+
+function previewUrl(
+  member: RawMember,
+  priority: "current" | "compare" | "adjacent" = "current",
+  size = { width: 0, height: 0 },
+  quality: "embedded" | "best" = "best",
+): string {
+  const query = new URLSearchParams({
+    look: isRaw(member) ? member.creative_look || "as_shot" : "as_shot",
+    priority,
+    v: sourceVersion(member),
+    quality,
+  });
+  if (size.width > 0) query.set("dw", String(Math.round(size.width)));
+  if (size.height > 0) query.set("dh", String(Math.round(size.height)));
+  return `api/raw-selection/members/${member.id}/preview?${query}`;
+}
+
+function thumbnailPrefetchUrl(member: RawMember, priority: "visible" | "overscan"): string {
+  const query = new URLSearchParams({ priority, v: sourceVersion(member) });
+  return `api/raw-selection/members/${member.id}/thumbnail?${query}`;
+}
+
+const singleImageUrl = computed(() => currentMember.value
+  ? previewUrl(currentMember.value, "current", singleDisplaySize.value)
+  : "");
+
+function compareImageUrl(member: RawMember, side: 0 | 1): string {
+  return previewUrl(member, side === 0 ? "current" : "compare", compareDisplaySizes.value[side]);
+}
+
+function buildQueryParams(): Record<string, string> {
+  const params: Record<string, string> = {
+    dir: sortDirection.value,
+    limit: "10000",
+    sort: sortField.value,
+  };
+  if (filterStarMode.value !== "none") {
+    params.star_mode = filterStarMode.value;
+    params.star_value = String(filterStarValue.value);
+  }
+  if (filterRated.value !== "all") params.rated = filterRated.value;
+  if (filterColorLabels.value.length) params.color_labels = filterColorLabels.value.join(",");
+  if (filterFilename.value.trim()) params.filename = filterFilename.value.trim();
+  if (filterExported.value !== "all") params.exported = filterExported.value;
+  if (filterFormats.value.length) params.formats = filterFormats.value.join(",");
+  if (filterOrientations.value.length) params.orientations = filterOrientations.value.join(",");
   return params;
 }
 
-async function loadMembers() {
+async function loadMembers(
+  preferredMemberId: string | null = currentMember.value?.id ?? null,
+): Promise<void> {
+  const request = ++loadSequence;
   abortController?.abort();
-  abortController = new AbortController();
+  const controller = new AbortController();
+  abortController = controller;
   loading.value = true;
   try {
-    const result = await listMembers(props.projectId, buildQueryParams(), abortController.signal);
+    const result = await listMembers(props.projectId, buildQueryParams(), controller.signal);
+    if (request !== loadSequence || controller.signal.aborted) return;
     members.value = result.members;
     total.value = result.total;
     filtered.value = result.filtered;
-    if (currentIndex.value >= members.value.length) {
-      currentIndex.value = Math.max(0, members.value.length - 1);
-    }
-  } catch (err) {
-    if (!(err instanceof DOMException && err.name === "AbortError")) {
-      emit("toast", "加载失败", "无法获取图片列表", "error");
-    }
+    const restoredIndex = preferredMemberId
+      ? result.members.findIndex((member) => member.id === preferredMemberId)
+      : -1;
+    currentIndex.value = restoredIndex >= 0 ? restoredIndex : 0;
+    singlePreviewError.value = false;
+  } catch (error) {
+    if (!isAbortError(error)) emit("toast", "加载失败", "无法获取图片列表", "error");
   } finally {
-    loading.value = false;
+    if (request === loadSequence) loading.value = false;
   }
 }
 
-async function loadWorkspaceState() {
+function parseCsv<T extends string>(value: unknown, allowed: readonly T[]): T[] {
+  if (typeof value !== "string") return [];
+  const allowedValues = new Set<string>(allowed);
+  return value.split(",").map((item) => item.trim()).filter(
+    (item): item is T => allowedValues.has(item),
+  );
+}
+
+async function loadWorkspace(): Promise<string | null> {
   try {
-    const ws = await getWorkspaceState(props.projectId);
-    if (ws.last_member_id) {
-      const idx = members.value.findIndex(m => m.id === ws.last_member_id);
-      if (idx >= 0) currentIndex.value = idx;
-    }
-    filterStarMode.value = ws.filter_star_mode || "none";
-    filterStarValue.value = ws.filter_star_value || 0;
-    filterColorLabels.value = ws.filter_color_labels || "";
-    filterFilename.value = ws.filter_filename || "";
-    filterRated.value = ws.filter_rated || "all";
-    sortField.value = ws.sort_field || "filename";
-    sortDirection.value = ws.sort_direction || "asc";
-    filmStripScroll.value = ws.filmstrip_scroll || 0;
-  } catch {
-    // Workspace state not yet saved
-  }
-}
-
-function scheduleSaveState() {
-  if (saveTimer) clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => {
-    void saveWorkspaceState(props.projectId, {
-      last_member_id: currentMember.value?.id ?? null,
-      filter_star_mode: filterStarMode.value,
-      filter_star_value: filterStarValue.value,
-      filter_color_labels: filterColorLabels.value,
-      filter_filename: filterFilename.value,
-      filter_rated: filterRated.value,
-      sort_field: sortField.value,
-      sort_direction: sortDirection.value,
-      filmstrip_scroll: filmStripScroll.value,
-    });
-  }, 500);
-}
-
-function navigate(delta: number) {
-  const next = currentIndex.value + delta;
-  if (next >= 0 && next < members.value.length) {
-    currentIndex.value = next;
-    zoom.value = 1;
-    panX.value = 0;
-    panY.value = 0;
-    previewError.value = false;
-    scheduleSaveState();
-  }
-}
-
-function toggleSelect(memberId: string) {
-  const next = new Set(selectedIds.value);
-  if (next.has(memberId)) next.delete(memberId);
-  else next.add(memberId);
-  selectedIds.value = next;
-}
-
-function selectAllFiltered() {
-  selectedIds.value = new Set(members.value.map(m => m.id));
-}
-
-function clearSelection() {
-  selectedIds.value = new Set();
-}
-
-async function setRating(star: number) {
-  if (!currentMember.value) return;
-  const memberId = currentMember.value.id;
-  const oldStar = currentMember.value.star_rating;
-  const oldColor = currentMember.value.color_label;
-  try {
-    await updateRating(memberId, star, oldColor);
-    currentMember.value.star_rating = star;
-  } catch {
-    emit("toast", "评级失败", "无法保存星级", "error");
-  }
-}
-
-async function setColorLabel(color: string) {
-  if (!currentMember.value) return;
-  const memberId = currentMember.value.id;
-  const oldStar = currentMember.value.star_rating;
-  try {
-    await updateRating(memberId, oldStar, color);
-    currentMember.value.color_label = color;
-  } catch {
-    emit("toast", "评级失败", "无法保存色标", "error");
-  }
-}
-
-function handleWheel(event: WheelEvent) {
-  if (event.ctrlKey) {
-    event.preventDefault();
-    const delta = event.deltaY > 0 ? -0.1 : 0.1;
-    zoom.value = Math.max(0.1, Math.min(8, zoom.value + delta));
-  }
-}
-
-function handleDoubleClick() {
-  zoom.value = zoom.value === 1 ? 1 : 1;
-  panX.value = 0;
-  panY.value = 0;
-}
-
-function handleRightMouseDown(event: MouseEvent) {
-  if (event.button !== 2) return;
-  event.preventDefault();
-  isPanning.value = true;
-  lastPanX.value = event.clientX;
-  lastPanY.value = event.clientY;
-}
-
-function handleMouseMove(event: MouseEvent) {
-  if (!isPanning.value) return;
-  panX.value += event.clientX - lastPanX.value;
-  panY.value += event.clientY - lastPanY.value;
-  lastPanX.value = event.clientX;
-  lastPanY.value = event.clientY;
-}
-
-function handleMouseUp() {
-  isPanning.value = false;
-}
-
-function handleKeydown(event: KeyboardEvent) {
-  const target = event.target;
-  if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) return;
-  switch (event.key) {
-    case "ArrowLeft":
-      event.preventDefault();
-      navigate(-1);
-      break;
-    case "ArrowRight":
-      event.preventDefault();
-      navigate(1);
-      break;
-    case "0": setRating(0); break;
-    case "1": setRating(1); break;
-    case "2": setRating(2); break;
-    case "3": setRating(3); break;
-    case "4": setRating(4); break;
-    case "5": setRating(5); break;
-    case "Escape":
-      if (showDeleteModal.value) {
-        closeDeleteModal();
-      } else if (compareMode.value) {
-        exitCompare();
-      } else if (showFilters.value || showSortMenu.value) {
-        showFilters.value = false;
-        showSortMenu.value = false;
-      } else {
-        emit("back");
-      }
-      break;
-  }
-}
-
-function handleFilmStripScroll(event: Event) {
-  const target = event.target as HTMLElement;
-  filmScrollLeft.value = target.scrollLeft;
-  filmViewportWidth.value = target.clientWidth;
-  filmStripScroll.value = target.scrollLeft;
-}
-
-function scrollFilmStripToActive() {
-  const el = filmStripEl.value;
-  if (!el) return;
-  const left = currentIndex.value * FILM_ITEM_WIDTH;
-  const visibleLeft = el.scrollLeft;
-  const visibleRight = visibleLeft + el.clientWidth;
-  if (left < visibleLeft || left + FILM_ITEM_WIDTH > visibleRight) {
-    el.scrollLeft = Math.max(0, left - el.clientWidth / 2 + FILM_ITEM_WIDTH / 2);
-  }
-}
-
-function enterCompare() {
-  if (selectedIds.value.size !== 2) {
-    emit(
-      "toast",
-      "无法对比",
-      "请先选中恰好两张图片（双击胶片缩略图可切换选择）。",
-      "info",
+    const state = await getWorkspaceState(props.projectId);
+    filterStarMode.value = ["none", "exact", "at_least"].includes(state.filter_star_mode)
+      ? state.filter_star_mode as FilterStarMode
+      : "none";
+    filterStarValue.value = Math.max(0, Math.min(5, Number(state.filter_star_value) || 0)) as StarRating;
+    filterColorLabels.value = parseCsv(
+      state.filter_color_labels,
+      colorLabelOptions.slice(1).map((option) => option.value),
     );
+    filterFilename.value = state.filter_filename || "";
+    filterRated.value = ["all", "rated", "unrated"].includes(state.filter_rated)
+      ? state.filter_rated as FilterRated
+      : "all";
+    if (filterRated.value === "rated") {
+      filterRated.value = "all";
+      filterStarMode.value = "at_least";
+      filterStarValue.value = 1;
+    } else if (filterRated.value === "unrated") {
+      filterStarMode.value = "none";
+      filterStarValue.value = 0;
+    } else if (filterStarMode.value !== "none" && filterStarValue.value === 0) {
+      filterStarValue.value = 1;
+    }
+    filterExported.value = ["all", "exported", "unexported"].includes(state.filter_exported)
+      ? state.filter_exported as FilterExported
+      : "all";
+    filterFormats.value = parseCsv(state.filter_formats, formatOptions.map((option) => option.value));
+    filterOrientations.value = parseCsv(
+      state.filter_orientations,
+      orientationOptions.map((option) => option.value),
+    );
+    sortField.value = sortOptions.some((option) => option.value === state.sort_field)
+      ? state.sort_field as SortField
+      : "filename";
+    sortDirection.value = state.sort_direction === "desc" ? "desc" : "asc";
+    filmStripScroll.value = Math.max(0, Number(state.filmstrip_scroll) || 0);
+    return state.last_member_id || null;
+  } catch {
+    return null;
+  }
+}
+
+function saveState(): void {
+  void saveWorkspaceState(props.projectId, {
+    last_member_id: currentMember.value?.id ?? null,
+    filter_star_mode: filterStarMode.value,
+    filter_star_value: filterStarValue.value,
+    filter_color_labels: filterColorLabels.value.join(","),
+    filter_filename: filterFilename.value,
+    filter_rated: filterRated.value,
+    filter_exported: filterExported.value,
+    filter_formats: filterFormats.value.join(","),
+    filter_orientations: filterOrientations.value.join(","),
+    sort_field: sortField.value,
+    sort_direction: sortDirection.value,
+    filmstrip_scroll: filmStripScroll.value,
+  }).catch(() => undefined);
+}
+
+function scheduleSaveState(): void {
+  if (hydrating) return;
+  if (saveTimer) clearTimeout(saveTimer);
+  saveTimer = setTimeout(saveState, 400);
+}
+
+function closeTransient(restoreFocus = false): void {
+  const trigger = transientTrigger;
+  const filtersWereOpen = showFilters.value;
+  openMenu.value = null;
+  showFilters.value = false;
+  transientTrigger = null;
+  if (filtersWereOpen) void nextTick(fitActive);
+  if (restoreFocus && trigger) void nextTick(() => trigger.focus({ preventScroll: true }));
+}
+
+function toggleMenu(name: MenuName, event: MouseEvent): void {
+  const trigger = event.currentTarget instanceof HTMLElement ? event.currentTarget : null;
+  if (openMenu.value === name) {
+    closeTransient(true);
     return;
   }
-  const idSet = new Set(selectedIds.value);
-  const picked = members.value.filter((m) => idSet.has(m.id));
-  if (picked.length !== 2) return;
-  compareRestore.value = {
-    index: currentIndex.value,
-    scroll: filmStripEl.value?.scrollLeft ?? 0,
-  };
-  compareItems.value = [picked[0], picked[1]];
-  compareZoomA.value = 1;
-  compareZoomB.value = 1;
-  comparePanA.value = { x: 0, y: 0 };
-  comparePanB.value = { x: 0, y: 0 };
-  compareSync.value = true;
-  compareMode.value = true;
+  const filtersWereOpen = showFilters.value;
+  showFilters.value = false;
+  openMenu.value = name;
+  transientTrigger = trigger;
+  if (filtersWereOpen) void nextTick(fitActive);
 }
 
-function exitCompare() {
-  compareMode.value = false;
-  compareItems.value = null;
-  const restore = compareRestore.value;
-  compareRestore.value = null;
-  if (restore) {
-    currentIndex.value = restore.index;
-    nextTick(() => {
-      const el = filmStripEl.value;
-      if (el) {
-        el.scrollLeft = restore.scroll;
-        filmScrollLeft.value = restore.scroll;
-      }
-    });
+function toggleFilters(event: MouseEvent): void {
+  const trigger = event.currentTarget instanceof HTMLElement ? event.currentTarget : null;
+  if (showFilters.value) {
+    closeTransient(true);
+    return;
   }
+  openMenu.value = null;
+  showFilters.value = true;
+  transientTrigger = trigger;
+  void nextTick(fitActive);
 }
 
-function handleCompareWheel(event: WheelEvent) {
-  if (!event.ctrlKey) return;
-  event.preventDefault();
-  const delta = event.deltaY > 0 ? -0.1 : 0.1;
-  const target = event.target as HTMLElement;
-  const sideB = target.closest(".rs-compare-side-b") !== null;
-  const nextA = Math.max(0.1, Math.min(8, compareZoomA.value + delta));
-  const nextB = Math.max(0.1, Math.min(8, compareZoomB.value + delta));
-  if (compareSync.value) {
-    const shared = sideB ? nextB : nextA;
-    compareZoomA.value = shared;
-    compareZoomB.value = shared;
-  } else if (sideB) {
-    compareZoomB.value = nextB;
-  } else {
-    compareZoomA.value = nextA;
-  }
+function toggleArrayValue<T extends string>(values: T[], value: T): T[] {
+  return values.includes(value)
+    ? values.filter((candidate) => candidate !== value)
+    : [...values, value];
 }
 
-async function compareSetRating(side: 0 | 1, star: number) {
-  const items = compareItems.value;
-  if (!items) return;
-  const m = items[side];
+function toggleFilterColor(value: ColorLabel): void {
+  if (value === "none") return;
+  filterColorLabels.value = toggleArrayValue(filterColorLabels.value, value);
+}
+
+function clearFilters(): void {
+  filterStarMode.value = "none";
+  filterStarValue.value = 0;
+  filterRated.value = "all";
+  filterColorLabels.value = [];
+  filterFilename.value = "";
+  filterExported.value = "all";
+  filterFormats.value = [];
+  filterOrientations.value = [];
+}
+
+function activateMember(index: number): void {
+  if (index < 0 || index >= members.value.length) return;
+  currentIndex.value = index;
+  viewport.fit("single", elementsFor("single"));
+  singlePreviewError.value = false;
+}
+
+function navigate(delta: number): void {
+  if (compareMode.value) return;
+  const next = currentIndex.value + delta;
+  if (next >= 0 && next < members.value.length) activateMember(next);
+}
+
+function selectAllFiltered(): void {
+  selectedIds.value = new Set(members.value.map((member) => member.id));
+  closeTransient(true);
+}
+
+function clearSelection(): void {
+  selectedIds.value = new Set();
+  closeTransient(true);
+}
+
+function updateMemberLocally(memberId: string, patch: Partial<RawMember>): void {
+  const main = members.value.find((candidate) => candidate.id === memberId);
+  if (main) Object.assign(main, patch);
+  const compared = compareItems.value?.find((candidate) => candidate.id === memberId);
+  if (compared && compared !== main) Object.assign(compared, patch);
+}
+
+async function setRating(star: number): Promise<void> {
+  const member = activeMember.value;
+  if (!member || !Number.isInteger(star) || star < 0 || star > 5) return;
   try {
-    await updateRating(m.id, star, m.color_label);
-    m.star_rating = star;
-    const main = members.value.find((x) => x.id === m.id);
-    if (main) main.star_rating = star;
+    await updateRating(member.id, star, member.color_label);
+    updateMemberLocally(member.id, { star_rating: star });
+    if (
+      filterStarMode.value !== "none"
+      || filterRated.value !== "all"
+      || sortField.value === "star_rating"
+    ) await loadMembers(member.id);
   } catch {
     emit("toast", "评级失败", "无法保存星级", "error");
   }
 }
 
-async function compareSetColor(side: 0 | 1, color: string) {
-  const items = compareItems.value;
-  if (!items) return;
-  const m = items[side];
+async function setColorLabel(color: ColorLabel): Promise<void> {
+  const member = activeMember.value;
+  if (!member) return;
   try {
-    await updateRating(m.id, m.star_rating, color);
-    m.color_label = color;
-    const main = members.value.find((x) => x.id === m.id);
-    if (main) main.color_label = color;
+    await updateRating(member.id, member.star_rating, color);
+    updateMemberLocally(member.id, { color_label: color });
+    if (filterColorLabels.value.length) await loadMembers(member.id);
   } catch {
     emit("toast", "评级失败", "无法保存色标", "error");
   }
 }
 
-function compareStyle(side: 0 | 1) {
-  const zoom = side === 0 ? compareZoomA.value : compareZoomB.value;
-  const pan = side === 0 ? comparePanA.value : comparePanB.value;
-  return {
-    transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
-  };
+async function setCreativeLook(lookId: string): Promise<void> {
+  const member = activeMember.value;
+  closeTransient(true);
+  if (!member || !isRaw(member)) return;
+  try {
+    await updateCreativeLook(member.id, lookId);
+    updateMemberLocally(member.id, { creative_look: lookId });
+    if (compareMode.value) {
+      const errors = [...comparePreviewErrors.value] as [boolean, boolean];
+      errors[viewport.activeCompareSide.value] = false;
+      comparePreviewErrors.value = errors;
+    } else {
+      singlePreviewError.value = false;
+    }
+    schedulePrefetch();
+  } catch {
+    emit("toast", "外观切换失败", "无法保存 Sony 创意外观", "error");
+  }
 }
 
-function handleExport() {
+async function loadSelectedMembers(ids: string[]): Promise<RawMember[]> {
+  const visible = new Map(members.value.map((member) => [member.id, member]));
+  const result = await Promise.all(ids.map(async (id) => visible.get(id) ?? getMember(id)));
+  return result.filter((member) => member.project_id === props.projectId);
+}
+
+async function enterCompare(): Promise<void> {
+  if (selectedIds.value.size !== 2) {
+    emit("toast", "无法对比", "请先明确选择恰好两张图片。", "info");
+    return;
+  }
+  try {
+    const ids = [...selectedIds.value];
+    const picked = await loadSelectedMembers(ids);
+    if (picked.length !== 2) {
+      emit("toast", "无法对比", "选择中包含已移出项目的图片。", "error");
+      return;
+    }
+    picked.sort((left, right) => {
+      const leftIndex = members.value.findIndex((member) => member.id === left.id);
+      const rightIndex = members.value.findIndex((member) => member.id === right.id);
+      return (leftIndex < 0 ? Number.MAX_SAFE_INTEGER : leftIndex)
+        - (rightIndex < 0 ? Number.MAX_SAFE_INTEGER : rightIndex);
+    });
+    compareRestore.value = {
+      memberId: currentMember.value?.id ?? null,
+      selectedIds: new Set(selectedIds.value),
+      scroll: filmStripScroll.value,
+    };
+    compareItems.value = [picked[0], picked[1]];
+    comparePreviewErrors.value = [false, false];
+    viewport.resetCompare();
+    compareMode.value = true;
+    closeTransient(false);
+    await nextTick();
+    measurePreviewContainers();
+  } catch {
+    emit("toast", "无法对比", "无法读取所选图片。", "error");
+  }
+}
+
+function exitCompare(restore = true): void {
+  compareMode.value = false;
+  compareItems.value = null;
+  viewport.resetCompare();
+  viewport.fit("single", elementsFor("single"));
+  const snapshot = compareRestore.value;
+  compareRestore.value = null;
+  if (!restore || !snapshot) return;
+  selectedIds.value = new Set(snapshot.selectedIds);
+  if (snapshot.memberId) {
+    const index = members.value.findIndex((member) => member.id === snapshot.memberId);
+    if (index >= 0) currentIndex.value = index;
+  }
+  filmStripScroll.value = snapshot.scroll;
+  void nextTick(() => filmstrip.value?.setScrollLeft(snapshot.scroll));
+}
+
+function viewportTarget(): RawViewportTarget {
+  return compareMode.value ? viewport.activeCompareSide.value : "single";
+}
+
+function elementsFor(target: RawViewportTarget): RawViewportElements {
+  if (target === "single") {
+    return { container: singleContainer.value, image: singleImage.value };
+  }
+  return { container: compareContainers.value[target], image: compareImages.value[target] };
+}
+
+function peerElements(target: RawViewportTarget): RawViewportElements | undefined {
+  if (target === "single") return undefined;
+  return elementsFor(target === 0 ? 1 : 0);
+}
+
+function fitActive(): void {
+  const target = viewportTarget();
+  viewport.fit(target, elementsFor(target), peerElements(target));
+}
+
+function actualSizeActive(): void {
+  const target = viewportTarget();
+  viewport.showActualSize(target, elementsFor(target), peerElements(target));
+}
+
+function handleImageWheel(target: RawViewportTarget, event: WheelEvent): void {
+  if (viewport.handleWheel(target, event, elementsFor(target), peerElements(target))) return;
+  event.preventDefault();
+  filmstrip.value?.scrollByWheel(event.deltaY || event.deltaX);
+}
+
+function handleImageDoubleClick(target: RawViewportTarget, event: MouseEvent): void {
+  viewport.handleDoubleClick(target, event, elementsFor(target), peerElements(target));
+}
+
+function handleImageMouseDown(target: RawViewportTarget, event: MouseEvent): void {
+  if (target !== "single") viewport.activeCompareSide.value = target;
+  viewport.startPan(target, event, elementsFor(target));
+}
+
+function setCompareContainer(side: number, element: unknown): void {
+  const resolved = element instanceof HTMLElement ? element : null;
+  if (compareContainers.value[side] === resolved) return;
+  const previous = compareContainers.value[side];
+  if (previous) previewResizeObserver?.unobserve(previous);
+  const next = [...compareContainers.value] as [HTMLElement | null, HTMLElement | null];
+  next[side] = resolved;
+  compareContainers.value = next;
+  if (next[side]) previewResizeObserver?.observe(next[side] as HTMLElement);
+}
+
+function setCompareImage(side: number, element: unknown): void {
+  const resolved = element instanceof HTMLImageElement ? element : null;
+  if (compareImages.value[side] === resolved) return;
+  const next = [...compareImages.value] as [HTMLImageElement | null, HTMLImageElement | null];
+  next[side] = resolved;
+  compareImages.value = next;
+}
+
+function measurePreviewContainers(): void {
+  if (singleContainer.value) {
+    singleDisplaySize.value = {
+      width: singleContainer.value.clientWidth,
+      height: singleContainer.value.clientHeight,
+    };
+  }
+  compareDisplaySizes.value = compareContainers.value.map((container) => ({
+    width: container?.clientWidth ?? 0,
+    height: container?.clientHeight ?? 0,
+  }));
+  viewport.handleResize("single", elementsFor("single"));
+  viewport.handleResize(0, elementsFor(0));
+  viewport.handleResize(1, elementsFor(1));
+}
+
+function setCompareError(side: number, failed: boolean): void {
+  const next = [...comparePreviewErrors.value] as [boolean, boolean];
+  next[side] = failed;
+  comparePreviewErrors.value = next;
+}
+
+function handleSingleImageLoad(): void {
+  singlePreviewError.value = false;
+  singlePreviewMessage.value = "";
+  void nextTick(() => {
+    measurePreviewContainers();
+    if (singleDisplayedStage.value === "thumbnail") {
+      viewport.fit("single", elementsFor("single"));
+    }
+  });
+}
+
+function handleCompareImageLoad(side: number): void {
+  setCompareError(side, false);
+  const messages = [...comparePreviewMessages.value] as [string, string];
+  messages[side] = "";
+  comparePreviewMessages.value = messages;
+  void nextTick(() => {
+    measurePreviewContainers();
+    if (compareDisplayedStages.value[side] === "thumbnail") {
+      viewport.fit(side as 0 | 1, elementsFor(side as 0 | 1));
+    }
+  });
+}
+
+function handleSingleDisplayedError(): void {
+  if (singleDisplayedStage.value === "best") void handleSingleImageError();
+}
+
+function handleCompareDisplayedError(side: 0 | 1): void {
+  if (compareDisplayedStages.value[side] === "best") {
+    void handleCompareImageError(side);
+  }
+}
+
+async function handleSingleImageError(): Promise<void> {
+  const member = currentMember.value;
+  if (!member) return;
+  singlePreviewError.value = true;
+  singlePreviewMessage.value = "正在检查源文件…";
+  try {
+    const status = await getSourceStatus(member.id);
+    singlePreviewMessage.value = status.message;
+    if (status.status === "refreshed") {
+      const refreshed = await getMember(member.id);
+      updateMemberLocally(member.id, refreshed);
+      singlePreviewError.value = false;
+      singlePreviewMessage.value = "";
+    }
+  } catch {
+    singlePreviewMessage.value = "预览解码失败。";
+  }
+}
+
+async function handleCompareImageError(side: 0 | 1): Promise<void> {
+  const member = compareItems.value?.[side];
+  if (!member) return;
+  setCompareError(side, true);
+  const messages = [...comparePreviewMessages.value] as [string, string];
+  messages[side] = "正在检查源文件…";
+  comparePreviewMessages.value = messages;
+  try {
+    const status = await getSourceStatus(member.id);
+    const next = [...comparePreviewMessages.value] as [string, string];
+    next[side] = status.message;
+    comparePreviewMessages.value = next;
+    if (status.status === "refreshed") {
+      const refreshed = await getMember(member.id);
+      updateMemberLocally(member.id, refreshed);
+      setCompareError(side, false);
+    }
+  } catch {
+    const next = [...comparePreviewMessages.value] as [string, string];
+    next[side] = "预览解码失败。";
+    comparePreviewMessages.value = next;
+  }
+}
+
+function handleImportFolder(): void {
+  closeTransient(true);
+  importing.value = true;
+  emit("selectFolder", async (path: string) => {
+    if (!path) {
+      importing.value = false;
+      return;
+    }
+    try {
+      const job = await importFolder(props.projectId, path);
+      emit("toast", "开始导入", "首批图片登记后会立即显示。", "info");
+      void monitorImportJob(job);
+    } catch {
+      emit("toast", "导入失败", "无法导入文件夹", "error");
+      importing.value = false;
+    }
+  });
+}
+
+function handleImportFiles(): void {
+  closeTransient(true);
+  importing.value = true;
+  emit("selectFiles", async (paths: string[]) => {
+    if (!paths.length) {
+      importing.value = false;
+      return;
+    }
+    try {
+      const result = await importFiles(props.projectId, paths);
+      emit(
+        "toast",
+        "导入完成",
+        `已登记 ${result.registered} 张，跳过 ${result.skipped_unsupported + result.skipped_raw_formats + result.skipped_unsupported_camera} 张，失败 ${result.errors} 张`,
+        result.errors > 0 ? "error" : result.registered > 0 ? "success" : "info",
+      );
+      await loadMembers();
+    } catch {
+      emit("toast", "导入失败", "无法导入所选图片", "error");
+    } finally {
+      importing.value = false;
+    }
+  });
+}
+
+async function handleExport(): Promise<void> {
   const ids = selectedMemberIds.value;
   if (!ids.length) {
     emit("toast", "未选择", "请先选择要导出的图片", "info");
@@ -419,61 +978,85 @@ function handleExport() {
   emit("selectFolder", async (path: string) => {
     if (!path) return;
     try {
-      const result = await exportFiles(props.projectId, ids, path);
-      emit("toast", "导出完成", `成功 ${result.exported} 张，跳过 ${result.skipped}，失败 ${result.failed}`, result.failed > 0 ? "error" : "success");
+      const job = await exportFiles(props.projectId, ids, path);
+      void monitorExportJob(job);
     } catch {
       emit("toast", "导出失败", "无法导出文件", "error");
     }
   });
 }
 
-async function handleRemove() {
+async function cancelImportJob(): Promise<void> {
+  if (!importJob.value || !isActiveJob(importJob.value)) return;
+  await cancelJob(importJob.value.id);
+}
+
+async function cancelExportJob(): Promise<void> {
+  if (!exportJob.value || !isActiveJob(exportJob.value)) return;
+  await cancelJob(exportJob.value.id);
+}
+
+async function handleRemove(): Promise<void> {
   const ids = selectedMemberIds.value;
   if (!ids.length) return;
   if (!confirm(`确定将 ${ids.length} 张图片移出项目？\n\n此操作不会删除源文件。`)) return;
   try {
     const result = await removeMembers(ids);
     emit("toast", "已移出", `${result.removed} 张图片已移出项目`, "info");
-    clearSelection();
+    exitCompare(false);
+    selectedIds.value = new Set();
     await loadMembers();
   } catch {
     emit("toast", "操作失败", "无法移出图片", "error");
   }
 }
 
-async function handlePermanentDelete() {
+async function handlePermanentDelete(): Promise<void> {
   const ids = selectedMemberIds.value;
   if (!ids.length) return;
-  // Collect target members with sizes for the confirmation dialog.
-  const idSet = new Set(ids);
-  deleteTargets.value = members.value.filter((m) => idSet.has(m.id));
-  deleteConfirmed.value = false;
-  showDeleteModal.value = true;
+  try {
+    const targets = await loadSelectedMembers(ids);
+    if (targets.length !== ids.length) {
+      emit("toast", "无法删除", "部分图片已不属于当前项目，请刷新后重试。", "error");
+      return;
+    }
+    deleteTargets.value = targets;
+    deleteConfirmed.value = false;
+    showDeleteModal.value = true;
+    await nextTick();
+    deleteCheck.value?.focus({ preventScroll: true });
+  } catch {
+    emit("toast", "无法删除", "无法读取待删除图片。", "error");
+  }
 }
 
-function closeDeleteModal() {
+function closeDeleteModal(restoreFocus = true): void {
   if (deleteBusy.value) return;
   showDeleteModal.value = false;
   deleteTargets.value = [];
   deleteConfirmed.value = false;
+  if (restoreFocus) void nextTick(() => deleteTrigger.value?.focus({ preventScroll: true }));
 }
 
-async function confirmPermanentDelete() {
+async function confirmPermanentDelete(): Promise<void> {
   if (!deleteConfirmed.value || deleteBusy.value) return;
   deleteBusy.value = true;
-  const ids = deleteTargets.value.map((m) => m.id);
+  const attemptedIds = new Set(deleteTargets.value.map((member) => member.id));
   try {
-    const result = await permanentDelete(ids, true);
+    const result = await permanentDelete([...attemptedIds], true);
     emit(
       "toast",
       "删除完成",
       `已删除 ${result.deleted}，缺失 ${result.already_missing}，失败 ${result.failed}`,
       result.failed > 0 ? "error" : "success",
     );
-    clearSelection();
     showDeleteModal.value = false;
     deleteTargets.value = [];
+    exitCompare(false);
     await loadMembers();
+    selectedIds.value = new Set(
+      members.value.filter((member) => attemptedIds.has(member.id)).map((member) => member.id),
+    );
   } catch {
     emit("toast", "删除失败", "无法执行永久删除", "error");
   } finally {
@@ -488,769 +1071,1258 @@ function formatSize(bytes: number): string {
   return `${bytes} B`;
 }
 
-const isRawFile = computed(() => {
-  const ext = currentMember.value?.extension;
-  return ext === ".arw";
-});
-
-const thumbnailUrl = computed(() => {
-  if (!currentMember.value) return "";
-  return `api/raw-selection/members/${currentMember.value.id}/thumbnail`;
-});
-
-const previewUrl = computed(() => {
-  if (!currentMember.value) return "";
-  const look = currentMember.value.creative_look || "as_shot";
-  return `api/raw-selection/members/${currentMember.value.id}/preview?look=${encodeURIComponent(look)}`;
-});
-
-const imageUrl = computed(() => {
-  if (!currentMember.value) return "";
-  // For ARW without rawpy, show placeholder
-  if (isRawFile.value) return previewUrl.value;
-  // For JPG/PNG, use preview endpoint (no creative look re-render)
-  return previewUrl.value;
-});
-
-// Creative look selector state (7.4)
-const creativeLooks = ref<CreativeLook[]>([]);
-const showLookMenu = ref(false);
-
-const currentLookLabel = computed(() => {
-  const look = currentMember.value?.creative_look || "as_shot";
-  const found = creativeLooks.value.find((l) => l.id === look);
-  return found ? found.label : look;
-});
-
-async function loadLooks() {
-  try {
-    const result = await listCreativeLooks();
-    creativeLooks.value = result.looks;
-  } catch {
-    creativeLooks.value = [];
-  }
-}
-
-async function setCreativeLook(lookId: string) {
-  showLookMenu.value = false;
-  if (!currentMember.value) return;
-  // JPG/PNG pixels are final — do not re-render.
-  if (!isRawFile.value) return;
-  const memberId = currentMember.value.id;
-  try {
-    await updateCreativeLook(memberId, lookId);
-    currentMember.value.creative_look = lookId;
-    // Force preview reload with the new look by busting the img src.
-    previewError.value = false;
-  } catch {
-    emit("toast", "外观切换失败", "无法保存创意外观", "error");
-  }
-}
-
-const imageStyle = computed(() => ({
-  transform: `translate(${panX.value}px, ${panY.value}px) scale(${zoom.value})`,
-  cursor: isPanning.value ? "grabbing" : zoom.value > 1 ? "grab" : "default",
-}));
-
-const colorLabelOptions = [
-  { value: "none", label: "无", color: "transparent" },
-  { value: "red", label: "红", color: "#e74c3c" },
-  { value: "yellow", label: "黄", color: "#f1c40f" },
-  { value: "green", label: "绿", color: "#2ecc71" },
-  { value: "blue", label: "蓝", color: "#3498db" },
-  { value: "purple", label: "紫", color: "#9b59b6" },
-];
-
-const sortOptions = [
-  { value: "filename", label: "文件名" },
-  { value: "import_order", label: "导入顺序" },
-  { value: "star_rating", label: "星级" },
-];
-
-watch(currentIndex, () => {
+function handleFilmScroll(left: number): void {
+  filmStripScroll.value = left;
   scheduleSaveState();
-  nextTick(() => scrollFilmStripToActive());
+}
+
+function handleWindowPointerDown(event: PointerEvent): void {
+  const target = event.target;
+  if (target instanceof Element && target.closest("[data-raw-transient]")) return;
+  if (openMenu.value || showFilters.value) closeTransient(false);
+}
+
+function handleWindowResize(): void {
+  viewport.endPan();
+  if (openMenu.value || showFilters.value) closeTransient(true);
+  void nextTick(measurePreviewContainers);
+}
+
+function handleKeydown(event: KeyboardEvent): void {
+  if (event.key === "Escape") {
+    if (showDeleteModal.value) {
+      if (!deleteBusy.value) {
+        event.preventDefault();
+        closeDeleteModal(true);
+      }
+      return;
+    }
+    if (openMenu.value || showFilters.value) {
+      event.preventDefault();
+      closeTransient(true);
+      return;
+    }
+    if (compareMode.value) {
+      event.preventDefault();
+      exitCompare(true);
+      return;
+    }
+  }
+
+  const target = event.target;
+  const editing = target instanceof HTMLInputElement
+    || target instanceof HTMLTextAreaElement
+    || target instanceof HTMLSelectElement
+    || (target instanceof HTMLElement && target.isContentEditable);
+  if (editing) return;
+
+  if (event.key === "ArrowLeft") {
+    event.preventDefault();
+    navigate(-1);
+  } else if (event.key === "ArrowRight") {
+    event.preventDefault();
+    navigate(1);
+  } else if (/^[0-5]$/.test(event.key)) {
+    event.preventDefault();
+    void setRating(Number(event.key));
+  }
+}
+
+function preloadImage(url: string, signal: AbortSignal, priority: "high" | "low"): Promise<void> {
+  if (signal.aborted) return Promise.reject(new DOMException("Aborted", "AbortError"));
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    (image as HTMLImageElement & { fetchPriority?: string }).fetchPriority = priority;
+    let settled = false;
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", abort);
+      image.onload = null;
+      image.onerror = null;
+      if (error) reject(error);
+      else resolve();
+    };
+    const abort = () => {
+      image.src = "";
+      finish(new DOMException("Aborted", "AbortError"));
+    };
+    image.onload = () => finish();
+    image.onerror = () => finish(new Error("Image preload failed"));
+    signal.addEventListener("abort", abort, { once: true });
+    image.src = url;
+  });
+}
+
+async function progressSinglePreview(
+  member: RawMember,
+  generation: number,
+  controller: AbortController,
+): Promise<void> {
+  if (singleDisplayedMemberId.value !== member.id || !singleDisplayedUrl.value) {
+    singleDisplayedStage.value = "thumbnail";
+    singleDisplayedUrl.value = thumbnailPrefetchUrl(member, "visible");
+    singleDisplayedMemberId.value = member.id;
+  }
+  singlePreviewError.value = false;
+  singlePreviewMessage.value = "";
+
+  const embedded = previewUrl(
+    member,
+    "current",
+    singleDisplaySize.value,
+    "embedded",
+  );
+  try {
+    await preloadImage(embedded, controller.signal, "high");
+    if (controller.signal.aborted || generation !== progressiveGeneration) return;
+    singleDisplayedStage.value = "embedded";
+    singleDisplayedUrl.value = embedded;
+  } catch (error) {
+    if (isAbortError(error)) return;
+  }
+
+  const best = previewUrl(member, "current", singleDisplaySize.value, "best");
+  try {
+    await preloadImage(best, controller.signal, "high");
+    if (controller.signal.aborted || generation !== progressiveGeneration) return;
+    singleDisplayedStage.value = "best";
+    singleDisplayedUrl.value = best;
+  } catch (error) {
+    if (!isAbortError(error) && generation === progressiveGeneration) {
+      singleDisplayedStage.value = "best";
+      void handleSingleImageError();
+    }
+  }
+}
+
+async function progressComparePreview(
+  member: RawMember,
+  side: 0 | 1,
+  generation: number,
+  controller: AbortController,
+): Promise<void> {
+  const stages = [...compareDisplayedStages.value] as [
+    "thumbnail" | "embedded" | "best",
+    "thumbnail" | "embedded" | "best",
+  ];
+  const urls = [...compareDisplayedUrls.value] as [string, string];
+  if (compareDisplayedMemberIds.value[side] !== member.id || !urls[side]) {
+    const memberIds = [...compareDisplayedMemberIds.value] as [string, string];
+    stages[side] = "thumbnail";
+    urls[side] = thumbnailPrefetchUrl(member, "visible");
+    memberIds[side] = member.id;
+    compareDisplayedStages.value = stages;
+    compareDisplayedUrls.value = urls;
+    compareDisplayedMemberIds.value = memberIds;
+  }
+  setCompareError(side, false);
+
+  const embedded = previewUrl(
+    member,
+    side === 0 ? "current" : "compare",
+    compareDisplaySizes.value[side],
+    "embedded",
+  );
+  try {
+    await preloadImage(embedded, controller.signal, "high");
+    if (controller.signal.aborted || generation !== progressiveGeneration) return;
+    const nextStages = [...compareDisplayedStages.value] as typeof stages;
+    const nextUrls = [...compareDisplayedUrls.value] as [string, string];
+    nextStages[side] = "embedded";
+    nextUrls[side] = embedded;
+    compareDisplayedStages.value = nextStages;
+    compareDisplayedUrls.value = nextUrls;
+  } catch (error) {
+    if (isAbortError(error)) return;
+  }
+
+  const best = previewUrl(
+    member,
+    side === 0 ? "current" : "compare",
+    compareDisplaySizes.value[side],
+    "best",
+  );
+  try {
+    await preloadImage(best, controller.signal, "high");
+    if (controller.signal.aborted || generation !== progressiveGeneration) return;
+    const nextStages = [...compareDisplayedStages.value] as typeof stages;
+    const nextUrls = [...compareDisplayedUrls.value] as [string, string];
+    nextStages[side] = "best";
+    nextUrls[side] = best;
+    compareDisplayedStages.value = nextStages;
+    compareDisplayedUrls.value = nextUrls;
+  } catch (error) {
+    if (!isAbortError(error) && generation === progressiveGeneration) {
+      const nextStages = [...compareDisplayedStages.value] as typeof stages;
+      nextStages[side] = "best";
+      compareDisplayedStages.value = nextStages;
+      void handleCompareImageError(side);
+    }
+  }
+}
+
+function startProgressivePreviews(): void {
+  progressiveController?.abort();
+  const generation = ++progressiveGeneration;
+  const controller = new AbortController();
+  progressiveController = controller;
+  if (compareMode.value && compareItems.value) {
+    void progressComparePreview(compareItems.value[0], 0, generation, controller);
+    void progressComparePreview(compareItems.value[1], 1, generation, controller);
+    return;
+  }
+  if (currentMember.value) {
+    void progressSinglePreview(currentMember.value, generation, controller);
+  } else {
+    singleDisplayedUrl.value = "";
+    singleDisplayedMemberId.value = "";
+  }
+}
+
+function schedulePrefetch(): void {
+  prefetchController?.abort();
+  const generation = ++prefetchGeneration;
+  if (!workspaceVisible.value || document.hidden || !members.value.length) return;
+  const controller = new AbortController();
+  prefetchController = controller;
+
+  const high = new Set<string>();
+  const low = new Set<string>();
+  if (currentMember.value && !compareMode.value) {
+    high.add(previewUrl(currentMember.value, "current", singleDisplaySize.value, "embedded"));
+    low.add(previewUrl(currentMember.value, "current", singleDisplaySize.value, "best"));
+  }
+  if (compareItems.value) {
+    high.add(previewUrl(compareItems.value[0], "current", compareDisplaySizes.value[0], "embedded"));
+    high.add(previewUrl(compareItems.value[1], "compare", compareDisplaySizes.value[1], "embedded"));
+    low.add(compareImageUrl(compareItems.value[0], 0));
+    low.add(compareImageUrl(compareItems.value[1], 1));
+  }
+  for (let index = filmRange.value.visibleStart; index < filmRange.value.visibleEnd; index += 1) {
+    const member = members.value[index];
+    if (member) high.add(thumbnailPrefetchUrl(member, "visible"));
+  }
+  for (let index = filmRange.value.start; index < filmRange.value.end; index += 1) {
+    if (index >= filmRange.value.visibleStart && index < filmRange.value.visibleEnd) continue;
+    const member = members.value[index];
+    if (member) low.add(thumbnailPrefetchUrl(member, "overscan"));
+  }
+  if (!compareMode.value) {
+    for (const index of [currentIndex.value - 1, currentIndex.value + 1]) {
+      const member = members.value[index];
+      if (member) low.add(previewUrl(member, "adjacent", singleDisplaySize.value));
+    }
+  }
+
+  void (async () => {
+    await Promise.allSettled([...high].map((url) => preloadImage(url, controller.signal, "high")));
+    if (controller.signal.aborted || generation !== prefetchGeneration) return;
+    await Promise.allSettled([...low].map((url) => preloadImage(url, controller.signal, "low")));
+  })();
+}
+
+function cancelBackendWork(): void {
+  if (cancelWorkPromise) return;
+  cancelWorkPromise = cancelProjectWork(props.projectId)
+    .catch(() => undefined)
+    .finally(() => {
+      cancelWorkPromise = null;
+      if (!destroyed && workspaceVisible.value) schedulePrefetch();
+    });
+}
+
+function updateDocumentVisibility(): void {
+  workspaceVisible.value = workspaceIntersecting && !document.hidden;
+  if (!workspaceVisible.value) {
+    prefetchController?.abort();
+    prefetchGeneration += 1;
+    cancelBackendWork();
+  } else if (!cancelWorkPromise) {
+    schedulePrefetch();
+  }
+}
+
+watch(
+  () => [
+    filterStarMode.value,
+    filterStarValue.value,
+    filterRated.value,
+    filterColorLabels.value.join(","),
+    filterFilename.value,
+    filterExported.value,
+    filterFormats.value.join(","),
+    filterOrientations.value.join(","),
+    sortField.value,
+    sortDirection.value,
+  ],
+  () => {
+    if (hydrating) return;
+    const preferred = currentMember.value?.id ?? null;
+    prefetchController?.abort();
+    prefetchGeneration += 1;
+    scheduleSaveState();
+    void loadMembers(preferred);
+  },
+);
+
+watch(
+  () => [
+    compareMode.value,
+    currentMember.value
+      ? `${currentMember.value.id}:${sourceVersion(currentMember.value)}:${currentMember.value.creative_look}`
+      : "",
+    compareItems.value
+      ?.map((member) => `${member.id}:${sourceVersion(member)}:${member.creative_look}`)
+      .join("|") ?? "",
+    singleDisplaySize.value.width,
+    singleDisplaySize.value.height,
+    compareDisplaySizes.value[0].width,
+    compareDisplaySizes.value[0].height,
+    compareDisplaySizes.value[1].width,
+    compareDisplaySizes.value[1].height,
+  ],
+  startProgressivePreviews,
+  { flush: "post" },
+);
+
+watch(
+  () => currentMember.value
+    ? `${currentMember.value.id}:${sourceVersion(currentMember.value)}`
+    : "",
+  () => {
+    if (!hydrating) scheduleSaveState();
+    if (!compareMode.value) viewport.fit("single", elementsFor("single"));
+    singlePreviewError.value = false;
+    schedulePrefetch();
+  },
+);
+
+watch(
+  () => [
+    filmRange.value.start,
+    filmRange.value.end,
+    filmRange.value.visibleStart,
+    filmRange.value.visibleEnd,
+    compareMode.value,
+    compareItems.value?.map((member) => `${member.id}:${member.creative_look}`).join("|") ?? "",
+    members.value.map((member) => `${member.id}:${sourceVersion(member)}`).join("|"),
+  ],
+  schedulePrefetch,
+);
+
+watch(() => activeMember.value?.id, () => {
+  if (openMenu.value === "look") closeTransient(false);
 });
-watch([filterStarMode, filterStarValue, filterColorLabels, filterFilename, filterRated, sortField, sortDirection], () => {
-  void loadMembers();
+
+watch(singleContainer, (current, previous) => {
+  if (previous) previewResizeObserver?.unobserve(previous);
+  if (current) previewResizeObserver?.observe(current);
+  void nextTick(measurePreviewContainers);
 });
 
 onMounted(async () => {
   window.addEventListener("keydown", handleKeydown);
-  window.addEventListener("mousemove", handleMouseMove);
-  window.addEventListener("mouseup", handleMouseUp);
-  await loadMembers();
-  await loadWorkspaceState();
-  await loadLooks();
-  await nextTick();
-  const strip = filmStripEl.value;
-  if (strip) {
-    filmViewportWidth.value = strip.clientWidth;
-    strip.scrollLeft = filmStripScroll.value;
-    filmScrollLeft.value = strip.scrollLeft;
+  window.addEventListener("pointerdown", handleWindowPointerDown);
+  window.addEventListener("resize", handleWindowResize);
+  window.addEventListener("mousemove", viewport.movePan);
+  window.addEventListener("mouseup", viewport.endPan);
+  window.addEventListener("blur", viewport.endPan);
+  document.addEventListener("visibilitychange", updateDocumentVisibility);
+
+  const preferredMemberId = await loadWorkspace();
+  await loadMembers(preferredMemberId);
+  await resumeRememberedJob("import");
+  await resumeRememberedJob("export");
+  try {
+    creativeLooks.value = (await listCreativeLooks()).looks;
+  } catch {
+    creativeLooks.value = [];
   }
+  hydrating = false;
+  await nextTick();
+  filmstrip.value?.setScrollLeft(filmStripScroll.value);
+  measurePreviewContainers();
+
+  if (typeof ResizeObserver !== "undefined") {
+    previewResizeObserver = new ResizeObserver(measurePreviewContainers);
+    if (singleContainer.value) previewResizeObserver.observe(singleContainer.value);
+    compareContainers.value.forEach((container) => {
+      if (container) previewResizeObserver?.observe(container);
+    });
+  }
+  if (typeof IntersectionObserver !== "undefined" && rootElement.value) {
+    intersectionObserver = new IntersectionObserver((entries) => {
+      workspaceIntersecting = entries[0]?.isIntersecting ?? true;
+      updateDocumentVisibility();
+    });
+    intersectionObserver.observe(rootElement.value);
+  }
+  schedulePrefetch();
 });
 
 onBeforeUnmount(() => {
+  destroyed = true;
+  workspaceVisible.value = false;
   window.removeEventListener("keydown", handleKeydown);
-  window.removeEventListener("mousemove", handleMouseMove);
-  window.removeEventListener("mouseup", handleMouseUp);
+  window.removeEventListener("pointerdown", handleWindowPointerDown);
+  window.removeEventListener("resize", handleWindowResize);
+  window.removeEventListener("mousemove", viewport.movePan);
+  window.removeEventListener("mouseup", viewport.endPan);
+  window.removeEventListener("blur", viewport.endPan);
+  document.removeEventListener("visibilitychange", updateDocumentVisibility);
   abortController?.abort();
+  prefetchController?.abort();
+  progressiveController?.abort();
+  prefetchGeneration += 1;
+  progressiveGeneration += 1;
+  cancelBackendWork();
+  previewResizeObserver?.disconnect();
+  intersectionObserver?.disconnect();
   if (saveTimer) clearTimeout(saveTimer);
+  if (!hydrating) saveState();
 });
 </script>
 
 <template>
-  <div class="rs-workspace" @contextmenu.prevent>
-    <!-- Top toolbar -->
-    <header class="rs-toolbar">
-      <button type="button" class="rs-back-btn" @click="emit('back')">
-        <AppIcon name="chevron-down" :size="16" />
-        <span>{{ projectName }}</span>
-      </button>
+  <section
+    ref="rootElement"
+    class="rs-workspace"
+    :class="{ 'has-filters': showFilters && total > 0, 'is-empty': total === 0 }"
+    aria-label="ARW 选片工作区"
+  >
+    <div class="rs-task-stack" aria-live="polite">
+      <section v-if="importJob && isActiveJob(importJob)" class="rs-task-status">
+        <span>{{ importProgressText }}</span>
+        <button type="button" @click="cancelImportJob">取消导入</button>
+      </section>
+      <section v-if="exportJob && isActiveJob(exportJob)" class="rs-task-status">
+        <label>
+          <span>{{ exportProgressText }}</span>
+          <progress
+            :value="exportJob.progress.completed ?? 0"
+            :max="Math.max(1, exportJob.progress.total ?? 1)"
+          />
+        </label>
+        <button type="button" @click="cancelExportJob">取消导出</button>
+      </section>
+    </div>
 
-      <div class="rs-info">
-        <span v-if="currentMember">{{ currentIndex + 1 }} / {{ members.length }}</span>
-        <span v-if="selectedCount" class="rs-selected-count">已选 {{ selectedCount }}</span>
-        <span class="rs-filter-count">筛选 {{ filtered }}/{{ total }}</span>
+    <div v-if="total === 0 && !loading" class="rs-empty-workspace">
+      <button type="button" class="rs-empty-back" @click="emit('back')">返回项目列表</button>
+      <div>
+        <h2>{{ projectName }}</h2>
+        <p>导入 Sony A7M4 ARW 或配套 JPG/PNG 开始选片</p>
+      </div>
+      <div class="rs-empty-imports">
+        <button type="button" :disabled="importing" @click="handleImportFiles">导入图片</button>
+        <button type="button" :disabled="importing" @click="handleImportFolder">导入文件夹</button>
+      </div>
+    </div>
+
+    <div v-else-if="compareMode && compareItems" class="rs-preview-stage rs-compare-stage">
+      <div class="rs-compare-panes">
+        <div
+          v-for="(item, sideValue) in compareItems"
+          :key="item.id"
+          :ref="(element) => setCompareContainer(sideValue, element)"
+          class="rs-compare-pane"
+          :class="{ 'is-active': viewport.activeCompareSide.value === sideValue }"
+          role="group"
+          :aria-label="`${sideValue === 0 ? '左侧' : '右侧'}对比图片${viewport.activeCompareSide.value === sideValue ? '，当前操作侧' : ''}`"
+          @click="viewport.activeCompareSide.value = sideValue as 0 | 1"
+          @wheel="handleImageWheel(sideValue as 0 | 1, $event)"
+          @dblclick="handleImageDoubleClick(sideValue as 0 | 1, $event)"
+          @mousedown="handleImageMouseDown(sideValue as 0 | 1, $event)"
+          @contextmenu.prevent
+        >
+          <div class="rs-preview-media">
+            <img
+              :ref="(element) => setCompareImage(sideValue, element)"
+              :src="compareDisplayedUrls[sideValue] || compareImageUrl(item, sideValue as 0 | 1)"
+              :alt="item.file_name"
+              class="rs-preview-img"
+              :style="viewport.styleFor(sideValue as 0 | 1)"
+              draggable="false"
+              @load="handleCompareImageLoad(sideValue)"
+              @error="handleCompareDisplayedError(sideValue as 0 | 1)"
+            />
+          </div>
+          <div v-if="comparePreviewErrors[sideValue]" class="rs-preview-error" role="status">
+            <strong>无法加载预览</strong>
+            <span>{{ comparePreviewMessages[sideValue] || item.file_name }}</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div
+      v-else
+      ref="singleContainer"
+      class="rs-preview-stage"
+      @wheel="handleImageWheel('single', $event)"
+      @dblclick="handleImageDoubleClick('single', $event)"
+      @mousedown="handleImageMouseDown('single', $event)"
+      @contextmenu.prevent
+    >
+      <div v-if="!currentMember && !loading" class="rs-preview-empty">项目中暂无图片</div>
+      <div v-else-if="!currentMember" class="rs-preview-empty">加载中…</div>
+      <div v-else class="rs-preview-media">
+        <img
+          ref="singleImage"
+          :src="singleDisplayedUrl || singleImageUrl"
+          :alt="currentMember.file_name"
+          class="rs-preview-img"
+          :style="viewport.styleFor('single')"
+          draggable="false"
+          @load="handleSingleImageLoad"
+          @error="handleSingleDisplayedError"
+        />
+      </div>
+      <div v-if="singlePreviewError && currentMember" class="rs-preview-error" role="status">
+        <strong>无法加载预览</strong>
+        <span>{{ singlePreviewMessage || currentMember.file_name }}</span>
+      </div>
+    </div>
+
+    <section
+      v-if="total > 0 && showFilters"
+      id="raw-filter-bar"
+      class="rs-filter-bar"
+      data-raw-transient
+      aria-label="筛选条件"
+    >
+      <label class="rs-filter-field">
+        <span>星级</span>
+        <select v-model="starFilterKind">
+          <option value="none">全部</option>
+          <option value="exact">精确</option>
+          <option value="at_least">至少</option>
+          <option value="unrated">未评级</option>
+        </select>
+      </label>
+      <label v-if="starFilterKind === 'exact' || starFilterKind === 'at_least'" class="rs-filter-field rs-star-value">
+        <span>数量</span>
+        <select v-model.number="filterStarValue">
+          <option v-for="star in 5" :key="star" :value="star">{{ star }} 星</option>
+        </select>
+      </label>
+      <fieldset class="rs-filter-group">
+        <legend>色标</legend>
+        <button
+          v-for="option in colorLabelOptions.slice(1)"
+          :key="option.value"
+          type="button"
+          :aria-pressed="filterColorLabels.includes(option.value)"
+          :class="{ active: filterColorLabels.includes(option.value) }"
+          @click="toggleFilterColor(option.value)"
+        >{{ option.label }}</button>
+      </fieldset>
+      <label class="rs-filter-field">
+        <span>导出状态</span>
+        <select v-model="filterExported">
+          <option value="all">全部</option>
+          <option value="unexported">未导出</option>
+          <option value="exported">已导出</option>
+        </select>
+      </label>
+      <fieldset class="rs-filter-group">
+        <legend>格式</legend>
+        <button
+          v-for="option in formatOptions"
+          :key="option.value"
+          type="button"
+          :aria-pressed="filterFormats.includes(option.value)"
+          :class="{ active: filterFormats.includes(option.value) }"
+          @click="filterFormats = toggleArrayValue(filterFormats, option.value)"
+        >{{ option.label }}</button>
+      </fieldset>
+      <fieldset class="rs-filter-group">
+        <legend>构图</legend>
+        <button
+          v-for="option in orientationOptions"
+          :key="option.value"
+          type="button"
+          :aria-pressed="filterOrientations.includes(option.value)"
+          :class="{ active: filterOrientations.includes(option.value) }"
+          @click="filterOrientations = toggleArrayValue(filterOrientations, option.value)"
+        >{{ option.label }}</button>
+      </fieldset>
+      <label class="rs-filter-field rs-filter-filename">
+        <span>文件名包含</span>
+        <input v-model="filterFilename" type="search" maxlength="200" placeholder="输入文件名" />
+      </label>
+      <button class="rs-clear-filter" type="button" :disabled="activeFilterCount === 0" @click="clearFilters">
+        清除筛选
+      </button>
+    </section>
+
+    <footer v-if="total > 0" class="rs-control-bar">
+      <div class="rs-control-left">
+        <button type="button" class="rs-project-back" :title="`返回项目列表 · ${projectName}`" @click="emit('back')">
+          <AppIcon name="chevron-down" :size="15" />
+          <span class="rs-control-label">{{ projectName }}</span>
+        </button>
+
+        <div class="rs-menu-wrap" data-raw-transient>
+          <button
+            type="button"
+            aria-label="导入"
+            aria-haspopup="menu"
+            :aria-expanded="openMenu === 'import'"
+            :disabled="importing"
+            @click="toggleMenu('import', $event)"
+          ><AppIcon name="plus" :size="15" /></button>
+          <div v-if="openMenu === 'import'" class="rs-menu" role="menu" aria-label="导入">
+            <button type="button" role="menuitem" @click="handleImportFiles">导入图片</button>
+            <button type="button" role="menuitem" @click="handleImportFolder">导入文件夹</button>
+          </div>
+        </div>
+
+        <button
+          type="button"
+          data-raw-transient
+          :aria-expanded="showFilters"
+          aria-controls="raw-filter-bar"
+          @click="toggleFilters"
+        >{{ filterSummary }}</button>
+
+        <div class="rs-menu-wrap" data-raw-transient>
+          <button
+            type="button"
+            aria-haspopup="menu"
+            :aria-expanded="openMenu === 'sort'"
+            :title="sortSummary"
+            @click="toggleMenu('sort', $event)"
+          >排序</button>
+          <div v-if="openMenu === 'sort'" class="rs-menu rs-sort-menu" role="menu" aria-label="排序">
+            <button
+              v-for="option in sortOptions"
+              :key="option.value"
+              type="button"
+              role="menuitemradio"
+              :aria-checked="sortField === option.value"
+              :class="{ active: sortField === option.value }"
+              @click="sortField = option.value; closeTransient(true)"
+            >{{ option.label }}</button>
+            <hr />
+            <button type="button" role="menuitemradio" :aria-checked="sortDirection === 'asc'" :class="{ active: sortDirection === 'asc' }" @click="sortDirection = 'asc'; closeTransient(true)">升序</button>
+            <button type="button" role="menuitemradio" :aria-checked="sortDirection === 'desc'" :class="{ active: sortDirection === 'desc' }" @click="sortDirection = 'desc'; closeTransient(true)">降序</button>
+          </div>
+        </div>
+
+        <div class="rs-menu-wrap" data-raw-transient>
+          <button
+            type="button"
+            aria-haspopup="menu"
+            :aria-expanded="openMenu === 'selection'"
+            @click="toggleMenu('selection', $event)"
+          >已选 {{ selectedCount }}</button>
+          <div v-if="openMenu === 'selection'" class="rs-menu" role="menu" aria-label="选择">
+            <button type="button" role="menuitem" :disabled="!members.length" @click="selectAllFiltered">全选筛选结果</button>
+            <button type="button" role="menuitem" :disabled="!selectedCount" @click="clearSelection">清除选择</button>
+          </div>
+        </div>
       </div>
 
-      <div class="rs-tools">
-        <button type="button" title="适合窗口" @click="zoom = 1; panX = 0; panY = 0">适合</button>
-        <button type="button" title="100%" @click="zoom = 1; panX = 0; panY = 0">100%</button>
-
-        <!-- Star rating -->
-        <div class="rs-stars">
+      <div class="rs-control-center">
+        <span class="rs-position">{{ activeMemberIndex >= 0 ? `${activeMemberIndex + 1} / ${members.length}` : '—' }}</span>
+        <div class="rs-stars" role="group" aria-label="星级">
           <button
-            v-for="s in 5"
-            :key="s"
+            v-for="star in 5"
+            :key="star"
             type="button"
             class="rs-star"
-            :class="{ active: currentMember && currentMember.star_rating >= s }"
-            @click="setRating(s)"
+            :class="{ active: activeMember && activeMember.star_rating >= star }"
+            :aria-label="`${star} 星`"
+            :aria-pressed="Boolean(activeMember && activeMember.star_rating === star)"
+            :disabled="!activeMember"
+            @click="setRating(star)"
           >★</button>
-          <button
-            v-if="currentMember && currentMember.star_rating > 0"
-            type="button"
-            class="rs-star-clear"
-            @click="setRating(0)"
-          >×</button>
+          <button type="button" class="rs-star-clear" aria-label="清除星级" :disabled="!activeMember || activeMember.star_rating === 0" @click="setRating(0)">×</button>
         </div>
-
-        <!-- Color labels -->
-        <div class="rs-colors">
+        <div class="rs-colors" role="group" aria-label="色标">
           <button
-            v-for="opt in colorLabelOptions"
-            :key="opt.value"
+            v-for="option in colorLabelOptions"
+            :key="option.value"
             type="button"
-            class="rs-color-btn"
-            :class="{ active: currentMember && currentMember.color_label === opt.value }"
-            :style="{ '--dot-color': opt.color }"
-            :title="opt.label"
-            @click="setColorLabel(opt.value)"
-          />
+            class="rs-color-button"
+            :class="{ active: activeMember?.color_label === option.value }"
+            :style="{ '--label-color': option.color }"
+            :aria-label="option.label"
+            :aria-pressed="activeMember?.color_label === option.value"
+            :disabled="!activeMember"
+            @click="setColorLabel(option.value)"
+          ><span aria-hidden="true">{{ option.value === 'none' ? '–' : '' }}</span></button>
         </div>
-
-        <!-- Creative look selector (7.4) — ARW only -->
-        <div class="rs-look-wrap">
+        <div class="rs-menu-wrap" data-raw-transient>
           <button
             type="button"
-            class="rs-look-btn"
-            :disabled="!isRawFile"
-            :title="isRawFile ? 'Sony 创意外观' : 'JPG/PNG 不适用创意外观'"
-            @click="showLookMenu = !showLookMenu"
-          >
-            {{ isRawFile ? currentLookLabel : '外观不适用' }}
-          </button>
-          <div v-if="showLookMenu && isRawFile" class="rs-dropdown">
+            class="rs-look-button"
+            aria-haspopup="menu"
+            :aria-expanded="openMenu === 'look'"
+            :disabled="!activeMember || !activeIsRaw || creativeLooks.length <= 1"
+            :title="!activeIsRaw ? 'JPG/PNG 不应用 Sony 创意外观' : creativeLooks.length <= 1 ? '未经可信参考校准的外观暂不可用' : 'Sony 创意外观'"
+            @click="toggleMenu('look', $event)"
+          >{{ activeIsRaw ? activeLookLabel : '外观不适用' }}</button>
+          <div v-if="openMenu === 'look' && activeIsRaw && creativeLooks.length > 1" class="rs-menu rs-look-menu" role="menu" aria-label="Sony 创意外观">
             <button
               v-for="look in creativeLooks"
               :key="look.id"
               type="button"
-              :class="{ active: currentMember && currentMember.creative_look === look.id }"
+              role="menuitemradio"
+              :aria-checked="activeMember?.creative_look === look.id"
+              :class="{ active: activeMember?.creative_look === look.id }"
               :title="look.calibration"
               @click="setCreativeLook(look.id)"
             >{{ look.label }}</button>
           </div>
         </div>
-
-        <!-- Sort menu -->
-        <div class="rs-sort-wrap">
-          <button type="button" @click="showSortMenu = !showSortMenu">
-            <AppIcon name="sliders" :size="15" />
-          </button>
-          <div v-if="showSortMenu" class="rs-dropdown">
-            <button
-              v-for="opt in sortOptions"
-              :key="opt.value"
-              type="button"
-              :class="{ active: sortField === opt.value }"
-              @click="sortField = opt.value; showSortMenu = false"
-            >{{ opt.label }}</button>
-            <hr />
-            <button type="button" :class="{ active: sortDirection === 'asc' }" @click="sortDirection = 'asc'">升序</button>
-            <button type="button" :class="{ active: sortDirection === 'desc' }" @click="sortDirection = 'desc'">降序</button>
-          </div>
-        </div>
-
-        <button type="button" title="全选筛选结果" @click="selectAllFiltered">全选</button>
-        <button
-          type="button"
-          title="双图对比（需选中恰好两张）"
-          :disabled="selectedCount !== 2"
-          @click="enterCompare"
-        >对比</button>
-        <button type="button" title="导出" @click="handleExport">导出</button>
-        <button type="button" title="移出项目" @click="handleRemove">移出</button>
-        <button type="button" class="rs-danger-btn" title="永久删除源文件" @click="handlePermanentDelete">永久删除</button>
+        <span class="rs-file-name" :title="activeMember?.file_name">{{ activeMember?.file_name || '未选择图片' }}</span>
       </div>
-    </header>
 
-    <!-- Dual image comparison view (Section 6) -->
-    <div v-if="compareMode && compareItems" class="rs-compare" @wheel="handleCompareWheel">
-      <div class="rs-compare-bar">
-        <button type="button" @click="exitCompare">返回</button>
-        <label class="rs-compare-sync">
-          <input v-model="compareSync" type="checkbox" />
+      <div class="rs-control-right">
+        <button type="button" :disabled="!activeMember" @click="fitActive">适合</button>
+        <button type="button" :disabled="!activeMember" @click="actualSizeActive">100%</button>
+        <button type="button" :disabled="!activeMember || exportBusy" @click="handleExport">{{ exportBusy ? '导出中…' : '导出' }}</button>
+        <button type="button" :disabled="!activeMember" @click="handleRemove">移出</button>
+        <button ref="deleteTrigger" type="button" class="rs-danger" :disabled="!activeMember" @click="handlePermanentDelete">永久删除</button>
+        <div class="rs-view-switch" role="group" aria-label="视图">
+          <button type="button" :aria-pressed="!compareMode" :class="{ active: !compareMode }" @click="compareMode && exitCompare(true)">单视图</button>
+          <button type="button" :aria-pressed="compareMode" :class="{ active: compareMode }" :disabled="!compareMode && !compareAvailable" :title="!compareMode && !compareAvailable ? '请先选择两张图片' : '对比视图'" @click="!compareMode && enterCompare()">对比视图</button>
+        </div>
+        <label v-if="compareMode" class="rs-sync-toggle">
+          <input v-model="viewport.compareSync.value" type="checkbox" />
           <span>同步缩放</span>
         </label>
-        <span class="rs-compare-hint">Ctrl+滚轮缩放 · Esc 退出</span>
       </div>
-      <div class="rs-compare-panes">
-        <div
-          v-for="(item, side) in compareItems"
-          :key="item.id"
-          class="rs-compare-side"
-          :class="side === 1 ? 'rs-compare-side-b' : 'rs-compare-side-a'"
-        >
-          <div class="rs-compare-image-wrap">
-            <img
-              :src="`api/raw-selection/members/${item.id}/preview`"
-              :alt="item.file_name"
-              class="rs-compare-img"
-              :style="compareStyle(side as 0 | 1)"
-              draggable="false"
-            />
-          </div>
-          <div class="rs-compare-side-bar">
-            <span class="rs-compare-name">{{ item.file_name }}</span>
-            <div class="rs-stars">
-              <button
-                v-for="s in 5"
-                :key="s"
-                type="button"
-                class="rs-star"
-                :class="{ active: item.star_rating >= s }"
-                @click="compareSetRating(side as 0 | 1, s)"
-              >★</button>
-            </div>
-            <div class="rs-colors">
-              <button
-                v-for="opt in colorLabelOptions"
-                :key="opt.value"
-                type="button"
-                class="rs-color-btn"
-                :class="{ active: item.color_label === opt.value }"
-                :style="{ '--dot-color': opt.color }"
-                :title="opt.label"
-                @click="compareSetColor(side as 0 | 1, opt.value)"
-              />
-            </div>
-          </div>
-        </div>
-      </div>
-    </div>
+    </footer>
 
-    <!-- Central preview -->
-    <div
-      v-else
-      class="rs-preview-area"
-      @wheel="handleWheel"
-      @dblclick="handleDoubleClick"
-      @mousedown="handleRightMouseDown"
-    >
-      <div v-if="!currentMember && !loading" class="rs-no-image">
-        <p>项目中暂无图片</p>
-      </div>
-      <div v-else-if="loading" class="rs-loading">加载中…</div>
-      <img
-        v-else-if="currentMember"
-        :src="imageUrl"
-        :alt="currentMember.file_name"
-        class="rs-preview-img"
-        :style="imageStyle"
-        draggable="false"
-        @error="previewError = true"
-        @load="previewError = false"
-      />
-      <div v-if="previewError && currentMember" class="rs-raw-placeholder">
-        <p>无法加载预览</p>
-        <small>{{ currentMember.file_name }}（{{ isRawFile ? 'ARW 解码器未安装' : '文件可能已损坏' }}）</small>
-      </div>
-    </div>
+    <RawSelectionFilmstrip
+      v-if="total > 0"
+      ref="filmstrip"
+      :members="members"
+      :current-index="currentIndex"
+      :selected-ids="selectedIds"
+      :initial-scroll="filmStripScroll"
+      @activate="activateMember"
+      @selection="selectedIds = $event"
+      @scroll="handleFilmScroll"
+      @range="filmRange = $event"
+    />
 
-    <!-- Film strip (virtualized) -->
-    <div ref="filmStripEl" class="rs-film-strip" @scroll="handleFilmStripScroll">
-      <div class="rs-film-strip-inner" :style="{ width: filmInnerWidth + 'px' }">
-        <button
-          v-for="{ member: m, index: i } in filmVisibleItems"
-          :key="m.id"
-          type="button"
-          class="rs-thumb"
-          :style="{ left: i * FILM_ITEM_WIDTH + 'px' }"
-          :class="{
-            active: i === currentIndex,
-            selected: selectedIds.has(m.id),
-          }"
-          @click="currentIndex = i; zoom = 1; panX = 0; panY = 0; previewError = false"
-          @dblclick="toggleSelect(m.id)"
-        >
-          <img
-            :src="`api/raw-selection/members/${m.id}/thumbnail`"
-            :alt="m.file_name"
-            class="rs-thumb-img"
-            loading="lazy"
-            @error="(e) => ((e.target as HTMLImageElement).style.display = 'none')"
-          />
-          <span class="rs-thumb-name">{{ m.file_name }}</span>
-          <span v-if="m.star_rating > 0" class="rs-thumb-stars">{{ '★'.repeat(m.star_rating) }}</span>
-        </button>
-      </div>
-    </div>
-
-    <!-- Permanent delete confirmation modal (11.2) -->
-    <div
-      v-if="showDeleteModal"
-      class="rs-delete-backdrop"
-      role="presentation"
-      @click.self="closeDeleteModal"
-    >
-      <div class="rs-delete-modal" role="alertdialog" aria-modal="true" aria-labelledby="rs-delete-title">
-        <h3 id="rs-delete-title">永久删除源文件</h3>
-        <p class="rs-delete-summary">
-          将永久删除 <strong>{{ deleteTargets.length }}</strong> 个源文件，
-          总大小 <strong>{{ formatSize(deleteTotalSize) }}</strong>。
-        </p>
-        <p class="rs-delete-warning">
-          这些文件不会进入回收站，删除后无法恢复。
-        </p>
+    <div v-if="showDeleteModal" class="rs-modal-backdrop" role="presentation" @click.self="closeDeleteModal(true)">
+      <div class="rs-delete-modal" role="alertdialog" aria-modal="true" aria-labelledby="raw-delete-title" aria-describedby="raw-delete-warning">
+        <h3 id="raw-delete-title">永久删除源文件</h3>
+        <p>将永久删除 <strong>{{ deleteTargets.length }}</strong> 个源文件，总大小 <strong>{{ formatSize(deleteTotalSize) }}</strong>。</p>
+        <p id="raw-delete-warning" class="rs-delete-warning">文件不会进入回收站，删除后无法恢复。</p>
+        <ul class="rs-delete-list" aria-label="待删除文件">
+          <li v-for="member in deleteTargets.slice(0, 5)" :key="member.id">{{ member.file_name }}</li>
+          <li v-if="deleteTargets.length > 5">以及其他 {{ deleteTargets.length - 5 }} 个文件</li>
+        </ul>
         <label class="rs-delete-check">
-          <input
-            v-model="deleteConfirmed"
-            type="checkbox"
-            :disabled="deleteBusy"
-          />
+          <input ref="deleteCheck" v-model="deleteConfirmed" type="checkbox" :disabled="deleteBusy" />
           <span>我理解这些源文件将被永久删除</span>
         </label>
         <div class="rs-delete-actions">
-          <button
-            type="button"
-            class="rs-delete-cancel"
-            :disabled="deleteBusy"
-            @click="closeDeleteModal"
-          >取消</button>
-          <button
-            type="button"
-            class="rs-delete-confirm"
-            :disabled="!deleteConfirmed || deleteBusy"
-            @click="confirmPermanentDelete"
-          >{{ deleteBusy ? '删除中…' : '永久删除' }}</button>
+          <button type="button" :disabled="deleteBusy" @click="closeDeleteModal(true)">取消</button>
+          <button type="button" class="rs-delete-confirm" :disabled="!deleteConfirmed || deleteBusy" @click="confirmPermanentDelete">
+            {{ deleteBusy ? '删除中…' : '永久删除' }}
+          </button>
         </div>
       </div>
     </div>
-  </div>
+  </section>
 </template>
 
 <style scoped>
 .rs-workspace {
+  --raw-preview-safe-inset: 24px;
+
+  position: relative;
   display: grid;
-  grid-template-rows: 44px 1fr 100px;
+  width: 100%;
   height: 100%;
+  min-width: 0;
+  min-height: 0;
+  grid-template-rows: minmax(0, 1fr) auto 100px;
+  grid-template-areas:
+    "preview"
+    "controls"
+    "filmstrip";
   overflow: hidden;
-}
-
-.rs-toolbar {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 0 12px;
-  border-bottom: 1px solid var(--border);
+  color: var(--text);
   background: var(--surface);
 }
 
-.rs-back-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 0 10px;
-  min-height: 30px;
-  border: 1px solid var(--border);
-  border-radius: 9px;
-  background: var(--surface);
-  font-size: 13px;
+.rs-workspace.is-empty {
+  grid-template-rows: minmax(0, 1fr);
+  grid-template-areas: "preview";
 }
 
-.rs-back-btn:hover {
+.rs-empty-workspace {
+  display: grid;
+  grid-area: preview;
+  align-content: center;
+  justify-items: center;
+  gap: 20px;
+  padding: 24px;
+  text-align: center;
   background: var(--surface-soft);
 }
 
-.rs-info {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  font-size: 12px;
-  color: var(--muted);
-}
-
-.rs-selected-count {
-  color: var(--text);
+.rs-empty-workspace h2 {
+  margin: 0 0 4px;
+  font-size: 17px;
   font-weight: 500;
 }
 
-.rs-tools {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  margin-left: auto;
-}
-
-.rs-tools button {
-  padding: 0 8px;
-  min-height: 28px;
-  border: 1px solid var(--border);
-  border-radius: 7px;
-  background: var(--surface);
-  color: var(--text);
-  font-size: 12px;
-}
-
-.rs-tools button:hover {
-  background: var(--surface-soft);
-}
-
-.rs-danger-btn {
-  color: var(--danger) !important;
-}
-
-.rs-stars {
-  display: flex;
-  align-items: center;
-  gap: 1px;
-}
-
-.rs-star {
-  border: 0 !important;
-  background: transparent !important;
-  color: var(--faint);
-  font-size: 16px;
-  padding: 0 2px !important;
-}
-
-.rs-star.active {
-  color: #e8a800;
-}
-
-.rs-star-clear {
-  border: 0 !important;
-  background: transparent !important;
+.rs-empty-workspace p {
+  margin: 0;
   color: var(--muted);
-  font-size: 14px;
+  font-size: 13px;
 }
 
-.rs-colors {
-  display: flex;
-  align-items: center;
-  gap: 2px;
-}
-
-.rs-color-btn {
-  width: 20px;
-  height: 20px;
-  border: 1px solid var(--border) !important;
-  border-radius: 50%;
-  background: var(--dot-color, transparent) !important;
-  padding: 0 !important;
-  min-height: 20px !important;
-}
-
-.rs-color-btn.active {
-  box-shadow: 0 0 0 2px var(--brand);
-}
-
-.rs-sort-wrap {
-  position: relative;
-}
-
-.rs-look-wrap {
-  position: relative;
-}
-
-.rs-look-btn {
-  max-width: 110px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.rs-dropdown {
+.rs-empty-back {
   position: absolute;
-  top: 32px;
-  right: 0;
-  z-index: 30;
+  top: 16px;
+  left: 16px;
+}
+
+.rs-empty-imports {
   display: flex;
-  flex-direction: column;
-  gap: 2px;
-  padding: 6px;
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  background: var(--surface);
-  box-shadow: var(--shadow-float);
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
 }
 
-.rs-dropdown button {
-  border: 0 !important;
-  background: transparent !important;
-  text-align: left;
-  padding: 0 10px !important;
-  min-height: 28px !important;
-  border-radius: 6px;
+.rs-empty-imports button {
+  min-width: 112px;
+  min-height: 36px;
 }
 
-.rs-dropdown button:hover,
-.rs-dropdown button.active {
-  background: var(--surface-soft) !important;
-}
-
-.rs-dropdown hr {
-  border: 0;
-  border-top: 1px solid var(--border);
-  margin: 2px 0;
-}
-
-.rs-preview-area {
+.rs-task-stack {
+  position: absolute;
+  z-index: 30;
+  top: 12px;
+  right: 12px;
   display: grid;
-  place-items: center;
-  overflow: hidden;
-  background: var(--surface-soft);
-  position: relative;
-  user-select: none;
-}
-
-.rs-preview-img {
-  max-width: 100%;
-  max-height: 100%;
-  transition: transform 0.05s linear;
+  width: min(360px, calc(100% - 24px));
+  gap: 8px;
   pointer-events: none;
 }
 
-.rs-no-image,
-.rs-loading,
-.rs-raw-placeholder {
+.rs-task-status {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-strong);
+  box-shadow: var(--shadow-float);
+  color: var(--text);
+  font-size: 12px;
+  pointer-events: auto;
+}
+
+.rs-task-status label {
   display: grid;
-  place-items: center;
-  color: var(--muted);
+  flex: 1;
   gap: 4px;
 }
 
-.rs-raw-placeholder small {
-  font-size: 12px;
-  color: var(--faint);
+.rs-task-status progress {
+  width: 100%;
+  height: 5px;
 }
 
-.rs-film-strip {
-  overflow-x: auto;
-  overflow-y: hidden;
-  border-top: 1px solid var(--border);
-  background: var(--surface);
-  scrollbar-width: thin;
+.rs-workspace.has-filters {
+  grid-template-rows: minmax(0, 1fr) auto auto 100px;
+  grid-template-areas:
+    "preview"
+    "filters"
+    "controls"
+    "filmstrip";
 }
 
-.rs-film-strip-inner {
+.rs-preview-stage {
   position: relative;
-  height: 100%;
+  display: grid;
+  grid-area: preview;
+  min-width: 0;
+  min-height: 0;
+  place-items: center;
+  overflow: hidden;
+  user-select: none;
+  background: var(--surface-soft);
 }
 
-.rs-thumb {
+.rs-preview-media {
   position: absolute;
-  top: 6px;
-  bottom: 6px;
+  inset: var(--raw-preview-safe-inset);
   display: flex;
-  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
   align-items: center;
   justify-content: center;
-  gap: 2px;
-  width: 84px;
-  padding: 4px 6px;
-  border: 2px solid transparent;
-  border-radius: 6px;
-  background: var(--surface-soft);
-  color: var(--muted);
-  font-size: 11px;
   overflow: hidden;
-  cursor: pointer;
 }
 
-.rs-thumb.active {
-  border-color: var(--brand);
-  background: var(--surface);
-  color: var(--text);
-}
-
-.rs-thumb.selected {
-  border-color: var(--success);
-}
-
-.rs-thumb-img {
-  width: 100%;
-  height: 60px;
-  object-fit: cover;
-  border-radius: 4px;
+.rs-preview-img {
   display: block;
+  width: auto;
+  height: auto;
+  max-width: none;
+  max-height: none;
+  flex: 0 0 auto;
+  pointer-events: none;
+  transform-origin: center;
+  transition: transform 50ms linear;
 }
 
-.rs-thumb-name {
+.rs-preview-empty,
+.rs-preview-error {
+  display: grid;
+  place-items: center;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.rs-preview-error {
+  position: absolute;
+  inset: 0;
+  align-content: center;
+  background: var(--surface-soft);
+}
+
+.rs-preview-error span {
+  max-width: min(360px, 80%);
   overflow: hidden;
+  color: var(--faint);
+  font-size: 11px;
   text-overflow: ellipsis;
   white-space: nowrap;
-  max-width: 72px;
-}
-
-.rs-thumb-stars {
-  font-size: 10px;
-  color: #e8a800;
-}
-
-/* Dual image comparison */
-.rs-compare {
-  display: flex;
-  flex-direction: column;
-  min-height: 0;
-  overflow: hidden;
-  background: var(--surface-soft);
-}
-
-.rs-compare-bar {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 6px 12px;
-  border-bottom: 1px solid var(--border);
-  background: var(--surface);
-}
-
-.rs-compare-bar button {
-  padding: 0 10px;
-  min-height: 28px;
-  border: 1px solid var(--border);
-  border-radius: 7px;
-  background: var(--surface);
-  font-size: 12px;
-}
-
-.rs-compare-sync {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  font-size: 12px;
-  color: var(--muted);
-  cursor: pointer;
-}
-
-.rs-compare-hint {
-  margin-left: auto;
-  font-size: 11px;
-  color: var(--faint);
 }
 
 .rs-compare-panes {
   display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 1px;
-  flex: 1;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
   min-height: 0;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 1px;
   background: var(--border);
 }
 
-.rs-compare-side {
+.rs-compare-pane {
+  position: relative;
   display: grid;
-  grid-template-rows: minmax(0, 1fr) auto;
   min-width: 0;
   min-height: 0;
+  place-items: center;
+  overflow: hidden;
   background: var(--surface-soft);
 }
 
-.rs-compare-image-wrap {
+.rs-compare-pane.is-active {
+  box-shadow: inset 0 0 0 2px var(--brand);
+}
+
+.rs-filter-bar {
   display: grid;
-  place-items: center;
-  overflow: hidden;
-  min-height: 0;
-}
-
-.rs-compare-img {
-  max-width: 100%;
-  max-height: 100%;
-  pointer-events: none;
-  transition: transform 0.05s linear;
-}
-
-.rs-compare-side-bar {
-  display: flex;
-  align-items: center;
+  grid-area: filters;
+  min-width: 0;
+  grid-template-columns: repeat(7, minmax(110px, auto));
+  align-items: end;
   gap: 8px;
-  padding: 6px 10px;
+  max-height: 176px;
+  overflow: auto;
+  padding: 8px 12px;
   border-top: 1px solid var(--border);
   background: var(--surface);
 }
 
-.rs-compare-name {
+.rs-filter-field {
+  display: grid;
   min-width: 0;
-  flex: 1;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.rs-filter-field :is(select, input) {
+  min-width: 0;
+  height: 30px;
+  padding: 0 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: 7px;
+  color: var(--text);
+  background: var(--surface);
+}
+
+.rs-filter-filename { min-width: 150px; }
+
+.rs-filter-group {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 3px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.rs-filter-group legend {
+  width: 100%;
+  margin-bottom: 4px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.rs-filter-group button,
+.rs-clear-filter {
+  min-height: 30px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  color: var(--text);
+  font-size: 11px;
+  white-space: nowrap;
+  background: var(--surface);
+}
+
+.rs-filter-group button.active {
+  border-color: var(--border-strong);
+  background: var(--surface-strong);
+  box-shadow: inset 0 -2px 0 var(--brand);
+}
+
+.rs-control-bar {
+  position: relative;
+  z-index: 20;
+  display: grid;
+  grid-area: controls;
+  min-width: 0;
+  grid-template-columns: max-content minmax(240px, 1fr) max-content;
+  grid-template-areas: "left center right";
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.rs-workspace > .rs-film-strip { grid-area: filmstrip; }
+
+.rs-control-left,
+.rs-control-center,
+.rs-control-right {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 4px;
+}
+
+.rs-control-left { grid-area: left; }
+.rs-control-center { grid-area: center; justify-content: center; }
+.rs-control-right { grid-area: right; justify-content: flex-end; }
+
+.rs-control-bar button {
+  min-height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  color: var(--text);
+  font-size: 12px;
+  white-space: nowrap;
+  background: var(--surface);
+}
+
+.rs-control-bar button:not(:disabled):hover,
+.rs-control-bar button[aria-expanded="true"] {
+  background: var(--surface-soft);
+}
+
+.rs-project-back {
+  display: inline-flex;
+  max-width: 150px;
+  align-items: center;
+  gap: 5px;
+}
+
+.rs-project-back .app-icon { transform: rotate(90deg); }
+
+.rs-control-label,
+.rs-file-name {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: 12px;
-  color: var(--muted);
 }
 
-/* Permanent delete confirmation modal */
-.rs-delete-backdrop {
+.rs-position {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.rs-file-name {
+  max-width: 180px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.rs-stars,
+.rs-colors,
+.rs-view-switch {
+  display: flex;
+  align-items: center;
+  gap: 1px;
+}
+
+.rs-star,
+.rs-star-clear {
+  min-width: 20px;
+  padding: 0 2px !important;
+  border: 0 !important;
+  color: var(--faint) !important;
+  font-size: 16px !important;
+  background: transparent !important;
+}
+
+.rs-star.active { color: #b77d00 !important; }
+.rs-star-clear { font-size: 14px !important; }
+
+.rs-color-button {
+  display: grid;
+  width: 20px;
+  min-width: 20px;
+  height: 20px;
+  min-height: 20px !important;
+  place-items: center;
+  padding: 0 !important;
+  border-radius: 50% !important;
+  background: var(--label-color, transparent) !important;
+}
+
+.rs-color-button.active {
+  box-shadow: 0 0 0 2px var(--surface), 0 0 0 3px var(--brand);
+}
+
+.rs-look-button {
+  max-width: 112px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.rs-danger { color: var(--danger) !important; }
+
+.rs-view-switch {
+  padding: 2px;
+  border-radius: 8px;
+  background: var(--surface-soft);
+}
+
+.rs-view-switch button { border: 0; background: transparent; }
+.rs-view-switch button.active { background: var(--surface-strong); }
+
+.rs-sync-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.rs-menu-wrap { position: relative; }
+
+.rs-menu {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 6px);
+  z-index: 60;
+  display: grid;
+  width: max-content;
+  min-width: 136px;
+  max-width: min(260px, calc(100vw - 16px));
+  max-height: min(420px, calc(100vh - 32px));
+  gap: 2px;
+  overflow: auto;
+  padding: 6px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  color: var(--text);
+  background: color-mix(in srgb, var(--surface) 97%, transparent);
+  box-shadow: var(--shadow-float);
+}
+
+.rs-control-left .rs-menu-wrap:first-of-type .rs-menu { right: auto; left: 0; }
+
+.rs-menu button {
+  width: 100%;
+  min-height: 30px;
+  padding: 0 10px;
+  border: 0;
+  text-align: left;
+  background: transparent;
+}
+
+.rs-menu button:hover,
+.rs-menu button.active { background: var(--surface-soft); }
+
+.rs-menu hr {
+  width: 100%;
+  margin: 3px 0;
+  border: 0;
+  border-top: 1px solid var(--border);
+}
+
+.rs-look-menu {
+  right: auto;
+  left: 50%;
+  transform: translateX(-50%);
+}
+
+.rs-modal-backdrop {
   position: fixed;
-  inset: 0;
   z-index: 1100;
+  inset: 0;
   display: grid;
   place-items: center;
-  background: rgb(0 0 0 / 35%);
+  padding: 16px;
+  background: rgb(0 0 0 / 38%);
 }
 
 .rs-delete-modal {
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  width: min(420px, 100%);
   gap: 12px;
-  width: min(400px, calc(100vw - 32px));
   padding: 20px;
   border: 1px solid var(--border);
   border-radius: 14px;
+  color: var(--text);
   background: var(--surface);
   box-shadow: var(--shadow-float);
 }
 
-.rs-delete-modal h3 {
-  margin: 0;
-  font-size: 15px;
-  font-weight: 500;
-  color: var(--danger);
-}
+.rs-delete-modal h3,
+.rs-delete-modal p { margin: 0; }
+.rs-delete-modal h3 { color: var(--danger); font-size: 15px; font-weight: 500; }
+.rs-delete-modal p { font-size: 13px; }
+.rs-delete-warning { color: var(--danger); font-size: 12px !important; }
 
-.rs-delete-summary {
+.rs-delete-list {
+  max-height: 110px;
   margin: 0;
-  font-size: 13px;
-  color: var(--text);
-}
-
-.rs-delete-warning {
-  margin: 0;
+  overflow: auto;
+  padding-left: 20px;
+  color: var(--muted);
   font-size: 12px;
-  color: var(--danger);
 }
 
 .rs-delete-check {
@@ -1260,14 +2332,8 @@ onBeforeUnmount(() => {
   padding: 10px;
   border: 1px solid var(--border);
   border-radius: 9px;
-  background: var(--surface-soft);
   font-size: 13px;
-  cursor: pointer;
-}
-
-.rs-delete-check input {
-  width: 16px;
-  height: 16px;
+  background: var(--surface-soft);
 }
 
 .rs-delete-actions {
@@ -1276,27 +2342,73 @@ onBeforeUnmount(() => {
   gap: 8px;
 }
 
-.rs-delete-cancel,
-.rs-delete-confirm {
-  padding: 0 14px;
+.rs-delete-actions button {
   min-height: 32px;
+  padding: 0 14px;
   border: 1px solid var(--border);
   border-radius: 9px;
-  font-size: 13px;
-}
-
-.rs-delete-cancel {
-  background: var(--surface);
   color: var(--text);
+  background: var(--surface);
 }
 
 .rs-delete-confirm {
-  background: var(--danger);
-  border-color: var(--danger);
-  color: #fff;
+  border-color: var(--danger) !important;
+  color: #fff !important;
+  background: var(--danger) !important;
 }
 
-.rs-delete-confirm:disabled {
-  opacity: 0.45;
+@media (max-width: 1180px) {
+  .rs-workspace { --raw-preview-safe-inset: 16px; }
+
+  .rs-control-bar {
+    grid-template-columns: minmax(0, 1fr) max-content;
+    grid-template-areas:
+      "left right"
+      "center center";
+  }
+
+  .rs-control-left,
+  .rs-control-right { flex-wrap: wrap; }
+  .rs-control-center { justify-content: flex-start; }
+  .rs-filter-bar { grid-template-columns: repeat(4, minmax(120px, 1fr)); }
+}
+
+@media (max-width: 760px) {
+  .rs-workspace { --raw-preview-safe-inset: 12px; }
+
+  .rs-control-bar { padding-inline: 6px; }
+  .rs-control-label { display: none; }
+  .rs-file-name { max-width: 120px; }
+  .rs-filter-bar { grid-template-columns: repeat(3, minmax(110px, 1fr)); }
+  .rs-control-bar button { padding-inline: 6px; }
+  .rs-control-left,
+  .rs-control-right { flex-wrap: nowrap; }
+  .rs-sync-toggle span { font-size: 0; }
+  .rs-sync-toggle span::after { content: "同步"; font-size: 11px; }
+}
+
+@media (prefers-color-scheme: dark) {
+  .rs-workspace {
+    color-scheme: dark;
+    --surface: #20211e;
+    --surface-soft: #181916;
+    --surface-strong: #30312c;
+    --text: #f1f1eb;
+    --muted: #b1b2aa;
+    --faint: #8e9088;
+    --border: rgb(255 255 255 / 10%);
+    --border-strong: rgb(255 255 255 / 18%);
+    --brand: #efefe9;
+    --success: #71b89a;
+    --danger: #ff9aa7;
+    --shadow-float: 0 18px 48px rgb(0 0 0 / 46%);
+  }
+
+  .rs-star.active,
+  .rs-thumb-stars { color: #f0bd54 !important; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rs-preview-img { transition: none; }
 }
 </style>

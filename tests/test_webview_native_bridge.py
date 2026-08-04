@@ -25,6 +25,19 @@ class _Window:
         return (str(self.selected),)
 
 
+class _MultiWindow(_Window):
+    def __init__(self, selected: list[Path] | None) -> None:
+        super().__init__(Path("."))
+        self.selected_paths = selected
+
+    def create_file_dialog(self, dialog_type, **kwargs):
+        self.dialog_type = dialog_type
+        self.dialog_kwargs = dict(kwargs)
+        if self.selected_paths is None:
+            return None
+        return tuple(str(path) for path in self.selected_paths)
+
+
 class NativeBridgeTests(unittest.TestCase):
     def _registered_image(self, directory: str) -> tuple[ImageRegistry, str, Path]:
         path = Path(directory) / "native action.jpg"
@@ -97,6 +110,72 @@ class NativeBridgeTests(unittest.TestCase):
             self.assertFalse(response["ok"])
             self.assertEqual(response["code"], "native_action_failed")
             self.assertIn("JSON", response["error"])
+
+    def test_raw_selection_allows_multiple_supported_images_in_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            arw = root / "one.ARW"
+            jpg = root / "two.jpg"
+            png = root / "three.PNG"
+            for path in (arw, jpg, png):
+                path.write_bytes(b"source")
+            bridge = NativeBridge(ImageRegistry())
+            window = _MultiWindow([arw, jpg, arw, png])
+            bridge.attach_window(window)
+            fake_webview = SimpleNamespace(
+                FileDialog=SimpleNamespace(OPEN="open", FOLDER="folder")
+            )
+
+            with patch.dict(sys.modules, {"webview": fake_webview}):
+                response = bridge.select_raw_images()
+
+            self.assertEqual(
+                response,
+                {
+                    "ok": True,
+                    "paths": [
+                        str(arw.resolve()),
+                        str(jpg.resolve()),
+                        str(png.resolve()),
+                    ],
+                },
+            )
+            self.assertEqual(window.dialog_type, "open")
+            self.assertEqual(window.dialog_kwargs["allow_multiple"], True)
+            self.assertEqual(
+                window.dialog_kwargs["file_types"],
+                ("Sony A7M4 ARW / 图片 (*.arw;*.jpg;*.jpeg;*.png)",),
+            )
+
+    def test_raw_selection_cancel_returns_an_empty_success(self) -> None:
+        bridge = NativeBridge(ImageRegistry())
+        bridge.attach_window(_MultiWindow(None))
+        fake_webview = SimpleNamespace(
+            FileDialog=SimpleNamespace(OPEN="open", FOLDER="folder")
+        )
+
+        with patch.dict(sys.modules, {"webview": fake_webview}):
+            response = bridge.select_raw_images()
+
+        self.assertEqual(response, {"ok": True, "paths": []})
+
+    def test_raw_selection_rejects_unsupported_or_non_file_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            unsupported = root / "image.webp"
+            unsupported.write_bytes(b"source")
+            bridge = NativeBridge(ImageRegistry())
+            fake_webview = SimpleNamespace(
+                FileDialog=SimpleNamespace(OPEN="open", FOLDER="folder")
+            )
+
+            for selected in ([unsupported], [root]):
+                with self.subTest(selected=selected[0].name):
+                    bridge.attach_window(_MultiWindow(selected))
+                    with patch.dict(sys.modules, {"webview": fake_webview}):
+                        response = bridge.select_raw_images()
+                    self.assertFalse(response["ok"])
+                    self.assertEqual(response["code"], "native_action_failed")
 
     def test_open_image_uses_default_program_and_suppresses_duplicate(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

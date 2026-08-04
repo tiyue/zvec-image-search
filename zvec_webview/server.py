@@ -38,6 +38,8 @@ _MAX_JSON_BYTES: Final = 2 * 1024 * 1024
 _MAX_DIAGNOSTIC_JSON_BYTES: Final = 64 * 1024
 _MAX_QUERY_IMAGE_BYTES: Final = 128 * 1024 * 1024
 _MAX_ASSET_BYTES: Final = 8 * 1024 * 1024
+_MAX_RAW_IMPORT_FILES: Final = 10_000
+_RAW_IMPORT_EXTENSIONS: Final = frozenset({".arw", ".jpg", ".jpeg", ".png"})
 _QUERY_IMAGE_SUFFIXES: Final = {
     "JPEG": ".jpg",
     "PNG": ".png",
@@ -1207,7 +1209,14 @@ def _handler_type(gateway: GatewayServer) -> type[BaseHTTPRequestHandler]:
             # ARW Selection module routes
             # ------------------------------------------------------------------
             if segments and segments[0] == "raw-selection":
-                self._route_raw_selection(method, segments[1:], query_values)
+                try:
+                    self._route_raw_selection(method, segments[1:], query_values)
+                except ValueError as exc:
+                    raise FacadeError(
+                        "invalid_raw_selection_request",
+                        str(exc) or "ARW 选片请求无效。",
+                        status=400,
+                    ) from exc
                 return
             raise FacadeError("route_not_found", "接口不存在。", status=404)
 
@@ -1228,7 +1237,11 @@ def _handler_type(gateway: GatewayServer) -> type[BaseHTTPRequestHandler]:
             if method == "POST" and segments == ("projects",):
                 body = self._read_json()
                 name = body.get("name", "")
-                if not isinstance(name, str) or not name.strip():
+                if (
+                    set(body) != {"name"}
+                    or not isinstance(name, str)
+                    or not name.strip()
+                ):
                     raise FacadeError(
                         "invalid_request",
                         "项目名称不能为空。",
@@ -1241,9 +1254,7 @@ def _handler_type(gateway: GatewayServer) -> type[BaseHTTPRequestHandler]:
             if method == "GET" and len(segments) == 2 and segments[0] == "projects":
                 project = svc.get_project(segments[1])
                 if project is None:
-                    raise FacadeError(
-                        "not_found", "项目不存在。", status=404
-                    )
+                    raise FacadeError("not_found", "项目不存在。", status=404)
                 self._json(HTTPStatus.OK, project)
                 return
 
@@ -1251,7 +1262,11 @@ def _handler_type(gateway: GatewayServer) -> type[BaseHTTPRequestHandler]:
             if method == "PATCH" and len(segments) == 2 and segments[0] == "projects":
                 body = self._read_json()
                 name = body.get("name", "")
-                if not isinstance(name, str) or not name.strip():
+                if (
+                    set(body) != {"name"}
+                    or not isinstance(name, str)
+                    or not name.strip()
+                ):
                     raise FacadeError(
                         "invalid_request",
                         "项目名称不能为空。",
@@ -1259,18 +1274,14 @@ def _handler_type(gateway: GatewayServer) -> type[BaseHTTPRequestHandler]:
                     )
                 project = svc.rename_project(segments[1], name)
                 if project is None:
-                    raise FacadeError(
-                        "not_found", "项目不存在。", status=404
-                    )
+                    raise FacadeError("not_found", "项目不存在。", status=404)
                 self._json(HTTPStatus.OK, project)
                 return
 
             # DELETE raw-selection/projects/{id} — delete project
             if method == "DELETE" and len(segments) == 2 and segments[0] == "projects":
                 if not svc.delete_project(segments[1]):
-                    raise FacadeError(
-                        "not_found", "项目不存在。", status=404
-                    )
+                    raise FacadeError("not_found", "项目不存在。", status=404)
                 self._json(HTTPStatus.OK, {"ok": True})
                 return
 
@@ -1283,15 +1294,20 @@ def _handler_type(gateway: GatewayServer) -> type[BaseHTTPRequestHandler]:
             ):
                 body = self._read_json()
                 folder = body.get("path", "")
-                if not isinstance(folder, str) or not folder.strip():
+                if (
+                    set(body) != {"path"}
+                    or not isinstance(folder, str)
+                    or not folder.strip()
+                    or not Path(folder).is_absolute()
+                ):
                     raise FacadeError(
                         "invalid_request",
                         "文件夹路径不能为空。",
                         status=400,
                     )
                 self._json(
-                    HTTPStatus.OK,
-                    svc.import_folder(segments[1], folder),
+                    HTTPStatus.ACCEPTED,
+                    svc.start_folder_import(segments[1], folder),
                 )
                 return
 
@@ -1304,7 +1320,19 @@ def _handler_type(gateway: GatewayServer) -> type[BaseHTTPRequestHandler]:
             ):
                 body = self._read_json()
                 paths = body.get("paths", [])
-                if not isinstance(paths, list) or not paths:
+                if (
+                    set(body) != {"paths"}
+                    or not isinstance(paths, list)
+                    or not paths
+                    or len(paths) > _MAX_RAW_IMPORT_FILES
+                    or any(
+                        not isinstance(path, str)
+                        or not path.strip()
+                        or not Path(path).is_absolute()
+                        or Path(path).suffix.casefold() not in _RAW_IMPORT_EXTENSIONS
+                        for path in paths
+                    )
+                ):
                     raise FacadeError(
                         "invalid_request",
                         "文件路径列表不能为空。",
@@ -1323,48 +1351,122 @@ def _handler_type(gateway: GatewayServer) -> type[BaseHTTPRequestHandler]:
                 and segments[0] == "projects"
                 and segments[2] == "members"
             ):
-                self._json(
-                    HTTPStatus.OK,
-                    svc.list_members(
+                _reject_unknown_query(
+                    query_values,
+                    {
+                        "offset",
+                        "limit",
+                        "star_mode",
+                        "star_value",
+                        "color_labels",
+                        "filename",
+                        "rated",
+                        "exported",
+                        "formats",
+                        "orientations",
+                        "sort",
+                        "dir",
+                    },
+                )
+                if svc.get_project(segments[1]) is None:
+                    raise FacadeError("not_found", "项目不存在。", status=404)
+                try:
+                    result = svc.list_members(
                         segments[1],
                         offset=_query_int(query_values, "offset", 0, 0, 1_000_000),
                         limit=_query_int(query_values, "limit", 1000, 1, 10_000),
                         star_mode=_query_optional_text(
                             query_values, "star_mode", "", maximum=20
-                        ) or "none",
+                        )
+                        or "none",
                         star_value=_query_int(query_values, "star_value", 0, 0, 5),
                         color_labels=_query_optional_text(
                             query_values, "color_labels", "", maximum=200
-                        ) or "",
+                        )
+                        or "",
                         filename_contains=_query_optional_text(
                             query_values, "filename", "", maximum=500
-                        ) or "",
+                        )
+                        or "",
                         rated_filter=_query_optional_text(
                             query_values, "rated", "", maximum=20
-                        ) or "all",
+                        )
+                        or "all",
+                        exported_filter=_query_optional_text(
+                            query_values, "exported", "", maximum=20
+                        )
+                        or "all",
+                        formats=_query_optional_text(
+                            query_values, "formats", "", maximum=100
+                        )
+                        or "",
+                        orientations=_query_optional_text(
+                            query_values, "orientations", "", maximum=100
+                        )
+                        or "",
                         sort_field=_query_optional_text(
                             query_values, "sort", "", maximum=30
-                        ) or "filename",
+                        )
+                        or "filename",
                         sort_direction=_query_optional_text(
                             query_values, "dir", "", maximum=10
-                        ) or "asc",
-                    ),
-                )
+                        )
+                        or "asc",
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise FacadeError(
+                        "invalid_query",
+                        "筛选或排序参数无效。",
+                        status=400,
+                    ) from exc
+                self._json(HTTPStatus.OK, result)
                 return
 
             # GET raw-selection/members/{id}
             if method == "GET" and len(segments) == 2 and segments[0] == "members":
                 member = svc.get_member(segments[1])
                 if member is None:
-                    raise FacadeError(
-                        "not_found", "图片不存在。", status=404
-                    )
+                    raise FacadeError("not_found", "图片不存在。", status=404)
                 self._json(HTTPStatus.OK, member)
                 return
 
             # GET raw-selection/looks — list A7M4 creative looks
             if method == "GET" and segments == ("looks",):
                 self._json(HTTPStatus.OK, {"looks": svc.list_creative_looks()})
+                return
+
+            # GET raw-selection/jobs/{id}
+            if method == "GET" and len(segments) == 2 and segments[0] == "jobs":
+                job = svc.get_job(segments[1])
+                if job is None:
+                    raise FacadeError("not_found", "任务不存在。", status=404)
+                self._json(HTTPStatus.OK, job)
+                return
+
+            # POST raw-selection/jobs/{id}/cancel
+            if (
+                method == "POST"
+                and len(segments) == 3
+                and segments[0] == "jobs"
+                and segments[2] == "cancel"
+            ):
+                cancelled = svc.cancel_job(segments[1])
+                if cancelled is None:
+                    raise FacadeError("not_found", "任务不存在。", status=404)
+                self._json(HTTPStatus.OK, {"cancel_requested": cancelled})
+                return
+
+            # GET raw-selection/members/{id}/source-status
+            if (
+                method == "GET"
+                and len(segments) == 3
+                and segments[0] == "members"
+                and segments[2] == "source-status"
+            ):
+                status = svc.get_source_status(segments[1])
+                if status is None:
+                    raise FacadeError("not_found", "图片不存在。", status=404)
+                self._json(HTTPStatus.OK, status)
                 return
 
             # GET raw-selection/members/{id}/thumbnail
@@ -1374,18 +1476,22 @@ def _handler_type(gateway: GatewayServer) -> type[BaseHTTPRequestHandler]:
                 and segments[0] == "members"
                 and segments[2] == "thumbnail"
             ):
-                result = svc.get_thumbnail_bytes(segments[1])
+                _reject_unknown_query(query_values, {"priority", "v"})
+                _query_optional_text(query_values, "v", "", maximum=300)
+                priority = _raw_image_priority(query_values, "visible")
+                result = svc.get_thumbnail_bytes(segments[1], priority=priority)
                 if result.error:
                     raise FacadeError(
                         "decode_failed",
                         result.error,
-                        status=500,
+                        status=503 if result.retryable else 500,
                     )
                 self._bytes(
                     HTTPStatus.OK,
                     result.data,
                     result.content_type,
                     cache="private, max-age=300",
+                    warning=result.warning,
                 )
                 return
 
@@ -1396,25 +1502,44 @@ def _handler_type(gateway: GatewayServer) -> type[BaseHTTPRequestHandler]:
                 and segments[0] == "members"
                 and segments[2] == "preview"
             ):
-                result = svc.get_preview_bytes(
-                    segments[1],
-                    display_width=_query_int(query_values, "dw", 0, 0, 10_000),
-                    display_height=_query_int(query_values, "dh", 0, 0, 10_000),
-                    look=_query_optional_text(
-                        query_values, "look", "as_shot", maximum=20
-                    ) or "as_shot",
+                _reject_unknown_query(
+                    query_values,
+                    {"dw", "dh", "look", "priority", "quality", "v"},
                 )
+                _query_optional_text(query_values, "v", "", maximum=300)
+                try:
+                    result = svc.get_preview_bytes(
+                        segments[1],
+                        display_width=_query_int(query_values, "dw", 0, 0, 10_000),
+                        display_height=_query_int(query_values, "dh", 0, 0, 10_000),
+                        look=_query_optional_text(
+                            query_values, "look", "as_shot", maximum=20
+                        )
+                        or "as_shot",
+                        quality=_query_optional_text(
+                            query_values, "quality", "best", maximum=20
+                        )
+                        or "best",
+                        priority=_raw_image_priority(query_values, "current"),
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise FacadeError(
+                        "invalid_query",
+                        "预览参数无效。",
+                        status=400,
+                    ) from exc
                 if result.error:
                     raise FacadeError(
                         "decode_failed",
                         result.error,
-                        status=500,
+                        status=503 if result.retryable else 500,
                     )
                 self._bytes(
                     HTTPStatus.OK,
                     result.data,
                     result.content_type,
                     cache="private, max-age=300",
+                    warning=result.warning,
                 )
                 return
 
@@ -1428,16 +1553,20 @@ def _handler_type(gateway: GatewayServer) -> type[BaseHTTPRequestHandler]:
                 body = self._read_json()
                 star = body.get("star_rating")
                 color = body.get("color_label", "none")
-                if not isinstance(star, int) or not (0 <= star <= 5):
+                if (
+                    set(body) != {"star_rating", "color_label"}
+                    or isinstance(star, bool)
+                    or not isinstance(star, int)
+                    or not (0 <= star <= 5)
+                    or color not in {"none", "red", "yellow", "green", "blue", "purple"}
+                ):
                     raise FacadeError(
                         "invalid_request",
-                        "星级必须为 0-5 的整数。",
+                        "星级或色标无效。",
                         status=400,
                     )
                 if not svc.update_rating(segments[1], star, color):
-                    raise FacadeError(
-                        "not_found", "图片不存在。", status=404
-                    )
+                    raise FacadeError("not_found", "图片不存在。", status=404)
                 self._json(HTTPStatus.OK, {"ok": True})
                 return
 
@@ -1450,10 +1579,15 @@ def _handler_type(gateway: GatewayServer) -> type[BaseHTTPRequestHandler]:
             ):
                 body = self._read_json()
                 look = body.get("creative_look", "as_shot")
-                if not svc.update_creative_look(segments[1], look):
+                valid_looks = {item["id"] for item in svc.list_creative_looks()}
+                if set(body) != {"creative_look"} or look not in valid_looks:
                     raise FacadeError(
-                        "not_found", "图片不存在。", status=404
+                        "invalid_request",
+                        "Sony 创意外观无效。",
+                        status=400,
                     )
+                if not svc.update_creative_look(segments[1], look):
+                    raise FacadeError("not_found", "图片不存在。", status=404)
                 self._json(HTTPStatus.OK, {"ok": True})
                 return
 
@@ -1464,6 +1598,8 @@ def _handler_type(gateway: GatewayServer) -> type[BaseHTTPRequestHandler]:
                 and segments[0] == "projects"
                 and segments[2] == "workspace"
             ):
+                if svc.get_project(segments[1]) is None:
+                    raise FacadeError("not_found", "项目不存在。", status=404)
                 ws = svc.get_workspace_state(segments[1])
                 self._json(HTTPStatus.OK, ws or {})
                 return
@@ -1476,18 +1612,50 @@ def _handler_type(gateway: GatewayServer) -> type[BaseHTTPRequestHandler]:
                 and segments[2] == "workspace"
             ):
                 body = self._read_json()
-                svc.save_workspace_state(
-                    segments[1],
-                    last_member_id=body.get("last_member_id"),
-                    filter_star_mode=body.get("filter_star_mode", "none"),
-                    filter_star_value=body.get("filter_star_value", 0),
-                    filter_color_labels=body.get("filter_color_labels", ""),
-                    filter_filename=body.get("filter_filename", ""),
-                    filter_rated=body.get("filter_rated", "all"),
-                    sort_field=body.get("sort_field", "filename"),
-                    sort_direction=body.get("sort_direction", "asc"),
-                    filmstrip_scroll=body.get("filmstrip_scroll", 0.0),
-                )
+                allowed_workspace_fields = {
+                    "last_member_id",
+                    "filter_star_mode",
+                    "filter_star_value",
+                    "filter_color_labels",
+                    "filter_filename",
+                    "filter_rated",
+                    "filter_exported",
+                    "filter_formats",
+                    "filter_orientations",
+                    "sort_field",
+                    "sort_direction",
+                    "filmstrip_scroll",
+                }
+                unknown = sorted(set(body) - allowed_workspace_fields)
+                if unknown:
+                    raise FacadeError(
+                        "invalid_request",
+                        "工作区状态字段无效。",
+                        status=400,
+                        details={"unknown_fields": unknown},
+                    )
+                try:
+                    svc.save_workspace_state(
+                        segments[1],
+                        last_member_id=body.get("last_member_id"),
+                        filter_star_mode=body.get("filter_star_mode", "none"),
+                        filter_star_value=body.get("filter_star_value", 0),
+                        filter_color_labels=body.get("filter_color_labels", ""),
+                        filter_filename=body.get("filter_filename", ""),
+                        filter_rated=body.get("filter_rated", "all"),
+                        filter_exported=body.get("filter_exported", "all"),
+                        filter_formats=body.get("filter_formats", ""),
+                        filter_orientations=body.get("filter_orientations", ""),
+                        sort_field=body.get("sort_field", "filename"),
+                        sort_direction=body.get("sort_direction", "asc"),
+                        filmstrip_scroll=body.get("filmstrip_scroll", 0.0),
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise FacadeError(
+                        "invalid_request",
+                        "工作区状态无效。",
+                        status=400,
+                    ) from exc
                 self._json(HTTPStatus.OK, {"ok": True})
                 return
 
@@ -1501,7 +1669,10 @@ def _handler_type(gateway: GatewayServer) -> type[BaseHTTPRequestHandler]:
                 body = self._read_json()
                 member_ids = body.get("member_ids", [])
                 destination = body.get("destination", "")
-                if not isinstance(member_ids, list) or not member_ids:
+                if set(body) != {
+                    "member_ids",
+                    "destination",
+                } or not _valid_raw_member_ids(member_ids):
                     raise FacadeError(
                         "invalid_request",
                         "请选择要导出的图片。",
@@ -1513,17 +1684,24 @@ def _handler_type(gateway: GatewayServer) -> type[BaseHTTPRequestHandler]:
                         "请选择导出目标目录。",
                         status=400,
                     )
-                self._json(
-                    HTTPStatus.OK,
-                    svc.export_files(member_ids, destination),
-                )
+                if svc.get_project(segments[1]) is None:
+                    raise FacadeError("not_found", "项目不存在。", status=404)
+                try:
+                    result = svc.start_export(segments[1], member_ids, destination)
+                except (TypeError, ValueError) as exc:
+                    raise FacadeError(
+                        "invalid_request",
+                        "导出图片不属于当前项目或导出参数无效。",
+                        status=400,
+                    ) from exc
+                self._json(HTTPStatus.ACCEPTED, result)
                 return
 
             # POST raw-selection/members/remove
             if method == "POST" and segments == ("members", "remove"):
                 body = self._read_json()
                 member_ids = body.get("member_ids", [])
-                if not isinstance(member_ids, list) or not member_ids:
+                if set(body) != {"member_ids"} or not _valid_raw_member_ids(member_ids):
                     raise FacadeError(
                         "invalid_request",
                         "请选择要移出的图片。",
@@ -1538,13 +1716,16 @@ def _handler_type(gateway: GatewayServer) -> type[BaseHTTPRequestHandler]:
                 body = self._read_json()
                 member_ids = body.get("member_ids", [])
                 confirmed = body.get("confirmed", False)
-                if not isinstance(member_ids, list) or not member_ids:
+                if set(body) != {
+                    "member_ids",
+                    "confirmed",
+                } or not _valid_raw_member_ids(member_ids):
                     raise FacadeError(
                         "invalid_request",
                         "请选择要删除的图片。",
                         status=400,
                     )
-                if not confirmed:
+                if confirmed is not True:
                     raise FacadeError(
                         "invalid_request",
                         "永久删除需要明确确认。",
@@ -1563,7 +1744,35 @@ def _handler_type(gateway: GatewayServer) -> type[BaseHTTPRequestHandler]:
                 and segments[0] == "projects"
                 and segments[2] == "clear-cache"
             ):
-                svc.clear_project_cache(segments[1])
+                if svc.get_project(segments[1]) is None:
+                    raise FacadeError("not_found", "项目不存在。", status=404)
+                try:
+                    svc.clear_project_cache(segments[1])
+                except (TypeError, ValueError) as exc:
+                    raise FacadeError(
+                        "invalid_request",
+                        "无法清除项目缓存。",
+                        status=400,
+                    ) from exc
+                self._json(HTTPStatus.OK, {"ok": True})
+                return
+
+            # POST raw-selection/projects/{id}/cancel-work
+            if (
+                method == "POST"
+                and len(segments) == 3
+                and segments[0] == "projects"
+                and segments[2] == "cancel-work"
+            ):
+                if query_values:
+                    raise FacadeError(
+                        "invalid_query",
+                        "取消任务接口不接受查询参数。",
+                        status=400,
+                    )
+                if svc.get_project(segments[1]) is None:
+                    raise FacadeError("not_found", "项目不存在。", status=404)
+                svc.cancel_project_work(segments[1])
                 self._json(HTTPStatus.OK, {"ok": True})
                 return
 
@@ -1688,12 +1897,18 @@ def _handler_type(gateway: GatewayServer) -> type[BaseHTTPRequestHandler]:
             *,
             cache: str,
             etag: str | None = None,
+            warning: str | None = None,
         ) -> None:
             self.send_response(status)
             self._security_headers(cache=cache)
             self.send_header("Content-Type", content_type)
             if etag is not None:
                 self.send_header("ETag", etag)
+            if warning:
+                self.send_header(
+                    "X-Zvec-Warning",
+                    warning.encode("ascii", errors="replace").decode("ascii"),
+                )
             self.send_header("Content-Length", str(len(content)))
             self.end_headers()
             if self.command != "HEAD":
@@ -1787,6 +2002,37 @@ def _query_optional_text(
     if len(value) > maximum or any(ord(character) < 32 for character in value):
         raise FacadeError("invalid_query", f"{name} is invalid.")
     return value
+
+
+def _raw_image_priority(
+    query: Mapping[str, list[str]],
+    default: str,
+) -> str:
+    value = _query_optional_text(query, "priority", default, maximum=20) or default
+    if value not in {
+        "current",
+        "compare",
+        "visible",
+        "overscan",
+        "adjacent",
+        "background",
+    }:
+        raise FacadeError("invalid_query", "图片任务优先级无效。")
+    return value
+
+
+def _valid_raw_member_ids(value: Any) -> bool:
+    return (
+        isinstance(value, list)
+        and 0 < len(value) <= 10_000
+        and all(
+            isinstance(member_id, str)
+            and 0 < len(member_id) <= 160
+            and not any(character in member_id for character in "\r\n\0/\\")
+            for member_id in value
+        )
+        and len(value) == len(set(value))
+    )
 
 
 def _query_required_text(

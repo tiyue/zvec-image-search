@@ -234,25 +234,28 @@ class DerivedCacheTest(unittest.TestCase):
 
 
 class CreativeLookTest(unittest.TestCase):
-    def test_valid_looks(self) -> None:
+    def test_only_calibrated_as_shot_look_is_available(self) -> None:
         self.assertTrue(is_valid_look(DEFAULT_LOOK))
-        self.assertTrue(is_valid_look("VV"))
-        self.assertFalse(is_valid_look("nope"))
-        # Expected A7M4 preset baseline present.
+        self.assertEqual(VALID_LOOKS, (DEFAULT_LOOK,))
         for look in ("ST", "PT", "NT", "VV", "VV2", "FL", "IN", "SH", "BW", "SE"):
-            self.assertIn(look, VALID_LOOKS)
+            with self.subTest(look=look):
+                self.assertFalse(is_valid_look(look))
 
     def test_as_shot_noop(self) -> None:
         img = Image.new("RGB", (10, 10), color=(10, 20, 30))
         out = apply_creative_look(img, DEFAULT_LOOK)
         self.assertEqual(out.getpixel((0, 0)), (10, 20, 30))
 
-    def test_bw_is_monochrome(self) -> None:
-        img = Image.new("RGB", (10, 10), color=(200, 100, 50))
-        out = apply_creative_look(img, "BW")
-        r, g, b = out.getpixel((0, 0))
-        self.assertEqual(r, g)
-        self.assertEqual(g, b)
+    def test_uncalibrated_looks_are_rejected_without_mutating_base(self) -> None:
+        base = Image.new("RGB", (12, 8), color=(80, 120, 160))
+        original = base.tobytes()
+        for look in ("ST", "VV", "BW"):
+            with (
+                self.subTest(look=look),
+                self.assertRaisesRegex(ValueError, "trusted calibration"),
+            ):
+                apply_creative_look(base, look)
+        self.assertEqual(base.tobytes(), original)
 
 
 class DecodeSchedulerTest(unittest.TestCase):
@@ -307,9 +310,7 @@ class DecodeSchedulerTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.sched.run_single_flight(("f",), ".jpg", "thumb", work)
         state["fail"] = False
-        self.assertEqual(
-            self.sched.run_single_flight(("f",), ".jpg", "thumb", work), 7
-        )
+        self.assertEqual(self.sched.run_single_flight(("f",), ".jpg", "thumb", work), 7)
 
     def test_generation_bump(self) -> None:
         g0 = self.sched.generation

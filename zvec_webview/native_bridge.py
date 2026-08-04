@@ -21,8 +21,10 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 from .image_registry import ImageRegistry, ImageRegistryError
 
 _MAX_BATCH_IMAGES: Final = 10_000
+_MAX_RAW_IMAGE_SELECTION: Final = 10_000
 _MAX_CLIPBOARD_PIXELS: Final = 50_000_000
 _EXPORT_HISTORY_LIMIT: Final = 64
+_RAW_IMAGE_EXTENSIONS: Final = frozenset({".arw", ".jpg", ".jpeg", ".png"})
 
 
 @dataclass(slots=True)
@@ -80,6 +82,34 @@ class NativeBridge:
             if path is not None and path.suffix.casefold() != ".json":
                 raise ValueError("请选择 JSON 文件。")
             return {"ok": True, "path": str(path) if path is not None else None}
+        except Exception as exc:
+            return _bridge_error(exc)
+
+    def select_raw_images(self) -> dict[str, Any]:
+        """Select supported RAW-workspace sources without registering them.
+
+        RAW selection intentionally returns absolute paths because the isolated
+        project database stores user-selected source references.  The general
+        search-image picker keeps using opaque ``ImageRegistry`` IDs.
+        """
+
+        try:
+            result = self._create_dialog("raw_images")
+            paths = _dialog_paths(result, limit=_MAX_RAW_IMAGE_SELECTION)
+            selected: list[str] = []
+            seen: set[str] = set()
+            for path in paths:
+                if path.suffix.casefold() not in _RAW_IMAGE_EXTENSIONS:
+                    raise ValueError("仅支持 Sony A7M4 ARW、JPG、JPEG 和 PNG 图片。")
+                resolved = path.resolve(strict=True)
+                if not resolved.is_file():
+                    raise ValueError("请选择图片文件，不能选择文件夹。")
+                key = os.path.normcase(str(resolved))
+                if key in seen:
+                    continue
+                seen.add(key)
+                selected.append(str(resolved))
+            return {"ok": True, "paths": selected}
         except Exception as exc:
             return _bridge_error(exc)
 
@@ -370,17 +400,21 @@ class NativeBridge:
         ) or getattr(webview, "OPEN_DIALOG", None)
         if dialog_type is None:
             raise RuntimeError("当前 pywebview 不支持文件选择。")
-        file_types = (
-            ("JSON 文件 (*.json)", "所有文件 (*.*)")
-            if kind == "json"
-            else (
+        if kind == "json":
+            file_types = ("JSON 文件 (*.json)", "所有文件 (*.*)")
+            allow_multiple = False
+        elif kind == "raw_images":
+            file_types = ("Sony A7M4 ARW / 图片 (*.arw;*.jpg;*.jpeg;*.png)",)
+            allow_multiple = True
+        else:
+            file_types = (
                 "图片 (*.jpg;*.jpeg;*.png;*.webp;*.bmp;*.gif;*.tif;*.tiff)",
                 "所有文件 (*.*)",
             )
-        )
+            allow_multiple = False
         return window.create_file_dialog(
             dialog_type,
-            allow_multiple=False,
+            allow_multiple=allow_multiple,
             file_types=file_types,
         )
 
@@ -426,6 +460,25 @@ def _first_dialog_path(value: Any) -> Path | None:
     if not isinstance(value, str) or not value.strip():
         raise RuntimeError("文件选择器返回了无效路径。")
     return Path(value).expanduser()
+
+
+def _dialog_paths(value: Any, *, limit: int) -> tuple[Path, ...]:
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+        raise ValueError("文件选择数量上限无效。")
+    if value is None or value == "":
+        return ()
+    values = value if isinstance(value, (tuple, list)) else (value,)
+    if len(values) > limit:
+        raise ValueError(f"一次最多选择 {limit} 张图片。")
+    result: list[Path] = []
+    for item in values:
+        if not isinstance(item, str) or not item.strip():
+            raise RuntimeError("文件选择器返回了无效路径。")
+        path = Path(item).expanduser()
+        if not path.is_absolute():
+            raise RuntimeError("文件选择器必须返回绝对路径。")
+        result.append(path)
+    return tuple(result)
 
 
 def _copy_windows_clipboard(text: str) -> None:

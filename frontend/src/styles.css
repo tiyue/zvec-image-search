@@ -204,6 +204,9 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 
 /* Full-height feature workspaces. Their own scoped styles keep the controls functional; these rules remove the old card-dashboard framing. */
 .feature-page, .settings-feature-page { width: 100%; height: 100%; min-width: 0; min-height: 0; overflow: auto; padding: 14px; background: #fff; scrollbar-gutter: stable; }
+.page-host.raw-selection-active { grid-template-rows: minmax(0, 1fr); }
+.page-host.raw-selection-active > .app-topbar { display: none; }
+.page-host.raw-selection-active > [data-page-section="raw-selection"] { overflow: hidden; padding: 0; scrollbar-gutter: auto; }
 .feature-page :is(.panel, .activity-panel, .composer, .settings-card), .settings-feature-page :is(.panel, .settings-card) { border-color: var(--border) !important; color: #222 !important; background: #fff !important; box-shadow: none !important; }
 .feature-page :is(.primary, .activity-button-primary, .primary-button), .settings-feature-page :is(.primary) { color: #fff !important; border-color: #5f5f5f !important; background: #5f5f5f !important; box-shadow: none !important; }
 .feature-page :is(.secondary, .activity-button-quiet, .toolbar-button, .intelligence-button, .learning-button), .settings-feature-page :is(.secondary) { border-color: var(--border) !important; color: #333 !important; background: #f4f4f4 !important; box-shadow: none !important; }

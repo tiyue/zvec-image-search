@@ -513,9 +513,8 @@ raw-selection/
 - `image_vector_service/raw_selection/decoder.py` — ARW/JPG/PNG 解码
 - `image_vector_service/raw_selection/cache.py` — 派生缓存管理
 - `image_vector_service/raw_selection/scheduler.py` — 任务优先级调度
+- `image_vector_service/raw_selection/jobs.py` — 有界后台任务登记、进度与取消
 - `image_vector_service/raw_selection/service.py` — 高层服务编排
-- `image_vector_service/raw_selection/exporter.py` — 统一导出
-- `image_vector_service/raw_selection/deleter.py` — 永久删除两阶段日志
 - `image_vector_service/raw_selection/creative_look.py` — Sony 创意外观（阻断中）
 
 **新增文件（前端 Vue）：**
@@ -523,10 +522,14 @@ raw-selection/
 
 **修改文件（集成接入点）：**
 - `zvec_webview/server.py` — 新增 ARW 选片 API 路由
-- `zvec_webview/app.py` — 初始化 raw_selection 服务
+- `zvec_webview/native_bridge.py` — 原生多文件选择桥接
 - `frontend/src/App.vue` — 新增左侧导航入口
-- `pyproject.toml` — 新增 rawpy 可选依赖
-- `requirements.txt` — 新增 rawpy 依赖
+- `frontend/src/api/gateway.ts`、`frontend/src/types/contracts.ts`、`frontend/src/styles.css` — 直接接入契约与模块样式
+- `pyproject.toml` — 声明锁定的 rawpy 运行依赖
+- `tests/test_raw_selection*.py`、`tests/test_webview_gateway.py`、`tests/test_webview_native_bridge.py` — 定向回归
+- `tools/benchmark_raw_selection.py` — RAW 专用、只读性能与正式性检查
+- `docs/raw-image-support-requirements.md`、`docs/raw-selection-dev-summary.md`、`docs/spec.md` — 事实与规格同步
+- `zvec_webview/frontend_dist/` — 前端验证通过后由 Vite 机械生成的产物
 
 **绝不修改：**
 - `android/` 目录任何文件
@@ -551,14 +554,19 @@ raw-selection/
 | 2026-08-03 12:50 | 已完成 | Phase 4: 星级/色标/筛选/排序 UI |
 | 2026-08-03 12:50 | 已完成 | Phase 5: 统一导出 + 移出项目 + 永久删除 |
 | 2026-08-03 13:10 | 已完成 | Phase 6: 双图对比（同步缩放/平移、双侧评级、Esc 返回） |
-| 2026-08-03 13:20 | 已完成 | Phase 7: Sony 创意外观（新方案：as_shot 内嵌 JPEG + 其他外观校准渲染） |
-| 2026-08-03 13:30 | 已完成 | 浏览器端到端视觉验证（项目页/工作区/缩略图/外观选择器） |
+| 2026-08-03 13:20 | 已撤回 | Phase 7 旧实现未经过可信 A7M4 参考输出校准，近似预置已移除；当前仅开放 `拍摄时（As Shot）` |
+| 2026-08-03 13:30 | 已完成 | 已验证项目页、工作区、空状态、对比模式及 light/dark、宽/窄布局，并保留真实浏览器与 Windows WebView 截图证据 |
+| 2026-08-04 | 已完成 | 严格 A7M4 型号门禁、直接提取内嵌 JPEG、源文件版本刷新与错误可见化 |
+| 2026-08-04 | 已完成 | 渐进式文件夹导入、后台缩略图、异步导出、进度/取消与操作日志 |
+| 2026-08-04 | 已完成 | 项目封面拼图、空项目双入口、三级原位渐进预览与前后端回归测试 |
+| 2026-08-04 | 已完成 | 使用 ARW TIFF 容器方向统一元数据、缩略图和预览；`embedded` 首屏按显示尺寸快速缩放，`best` 保留完整 4672×7008 预览 |
+| 2026-08-04 | 已完成 | Python 120 项 + 63 个子测试、前端 41 文件/303 项、Ruff、TypeScript、production build 与基准自检通过；一次性 Python 3.12 环境验证锁定依赖闭包一致 |
 
 ### 已知限制
 
-1. **rawpy 已安装并锁定**：`rawpy==0.27.0`（requirements.txt / requirements-lock.txt）。真实 A7M4 ARW 解码验证通过（缩略图 546ms、预览 305ms、完整解码 1498ms）。
-2. **缩略图/预览磁盘缓存已实现**：`cache.py` 原子写入 + 源版本（path/size/mtime_ns）校验；缓存命中 0.5ms。
-3. **胶片栏虚拟化已实现**：仅渲染视口 ± 2 屏节点。
-4. **双图对比已实现**：同步缩放/平移开关、双侧独立评级/色标、Esc 返回。
-5. **Sony 创意外观已实现（新方案）**：as_shot 用内嵌 JPEG；其他 10 个预置（ST/PT/NT/VV/VV2/FL/IN/SH/BW/SE）为基于真实 A7M4 样片校准的近似渲染，非 Sony 内部算法像素级复刻，色彩差异已如实记录（calibration_note）。JPG/PNG 不应用外观（选择器禁用）。
-6. **性能门禁未完整验证**：未进行 20 组冷缓存首 24 张、各并发档 RAW 解码 P50/P95 等正式基准。
+1. **目标运行时闭包已验证，正式打包仍须保留同一闭包**：已声明 `rawpy==0.27.0`。一次性 Python 3.12.13 环境从 `requirements-lock.txt` 安装 NumPy 2.3.5、Pillow 12.3.0、rawpy 0.27.0 和 zvec 0.5.1 后，基准报告 `matches_target_closure=true`；已安装 rawpy wheel 含 rawpy 与 LibRaw 许可证文件。日常开发 `.venv` 仍是 Python 3.14.5，不得用其报告冒充目标闭包。
+2. **缩略图/预览磁盘缓存已实现**：`cache.py` 原子写入并校验源路径、大小、`mtime_ns` 与管线版本；源文件变化会失效旧派生结果并重新验证 A7M4 型号。
+3. **导入和导出是可观察后台任务**：文件夹扫描渐进登记，随后后台生成缩略图；导出逐项记录进度、失败和取消，重启会把遗留的未完成导入/导出日志明确收尾为失败。
+4. **三级预览已实现**：同一图像层依次显示缩略图、按实际显示尺寸快速生成的内嵌预览和完整最佳预览，高清替换时保留缩放/平移；双图两侧独立推进。ARW 内嵌 JPEG 不携带方向时使用 TIFF 容器方向，元数据、缩略图和预览保持一致；缓存管线版本已升级以失效历史错误方向结果。
+5. **Sony 创意外观处于规格定义的实施阻断**：只有 `拍摄时（As Shot）`可用，并使用相机内嵌 JPEG；ST/PT/NT/VV/VV2/FL/IN/SH/BW/SE 在取得合法、可复现且经可信 A7M4 参考输出逐项校准的路径前不可选择。历史近似滤镜已移除，数据库中的旧选择会重置为 `as_shot`。
+6. **当前性能结果只能作为非正式证据**：目标 Python 3.12 锁定闭包下，只读输入为 384 项（192 ARW + 192 JPG，无 PNG）。当前代码冷首 24 张 P95 525.142ms、冷首 100 张 2067.703ms、冷全 384 张 7230.719ms、冷内嵌预览 98.971ms、重启热首 24 张 43.538ms、热预览 2.982ms、重启预览 2.827ms、缓存双图 3.764ms；这些可测硬门禁均通过，但缺少至少 300 ARW、1000 项、PNG 和完整 RAW 模式清单，不能宣称正式验收通过。

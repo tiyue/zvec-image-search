@@ -17,6 +17,10 @@ const nativeActionMocks = vi.hoisted(() => ({
   exportJob: { value: null },
 }));
 
+const rawSelectionMocks = vi.hoisted(() => ({
+  selectedFiles: vi.fn(),
+}));
+
 vi.mock("../composables/useNativeImageActions", () => ({
   useNativeImageActions: () => nativeActionMocks,
 }));
@@ -144,6 +148,27 @@ const RecommendationStub = defineComponent({
   },
 });
 
+const RawSelectionStub = defineComponent({
+  name: "RawSelectionPage",
+  emits: ["toast", "select-folder", "select-files"],
+  setup(_props, { emit }) {
+    return () => h("section", { "data-testid": "raw-selection-page" }, [
+      "ARW 选片内容",
+      h(
+        "button",
+        {
+          type: "button",
+          "data-testid": "raw-select-files",
+          onClick: () => emit("select-files", (paths: string[]) => {
+            rawSelectionMocks.selectedFiles(paths);
+          }),
+        },
+        "导入图片",
+      ),
+    ]);
+  },
+});
+
 function jsonResponse(payload: unknown): Response {
   return new Response(JSON.stringify(payload), {
     status: 200,
@@ -159,6 +184,7 @@ function mountApp(): VueWrapper {
         TasksPage: TasksStub,
         OrganizePage: OrganizeStub,
         RecommendationPage: RecommendationStub,
+        RawSelectionPage: RawSelectionStub,
         SettingsPage: SettingsStub,
       },
     },
@@ -171,6 +197,7 @@ describe("App page shell", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    Reflect.deleteProperty(window, "pywebview");
     nativeActionMocks.selectQueryImage.mockResolvedValue(null);
     nativeActionMocks.registerQueryImage.mockResolvedValue(null);
     nativeActionMocks.exporting.value = false;
@@ -217,6 +244,7 @@ describe("App page shell", () => {
   afterEach(() => {
     wrapper?.unmount();
     wrapper = null;
+    Reflect.deleteProperty(window, "pywebview");
     vi.unstubAllGlobals();
   });
 
@@ -224,7 +252,7 @@ describe("App page shell", () => {
     wrapper = mountApp();
     await flushPromises();
 
-    expect(wrapper.findAll(".nav-item")).toHaveLength(6);
+    expect(wrapper.findAll(".nav-item")).toHaveLength(7);
     expect(wrapper.get(".nav-item[data-page='search']").attributes("aria-current")).toBe("page");
     expect(wrapper.get("[data-page-section='search']").isVisible()).toBe(true);
     expect(wrapper.find("[data-page-section='search'] .page-heading").exists()).toBe(false);
@@ -248,7 +276,7 @@ describe("App page shell", () => {
 
     await wrapper.get(".sidebar-toggle").trigger("click");
     expect(wrapper.get(".app-shell").classes()).toContain("sidebar-collapsed");
-    expect(wrapper.findAll(".nav-item")).toHaveLength(6);
+    expect(wrapper.findAll(".nav-item")).toHaveLength(7);
   });
 
   it("keeps the requested result count uncapped without a redundant fixed-page summary", async () => {
@@ -359,7 +387,7 @@ describe("App page shell", () => {
     expect(wrapper.find(".gallery-panel").exists()).toBe(true);
   });
 
-  it("supports Alt+1 through Alt+6 plus slash, Ctrl+K and Ctrl+G", async () => {
+  it("supports Alt+1 through Alt+7 plus slash, Ctrl+K and Ctrl+G", async () => {
     latestPayload = {
       ...latestPayload,
       total_items: 30,
@@ -368,14 +396,22 @@ describe("App page shell", () => {
     wrapper = mountApp();
     await flushPromises();
 
-    const destinations = ["search", "tasks", "batch", "groups", "learning", "recommendations"];
+    const destinations = [
+      "search",
+      "tasks",
+      "batch",
+      "groups",
+      "learning",
+      "recommendations",
+      "raw-selection",
+    ];
     for (const [index, page] of destinations.entries()) {
       const digit = String(index + 1);
       window.dispatchEvent(
         new KeyboardEvent("keydown", { key: digit, code: `Digit${digit}`, altKey: true }),
       );
       await wrapper.vm.$nextTick();
-      const section = page === "search" || page === "tasks" || page === "recommendations"
+      const section = page === "search" || page === "tasks" || page === "recommendations" || page === "raw-selection"
         ? page
         : "organize";
       expect(wrapper.get(`[data-page-section='${section}']`).isVisible()).toBe(true);
@@ -405,6 +441,33 @@ describe("App page shell", () => {
     await wrapper.vm.$nextTick();
     await wrapper.vm.$nextTick();
     expect(document.activeElement).toBe(wrapper.get("input[aria-label='跳转页码']").element);
+  });
+
+  it("uses the RAW-only shell and forwards native multi-file selections", async () => {
+    const selectRawImages = vi.fn().mockResolvedValue({
+      ok: true,
+      paths: ["D:\\shoot\\one.ARW", "D:\\shoot\\two.JPG"],
+    });
+    Object.defineProperty(window, "pywebview", {
+      configurable: true,
+      value: { api: { select_raw_images: selectRawImages } },
+    });
+    wrapper = mountApp();
+    await flushPromises();
+
+    await wrapper.get(".nav-item[data-page='raw-selection']").trigger("click");
+    await wrapper.vm.$nextTick();
+    expect(wrapper.get(".app-shell").classes()).toContain("raw-selection-active");
+    expect(wrapper.get(".page-host").classes()).toContain("raw-selection-active");
+    expect(wrapper.get("[data-page-section='raw-selection']").isVisible()).toBe(true);
+
+    await wrapper.get("[data-testid='raw-select-files']").trigger("click");
+    await flushPromises();
+    expect(selectRawImages).toHaveBeenCalledTimes(1);
+    expect(rawSelectionMocks.selectedFiles).toHaveBeenCalledWith([
+      "D:\\shoot\\one.ARW",
+      "D:\\shoot\\two.JPG",
+    ]);
   });
 
   it("tells the task page to stop live polling while it is hidden", async () => {

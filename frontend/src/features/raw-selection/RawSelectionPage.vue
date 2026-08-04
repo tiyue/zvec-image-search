@@ -1,12 +1,11 @@
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, ref } from "vue";
+import { nextTick, onBeforeUnmount, onMounted, ref } from "vue";
 
 import AppIcon from "../../components/AppIcon.vue";
 import {
   clearProjectCache,
   createProject,
   deleteProject,
-  importFolder,
   listProjects,
   renameProject,
 } from "./api";
@@ -16,6 +15,7 @@ import type { RawProject } from "./types";
 const emit = defineEmits<{
   toast: [title: string, message: string, kind: "info" | "success" | "error"];
   selectFolder: [callback: (path: string) => void];
+  selectFiles: [callback: (paths: string[]) => void];
 }>();
 
 const projects = ref<RawProject[]>([]);
@@ -24,7 +24,8 @@ const showCreateModal = ref(false);
 const newName = ref("");
 const renamingId = ref<string | null>(null);
 const renameValue = ref("");
-const importing = ref(false);
+const createInput = ref<HTMLInputElement | null>(null);
+let createTrigger: HTMLElement | null = null;
 
 const workspaceProject = ref<RawProject | null>(null);
 
@@ -54,8 +55,7 @@ async function handleCreate() {
   }
   try {
     await createProject(name);
-    showCreateModal.value = false;
-    newName.value = "";
+    closeCreateModal(true);
     emit("toast", "已创建", `项目「${name}」已创建`, "success");
     await refresh();
   } catch {
@@ -105,33 +105,6 @@ async function handleClearCache(p: RawProject) {
   }
 }
 
-function handleImportFolder(p: RawProject) {
-  importing.value = true;
-  emit("selectFolder", async (path: string) => {
-    if (!path) {
-      importing.value = false;
-      return;
-    }
-    try {
-      const result = await importFolder(p.id, path);
-      emit(
-        "toast",
-        "导入完成",
-        `已登记 ${result.registered} 张` +
-          (result.skipped_raw_formats > 0
-            ? `，跳过 ${result.skipped_raw_formats} 张不支持的 RAW 格式`
-            : ""),
-        result.registered > 0 ? "success" : "info",
-      );
-      await refresh();
-    } catch {
-      emit("toast", "导入失败", "无法导入文件夹", "error");
-    } finally {
-      importing.value = false;
-    }
-  });
-}
-
 function formatDate(iso: string): string {
   try {
     return new Intl.DateTimeFormat("zh-CN", {
@@ -150,11 +123,43 @@ function openProject(p: RawProject) {
   workspaceProject.value = p;
 }
 
+function projectCoverUrl(memberId: string, updatedAt: string): string {
+  const query = new URLSearchParams({ priority: "background", v: updatedAt });
+  return `api/raw-selection/members/${memberId}/thumbnail?${query}`;
+}
+
+function openCreateModal(event?: MouseEvent) {
+  createTrigger = event?.currentTarget instanceof HTMLElement ? event.currentTarget : null;
+  showCreateModal.value = true;
+  void nextTick(() => createInput.value?.focus({ preventScroll: true }));
+}
+
+function closeCreateModal(restoreFocus = true) {
+  showCreateModal.value = false;
+  newName.value = "";
+  const trigger = createTrigger;
+  createTrigger = null;
+  if (restoreFocus && trigger) void nextTick(() => trigger.focus({ preventScroll: true }));
+}
+
+function handleWindowKeydown(event: KeyboardEvent) {
+  if (event.key !== "Escape" || !showCreateModal.value) return;
+  event.preventDefault();
+  closeCreateModal(true);
+}
+
+function closeWorkspace() {
+  workspaceProject.value = null;
+  void refresh();
+}
+
 onMounted(() => {
+  window.addEventListener("keydown", handleWindowKeydown);
   void refresh();
 });
 
 onBeforeUnmount(() => {
+  window.removeEventListener("keydown", handleWindowKeydown);
   abortController?.abort();
 });
 </script>
@@ -166,7 +171,8 @@ onBeforeUnmount(() => {
     :project-name="workspaceProject.name"
     @toast="(t, m, k) => emit('toast', t, m, k)"
     @select-folder="(cb) => emit('selectFolder', cb)"
-    @back="workspaceProject = null"
+    @select-files="(cb) => emit('selectFiles', cb)"
+    @back="closeWorkspace"
   />
   <div v-else class="raw-selection-page">
     <header class="rs-header">
@@ -174,7 +180,7 @@ onBeforeUnmount(() => {
         <h2>ARW 选片</h2>
         <p>导入 Sony A7M4 ARW 和 JPG/PNG，快速浏览、评级、筛选与导出</p>
       </div>
-      <button class="rs-new-btn" type="button" @click="showCreateModal = true">
+      <button class="rs-new-btn" type="button" @click="openCreateModal">
         <AppIcon name="plus" :size="16" />
         <span>新建项目</span>
       </button>
@@ -184,7 +190,7 @@ onBeforeUnmount(() => {
 
     <div v-else-if="!projects.length" class="rs-empty">
       <p>暂无选片项目</p>
-      <button class="rs-empty-btn" type="button" @click="showCreateModal = true">
+      <button class="rs-empty-btn" type="button" @click="openCreateModal">
         创建第一个项目
       </button>
     </div>
@@ -196,7 +202,18 @@ onBeforeUnmount(() => {
         class="rs-card"
         @dblclick="openProject(p)"
       >
-        <div class="rs-card-thumb">
+        <div
+          class="rs-card-thumb"
+          :class="`has-${Math.min(p.cover_member_ids.length, 4)}`"
+          aria-hidden="true"
+        >
+          <img
+            v-for="memberId in p.cover_member_ids"
+            :key="memberId"
+            :src="projectCoverUrl(memberId, p.updated_at)"
+            alt=""
+            loading="lazy"
+          />
           <span class="rs-card-count">{{ p.member_count }}</span>
         </div>
         <div class="rs-card-body">
@@ -211,16 +228,13 @@ onBeforeUnmount(() => {
             />
           </template>
           <template v-else>
-            <strong class="rs-card-name" @dblclick="startRename(p)">{{ p.name }}</strong>
+            <strong class="rs-card-name" @dblclick.stop="startRename(p)">{{ p.name }}</strong>
           </template>
           <small class="rs-card-date">{{ formatDate(p.updated_at) }} 更新</small>
         </div>
         <div class="rs-card-actions">
           <button type="button" title="进入工作区" @click="openProject(p)">
             <AppIcon name="image" :size="15" />
-          </button>
-          <button type="button" title="导入文件夹" :disabled="importing" @click="handleImportFolder(p)">
-            <AppIcon name="plus" :size="15" />
           </button>
           <button type="button" title="重命名" @click="startRename(p)">
             <AppIcon name="compose" :size="15" />
@@ -235,19 +249,20 @@ onBeforeUnmount(() => {
       </article>
     </div>
 
-    <div v-if="showCreateModal" class="rs-modal-backdrop" @click.self="showCreateModal = false">
-      <div class="rs-modal" role="dialog" aria-modal="true">
-        <h3>新建选片项目</h3>
+    <div v-if="showCreateModal" class="rs-modal-backdrop" @click.self="closeCreateModal(true)">
+      <div class="rs-modal" role="dialog" aria-modal="true" aria-labelledby="raw-create-title">
+        <h3 id="raw-create-title">新建选片项目</h3>
         <input
+          ref="createInput"
           v-model="newName"
           class="rs-modal-input"
           placeholder="项目名称（1-40 字符）"
           maxlength="40"
           @keydown.enter="handleCreate"
-          @keydown.escape="showCreateModal = false"
+          @keydown.escape="closeCreateModal(true)"
         />
         <div class="rs-modal-actions">
-          <button type="button" class="rs-modal-cancel" @click="showCreateModal = false">取消</button>
+          <button type="button" class="rs-modal-cancel" @click="closeCreateModal(true)">取消</button>
           <button type="button" class="rs-modal-confirm" :disabled="!newName.trim()" @click="handleCreate">创建</button>
         </div>
       </div>
@@ -342,13 +357,40 @@ onBeforeUnmount(() => {
 }
 
 .rs-card-thumb {
+  position: relative;
   display: grid;
-  place-items: center;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-rows: repeat(2, minmax(0, 1fr));
   height: 120px;
+  overflow: hidden;
   background: var(--surface-soft);
   color: var(--faint);
   font-size: 20px;
   font-weight: 500;
+}
+
+.rs-card-thumb img {
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  object-fit: cover;
+}
+
+.rs-card-thumb.has-1 img { grid-area: 1 / 1 / 3 / 3; }
+.rs-card-thumb.has-2 img { grid-row: 1 / 3; }
+.rs-card-thumb.has-3 img:first-child { grid-row: 1 / 3; }
+
+.rs-card-count {
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
+  padding: 3px 7px;
+  border-radius: 6px;
+  color: #fff;
+  background: rgb(0 0 0 / 62%);
+  font-size: 14px;
+  line-height: 1.2;
 }
 
 .rs-card-count::after {
@@ -478,5 +520,35 @@ onBeforeUnmount(() => {
 
 .rs-modal-confirm:disabled {
   opacity: 0.45;
+}
+
+@media (max-width: 760px) {
+  .raw-selection-page { padding: 12px; }
+  .rs-header { align-items: stretch; }
+  .rs-header p { max-width: 440px; }
+  .rs-grid { grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); }
+}
+
+@media (prefers-color-scheme: dark) {
+  .raw-selection-page {
+    color-scheme: dark;
+    --surface: #20211e;
+    --surface-soft: #181916;
+    --surface-strong: #30312c;
+    --text: #f1f1eb;
+    --muted: #b1b2aa;
+    --faint: #8e9088;
+    --border: rgb(255 255 255 / 10%);
+    --border-strong: rgb(255 255 255 / 18%);
+    --brand: #efefe9;
+    --success: #71b89a;
+    --danger: #ff9aa7;
+    --shadow-float: 0 18px 48px rgb(0 0 0 / 46%);
+    color: var(--text);
+    background: var(--surface-soft);
+  }
+
+  .rs-modal-backdrop { background: rgb(0 0 0 / 48%); }
+  .rs-modal-confirm { color: #181916; }
 }
 </style>

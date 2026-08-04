@@ -2,11 +2,12 @@ import { requestJson } from "../../api/gateway";
 
 import type {
   DeleteResult,
-  ExportResult,
   ImportResult,
   MemberListResult,
   RawMember,
   RawProject,
+  RawSelectionJob,
+  SourceStatus,
   WorkspaceState,
 } from "./types";
 
@@ -50,7 +51,7 @@ export async function importFolder(
   path: string,
   signal?: AbortSignal,
 ) {
-  return requestJson<ImportResult>(
+  return requestJson<RawSelectionJob>(
     `${BASE}/projects/${projectId}/import-folder`,
     { method: "POST", body: { path }, signal },
   );
@@ -81,6 +82,21 @@ export async function listMembers(
 
 export async function getMember(id: string, signal?: AbortSignal) {
   return requestJson<RawMember>(`${BASE}/members/${id}`, { signal });
+}
+
+export async function getSourceStatus(id: string, signal?: AbortSignal) {
+  return requestJson<SourceStatus>(`${BASE}/members/${id}/source-status`, { signal });
+}
+
+export async function getJob(id: string, signal?: AbortSignal) {
+  return requestJson<RawSelectionJob>(`${BASE}/jobs/${id}`, { signal });
+}
+
+export async function cancelJob(id: string, signal?: AbortSignal) {
+  return requestJson<{ cancel_requested: boolean }>(`${BASE}/jobs/${id}/cancel`, {
+    method: "POST",
+    signal,
+  });
 }
 
 export async function updateRating(
@@ -130,7 +146,7 @@ export async function exportFiles(
   destination: string,
   signal?: AbortSignal,
 ) {
-  return requestJson<ExportResult>(
+  return requestJson<RawSelectionJob>(
     `${BASE}/projects/${projectId}/export`,
     { method: "POST", body: { member_ids: memberIds, destination }, signal },
   );
@@ -159,6 +175,13 @@ export async function permanentDelete(
 export async function clearProjectCache(projectId: string, signal?: AbortSignal) {
   return requestJson<{ ok: boolean }>(
     `${BASE}/projects/${projectId}/clear-cache`,
+    { method: "POST", signal },
+  );
+}
+
+export async function cancelProjectWork(projectId: string, signal?: AbortSignal) {
+  return requestJson<{ ok: boolean }>(
+    `${BASE}/projects/${projectId}/cancel-work`,
     { method: "POST", signal },
   );
 }

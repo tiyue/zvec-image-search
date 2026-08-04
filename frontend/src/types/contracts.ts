@@ -189,8 +189,13 @@ export interface NativeDirectorySelection extends NativeResult {
   path?: string | null;
 }
 
+export interface NativeFileSelection extends NativeResult {
+  paths?: string[] | null;
+}
+
 export interface PywebviewApi {
   select_directory(): Promise<NativeDirectorySelection>;
+  select_raw_images?(): Promise<NativeFileSelection>;
   select_json_file(): Promise<NativeDirectorySelection>;
   select_query_image(): Promise<NativeImageSelection>;
   exit_application?(): Promise<NativeResult>;

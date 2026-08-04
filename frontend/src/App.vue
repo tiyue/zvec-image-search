@@ -21,6 +21,8 @@ import { TasksPage } from "./features/tasks";
 import type {
   GalleryContextIntent,
   GallerySelectionIntent,
+  NativeDirectorySelection,
+  NativeFileSelection,
   SearchHistoryEntry,
   SearchResultItem,
   ToastMessage,
@@ -33,7 +35,7 @@ const pageDefinitions: Array<{
   label: string;
   description: string;
   icon: "search" | "tasks" | "tags" | "groups" | "learning" | "image";
-  shortcut: `Alt+${1 | 2 | 3 | 4 | 5 | 6}`;
+  shortcut: `Alt+${1 | 2 | 3 | 4 | 5 | 6 | 7}`;
 }> = [
   {
     id: "search",
@@ -562,7 +564,7 @@ function handleRawSelectionSelectFolder(callback: (path: string) => void): void 
     addToast("无法选择文件夹", "桌面桥接尚未就绪，请稍后重试。", "error");
     return;
   }
-  void bridge.select_directory().then((result: { ok?: boolean; path?: string; error?: string }) => {
+  void bridge.select_directory().then((result: NativeDirectorySelection) => {
     if (!result || result.ok !== true) {
       addToast("无法选择文件夹", result?.error ?? "文件夹选择失败。", "error");
       callback("");
@@ -572,6 +574,26 @@ function handleRawSelectionSelectFolder(callback: (path: string) => void): void 
   }).catch(() => {
     addToast("无法选择文件夹", "文件夹选择失败。", "error");
     callback("");
+  });
+}
+
+function handleRawSelectionSelectFiles(callback: (paths: string[]) => void): void {
+  const bridge = window.pywebview?.api;
+  if (!bridge || typeof bridge.select_raw_images !== "function") {
+    addToast("无法选择图片", "桌面桥接尚未就绪，请稍后重试。", "error");
+    callback([]);
+    return;
+  }
+  void bridge.select_raw_images().then((result: NativeFileSelection) => {
+    if (!result || result.ok !== true) {
+      addToast("无法选择图片", result?.error ?? "图片选择失败。", "error");
+      callback([]);
+      return;
+    }
+    callback(Array.isArray(result.paths) ? result.paths.filter((path) => typeof path === "string") : []);
+  }).catch(() => {
+    addToast("无法选择图片", "图片选择失败。", "error");
+    callback([]);
   });
 }
 
@@ -695,7 +717,13 @@ watch(
 </script>
 
 <template>
-  <div class="app-shell" :class="{ 'sidebar-collapsed': sidebarCollapsed }">
+  <div
+    class="app-shell"
+    :class="{
+      'sidebar-collapsed': sidebarCollapsed,
+      'raw-selection-active': activePage === 'raw-selection',
+    }"
+  >
     <aside class="sidebar" aria-label="主导航">
       <div class="sidebar-head">
         <button
@@ -756,7 +784,7 @@ watch(
       </button>
     </aside>
 
-    <main class="page-host">
+    <main class="page-host" :class="{ 'raw-selection-active': activePage === 'raw-selection' }">
       <header class="app-topbar">
         <div v-if="activePage === 'search' || activePage === 'tasks'" class="top-switch" aria-label="主要视图">
           <button type="button" :class="{ active: activePage === 'search' }" @click="setPage('search')">搜索</button>
@@ -926,6 +954,7 @@ watch(
         <RawSelectionPage
           @toast="handleFeatureToast"
           @select-folder="handleRawSelectionSelectFolder"
+          @select-files="handleRawSelectionSelectFiles"
         />
       </div>
 

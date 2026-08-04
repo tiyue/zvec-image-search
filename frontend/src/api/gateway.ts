@@ -10,7 +10,7 @@ export class GatewayError extends Error {
 }
 
 export interface JsonRequestOptions {
-  method?: "GET" | "POST" | "PUT" | "DELETE";
+  method?: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
   body?: unknown;
   signal?: AbortSignal;
   headers?: Record<string, string>;

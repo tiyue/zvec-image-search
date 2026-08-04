@@ -441,6 +441,115 @@ def _write_frontend_build(root: Path, *, script: str = "assets/app-H4sH.js") -> 
     )
 
 
+class _RawSelectionRouteStub:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
+        self.thumbnail_error: str | None = None
+        self.thumbnail_retryable = False
+
+    def close(self) -> None:
+        return None
+
+    def get_project(self, project_id: str) -> dict[str, str] | None:
+        return {"id": project_id} if project_id == "project-1" else None
+
+    def list_members(self, project_id: str, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(("list_members", (project_id,), kwargs))
+        return {"members": [], "total": 0, "filtered": 0}
+
+    def get_thumbnail_bytes(self, member_id: str, **kwargs: Any) -> Any:
+        self.calls.append(("thumbnail", (member_id,), kwargs))
+        return type(
+            "ImageResult",
+            (),
+            {
+                "data": b"thumbnail",
+                "content_type": "image/jpeg",
+                "error": self.thumbnail_error,
+                "retryable": self.thumbnail_retryable,
+                "warning": None,
+            },
+        )()
+
+    def get_preview_bytes(self, member_id: str, **kwargs: Any) -> Any:
+        self.calls.append(("preview", (member_id,), kwargs))
+        return type(
+            "ImageResult",
+            (),
+            {
+                "data": b"preview",
+                "content_type": "image/jpeg",
+                "error": None,
+                "retryable": False,
+                "warning": None,
+            },
+        )()
+
+    def start_folder_import(self, project_id: str, path: str) -> dict[str, Any]:
+        self.calls.append(("start_import", (project_id, path), {}))
+        return {
+            "id": "import-job-1",
+            "kind": "import",
+            "project_id": project_id,
+            "status": "queued",
+        }
+
+    def start_export(
+        self,
+        project_id: str,
+        member_ids: list[str],
+        destination: str,
+    ) -> dict[str, Any]:
+        self.calls.append(
+            ("start_export", (project_id, tuple(member_ids), destination), {})
+        )
+        return {
+            "id": "export-job-1",
+            "kind": "export",
+            "project_id": project_id,
+            "status": "queued",
+        }
+
+    def get_job(self, job_id: str) -> dict[str, Any] | None:
+        self.calls.append(("get_job", (job_id,), {}))
+        if job_id == "missing":
+            return None
+        return {
+            "id": job_id,
+            "kind": "import",
+            "project_id": "project-1",
+            "status": "running",
+            "phase": "scanning",
+            "progress": {"registered": 2, "seen": 3},
+        }
+
+    def cancel_job(self, job_id: str) -> bool | None:
+        self.calls.append(("cancel_job", (job_id,), {}))
+        if job_id == "missing":
+            return None
+        return job_id != "completed"
+
+    def get_source_status(self, member_id: str) -> dict[str, str] | None:
+        self.calls.append(("source_status", (member_id,), {}))
+        if member_id == "missing":
+            return None
+        return {
+            "status": "refreshed",
+            "code": "source_refreshed",
+            "message": "refreshed",
+        }
+
+    def list_creative_looks(self) -> list[dict[str, str]]:
+        return [{"id": "as_shot"}]
+
+    def update_creative_look(self, member_id: str, look: str) -> bool:
+        self.calls.append(("creative_look", (member_id, look), {}))
+        return member_id != "missing"
+
+    def cancel_project_work(self, project_id: str) -> None:
+        self.calls.append(("cancel", (project_id,), {}))
+
+
 class GatewayTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -525,6 +634,232 @@ class GatewayTests(unittest.TestCase):
             urlopen(wrong, timeout=5)
         self.assertEqual(caught.exception.code, 404)
         caught.exception.close()
+
+    def test_raw_selection_routes_forward_filters_priorities_and_async_jobs(
+        self,
+    ) -> None:
+        raw = _RawSelectionRouteStub()
+        self.server._raw_selection = raw  # type: ignore[assignment]
+
+        status, _headers, payload = _json(
+            self.server.url
+            + "api/raw-selection/projects/project-1/members?"
+            + "star_mode=exact&star_value=3&color_labels=red%2Cblue&"
+            + "exported=unexported&formats=arw%2Cjpeg&"
+            + "orientations=landscape%2Csquare&sort=mtime_ns&dir=desc"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["filtered"], 0)
+        self.assertEqual(
+            raw.calls[-1],
+            (
+                "list_members",
+                ("project-1",),
+                {
+                    "offset": 0,
+                    "limit": 1000,
+                    "star_mode": "exact",
+                    "star_value": 3,
+                    "color_labels": "red,blue",
+                    "filename_contains": "",
+                    "rated_filter": "all",
+                    "exported_filter": "unexported",
+                    "formats": "arw,jpeg",
+                    "orientations": "landscape,square",
+                    "sort_field": "mtime_ns",
+                    "sort_direction": "desc",
+                },
+            ),
+        )
+
+        with urlopen(
+            self.server.url
+            + "api/raw-selection/members/member-1/thumbnail?priority=overscan&v=1",
+            timeout=5,
+        ) as response:
+            self.assertEqual(response.read(), b"thumbnail")
+        self.assertEqual(
+            raw.calls[-1],
+            ("thumbnail", ("member-1",), {"priority": "overscan"}),
+        )
+
+        with urlopen(
+            self.server.url
+            + "api/raw-selection/members/member-2/preview?"
+            + "dw=1280&dh=720&look=as_shot&priority=compare&v=2",
+            timeout=5,
+        ) as response:
+            self.assertEqual(response.read(), b"preview")
+        self.assertEqual(
+            raw.calls[-1],
+            (
+                "preview",
+                ("member-2",),
+                {
+                    "display_width": 1280,
+                    "display_height": 720,
+                    "look": "as_shot",
+                    "quality": "best",
+                    "priority": "compare",
+                },
+            ),
+        )
+
+        status, _headers, payload = _json(
+            self.server.url + "api/raw-selection/projects/project-1/import-folder",
+            method="POST",
+            body={"path": "D:\\camera-roll"},
+        )
+        self.assertEqual(status, 202)
+        self.assertEqual(payload["id"], "import-job-1")
+        self.assertEqual(
+            raw.calls[-1],
+            ("start_import", ("project-1", "D:\\camera-roll"), {}),
+        )
+
+        status, _headers, payload = _json(
+            self.server.url + "api/raw-selection/jobs/import-job-1"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["status"], "running")
+        self.assertEqual(payload["progress"], {"registered": 2, "seen": 3})
+        self.assertEqual(raw.calls[-1], ("get_job", ("import-job-1",), {}))
+
+        status, _headers, payload = _json(
+            self.server.url + "api/raw-selection/jobs/import-job-1/cancel",
+            method="POST",
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["cancel_requested"])
+        self.assertEqual(raw.calls[-1], ("cancel_job", ("import-job-1",), {}))
+
+        status, _headers, payload = _json(
+            self.server.url + "api/raw-selection/members/member-2/source-status"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["code"], "source_refreshed")
+        self.assertEqual(raw.calls[-1], ("source_status", ("member-2",), {}))
+
+        status, _headers, payload = _json(
+            self.server.url + "api/raw-selection/projects/project-1/export",
+            method="POST",
+            body={
+                "member_ids": ["member-1", "member-2"],
+                "destination": "D:\\temporary-export",
+            },
+        )
+        self.assertEqual(status, 202)
+        self.assertEqual(payload["id"], "export-job-1")
+        self.assertEqual(
+            raw.calls[-1],
+            (
+                "start_export",
+                (
+                    "project-1",
+                    ("member-1", "member-2"),
+                    "D:\\temporary-export",
+                ),
+                {},
+            ),
+        )
+
+        status, _headers, payload = _json(
+            self.server.url + "api/raw-selection/projects/project-1/cancel-work",
+            method="POST",
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(raw.calls[-1], ("cancel", ("project-1",), {}))
+
+    def test_raw_selection_routes_reject_invalid_or_retryable_requests(self) -> None:
+        raw = _RawSelectionRouteStub()
+        self.server._raw_selection = raw  # type: ignore[assignment]
+
+        status, _headers, payload = _json(self.server.url + "api/raw-selection/looks")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["looks"], [{"id": "as_shot"}])
+
+        with self.assertRaises(HTTPError) as caught:
+            _json(
+                self.server.url + "api/raw-selection/members/member-1/creative-look",
+                method="PATCH",
+                body={"creative_look": "VV"},
+            )
+        self.assertEqual(caught.exception.code, 400)
+        caught.exception.close()
+
+        status, _headers, payload = _json(
+            self.server.url + "api/raw-selection/members/member-1/creative-look",
+            method="PATCH",
+            body={"creative_look": "as_shot"},
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(
+            raw.calls[-1],
+            ("creative_look", ("member-1", "as_shot"), {}),
+        )
+
+        invalid_urls = (
+            "api/raw-selection/projects/project-1/members?unknown=1",
+            "api/raw-selection/members/member-1/thumbnail?priority=urgent",
+            "api/raw-selection/members/member-1/thumbnail?priority=current&priority=visible",
+        )
+        for relative in invalid_urls:
+            with (
+                self.subTest(relative=relative),
+                self.assertRaises(HTTPError) as caught,
+            ):
+                urlopen(self.server.url + relative, timeout=5)
+            self.assertEqual(caught.exception.code, 400)
+            payload = json.loads(caught.exception.read().decode("utf-8"))
+            self.assertEqual(payload["error"]["code"], "invalid_query")
+            caught.exception.close()
+
+        for relative, body in (
+            (
+                "api/raw-selection/members/member-1/rating",
+                {"star_rating": True, "color_label": "red"},
+            ),
+            (
+                "api/raw-selection/members/delete-permanent",
+                {"member_ids": ["member-1"], "confirmed": 1},
+            ),
+        ):
+            with (
+                self.subTest(relative=relative),
+                self.assertRaises(HTTPError) as caught,
+            ):
+                _json(
+                    self.server.url + relative,
+                    method="POST" if "delete" in relative else "PATCH",
+                    body=body,
+                )
+            self.assertEqual(caught.exception.code, 400)
+            caught.exception.close()
+
+        raw.thumbnail_error = "Image work queue is full; retry the request"
+        raw.thumbnail_retryable = True
+        with self.assertRaises(HTTPError) as caught:
+            urlopen(
+                self.server.url
+                + "api/raw-selection/members/member-1/thumbnail?priority=visible",
+                timeout=5,
+            )
+        self.assertEqual(caught.exception.code, 503)
+        caught.exception.close()
+
+        for relative in (
+            "api/raw-selection/jobs/missing",
+            "api/raw-selection/members/missing/source-status",
+        ):
+            with (
+                self.subTest(relative=relative),
+                self.assertRaises(HTTPError) as caught,
+            ):
+                urlopen(self.server.url + relative, timeout=5)
+            self.assertEqual(caught.exception.code, 404)
+            caught.exception.close()
 
     def test_recommendation_routes_inject_viewer_and_hide_paths(self) -> None:
         source = self.root / "raiden.png"
