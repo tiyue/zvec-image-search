@@ -705,16 +705,17 @@ class GatewayTests(unittest.TestCase):
             ),
         )
 
+        import_folder = str(Path(tempfile.gettempdir()).resolve() / "camera-roll")
         status, _headers, payload = _json(
             self.server.url + "api/raw-selection/projects/project-1/import-folder",
             method="POST",
-            body={"path": "D:\\camera-roll"},
+            body={"path": import_folder},
         )
         self.assertEqual(status, 202)
         self.assertEqual(payload["id"], "import-job-1")
         self.assertEqual(
             raw.calls[-1],
-            ("start_import", ("project-1", "D:\\camera-roll"), {}),
+            ("start_import", ("project-1", import_folder), {}),
         )
 
         status, _headers, payload = _json(
