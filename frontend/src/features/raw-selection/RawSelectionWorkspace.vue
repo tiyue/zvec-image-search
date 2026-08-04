@@ -63,7 +63,7 @@ const emit = defineEmits<{
 }>();
 
 type StarFilterKind = "none" | "exact" | "at_least" | "unrated";
-type MenuName = "import" | "sort" | "look" | "selection";
+type MenuName = "import" | "sort" | "look" | "selection" | "more";
 
 interface FilmstripRange {
   start: number;
@@ -1019,6 +1019,11 @@ async function handleRemove(): Promise<void> {
   }
 }
 
+function handleRemoveFromMenu(): void {
+  closeTransient(true);
+  void handleRemove();
+}
+
 async function handlePermanentDelete(): Promise<void> {
   const ids = selectedMemberIds.value;
   if (!ids.length) return;
@@ -1036,6 +1041,11 @@ async function handlePermanentDelete(): Promise<void> {
   } catch {
     emit("toast", "无法删除", "无法读取待删除图片。", "error");
   }
+}
+
+function handlePermanentDeleteFromMenu(): void {
+  closeTransient(true);
+  void handlePermanentDelete();
 }
 
 function closeDeleteModal(restoreFocus = true): void {
@@ -1714,12 +1724,16 @@ onBeforeUnmount(() => {
         <div class="rs-menu-wrap" data-raw-transient>
           <button
             type="button"
+            class="rs-import-button"
             aria-label="导入"
             aria-haspopup="menu"
             :aria-expanded="openMenu === 'import'"
             :disabled="importing"
             @click="toggleMenu('import', $event)"
-          ><AppIcon name="plus" :size="15" /></button>
+          >
+            <AppIcon name="plus" :size="15" />
+            <span class="rs-import-label">导入</span>
+          </button>
           <div v-if="openMenu === 'import'" class="rs-menu" role="menu" aria-label="导入">
             <button type="button" role="menuitem" @click="handleImportFiles">导入图片</button>
             <button type="button" role="menuitem" @click="handleImportFolder">导入文件夹</button>
@@ -1758,51 +1772,60 @@ onBeforeUnmount(() => {
           </div>
         </div>
 
-        <div class="rs-menu-wrap" data-raw-transient>
-          <button
-            type="button"
-            aria-haspopup="menu"
-            :aria-expanded="openMenu === 'selection'"
-            @click="toggleMenu('selection', $event)"
-          >已选 {{ selectedCount }}</button>
-          <div v-if="openMenu === 'selection'" class="rs-menu" role="menu" aria-label="选择">
-            <button type="button" role="menuitem" :disabled="!members.length" @click="selectAllFiltered">全选筛选结果</button>
-            <button type="button" role="menuitem" :disabled="!selectedCount" @click="clearSelection">清除选择</button>
+        <div class="rs-control-status">
+          <span class="rs-file-name" :title="activeMember?.file_name">{{ activeMember?.file_name || '未选择图片' }}</span>
+          <span class="rs-position">{{ activeMemberIndex >= 0 ? `${activeMemberIndex + 1} / ${members.length}` : '—' }}</span>
+          <div class="rs-menu-wrap" data-raw-transient>
+            <button
+              type="button"
+              aria-haspopup="menu"
+              :aria-expanded="openMenu === 'selection'"
+              @click="toggleMenu('selection', $event)"
+            >已选 {{ selectedCount }}</button>
+            <div v-if="openMenu === 'selection'" class="rs-menu" role="menu" aria-label="选择">
+              <button type="button" role="menuitem" :disabled="!members.length" @click="selectAllFiltered">全选筛选结果</button>
+              <button type="button" role="menuitem" :disabled="!selectedCount" @click="clearSelection">清除选择</button>
+            </div>
           </div>
         </div>
       </div>
 
-      <div class="rs-control-center">
-        <span class="rs-position">{{ activeMemberIndex >= 0 ? `${activeMemberIndex + 1} / ${members.length}` : '—' }}</span>
-        <div class="rs-stars" role="group" aria-label="星级">
-          <button
-            v-for="star in 5"
-            :key="star"
-            type="button"
-            class="rs-star"
-            :class="{ active: activeMember && activeMember.star_rating >= star }"
-            :aria-label="`${star} 星`"
-            :aria-pressed="Boolean(activeMember && activeMember.star_rating === star)"
-            :disabled="!activeMember"
-            @click="setRating(star)"
-          >★</button>
-          <button type="button" class="rs-star-clear" aria-label="清除星级" :disabled="!activeMember || activeMember.star_rating === 0" @click="setRating(0)">×</button>
+      <div class="rs-control-center" role="group" aria-label="图片标记">
+        <div class="rs-control-group">
+          <span class="rs-control-group-label">评分</span>
+          <div class="rs-stars" role="group" aria-label="星级">
+            <button
+              v-for="star in 5"
+              :key="star"
+              type="button"
+              class="rs-star"
+              :class="{ active: activeMember && activeMember.star_rating >= star }"
+              :aria-label="`${star} 星`"
+              :aria-pressed="Boolean(activeMember && activeMember.star_rating === star)"
+              :disabled="!activeMember"
+              @click="setRating(star)"
+            >★</button>
+            <button type="button" class="rs-star-clear" aria-label="清除星级" :disabled="!activeMember || activeMember.star_rating === 0" @click="setRating(0)">×</button>
+          </div>
         </div>
-        <div class="rs-colors" role="group" aria-label="色标">
-          <button
-            v-for="option in colorLabelOptions"
-            :key="option.value"
-            type="button"
-            class="rs-color-button"
-            :class="{ active: activeMember?.color_label === option.value }"
-            :style="{ '--label-color': option.color }"
-            :aria-label="option.label"
-            :aria-pressed="activeMember?.color_label === option.value"
-            :disabled="!activeMember"
-            @click="setColorLabel(option.value)"
-          ><span aria-hidden="true">{{ option.value === 'none' ? '–' : '' }}</span></button>
+        <div class="rs-control-group">
+          <span class="rs-control-group-label">色标</span>
+          <div class="rs-colors" role="group" aria-label="色标">
+            <button
+              v-for="option in colorLabelOptions"
+              :key="option.value"
+              type="button"
+              class="rs-color-button"
+              :class="{ active: activeMember?.color_label === option.value }"
+              :style="{ '--label-color': option.color }"
+              :aria-label="option.label"
+              :aria-pressed="activeMember?.color_label === option.value"
+              :disabled="!activeMember"
+              @click="setColorLabel(option.value)"
+            ><span aria-hidden="true">{{ option.value === 'none' ? '–' : '' }}</span></button>
+          </div>
         </div>
-        <div class="rs-menu-wrap" data-raw-transient>
+        <div class="rs-menu-wrap rs-look-control" data-raw-transient>
           <button
             type="button"
             class="rs-look-button"
@@ -1811,7 +1834,7 @@ onBeforeUnmount(() => {
             :disabled="!activeMember || !activeIsRaw || creativeLooks.length <= 1"
             :title="!activeIsRaw ? 'JPG/PNG 不应用 Sony 创意外观' : creativeLooks.length <= 1 ? '未经可信参考校准的外观暂不可用' : 'Sony 创意外观'"
             @click="toggleMenu('look', $event)"
-          >{{ activeIsRaw ? activeLookLabel : '外观不适用' }}</button>
+          >{{ activeIsRaw ? `外观：${activeLookLabel}` : '外观：不适用' }}</button>
           <div v-if="openMenu === 'look' && activeIsRaw && creativeLooks.length > 1" class="rs-menu rs-look-menu" role="menu" aria-label="Sony 创意外观">
             <button
               v-for="look in creativeLooks"
@@ -1825,23 +1848,38 @@ onBeforeUnmount(() => {
             >{{ look.label }}</button>
           </div>
         </div>
-        <span class="rs-file-name" :title="activeMember?.file_name">{{ activeMember?.file_name || '未选择图片' }}</span>
       </div>
 
       <div class="rs-control-right">
-        <button type="button" :disabled="!activeMember" @click="fitActive">适合</button>
-        <button type="button" :disabled="!activeMember" @click="actualSizeActive">100%</button>
-        <button type="button" :disabled="!activeMember || exportBusy" @click="handleExport">{{ exportBusy ? '导出中…' : '导出' }}</button>
-        <button type="button" :disabled="!activeMember" @click="handleRemove">移出</button>
-        <button ref="deleteTrigger" type="button" class="rs-danger" :disabled="!activeMember" @click="handlePermanentDelete">永久删除</button>
-        <div class="rs-view-switch" role="group" aria-label="视图">
-          <button type="button" :aria-pressed="!compareMode" :class="{ active: !compareMode }" @click="compareMode && exitCompare(true)">单视图</button>
-          <button type="button" :aria-pressed="compareMode" :class="{ active: compareMode }" :disabled="!compareMode && !compareAvailable" :title="!compareMode && !compareAvailable ? '请先选择两张图片' : '对比视图'" @click="!compareMode && enterCompare()">对比视图</button>
+        <div class="rs-zoom-controls" role="group" aria-label="缩放">
+          <button type="button" :disabled="!activeMember" @click="fitActive">适合</button>
+          <button type="button" :disabled="!activeMember" @click="actualSizeActive">100%</button>
+        </div>
+        <div class="rs-view-switch" role="group" aria-label="预览模式">
+          <button type="button" :aria-pressed="!compareMode" :class="{ active: !compareMode }" @click="compareMode && exitCompare(true)">单图</button>
+          <button type="button" :aria-pressed="compareMode" :class="{ active: compareMode }" :disabled="!compareMode && !compareAvailable" :title="!compareMode && !compareAvailable ? '请先选择两张图片' : '对比视图'" @click="!compareMode && enterCompare()">对比</button>
         </div>
         <label v-if="compareMode" class="rs-sync-toggle">
           <input v-model="viewport.compareSync.value" type="checkbox" />
           <span>同步缩放</span>
         </label>
+        <button type="button" :disabled="!activeMember || exportBusy" @click="handleExport">{{ exportBusy ? '导出中…' : '导出' }}</button>
+        <div class="rs-menu-wrap" data-raw-transient>
+          <button
+            ref="deleteTrigger"
+            type="button"
+            aria-label="更多操作"
+            aria-haspopup="menu"
+            :aria-expanded="openMenu === 'more'"
+            :disabled="!activeMember"
+            @click="toggleMenu('more', $event)"
+          >更多</button>
+          <div v-if="openMenu === 'more'" class="rs-menu rs-more-menu" role="menu" aria-label="更多操作">
+            <button type="button" role="menuitem" @click="handleRemoveFromMenu">移出项目</button>
+            <hr />
+            <button type="button" role="menuitem" class="rs-danger" @click="handlePermanentDeleteFromMenu">永久删除</button>
+          </div>
+        </div>
       </div>
     </footer>
 
@@ -2153,11 +2191,14 @@ onBeforeUnmount(() => {
   display: grid;
   grid-area: controls;
   min-width: 0;
-  grid-template-columns: max-content minmax(240px, 1fr) max-content;
-  grid-template-areas: "left center right";
+  grid-template-columns: minmax(0, 1fr) max-content;
+  grid-template-areas:
+    "left left"
+    "center right";
   align-items: center;
-  gap: 8px;
-  padding: 7px 10px;
+  column-gap: 16px;
+  row-gap: 8px;
+  padding: 8px 12px;
   border-top: 1px solid var(--border);
   background: var(--surface);
 }
@@ -2173,12 +2214,27 @@ onBeforeUnmount(() => {
   gap: 4px;
 }
 
-.rs-control-left { grid-area: left; }
-.rs-control-center { grid-area: center; justify-content: center; }
-.rs-control-right { grid-area: right; justify-content: flex-end; }
+.rs-control-left {
+  grid-area: left;
+  gap: 8px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.rs-control-center {
+  grid-area: center;
+  justify-content: flex-start;
+  gap: 12px;
+}
+
+.rs-control-right {
+  grid-area: right;
+  justify-content: flex-end;
+  gap: 8px;
+}
 
 .rs-control-bar button {
-  min-height: 28px;
+  min-height: 30px;
   padding: 0 8px;
   border: 1px solid var(--border);
   border-radius: 7px;
@@ -2200,6 +2256,12 @@ onBeforeUnmount(() => {
   gap: 5px;
 }
 
+.rs-import-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
 .rs-project-back .app-icon { transform: rotate(90deg); }
 
 .rs-control-label,
@@ -2207,6 +2269,40 @@ onBeforeUnmount(() => {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.rs-control-status,
+.rs-control-group,
+.rs-zoom-controls {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+}
+
+.rs-control-status {
+  gap: 8px;
+  margin-left: auto;
+  padding-left: 16px;
+}
+
+.rs-control-group { gap: 6px; }
+
+.rs-control-group + .rs-control-group,
+.rs-look-control {
+  padding-left: 12px;
+  border-left: 1px solid var(--border);
+}
+
+.rs-control-group-label {
+  color: var(--muted);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.rs-zoom-controls {
+  gap: 4px;
+  padding-right: 8px;
+  border-right: 1px solid var(--border);
 }
 
 .rs-position {
@@ -2217,7 +2313,7 @@ onBeforeUnmount(() => {
 }
 
 .rs-file-name {
-  max-width: 180px;
+  max-width: 220px;
   color: var(--muted);
   font-size: 12px;
 }
@@ -2268,12 +2364,15 @@ onBeforeUnmount(() => {
 .rs-danger { color: var(--danger) !important; }
 
 .rs-view-switch {
+  gap: 0;
+  overflow: hidden;
   padding: 2px;
+  border: 1px solid var(--border);
   border-radius: 8px;
   background: var(--surface-soft);
 }
 
-.rs-view-switch button { border: 0; background: transparent; }
+.rs-view-switch button { border: 0; border-radius: 5px; background: transparent; }
 .rs-view-switch button.active { background: var(--surface-strong); }
 
 .rs-sync-toggle {
@@ -2333,6 +2432,8 @@ onBeforeUnmount(() => {
   left: 50%;
   transform: translateX(-50%);
 }
+
+.rs-more-menu { min-width: 160px; }
 
 .rs-modal-backdrop {
   position: fixed;
@@ -2406,29 +2507,34 @@ onBeforeUnmount(() => {
 @media (max-width: 1180px) {
   .rs-workspace { --raw-preview-safe-inset: 16px; }
 
-  .rs-control-bar {
-    grid-template-columns: minmax(0, 1fr) max-content;
-    grid-template-areas:
-      "left right"
-      "center center";
-  }
-
-  .rs-control-left,
+  .rs-control-bar { column-gap: 12px; }
+  .rs-control-center,
   .rs-control-right { flex-wrap: wrap; }
-  .rs-control-center { justify-content: flex-start; }
+  .rs-file-name { max-width: 140px; }
   .rs-filter-bar { grid-template-columns: repeat(4, minmax(120px, 1fr)); }
 }
 
 @media (max-width: 760px) {
   .rs-workspace { --raw-preview-safe-inset: 12px; }
 
-  .rs-control-bar { padding-inline: 6px; }
+  .rs-control-bar {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas:
+      "left"
+      "center"
+      "right";
+    padding-inline: 6px;
+  }
   .rs-control-label { display: none; }
-  .rs-file-name { max-width: 120px; }
+  .rs-import-label { display: none; }
+  .rs-file-name { display: none; }
   .rs-filter-bar { grid-template-columns: repeat(3, minmax(110px, 1fr)); }
   .rs-control-bar button { padding-inline: 6px; }
-  .rs-control-left,
-  .rs-control-right { flex-wrap: nowrap; }
+  .rs-control-left { flex-wrap: nowrap; }
+  .rs-control-center,
+  .rs-control-right { flex-wrap: wrap; }
+  .rs-control-right { justify-content: flex-start; }
+  .rs-control-status { padding-left: 8px; }
   .rs-sync-toggle span { font-size: 0; }
   .rs-sync-toggle span::after { content: "同步"; font-size: 11px; }
 }

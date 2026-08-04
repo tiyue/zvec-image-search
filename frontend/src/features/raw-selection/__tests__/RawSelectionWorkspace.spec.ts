@@ -254,7 +254,7 @@ describe("RawSelectionWorkspace", () => {
     vi.useRealTimers();
   });
 
-  it("places every operation below a control-free preview and exposes only two import commands", async () => {
+  it("separates context, marking and action controls below a control-free preview", async () => {
     const wrapper = await mountWorkspace();
     const children = Array.from(wrapper.get(".rs-workspace").element.children)
       .filter((child) => !child.classList.contains("rs-task-stack"));
@@ -263,6 +263,12 @@ describe("RawSelectionWorkspace", () => {
     expect(children[2]?.classList.contains("rs-film-strip")).toBe(true);
     expect(wrapper.find(".rs-preview-stage button").exists()).toBe(false);
     expect(wrapper.find(".rs-preview-stage > .rs-preview-media").exists()).toBe(true);
+    expect(Array.from(wrapper.get(".rs-control-bar").element.children).map(
+      (child) => child.className,
+    )).toEqual(["rs-control-left", "rs-control-center", "rs-control-right"]);
+    expect(wrapper.get(".rs-control-center").text()).toContain("评分");
+    expect(wrapper.get(".rs-control-center").text()).toContain("色标");
+    expect(wrapper.get(".rs-control-right").text()).not.toContain("永久删除");
 
     await wrapper.get("button[aria-label='导入']").trigger("click");
     expect(wrapper.get(".rs-menu").findAll("button").map((button) => button.text())).toEqual([
@@ -297,7 +303,7 @@ describe("RawSelectionWorkspace", () => {
     const wrapper = await mountWorkspace();
     const lookButton = wrapper.get(".rs-look-button");
 
-    expect(lookButton.text()).toBe("拍摄时");
+    expect(lookButton.text()).toBe("外观：拍摄时");
     expect(lookButton.attributes()).toHaveProperty("disabled");
     expect(lookButton.attributes("title")).toBe("未经可信参考校准的外观暂不可用");
     expect(wrapper.find(".rs-look-menu").exists()).toBe(false);
@@ -443,6 +449,8 @@ describe("RawSelectionWorkspace", () => {
     expect(workspaceSource).toContain(".rs-workspace { --raw-preview-safe-inset: 12px; }");
     expect(workspaceSource).toContain("inset: var(--raw-preview-safe-inset)");
     expect(workspaceSource).toMatch(/\.rs-compare-panes\s*\{[\s\S]*?gap: 1px;/);
+    expect(workspaceSource).toContain('grid-template-areas:\n    "left left"\n    "center right";');
+    expect(workspaceSource).toContain('grid-template-areas:\n      "left"\n      "center"\n      "right";');
   });
 
   it("returns to a complete fit whenever the filter dock opens or closes", async () => {
@@ -609,17 +617,35 @@ describe("RawSelectionWorkspace", () => {
     await wrapper.vm.$nextTick();
     expect(wrapper.find(".rs-menu").exists()).toBe(false);
     expect(document.activeElement).toBe(trigger.element);
+
+    const moreTrigger = wrapper.get("button[aria-label='更多操作']");
+    await moreTrigger.trigger("click");
+    expect(wrapper.get(".rs-more-menu").text()).toContain("永久删除");
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    await wrapper.vm.$nextTick();
+    expect(wrapper.find(".rs-more-menu").exists()).toBe(false);
+    expect(document.activeElement).toBe(moreTrigger.element);
   });
 
   it("uses two independent preview sources, an active compare side and restores current/selection on Escape", async () => {
     const wrapper = await mountWorkspace();
+    const viewSwitch = wrapper.get(".rs-view-switch");
+    const viewButtons = viewSwitch.findAll("button");
+    expect(viewSwitch.attributes("aria-label")).toBe("预览模式");
+    expect(viewButtons.map((button) => button.text())).toEqual(["单图", "对比"]);
+    expect(viewButtons[0]?.attributes("aria-pressed")).toBe("true");
+    expect(viewButtons[1]?.attributes()).toHaveProperty("disabled");
+
     const thumbs = wrapper.findAll(".rs-thumb");
     await thumbs[0]?.trigger("click", { ctrlKey: true });
     await thumbs[1]?.trigger("click", { ctrlKey: true });
     expect(buttonByText(wrapper, "已选 2").text()).toBe("已选 2");
+    expect(buttonByText(wrapper, "对比").attributes()).not.toHaveProperty("disabled");
 
-    await buttonByText(wrapper, "对比视图").trigger("click");
+    await buttonByText(wrapper, "对比").trigger("click");
     await flushPromises();
+    expect(viewButtons[0]?.attributes("aria-pressed")).toBe("false");
+    expect(viewButtons[1]?.attributes("aria-pressed")).toBe("true");
     const images = wrapper.findAll<HTMLImageElement>(".rs-compare-pane .rs-preview-img");
     expect(images).toHaveLength(2);
     expect(wrapper.findAll(".rs-compare-pane > .rs-preview-media")).toHaveLength(2);
@@ -720,15 +746,47 @@ describe("RawSelectionWorkspace", () => {
     const thumbs = wrapper.findAll(".rs-thumb");
     await thumbs[0]?.trigger("click", { ctrlKey: true });
     await thumbs[1]?.trigger("click", { ctrlKey: true });
+
+    const moreTrigger = wrapper.get("button[aria-label='更多操作']");
+    await moreTrigger.trigger("click");
     await buttonByText(wrapper, "永久删除").trigger("click");
     await flushPromises();
+    expect(wrapper.find(".rs-more-menu").exists()).toBe(false);
     expect(wrapper.get(".rs-delete-modal").text()).toContain("将永久删除 2 个源文件");
+    expect(document.activeElement).toBe(wrapper.get(".rs-delete-check input").element);
+    await buttonByText(wrapper, "取消").trigger("click");
+    await wrapper.vm.$nextTick();
+    expect(document.activeElement).toBe(moreTrigger.element);
+
+    await moreTrigger.trigger("click");
+    await buttonByText(wrapper, "永久删除").trigger("click");
+    await flushPromises();
     const confirmButton = wrapper.get(".rs-delete-confirm");
     expect(confirmButton.attributes()).toHaveProperty("disabled");
     await wrapper.get(".rs-delete-check input").setValue(true);
     await confirmButton.trigger("click");
     await flushPromises();
     expect(api.permanentDelete).toHaveBeenCalledWith(["member-0", "member-1"], true);
+  });
+
+  it("keeps project removal in More and preserves its non-destructive confirmation", async () => {
+    api.removeMembers.mockResolvedValue({ removed: 2 });
+    const wrapper = await mountWorkspace();
+    const thumbs = wrapper.findAll(".rs-thumb");
+    await thumbs[0]?.trigger("click", { ctrlKey: true });
+    await thumbs[1]?.trigger("click", { ctrlKey: true });
+
+    await wrapper.get("button[aria-label='更多操作']").trigger("click");
+    expect(wrapper.get(".rs-more-menu").findAll("button").map((button) => button.text())).toEqual([
+      "移出项目",
+      "永久删除",
+    ]);
+    await buttonByText(wrapper, "移出项目").trigger("click");
+    await flushPromises();
+
+    expect(wrapper.find(".rs-more-menu").exists()).toBe(false);
+    expect(window.confirm).toHaveBeenCalledWith(expect.stringContaining("此操作不会删除源文件"));
+    expect(api.removeMembers).toHaveBeenCalledWith(["member-0", "member-1"]);
   });
 
   it("polls folder-import progress and sends cancellation to the active job", async () => {
