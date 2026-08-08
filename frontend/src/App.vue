@@ -392,6 +392,7 @@ function editContextImage(): void {
   imageEditImportSequence += 1;
   incomingImageEditSource.value = {
     key: `${imageId}-${Date.now()}-${imageEditImportSequence}`,
+    imageId,
     name: item.name,
     url,
     sizeBytes: item.sizeBytes,
@@ -602,6 +603,26 @@ function handleRawSelectionSelectFolder(callback: (path: string) => void): void 
     callback(result.path ?? "");
   }).catch(() => {
     addToast("无法选择文件夹", "文件夹选择失败。", "error");
+    callback("");
+  });
+}
+
+function handleImageEditSelectDirectory(callback: (path: string) => void): void {
+  const bridge = window.pywebview?.api;
+  if (!bridge || typeof bridge.select_directory !== "function") {
+    addToast("无法选择输出目录", "桌面桥接尚未就绪，请稍后重试。", "error");
+    callback("");
+    return;
+  }
+  void bridge.select_directory().then((result: NativeDirectorySelection) => {
+    if (!result || result.ok !== true) {
+      if (result?.error) addToast("无法选择输出目录", result.error, "error");
+      callback("");
+      return;
+    }
+    callback(result.path ?? "");
+  }).catch(() => {
+    addToast("无法选择输出目录", "文件夹选择失败。", "error");
     callback("");
   });
 }
@@ -999,6 +1020,7 @@ watch(
           :visible="activePage === 'image-edit'"
           :incoming-source="incomingImageEditSource"
           @toast="handleFeatureToast"
+          @select-directory="handleImageEditSelectDirectory"
         />
       </div>
 

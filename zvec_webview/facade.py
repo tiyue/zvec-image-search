@@ -62,7 +62,7 @@ from image_vector_service.search_learning_store import (
     SearchLearningValidationError,
     SearchSessionRecord,
 )
-from zvec_host.backend_api import BackendApiError, JsonObject
+from zvec_host.backend_api import BackendApiError, BackendHttpError, JsonObject
 from zvec_host.backend_host import BackendBusyError, BackendHost, BackendRuntime
 from zvec_host.configuration_service import (
     ConfigurationSnapshot,
@@ -449,6 +449,124 @@ class PreviewFacade:
     @property
     def config_home(self) -> Path:
         return self._configuration.config_home
+
+    def image_edit_settings(self) -> JsonObject:
+        return self._image_edit_call(lambda client: client.get_image_edit_settings())
+
+    def update_image_edit_settings(self, output_directory: str) -> JsonObject:
+        return self._image_edit_call(
+            lambda client: client.update_image_edit_settings(output_directory)
+        )
+
+    def submit_image_edit_multipart(self, content_type: str, body: bytes) -> JsonObject:
+        task = self._image_edit_call(
+            lambda client: client.submit_image_edit_multipart(content_type, body)
+        )
+        return self._image_edit_task_view(task)
+
+    def submit_registered_image_edit(
+        self,
+        image_id: str,
+        metadata: Mapping[str, Any],
+    ) -> JsonObject:
+        try:
+            source_path = self._registry.resolve(image_id)
+            if source_path.stat().st_size > 10 * 1024 * 1024:
+                raise FacadeError(
+                    "image_too_large",
+                    "单张图片不能超过 10 MiB。",
+                    status=413,
+                )
+            source_bytes = source_path.read_bytes()
+        except FacadeError:
+            raise
+        except ImageRegistryError:
+            raise
+        except OSError as exc:
+            raise FacadeError(
+                "image_read_failed", "无法读取原图，请刷新后重试。", status=409
+            ) from exc
+        task = self._image_edit_call(
+            lambda client: client.submit_image_edit_file(
+                source_path.name,
+                source_bytes,
+                metadata,
+            )
+        )
+        return self._image_edit_task_view(task)
+
+    def list_image_edit_tasks(
+        self, *, active: bool | None = None, limit: int = 100
+    ) -> JsonObject:
+        payload = self._image_edit_call(
+            lambda client: client.list_image_edit_tasks(active=active, limit=limit)
+        )
+        tasks = payload.get("tasks")
+        if isinstance(tasks, list):
+            payload["tasks"] = [
+                self._image_edit_task_view(task)
+                for task in tasks
+                if isinstance(task, Mapping)
+            ]
+            payload["count"] = len(payload["tasks"])
+        return payload
+
+    def get_image_edit_task(self, task_id: str) -> JsonObject:
+        task = self._image_edit_call(lambda client: client.get_image_edit_task(task_id))
+        return self._image_edit_task_view(task)
+
+    def cancel_image_edit_task(self, task_id: str) -> JsonObject:
+        task = self._image_edit_call(
+            lambda client: client.cancel_image_edit_task(task_id)
+        )
+        return self._image_edit_task_view(task)
+
+    def abandon_image_edit_tasks(self) -> JsonObject:
+        return self._image_edit_call(lambda client: client.abandon_image_edit_tasks())
+
+    def _image_edit_task_view(self, task: Mapping[str, Any]) -> JsonObject:
+        view = dict(task)
+        result = view.get("result")
+        if not isinstance(result, Mapping):
+            return view
+        safe_result = dict(result)
+        output_path = safe_result.pop("output_path", None)
+        if isinstance(output_path, str) and output_path:
+            try:
+                metadata = self._registry.register(output_path)
+            except (ImageRegistryError, OSError):
+                safe_result["preview_error"] = "结果已保存，但暂时无法加载预览。"
+            else:
+                safe_result.update(
+                    {
+                        "image_id": metadata.image_id,
+                        "image_url": (f"api/image/{metadata.image_id}?variant=preview"),
+                        "thumbnail_url": (
+                            f"api/image/{metadata.image_id}?variant=thumbnail"
+                        ),
+                        "width": metadata.width,
+                        "height": metadata.height,
+                    }
+                )
+        view["result"] = safe_result
+        return view
+
+    def _image_edit_call(self, callback: Callable[[Any], JsonObject]) -> JsonObject:
+        try:
+            return callback(self._ready_client())
+        except BackendHttpError as exc:
+            raise FacadeError(
+                exc.code or "image_edit_request_failed",
+                exc.backend_message or "图片编辑请求失败。",
+                status=exc.status_code,
+                details=exc.details if isinstance(exc.details, Mapping) else None,
+            ) from exc
+        except BackendApiError as exc:
+            raise FacadeError(
+                "image_edit_backend_unavailable",
+                "本地图片编辑服务暂时不可用，请稍后重试。",
+                status=502,
+            ) from exc
 
     def diagnostic_redactions(self) -> tuple[str, ...]:
         """Return process-local secrets for the private diagnostic writer."""
@@ -3066,19 +3184,24 @@ class PreviewFacade:
             ):
                 return True
         try:
+            client = self._ready_client()
             future = self._executor.submit(
-                self._ready_client().list_jobs,
-                active=True,
-                limit=1,
+                lambda: (
+                    client.list_jobs(active=True, limit=1),
+                    client.list_image_edit_tasks(active=True, limit=1),
+                )
             )
-            payload = future.result(timeout=1.0)
+            jobs_payload, image_edit_payload = future.result(timeout=1.0)
         except FutureTimeout:
             return True
         except Exception:
             # If idleness cannot be established, do not claim shutdown is safe.
             return True
-        jobs = payload.get("jobs")
-        return isinstance(jobs, list) and bool(jobs)
+        jobs = jobs_payload.get("jobs")
+        image_edit_tasks = image_edit_payload.get("tasks")
+        return (isinstance(jobs, list) and bool(jobs)) or (
+            isinstance(image_edit_tasks, list) and bool(image_edit_tasks)
+        )
 
     def close(self, *, force: bool = False) -> None:
         with self._lock:

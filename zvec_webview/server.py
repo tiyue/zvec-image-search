@@ -37,6 +37,7 @@ from .image_registry import ImageRegistryError, ImageVariant
 _MAX_JSON_BYTES: Final = 2 * 1024 * 1024
 _MAX_DIAGNOSTIC_JSON_BYTES: Final = 64 * 1024
 _MAX_QUERY_IMAGE_BYTES: Final = 128 * 1024 * 1024
+_MAX_IMAGE_EDIT_REQUEST_BYTES: Final = 12 * 1024 * 1024
 _MAX_ASSET_BYTES: Final = 8 * 1024 * 1024
 _MAX_RAW_IMPORT_FILES: Final = 10_000
 _RAW_IMPORT_EXTENSIONS: Final = frozenset({".arw", ".jpg", ".jpeg", ".png"})
@@ -611,6 +612,101 @@ def _handler_type(gateway: GatewayServer) -> type[BaseHTTPRequestHandler]:
                     ),
                 )
                 return
+            if method == "GET" and segments == ("image-edit", "settings"):
+                _reject_unknown_query(query_values, set())
+                self._json(
+                    HTTPStatus.OK,
+                    gateway._facade.image_edit_settings(),
+                )
+                return
+            if method == "PUT" and segments == ("image-edit", "settings"):
+                _reject_unknown_query(query_values, set())
+                body = self._read_json()
+                if set(body) != {"output_directory"} or not isinstance(
+                    body.get("output_directory"), str
+                ):
+                    raise FacadeError(
+                        "invalid_request", "输出目录设置无效。", status=400
+                    )
+                self._json(
+                    HTTPStatus.OK,
+                    gateway._facade.update_image_edit_settings(
+                        body["output_directory"]
+                    ),
+                )
+                return
+            if method == "GET" and segments == ("image-edit", "tasks"):
+                _reject_unknown_query(query_values, {"active", "limit"})
+                active = (
+                    _query_bool(query_values, "active", False)
+                    if "active" in query_values
+                    else None
+                )
+                self._json(
+                    HTTPStatus.OK,
+                    gateway._facade.list_image_edit_tasks(
+                        active=active,
+                        limit=_query_int(query_values, "limit", 100, 1, 200),
+                    ),
+                )
+                return
+            if method == "POST" and segments == ("image-edit", "tasks"):
+                _reject_unknown_query(query_values, set())
+                content_type = self.headers.get("Content-Type", "")
+                normalized_type = content_type.split(";", 1)[0].strip().casefold()
+                if normalized_type == "application/json":
+                    body = self._read_json()
+                    source_image_id = body.pop("source_image_id", None)
+                    if not isinstance(source_image_id, str) or not source_image_id:
+                        raise FacadeError(
+                            "invalid_request",
+                            "搜索结果图片引用无效。",
+                            status=400,
+                        )
+                    task = gateway._facade.submit_registered_image_edit(
+                        source_image_id,
+                        body,
+                    )
+                else:
+                    multipart_body = self._read_image_edit_multipart(content_type)
+                    task = gateway._facade.submit_image_edit_multipart(
+                        content_type,
+                        multipart_body,
+                    )
+                self._json(HTTPStatus.ACCEPTED, {"task": task})
+                return
+            if method == "POST" and segments == (
+                "image-edit",
+                "tasks",
+                "abandon",
+            ):
+                _reject_unknown_query(query_values, set())
+                body = self._read_json()
+                if body != {"confirm": True}:
+                    raise FacadeError(
+                        "confirmation_required",
+                        "放弃未保存结果前必须明确确认。",
+                        status=400,
+                    )
+                self._json(
+                    HTTPStatus.OK,
+                    gateway._facade.abandon_image_edit_tasks(),
+                )
+                return
+            if len(segments) == 3 and segments[:2] == ("image-edit", "tasks"):
+                _reject_unknown_query(query_values, set())
+                if method == "GET":
+                    self._json(
+                        HTTPStatus.OK,
+                        {"task": gateway._facade.get_image_edit_task(segments[2])},
+                    )
+                    return
+                if method == "DELETE":
+                    self._json(
+                        HTTPStatus.ACCEPTED,
+                        {"task": gateway._facade.cancel_image_edit_task(segments[2])},
+                    )
+                    return
             if len(segments) == 2 and segments[0] == "search":
                 if method == "GET":
                     self._json(
@@ -1857,6 +1953,35 @@ def _handler_type(gateway: GatewayServer) -> type[BaseHTTPRequestHandler]:
                     "unsupported_media_type",
                     "查询图片请求必须使用 image/* 内容类型。",
                     status=415,
+                )
+            body = self.rfile.read(length)
+            if len(body) != length:
+                raise FacadeError("incomplete_body", "请求正文不完整。", status=400)
+            return body
+
+        def _read_image_edit_multipart(self, content_type: str) -> bytes:
+            if not content_type.casefold().startswith("multipart/form-data;"):
+                raise FacadeError(
+                    "unsupported_media_type",
+                    "图片编辑任务必须使用 multipart/form-data。",
+                    status=415,
+                )
+            raw_length = self.headers.get("Content-Length")
+            if raw_length is None:
+                raise FacadeError(
+                    "length_required", "请求必须包含 Content-Length。", status=411
+                )
+            try:
+                length = int(raw_length)
+            except ValueError as exc:
+                raise FacadeError(
+                    "invalid_length", "Content-Length 无效。", status=400
+                ) from exc
+            if length <= 0 or length > _MAX_IMAGE_EDIT_REQUEST_BYTES:
+                raise FacadeError(
+                    "image_edit_request_too_large",
+                    "图片编辑上传请求为空或超过 12 MiB。",
+                    status=413,
                 )
             body = self.rfile.read(length)
             if len(body) != length:

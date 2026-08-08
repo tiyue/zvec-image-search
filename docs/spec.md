@@ -70,6 +70,7 @@ Python 包，提供所有业务逻辑：
 | `image_scanner.py` | 文件系统扫描 |
 | `file_watcher.py` | 文件系统监听（watchdog），自动增量索引触发 |
 | `model_catalog.py` | 模型配置目录 |
+| `image_edit/` | 单图编辑请求校验、并发任务管理、阿里云适配、结果下载与错误翻译 |
 | `rate_limiter.py` | API 限流 |
 | `result_exporter.py` | 搜索结果导出 |
 | `library_browser.py` | 只读文件夹/图片浏览 |
@@ -88,7 +89,7 @@ WebView 与 LAN 宿主共用的 Python 服务层，不包含 Tkinter、系统托
 
 Vue 3 + TypeScript + Vite SPA：
 - 组件：`GalleryGrid`、`ImageCard`、`ImagePreview`、`PaginationBar` 等
-- 功能模块（`src/features/`）：search-learning、organize、settings、tasks、activity、cleanup
+- 功能模块（`src/features/`）：search-learning、organize、settings、tasks、activity、cleanup、image-edit
 - 图片推荐模块（`src/features/recommendations/`）：推荐批次、缩略图预加载、shown/action 事件同步、单张右键菜单与独立推荐详情
 - API 层（`src/api/`）：`client.ts`、`gateway.ts`
 - 构建产物嵌入 `zvec_webview/frontend_dist/`
@@ -106,14 +107,17 @@ Vue 3 + TypeScript + Vite SPA：
 
 ### 图片编辑模块（image-edit）
 
-当前仅完成 Windows WebView 前端本地预览，用于确认信息架构与交互；预览不会上传图片、调用模型、扣减免费额度、产生费用或写入输出文件，生成结果仅复用原图模拟任务状态。正式后端、阿里云适配、持久化输出目录、退出拦截和错误码转换尚未实现。
+Windows WebView 提供独立的 Qwen 单图编辑模块。前端、WebView 网关、宿主客户端和核心服务使用独立的 `image-edit` 协议边界；该模块只复用现有 DashScope API Key 与 API URL，不依赖图库排序、推荐或 ARW 流程。
 
-- 前端模块限定为 `frontend/src/features/image-edit/`，仅允许搜索结果单图右键入口及必要的 `App.vue` 接线；正式实现的后端范围限定为 `image_vector_service/image_edit/`、阿里云图像编辑适配及必要路由、对应测试和本规格文档。
-- 仅支持 Windows WebView；不得修改或耦合 ARW、推荐算法、搜索排序、Android、发布矩阵及其他无关模块，唯一复用项为现有 DashScope 凭证。
-- 支持文件选择、拖放和剪贴板粘贴导入；一次导入多张图片时自动按每张图建立一个独立任务，各任务分别保留编辑指令并由用户手动提交，可并发运行。
-- 第一版任务仍为单图输入、单图输出，不修改原图；成功结果下载为 PNG 到用户指定且跨重启记忆的目录。面向专业用户的工作流不显示逐任务上传/费用提醒，也不设置确认门禁。
+- 仅支持 Windows WebView。修改范围限定为 `frontend/src/features/image-edit/`、搜索结果单图右键入口及必要的 `App.vue` 接线、`image_vector_service/image_edit/`、必要的 Backend/WebView 路由和退出保护、对应测试与本规格文档；不得修改或耦合 ARW、推荐算法、搜索排序、Android、发布矩阵及其他无关模块，唯一复用项为现有 DashScope 凭证。
+- 支持文件选择、拖放、剪贴板粘贴和搜索结果单图右键导入。一次最多导入 50 张，按每张图建立一个本地草稿；导入不上传，用户为每张图写完指令并手动提交后才建立后端任务。会话最多保留 200 个任务，后端以 4 个独立工作线程并行处理，不提供自动批量提交。
+- 输入仅允许 JPG/JPEG、PNG、BMP、TIFF、WebP 和 GIF，单文件不超过 10 MiB；GIF 由模型按首帧处理。每个任务严格为单图输入、单图输出，`n` 固定为 1，`watermark` 固定为 `false`。阿里云临时上传文件最多保留 48 小时且不保存为应用历史；生成结果链接仅保留 24 小时，任务进入 `downloading` 后立即下载并校验为 PNG。
+- 原图只读，生成结果以唯一文件名和原子替换写入用户指定目录。目录保存于应用配置目录下的 `image-edit/settings.json` 并跨应用重启保留；任务提交时快照当前目录。浏览器只接收 ImageRegistry 的不透明结果 ID，不接收绝对输出路径。
+- 面向专业用户的工作流不显示上传/费用提醒，也不设置确认门禁。任务状态为 `queued`、`uploading`、`generating`、`downloading`、`cancelling` 以及三个终态 `succeeded`、`failed`、`cancelled`；失败或取消不修改原图，前端继续保留原图、编辑指令和参数，允许手动重新生成。
 - 页面采用左侧参数、中间单画布、右侧任务缩略图和底部编辑指令的布局；原图与结果在同一画布切换，不再并排显示两个图片框。左侧提供模型、画幅比例、图片尺寸、随机种子、反向提示词和提示词智能改写；提示词智能改写默认开启，Qwen 水印固定关闭且不显示开关。图片编辑模型目录同时保留浮动别名和固定快照：`qwen-image-3.0-pro`、`qwen-image-3.0`、`qwen-image-2.0-pro`、`qwen-image-2.0-pro-2026-06-22`、`qwen-image-2.0-pro-2026-04-22`、`qwen-image-2.0-pro-2026-03-03`、`qwen-image-2.0`、`qwen-image-2.0-2026-03-03`、`qwen-image-edit-max`、`qwen-image-edit-max-2026-01-16`、`qwen-image-edit-plus`、`qwen-image-edit-plus-2025-12-15`、`qwen-image-edit-plus-2025-10-30`、`qwen-image-edit`；默认使用 `qwen-image-edit-plus`，不得加入仅文生图用途的模型。
-- 失败时保留原图与编辑指令并允许重新生成；阿里云错误码须转换成用户可执行的实际原因。应用完全退出时，如仍有运行中或等待下载的任务，默认阻止退出，直至任务完成或用户明确放弃未保存结果。
+- 尺寸规则按模型执行：`qwen-image-3.0` 与 `qwen-image-3.0-pro` 的总像素范围为 512×512 至 2048×2048、宽高比为 1:8 至 8:1；Qwen Image 2.0 全系列只校验同一总像素范围；Edit Plus/Max 及其快照要求宽和高分别在 512–2048；`qwen-image-edit` 不接受 `size` 且不支持提示词智能改写。指定尺寸时允许阿里云调整到最接近的 16 像素倍数。界面提供自动、自定义以及官方常用比例 1:1、2:3、3:2、3:4、4:3、9:16、16:9、21:9 的精确推荐尺寸；除 3.0 系列外，反向提示词最多 500 字符，3.0 系列不附加文档未声明的长度上限。
+- 阿里云错误必须转换为实际原因并保留原始 `code`、HTTP 状态和可用的 `request_id`。至少专门处理无效 Key、欠费、`AllocationQuota.FreeTierOnly`、模型/业务空间无权限、`Endpoint.AccessDenied` 快照下线、模型不存在、限流、媒体读取超时、无效图片格式或分辨率、`RewriteFailed`、`ModelServingError`、`ModelUnavailable`、结果下载失败和网络超时；不得把结果链接 403 误报为 API Key 无权限。
+- WebView 网关提供 `api/image-edit/settings`、`api/image-edit/tasks`、`api/image-edit/tasks/{id}` 和 `api/image-edit/tasks/abandon`，核心后端对应 `v1/image-edit/*`。完全退出应用时，核心后端和 WebView 宿主都把排队、上传、生成、下载或取消中的图片任务视为活动任务并拒绝安全退出；只有全部到达终态，或用户通过明确确认放弃未保存结果后，才允许退出。
 - 第一版明确不做多图融合、自动批量提交、局部蒙版、历史记录或 Android 支持。
 
 ### ARW 选片模块（raw_selection）

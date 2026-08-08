@@ -27,6 +27,8 @@ from .activity_store import ActivityStore
 from .backend_instance_lock import BackendInstanceLock
 from .config import RuntimeCredentials, ServiceConfig, default_config_home
 from .federated_search import LibraryCandidateSet, export_federated_search
+from .image_edit import ImageEditTaskManager
+from .image_edit.service import ImageEditServiceError
 from .large_cluster_adapter import DEFAULT_CLUSTER_TYPES
 from .large_library_policy import (
     build_large_library_policy_snapshot,
@@ -70,11 +72,13 @@ _TERMINAL_STATUSES = frozenset(
     {"succeeded", "partial", "needs_attention", "failed", "cancelled"}
 )
 _JOB_PATH = re.compile(r"^/v1/jobs/([0-9a-f]{32})/?$")
+_IMAGE_EDIT_TASK_PATH = re.compile(r"^/v1/image-edit/tasks/([0-9a-f]{32})/?$")
 _RECOMMENDATION_EVENT_PATH = re.compile(
     r"^/v1/recommendations/([^/]+)/(shown|actions)$"
 )
 _PROGRESS_NUMBERS = re.compile(r"(?P<current>\d+)\s*/\s*(?P<total>\d+)")
 _MAX_REQUEST_BYTES = 1024 * 1024
+_MAX_IMAGE_EDIT_REQUEST_BYTES = 12 * 1024 * 1024
 _PROTOCOL_VERSION = 2
 _ACTIVITY_JOB_HISTORY_EXCLUDED_COMMANDS = frozenset(
     {
@@ -155,6 +159,7 @@ _CAPABILITIES = {
     "cooperative_batch_scheduling": True,
     "source_only_search_results": True,
     "large_library_policy_diagnostics": True,
+    "image_edit": True,
     # Reserved protocol flags.  The first concurrent-jobs release exposes the
     # state names to clients, while pause/resume and failure paging remain off.
     "job_pause_resume": False,
@@ -919,6 +924,8 @@ class BackendJobManager:
         self._config = config or ServiceConfig()
         self._credentials = self._config.runtime_credentials or RuntimeCredentials()
         self._config = replace(self._config, runtime_credentials=self._credentials)
+        self._image_edit_manager: ImageEditTaskManager | None = None
+        self._image_edit_lock = threading.Lock()
         # Keep the native default inside the selected workspace. Desktop callers pass
         # an isolated per-process staging directory explicitly.
         self._query_root = Path(
@@ -1219,6 +1226,10 @@ class BackendJobManager:
                     elif job.status == "running":
                         job.status = "cancelling"
         try:
+            with self._image_edit_lock:
+                image_edit_manager = self._image_edit_manager
+            if image_edit_manager is not None:
+                image_edit_manager.close()
             if self._started:
                 for worker in self._library_workers.values():
                     worker.close()
@@ -1380,6 +1391,74 @@ class BackendJobManager:
                 self._activity.add_redactions(normalized_key)
         self._credentials.configure(normalized_key, api_url)
         return {"credentials_configured": True}
+
+    def image_edit_settings(self) -> dict[str, object]:
+        return self._image_edit_call(lambda manager: manager.get_settings())
+
+    def update_image_edit_settings(self, payload: dict[str, Any]) -> dict[str, object]:
+        return self._image_edit_call(lambda manager: manager.update_settings(payload))
+
+    def submit_image_edit(self, content_type: str, body: bytes) -> dict[str, object]:
+        with self._jobs_lock:
+            if self._stop_requested.is_set():
+                raise BackendRequestError(
+                    "service_unavailable",
+                    "The backend is shutting down.",
+                    status=HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+            return self._image_edit_call(
+                lambda manager: manager.submit_multipart(content_type, body)
+            )
+
+    def list_image_edit_tasks(
+        self, *, active: bool | None = None, limit: int = 100
+    ) -> dict[str, object]:
+        return self._image_edit_call(
+            lambda manager: manager.list_tasks(active=active, limit=limit)
+        )
+
+    def get_image_edit_task(self, task_id: str) -> dict[str, object]:
+        return self._image_edit_call(lambda manager: manager.get_task(task_id))
+
+    def cancel_image_edit_task(self, task_id: str) -> dict[str, object]:
+        return self._image_edit_call(lambda manager: manager.cancel_task(task_id))
+
+    def abandon_image_edit_tasks(self, payload: dict[str, Any]) -> dict[str, object]:
+        return self._image_edit_call(lambda manager: manager.abandon_all(payload))
+
+    def _image_edit(self) -> ImageEditTaskManager:
+        with self._image_edit_lock:
+            if self._closed:
+                raise ImageEditServiceError(
+                    "service_unavailable",
+                    "图片编辑服务正在关闭。",
+                    status_code=503,
+                )
+            if self._image_edit_manager is None:
+                self._image_edit_manager = ImageEditTaskManager(
+                    config_home=self._config.config_home_path,
+                    api_key_getter=lambda: self._config.api_key,
+                    api_url_getter=lambda: self._config.api_url,
+                )
+            return self._image_edit_manager
+
+    def _image_edit_call(
+        self,
+        callback: Callable[[ImageEditTaskManager], dict[str, object]],
+    ) -> dict[str, object]:
+        try:
+            return callback(self._image_edit())
+        except ImageEditServiceError as exc:
+            try:
+                status = HTTPStatus(exc.status_code)
+            except ValueError:
+                status = HTTPStatus.BAD_REQUEST
+            raise BackendRequestError(
+                exc.code,
+                str(exc),
+                status=status,
+                details=dict(exc.details) if exc.details is not None else None,
+            ) from exc
 
     def create_recommendations(
         self,
@@ -2040,12 +2119,21 @@ class BackendJobManager:
                 for job in self._jobs.values()
                 if job.status not in _TERMINAL_STATUSES
             )
-            if active_job_ids:
+            image_edit_manager = self._image_edit_manager
+            active_image_edit_task_ids = (
+                image_edit_manager.active_task_ids()
+                if image_edit_manager is not None
+                else []
+            )
+            if active_job_ids or active_image_edit_task_ids:
                 raise BackendRequestError(
                     "backend_busy",
                     "The backend still has active jobs.",
                     status=HTTPStatus.CONFLICT,
-                    details={"active_job_ids": active_job_ids},
+                    details={
+                        "active_job_ids": active_job_ids,
+                        "active_image_edit_task_ids": active_image_edit_task_ids,
+                    },
                 )
             self._stop_requested.set()
         return {
@@ -2912,6 +3000,38 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
         if path == "/version":
             self._send_json(HTTPStatus.OK, self.backend.manager.version_info())
             return
+        if path == "/v1/image-edit/settings":
+            self._run_request(
+                lambda: (
+                    HTTPStatus.OK,
+                    {"settings": self.backend.manager.image_edit_settings()},
+                )
+            )
+            return
+        if path == "/v1/image-edit/tasks":
+
+            def list_image_edit_tasks() -> tuple[HTTPStatus, dict[str, Any]]:
+                options = _job_list_query(parsed.query)
+                return (
+                    HTTPStatus.OK,
+                    dict(self.backend.manager.list_image_edit_tasks(**options)),
+                )
+
+            self._run_request(list_image_edit_tasks)
+            return
+        image_edit_match = _IMAGE_EDIT_TASK_PATH.fullmatch(path)
+        if image_edit_match:
+            self._run_request(
+                lambda: (
+                    HTTPStatus.OK,
+                    {
+                        "task": self.backend.manager.get_image_edit_task(
+                            image_edit_match.group(1)
+                        )
+                    },
+                )
+            )
+            return
         if path == "/v1/jobs":
 
             def list_jobs() -> tuple[HTTPStatus, dict[str, Any]]:
@@ -2941,6 +3061,25 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
         if not self._authenticate():
             return
         path = urlsplit(self.path).path
+        if path == "/v1/image-edit/tasks":
+
+            def submit_image_edit() -> tuple[HTTPStatus, dict[str, Any]]:
+                content_type = self.headers.get("Content-Type", "")
+                body = self._read_body(_MAX_IMAGE_EDIT_REQUEST_BYTES)
+                task = self.backend.manager.submit_image_edit(content_type, body)
+                return HTTPStatus.ACCEPTED, {"task": task}
+
+            self._run_request(submit_image_edit)
+            return
+        if path == "/v1/image-edit/tasks/abandon":
+
+            def abandon_image_edit_tasks() -> tuple[HTTPStatus, dict[str, Any]]:
+                payload = self._read_json_object()
+                result = self.backend.manager.abandon_image_edit_tasks(payload)
+                return HTTPStatus.OK, dict(result)
+
+            self._run_request(abandon_image_edit_tasks)
+            return
         if path == "/v1/control/shutdown":
             try:
                 payload = self._read_json_object()
@@ -3053,7 +3192,17 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
     def do_PUT(self) -> None:  # noqa: N802
         if not self._authenticate():
             return
-        if urlsplit(self.path).path != "/v1/session/credentials":
+        path = urlsplit(self.path).path
+        if path == "/v1/image-edit/settings":
+
+            def update_image_edit_settings() -> tuple[HTTPStatus, dict[str, Any]]:
+                payload = self._read_json_object()
+                settings = self.backend.manager.update_image_edit_settings(payload)
+                return HTTPStatus.OK, {"settings": settings}
+
+            self._run_request(update_image_edit_settings)
+            return
+        if path != "/v1/session/credentials":
             self._send_error(
                 BackendRequestError(
                     "not_found",
@@ -3072,7 +3221,21 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
     def do_DELETE(self) -> None:  # noqa: N802
         if not self._authenticate():
             return
-        match = _JOB_PATH.fullmatch(urlsplit(self.path).path)
+        path = urlsplit(self.path).path
+        image_edit_match = _IMAGE_EDIT_TASK_PATH.fullmatch(path)
+        if image_edit_match:
+            self._run_request(
+                lambda: (
+                    HTTPStatus.ACCEPTED,
+                    {
+                        "task": self.backend.manager.cancel_image_edit_task(
+                            image_edit_match.group(1)
+                        )
+                    },
+                )
+            )
+            return
+        match = _JOB_PATH.fullmatch(path)
         if not match:
             self._send_error(
                 BackendRequestError(
@@ -3129,6 +3292,28 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
             extra_headers={"WWW-Authenticate": "Bearer"},
         )
         return False
+
+    def _read_body(self, maximum: int) -> bytes:
+        raw_length = self.headers.get("Content-Length")
+        if raw_length is None:
+            raise BackendRequestError(
+                "length_required",
+                "Content-Length is required.",
+                status=HTTPStatus.LENGTH_REQUIRED,
+            )
+        try:
+            length = int(raw_length)
+        except ValueError as exc:
+            raise BackendRequestError(
+                "invalid_content_length", "Content-Length is invalid."
+            ) from exc
+        if length < 0 or length > maximum:
+            raise BackendRequestError(
+                "request_too_large",
+                f"The request body must not exceed {maximum} bytes.",
+                status=HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+            )
+        return self.rfile.read(length)
 
     def _read_json_object(self) -> dict[str, Any]:
         content_type = self.headers.get("Content-Type", "")

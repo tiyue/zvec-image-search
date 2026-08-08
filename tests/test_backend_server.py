@@ -17,6 +17,8 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
+from PIL import Image
+
 import image_service
 from image_vector_service.backend_instance_lock import (
     BackendInstanceLock,
@@ -24,6 +26,7 @@ from image_vector_service.backend_instance_lock import (
 )
 from image_vector_service.backend_server import create_backend_server
 from image_vector_service.config import ServiceConfig
+from image_vector_service.image_edit.service import ImageEditTaskManager
 from image_vector_service.library_config import LibraryCatalog, LibraryDefinition
 from image_vector_service.model_catalog import default_model_configuration
 from image_vector_service.models import (
@@ -645,6 +648,111 @@ class BackendServerTest(unittest.TestCase):
 
         self.request("DELETE", f"/v1/jobs/{running['id']}")
         self.assertEqual(self.wait_for_job(running["id"])["status"], "cancelled")
+
+    def test_image_edit_routes_block_shutdown_until_explicit_abandon(self):
+        output_directory = self.temp_dir / "image-edit-output"
+        output_directory.mkdir()
+        provider_started = threading.Event()
+        provider_release = threading.Event()
+        self.addCleanup(provider_release.set)
+
+        class BlockingProvider:
+            def edit(
+                self,
+                source_path,
+                request,
+                output_path,
+                *,
+                progress,
+                cancel_event,
+            ):
+                del source_path, request, cancel_event
+                progress("generating")
+                provider_started.set()
+                provider_release.wait(2)
+                Image.new("RGB", (8, 8), (20, 40, 60)).save(output_path, format="PNG")
+                return {
+                    "output_path": str(output_path),
+                    "output_filename": output_path.name,
+                }
+
+        image_manager = ImageEditTaskManager(
+            config_home=self.temp_dir / "image-edit-config",
+            api_key_getter=lambda: "test-key",
+            api_url_getter=lambda: "https://dashscope.aliyuncs.com/api/v1/x",
+            provider_factory=BlockingProvider,
+            worker_count=1,
+        )
+        image_manager.update_settings({"output_directory": str(output_directory)})
+        with self.manager._image_edit_lock:
+            self.manager._image_edit_manager = image_manager
+
+        source = io.BytesIO()
+        Image.new("RGB", (12, 10), (40, 60, 80)).save(source, format="PNG")
+        boundary = "----backend-image-edit-test"
+        metadata = json.dumps(
+            {
+                "model": "qwen-image-edit-plus",
+                "prompt": "修改背景",
+                "negative_prompt": "",
+                "prompt_extend": True,
+            },
+            ensure_ascii=False,
+        ).encode("utf-8")
+        body = b"".join(
+            [
+                f"--{boundary}\r\n".encode(),
+                b'Content-Disposition: form-data; name="metadata"\r\n\r\n',
+                metadata,
+                b"\r\n",
+                f"--{boundary}\r\n".encode(),
+                (
+                    b'Content-Disposition: form-data; name="file"; '
+                    b'filename="source.png"\r\n\r\n'
+                ),
+                source.getvalue(),
+                b"\r\n",
+                f"--{boundary}--\r\n".encode(),
+            ]
+        )
+        connection = http.client.HTTPConnection(
+            "127.0.0.1", self.server.server_address[1], timeout=3
+        )
+        try:
+            connection.request(
+                "POST",
+                "/v1/image-edit/tasks",
+                body=body,
+                headers={
+                    "Authorization": f"Bearer {self.token}",
+                    "Content-Type": f"multipart/form-data; boundary={boundary}",
+                    "Content-Length": str(len(body)),
+                },
+            )
+            response = connection.getresponse()
+            submitted = json.loads(response.read())
+        finally:
+            connection.close()
+        self.assertEqual(response.status, 202, submitted)
+        task_id = submitted["task"]["id"]
+        self.assertTrue(provider_started.wait(1))
+
+        status, busy = self.request("POST", "/v1/control/shutdown", {"if_idle": True})
+        self.assertEqual(status, 409, busy)
+        self.assertEqual(
+            busy["error"]["details"]["active_image_edit_task_ids"],
+            [task_id],
+        )
+
+        status, abandoned = self.request(
+            "POST", "/v1/image-edit/tasks/abandon", {"confirm": True}
+        )
+        self.assertEqual(status, 200, abandoned)
+        self.assertEqual(abandoned["abandoned_task_ids"], [task_id])
+        status, task_payload = self.request("GET", f"/v1/image-edit/tasks/{task_id}")
+        self.assertEqual(status, 200, task_payload)
+        self.assertEqual(task_payload["task"]["status"], "cancelled")
+        provider_release.set()
 
     def test_shutdown_requires_an_explicit_idle_only_request(self):
         for payload in ({}, {"if_idle": False}, {"if_idle": True, "force": True}):

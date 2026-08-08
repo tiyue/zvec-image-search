@@ -47,6 +47,7 @@ class _Facade:
         self.migration_recovery_body: dict[str, Any] | None = None
         self.fixed_evaluation_body: dict[str, Any] | None = None
         self.lan_calls: list[tuple[str, object | None]] = []
+        self.image_edit_calls: list[tuple[str, object]] = []
 
     def bootstrap(self) -> dict[str, Any]:
         return {
@@ -164,6 +165,56 @@ class _Facade:
 
     def cancel_job(self, job_id: str) -> dict[str, Any]:
         return {"id": job_id, "status": "cancelled"}
+
+    @staticmethod
+    def _image_edit_task(task_id: str = "a" * 32) -> dict[str, Any]:
+        return {
+            "id": task_id,
+            "source_name": "source.png",
+            "status": "queued",
+            "stage": "queued",
+            "prompt": "修改背景",
+            "result": None,
+            "error": None,
+        }
+
+    def image_edit_settings(self) -> dict[str, Any]:
+        self.image_edit_calls.append(("settings", None))
+        return {"configured": True, "output_directory": r"C:\Output"}
+
+    def update_image_edit_settings(self, output_directory: str) -> dict[str, Any]:
+        self.image_edit_calls.append(("update_settings", output_directory))
+        return {"configured": True, "output_directory": output_directory}
+
+    def submit_image_edit_multipart(
+        self, content_type: str, body: bytes
+    ) -> dict[str, Any]:
+        self.image_edit_calls.append(("submit_multipart", (content_type, body)))
+        return self._image_edit_task()
+
+    def submit_registered_image_edit(
+        self, image_id: str, metadata: dict[str, Any]
+    ) -> dict[str, Any]:
+        self.image_edit_calls.append(("submit_registered", (image_id, metadata)))
+        return self._image_edit_task()
+
+    def list_image_edit_tasks(
+        self, *, active: bool | None, limit: int
+    ) -> dict[str, Any]:
+        self.image_edit_calls.append(("list", (active, limit)))
+        return {"tasks": [self._image_edit_task()], "count": 1, "total_count": 1}
+
+    def get_image_edit_task(self, task_id: str) -> dict[str, Any]:
+        self.image_edit_calls.append(("get", task_id))
+        return self._image_edit_task(task_id)
+
+    def cancel_image_edit_task(self, task_id: str) -> dict[str, Any]:
+        self.image_edit_calls.append(("cancel", task_id))
+        return {**self._image_edit_task(task_id), "status": "cancelled"}
+
+    def abandon_image_edit_tasks(self) -> dict[str, Any]:
+        self.image_edit_calls.append(("abandon", None))
+        return {"abandoned_task_ids": ["a" * 32], "count": 1}
 
     def data_migration_recovery(self) -> dict[str, Any]:
         return {
@@ -1058,6 +1109,118 @@ class GatewayTests(unittest.TestCase):
         resolved = self.registry.resolve(payload["id"])
         self.assertTrue(resolved.is_file())
         self.assertEqual(resolved.suffix, ".png")
+
+    def test_image_edit_json_routes_forward_registry_ids_and_explicit_abandon(
+        self,
+    ) -> None:
+        status, _headers, settings = _json(self.server.url + "api/image-edit/settings")
+        self.assertEqual(status, 200)
+        self.assertTrue(settings["configured"])
+        self.assertEqual(
+            _json(
+                self.server.url + "api/image-edit/settings",
+                method="PUT",
+                body={"output_directory": r"D:\Generated"},
+            )[0],
+            200,
+        )
+
+        submission = {
+            "source_image_id": "opaque-image-id",
+            "model": "qwen-image-edit-plus",
+            "prompt": "修改背景",
+            "negative_prompt": "",
+            "prompt_extend": True,
+        }
+        submitted = _json(
+            self.server.url + "api/image-edit/tasks",
+            method="POST",
+            body=submission,
+        )
+        self.assertEqual(submitted[0], 202)
+        self.assertEqual(submitted[2]["task"]["status"], "queued")
+        self.assertIn(
+            (
+                "submit_registered",
+                (
+                    "opaque-image-id",
+                    {
+                        "model": "qwen-image-edit-plus",
+                        "prompt": "修改背景",
+                        "negative_prompt": "",
+                        "prompt_extend": True,
+                    },
+                ),
+            ),
+            self.facade.image_edit_calls,
+        )
+
+        listed = _json(self.server.url + "api/image-edit/tasks?active=true&limit=2")
+        self.assertEqual(listed[0], 200)
+        self.assertEqual(self.facade.image_edit_calls[-1], ("list", (True, 2)))
+
+        task_id = "b" * 32
+        self.assertEqual(
+            _json(self.server.url + f"api/image-edit/tasks/{task_id}")[0], 200
+        )
+        self.assertEqual(
+            _json(
+                self.server.url + f"api/image-edit/tasks/{task_id}",
+                method="DELETE",
+            )[2]["task"]["status"],
+            "cancelled",
+        )
+        abandoned = _json(
+            self.server.url + "api/image-edit/tasks/abandon",
+            method="POST",
+            body={"confirm": True},
+        )
+        self.assertEqual(abandoned[2]["count"], 1)
+
+        with self.assertRaises(HTTPError) as caught:
+            _json(
+                self.server.url + "api/image-edit/tasks/abandon",
+                method="POST",
+                body={"confirm": False},
+            )
+        self.assertEqual(caught.exception.code, 400)
+        caught.exception.close()
+
+    def test_image_edit_multipart_is_forwarded_without_browser_path_disclosure(
+        self,
+    ) -> None:
+        boundary = "----gateway-image-edit-test"
+        body = b"".join(
+            [
+                f"--{boundary}\r\n".encode(),
+                b'Content-Disposition: form-data; name="metadata"\r\n\r\n{}\r\n',
+                f"--{boundary}\r\n".encode(),
+                (
+                    b'Content-Disposition: form-data; name="file"; '
+                    b'filename="source.png"\r\n\r\n'
+                ),
+                b"image-bytes\r\n",
+                f"--{boundary}--\r\n".encode(),
+            ]
+        )
+        content_type = f"multipart/form-data; boundary={boundary}"
+        request = Request(
+            self.server.url + "api/image-edit/tasks",
+            data=body,
+            headers={"Content-Type": content_type},
+            method="POST",
+        )
+
+        with urlopen(request, timeout=5) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+
+        self.assertEqual(response.status, 202)
+        self.assertEqual(payload["task"]["status"], "queued")
+        self.assertEqual(
+            self.facade.image_edit_calls[-1],
+            ("submit_multipart", (content_type, body)),
+        )
+        self.assertNotIn(str(self.root), repr(payload))
 
     def test_search_history_routes_list_and_reopen_persisted_results(self) -> None:
         status, _headers, history = _json(

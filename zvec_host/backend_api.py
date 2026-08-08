@@ -10,6 +10,7 @@ from __future__ import annotations
 import http.client
 import json
 import math
+import secrets
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, TypeAlias
@@ -19,6 +20,46 @@ JsonObject: TypeAlias = dict[str, Any]
 
 _JSON_CONTENT_TYPE = "application/json"
 _DEFAULT_TIMEOUT_SECONDS = 30.0
+_MAX_IMAGE_EDIT_UPLOAD_BYTES = 12 * 1024 * 1024
+
+
+def _image_edit_multipart_body(
+    file_name: str,
+    file_bytes: bytes,
+    metadata: Mapping[str, Any],
+) -> tuple[bytes, str]:
+    try:
+        metadata_bytes = json.dumps(
+            dict(metadata),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"metadata is not valid JSON: {exc}") from exc
+    boundary = f"----ZvecImageEdit{secrets.token_hex(16)}"
+    safe_name = file_name.replace('"', "_").replace("\r", "_").replace("\n", "_")
+    body = b"".join(
+        [
+            f"--{boundary}\r\n".encode("ascii"),
+            b'Content-Disposition: form-data; name="metadata"\r\n',
+            b"Content-Type: application/json; charset=utf-8\r\n\r\n",
+            metadata_bytes,
+            b"\r\n",
+            f"--{boundary}\r\n".encode("ascii"),
+            (
+                'Content-Disposition: form-data; name="file"; '
+                f'filename="{safe_name}"\r\n'
+            ).encode(),
+            b"Content-Type: application/octet-stream\r\n\r\n",
+            file_bytes,
+            b"\r\n",
+            f"--{boundary}--\r\n".encode("ascii"),
+        ]
+    )
+    if len(body) > _MAX_IMAGE_EDIT_UPLOAD_BYTES:
+        raise ValueError("image-edit upload body is too large")
+    return body, f"multipart/form-data; boundary={boundary}"
 
 
 class BackendApiError(RuntimeError):
@@ -283,6 +324,129 @@ class BackendApiClient:
             expected_statuses={200},
         )
 
+    def get_image_edit_settings(self) -> JsonObject:
+        relative_path = "v1/image-edit/settings"
+        payload = self._request_json("GET", relative_path, expected_statuses={200})
+        settings = payload.get("settings")
+        if not isinstance(settings, dict):
+            raise self._protocol_error(
+                "GET",
+                relative_path,
+                "the response did not contain image-edit settings",
+                status_code=200,
+                payload=payload,
+            )
+        return settings
+
+    def update_image_edit_settings(self, output_directory: str) -> JsonObject:
+        if not isinstance(output_directory, str) or not output_directory.strip():
+            raise ValueError("output_directory must be non-empty")
+        relative_path = "v1/image-edit/settings"
+        payload = self._request_json(
+            "PUT",
+            relative_path,
+            json_body={"output_directory": output_directory.strip()},
+            expected_statuses={200},
+        )
+        settings = payload.get("settings")
+        if not isinstance(settings, dict):
+            raise self._protocol_error(
+                "PUT",
+                relative_path,
+                "the response did not contain image-edit settings",
+                status_code=200,
+                payload=payload,
+            )
+        return settings
+
+    def submit_image_edit_multipart(self, content_type: str, body: bytes) -> JsonObject:
+        if not isinstance(content_type, str) or not content_type.casefold().startswith(
+            "multipart/form-data;"
+        ):
+            raise ValueError("content_type must be multipart/form-data with a boundary")
+        if not isinstance(body, bytes) or not body:
+            raise ValueError("body must be non-empty bytes")
+        if len(body) > _MAX_IMAGE_EDIT_UPLOAD_BYTES:
+            raise ValueError("image-edit upload body is too large")
+        relative_path = "v1/image-edit/tasks"
+        payload = self._request_json(
+            "POST",
+            relative_path,
+            raw_body=body,
+            raw_content_type=content_type,
+            expected_statuses={202},
+        )
+        return self._extract_image_edit_task("POST", relative_path, payload)
+
+    def submit_image_edit_file(
+        self,
+        file_name: str,
+        file_bytes: bytes,
+        metadata: Mapping[str, Any],
+    ) -> JsonObject:
+        if not isinstance(file_name, str) or not file_name.strip():
+            raise ValueError("file_name must be non-empty")
+        if not isinstance(file_bytes, bytes) or not file_bytes:
+            raise ValueError("file_bytes must be non-empty bytes")
+        if not isinstance(metadata, Mapping):
+            raise ValueError("metadata must be a mapping")
+        body, content_type = _image_edit_multipart_body(file_name, file_bytes, metadata)
+        return self.submit_image_edit_multipart(content_type, body)
+
+    def list_image_edit_tasks(
+        self, *, active: bool | None = None, limit: int = 100
+    ) -> JsonObject:
+        if active is not None and not isinstance(active, bool):
+            raise ValueError("active must be a boolean or None")
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= 200
+        ):
+            raise ValueError("limit must be between 1 and 200")
+        query: list[tuple[str, str | int]] = []
+        if active is not None:
+            query.append(("active", "true" if active else "false"))
+        query.append(("limit", limit))
+        relative_path = f"v1/image-edit/tasks?{urlencode(query)}"
+        payload = self._request_json("GET", relative_path, expected_statuses={200})
+        tasks = payload.get("tasks")
+        if not isinstance(tasks, list) or any(
+            not isinstance(task, dict) for task in tasks
+        ):
+            raise self._protocol_error(
+                "GET",
+                relative_path,
+                "the image-edit task list must contain task objects",
+                status_code=200,
+                payload=payload,
+            )
+        return payload
+
+    def get_image_edit_task(self, task_id: str) -> JsonObject:
+        normalized_id = self._validate_job_id(task_id)
+        relative_path = f"v1/image-edit/tasks/{quote(normalized_id, safe='')}"
+        payload = self._request_json("GET", relative_path, expected_statuses={200})
+        return self._extract_image_edit_task(
+            "GET", relative_path, payload, expected_task_id=normalized_id
+        )
+
+    def cancel_image_edit_task(self, task_id: str) -> JsonObject:
+        normalized_id = self._validate_job_id(task_id)
+        relative_path = f"v1/image-edit/tasks/{quote(normalized_id, safe='')}"
+        payload = self._request_json("DELETE", relative_path, expected_statuses={202})
+        return self._extract_image_edit_task(
+            "DELETE", relative_path, payload, expected_task_id=normalized_id
+        )
+
+    def abandon_image_edit_tasks(self) -> JsonObject:
+        return self._request_json(
+            "POST",
+            "v1/image-edit/tasks/abandon",
+            json_body={"confirm": True},
+            expected_statuses={200},
+        )
+
     def submit_job(
         self,
         command: str,
@@ -422,14 +586,53 @@ class BackendApiClient:
             )
         return job
 
+    def _extract_image_edit_task(
+        self,
+        method: str,
+        relative_path: str,
+        payload: JsonObject,
+        *,
+        expected_task_id: str | None = None,
+    ) -> JsonObject:
+        task = payload.get("task")
+        if not isinstance(task, dict):
+            raise self._protocol_error(
+                method,
+                relative_path,
+                "the response did not contain an image-edit task",
+                payload=payload,
+            )
+        task_id = task.get("id")
+        if not isinstance(task_id, str) or not task_id:
+            raise self._protocol_error(
+                method,
+                relative_path,
+                "the image-edit task did not contain a non-empty ID",
+                payload=payload,
+            )
+        if expected_task_id is not None and task_id != expected_task_id:
+            raise self._protocol_error(
+                method,
+                relative_path,
+                "the backend returned a different image-edit task",
+                payload=payload,
+            )
+        return task
+
     def _request_json(
         self,
         method: str,
         relative_path: str,
         *,
         json_body: Mapping[str, Any] | None = None,
+        raw_body: bytes | None = None,
+        raw_content_type: str | None = None,
         expected_statuses: set[int],
     ) -> JsonObject:
+        if json_body is not None and raw_body is not None:
+            raise ValueError("json_body and raw_body cannot both be supplied")
+        if raw_body is None and raw_content_type is not None:
+            raise ValueError("raw_content_type requires raw_body")
         url = urljoin(self._base_url, relative_path)
         parsed = urlsplit(url)
         request_target = urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
@@ -437,7 +640,7 @@ class BackendApiClient:
             "Accept": _JSON_CONTENT_TYPE,
             "Authorization": f"Bearer {self._session_token}",
         }
-        body: bytes | None = None
+        body = raw_body
         if json_body is not None:
             try:
                 # Serialising first is intentional: the backend rejects chunked
@@ -451,6 +654,9 @@ class BackendApiClient:
             except (TypeError, ValueError) as exc:
                 raise ValueError(f"request body is not valid JSON: {exc}") from exc
             headers["Content-Type"] = f"{_JSON_CONTENT_TYPE}; charset=utf-8"
+            headers["Content-Length"] = str(len(body))
+        elif body is not None:
+            headers["Content-Type"] = raw_content_type or "application/octet-stream"
             headers["Content-Length"] = str(len(body))
 
         connection_class = (

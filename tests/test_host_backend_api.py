@@ -204,6 +204,68 @@ class HostBackendApiClientTests(unittest.TestCase):
             )
             self.assertEqual(json.loads(shutdown_body), {"if_idle": True})
 
+    def test_image_edit_client_builds_multipart_and_uses_dedicated_routes(self) -> None:
+        with _running_server() as server:
+            client = BackendApiClient(f"http://127.0.0.1:{server.server_port}", "token")
+            task = {
+                "id": "a" * 32,
+                "status": "queued",
+                "source_name": "原图.png",
+            }
+            _set_json_response(server, {"task": task}, status=202)
+
+            submitted = client.submit_image_edit_file(
+                "原图.png",
+                b"png-content",
+                {
+                    "model": "qwen-image-edit-plus",
+                    "prompt": "修改背景",
+                    "negative_prompt": "",
+                    "prompt_extend": True,
+                },
+            )
+
+            self.assertEqual(submitted["id"], "a" * 32)
+            upload = server.requests[-1]
+            self.assertEqual(upload["path"], "/v1/image-edit/tasks")
+            self.assertTrue(
+                upload["headers"]["Content-Type"].startswith("multipart/form-data;")
+            )
+            self.assertEqual(int(upload["content_length"]), len(upload["body"]))
+            self.assertIn("修改背景".encode(), upload["body"])
+            self.assertIn(b"png-content", upload["body"])
+            self.assertGreater(
+                upload["body"].rfind(b'name="file"'),
+                upload["body"].find(b'name="metadata"'),
+            )
+
+            _set_json_response(
+                server,
+                {"tasks": [task], "count": 1, "total_count": 1},
+            )
+            listed = client.list_image_edit_tasks(active=True, limit=1)
+            self.assertEqual(listed["tasks"], [task])
+            self.assertEqual(
+                server.requests[-1]["path"],
+                "/v1/image-edit/tasks?active=true&limit=1",
+            )
+
+            _set_json_response(
+                server,
+                {"settings": {"configured": True, "output_directory": r"D:\Out"}},
+            )
+            settings = client.get_image_edit_settings()
+            self.assertEqual(settings["output_directory"], r"D:\Out")
+            self.assertEqual(server.requests[-1]["path"], "/v1/image-edit/settings")
+
+            _set_json_response(
+                server,
+                {"abandoned_task_ids": ["a" * 32], "count": 1},
+            )
+            abandoned = client.abandon_image_edit_tasks()
+            self.assertEqual(abandoned["count"], 1)
+            self.assertEqual(json.loads(server.requests[-1]["body"]), {"confirm": True})
+
     def test_get_list_and_delete_job_routes(self) -> None:
         with _running_server() as server:
             client = BackendApiClient(f"http://127.0.0.1:{server.server_port}", "token")

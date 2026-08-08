@@ -1,23 +1,35 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref, watch } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 
+import { GatewayError } from "../../api/gateway";
+import { imageEditApi } from "./api";
 import {
   DEFAULT_IMAGE_EDIT_MODEL,
+  IMAGE_EDIT_ASPECT_RATIOS,
   IMAGE_EDIT_MODEL_GROUPS,
+  IMAGE_EDIT_SIZE_PRESETS,
+  imageEditSizeRule,
   isQwenImageThree,
   supportsImageEditSize,
   supportsPromptExtension,
+  validateImageEditDimensions,
 } from "./modelCatalog";
-import type { ImageEditIncomingSource, ImageEditPreviewStatus } from "./types";
-
-type ImageEditAspectRatio = "auto" | "1:1" | "4:3" | "3:4" | "16:9" | "9:16";
-type ImageEditSizeMode = "auto" | "1024" | "1536" | "2048" | "custom";
+import type { ImageEditAspectRatio } from "./modelCatalog";
+import type {
+  ImageEditIncomingSource,
+  ImageEditPreviewStatus,
+  ImageEditRequestPayload,
+  ImageEditTaskWire,
+} from "./types";
 
 interface LocalPreviewTask {
   id: string;
   name: string;
   sourceUrl: string;
   ownsSourceUrl: boolean;
+  file: File | null;
+  sourceImageId: string;
+  backendTaskId: string;
   sizeBytes: number;
   width: number | null;
   height: number | null;
@@ -25,15 +37,15 @@ interface LocalPreviewTask {
   modelId: string;
   negativePrompt: string;
   aspectRatio: ImageEditAspectRatio;
-  sizeMode: ImageEditSizeMode;
+  outputSize: string;
   widthInput: number;
   heightInput: number;
   seed: string;
   promptExtend: boolean;
-  watermark: boolean;
   status: ImageEditPreviewStatus;
   error: string;
   resultUrl: string;
+  outputFilename: string;
 }
 
 const props = withDefaults(defineProps<{
@@ -46,9 +58,18 @@ const props = withDefaults(defineProps<{
 
 const emit = defineEmits<{
   toast: [title: string, message: string, kind: "success" | "error" | "info"];
+  selectDirectory: [callback: (path: string) => void];
 }>();
 
 const SUPPORTED_IMAGE = /\.(?:jpe?g|png|webp|bmp|gif|tiff?)$/iu;
+const SUPPORTED_MIME_TYPES = new Set([
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+  "image/bmp",
+  "image/gif",
+  "image/tiff",
+]);
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 const MAX_IMPORT_FILES = 50;
 const MAX_SESSION_TASKS = 200;
@@ -57,6 +78,7 @@ const ACTIVE_STATUSES = new Set<ImageEditPreviewStatus>([
   "uploading",
   "generating",
   "downloading",
+  "cancelling",
 ]);
 
 const tasks = ref<LocalPreviewTask[]>([]);
@@ -64,12 +86,17 @@ const activeTaskId = ref("");
 const canvasView = ref<"source" | "result">("source");
 const fileInput = ref<HTMLInputElement | null>(null);
 const dragActive = ref(false);
-const outputDirectory = ref("D:\\Pictures\\Qwen 编辑结果（预览）");
+const outputDirectory = ref("");
+const settingsLoading = ref(true);
 const lastModelId = ref(DEFAULT_IMAGE_EDIT_MODEL);
 const processedIncomingKey = ref("");
-const simulationTimers = new Map<string, number[]>();
+const submitControllers = new Map<string, AbortController>();
 let taskSequence = 0;
 let dragDepth = 0;
+let pollTimer: number | null = null;
+let polling = false;
+let destroyed = false;
+let pollErrorShown = false;
 
 const activeTask = computed(
   () => tasks.value.find((task) => task.id === activeTaskId.value) ?? null,
@@ -91,12 +118,31 @@ const activeSupportsPromptExtension = computed(
 const activeIsQwenThree = computed(
   () => Boolean(activeTask.value && isQwenImageThree(activeTask.value.modelId)),
 );
+const activeSizeRule = computed(() => (
+  activeTask.value ? imageEditSizeRule(activeTask.value.modelId) : "automatic-only"
+));
+const activeSizeOptions = computed(() => {
+  const task = activeTask.value;
+  if (!task || !activeSupportsSize.value || task.aspectRatio === "auto") {
+    return [{ value: "auto", label: "由模型根据原图自动决定" }];
+  }
+  if (task.aspectRatio === "custom") {
+    return [{ value: "custom", label: "自定义宽高" }];
+  }
+  return IMAGE_EDIT_SIZE_PRESETS[task.aspectRatio].map((size) => ({
+    value: size,
+    label: size.replace("*", " × ") + " px",
+  }));
+});
 const activeCount = computed(
   () => tasks.value.filter((task) => ACTIVE_STATUSES.has(task.status)).length,
 );
 const waitingCount = computed(
   () => tasks.value.filter((task) => task.status === "queued").length,
 );
+const canAbandonActive = computed(() => tasks.value
+  .filter((task) => ACTIVE_STATUSES.has(task.status))
+  .every((task) => Boolean(task.backendTaskId)));
 
 function statusLabel(status: ImageEditPreviewStatus): string {
   const labels: Record<ImageEditPreviewStatus, string> = {
@@ -105,10 +151,26 @@ function statusLabel(status: ImageEditPreviewStatus): string {
     uploading: "正在上传",
     generating: "正在生成",
     downloading: "正在下载",
-    succeeded: "已保存（模拟）",
+    cancelling: "正在取消",
+    succeeded: "已保存",
     failed: "需要处理",
+    cancelled: "已取消",
   };
   return labels[status];
+}
+
+function statusDescription(status: ImageEditPreviewStatus): string {
+  return {
+    draft: "等待手动提交。",
+    queued: "任务已进入本地并发队列。",
+    uploading: "正在上传原图。",
+    generating: "阿里云模型正在编辑图片。",
+    downloading: "正在下载并写入所选输出目录。",
+    cancelling: "正在停止当前任务。",
+    succeeded: "生成结果已保存。",
+    failed: "任务失败，原图和编辑指令已保留。",
+    cancelled: "任务已取消。",
+  }[status];
 }
 
 function formatBytes(value: number): string {
@@ -131,12 +193,17 @@ function createTask(
   sourceUrl: string,
   sizeBytes: number,
   ownsSourceUrl: boolean,
+  file: File | null = null,
+  sourceImageId = "",
 ): LocalPreviewTask {
   return {
     id: nextTaskId(),
     name,
     sourceUrl,
     ownsSourceUrl,
+    file,
+    sourceImageId,
+    backendTaskId: "",
     sizeBytes,
     width: null,
     height: null,
@@ -144,15 +211,15 @@ function createTask(
     modelId: lastModelId.value,
     negativePrompt: "",
     aspectRatio: "auto",
-    sizeMode: "auto",
+    outputSize: "auto",
     widthInput: 1024,
     heightInput: 1024,
     seed: "",
     promptExtend: true,
-    watermark: false,
     status: "draft",
     error: "",
     resultUrl: "",
+    outputFilename: "",
   };
 }
 
@@ -172,7 +239,7 @@ function readDimensions(task: LocalPreviewTask): void {
 function appendTasks(newTasks: LocalPreviewTask[]): void {
   if (newTasks.length === 0) return;
   tasks.value = [...tasks.value, ...newTasks];
-  for (const task of newTasks) readDimensions(task);
+  for (const task of tasks.value.slice(-newTasks.length)) readDimensions(task);
   activeTaskId.value = newTasks[0]?.id ?? activeTaskId.value;
   canvasView.value = "source";
 }
@@ -192,8 +259,10 @@ function importFiles(files: File[]): void {
   const valid: File[] = [];
   const rejected: string[] = [];
   for (const file of files) {
-    if (!(file.type.startsWith("image/") || SUPPORTED_IMAGE.test(file.name))) {
+    if (!(SUPPORTED_MIME_TYPES.has(file.type.toLowerCase()) || SUPPORTED_IMAGE.test(file.name))) {
       rejected.push(`${file.name}：格式不支持`);
+    } else if (file.size <= 0) {
+      rejected.push(`${file.name}：文件为空`);
     } else if (file.size > MAX_IMAGE_BYTES) {
       rejected.push(`${file.name}：超过 10 MB`);
     } else {
@@ -206,6 +275,7 @@ function importFiles(files: File[]): void {
     URL.createObjectURL(file),
     file.size,
     true,
+    file,
   )));
 
   if (valid.length > 0) {
@@ -223,7 +293,14 @@ function importIncomingSource(source: ImageEditIncomingSource): void {
     emit("toast", "无法建立编辑草稿", `当前会话最多保留 ${MAX_SESSION_TASKS} 个任务。`, "error");
     return;
   }
-  const task = createTask(source.name, source.url, source.sizeBytes ?? 0, false);
+  const task = createTask(
+    source.name,
+    source.url,
+    source.sizeBytes ?? 0,
+    false,
+    null,
+    source.imageId,
+  );
   appendTasks([task]);
   emit("toast", "已加入图片编辑", `${source.name} 已建立为本地草稿。`, "success");
 }
@@ -289,8 +366,8 @@ function selectTask(taskId: string): void {
 }
 
 function clearTaskTimers(taskId: string): void {
-  for (const timer of simulationTimers.get(taskId) ?? []) window.clearTimeout(timer);
-  simulationTimers.delete(taskId);
+  submitControllers.get(taskId)?.abort();
+  submitControllers.delete(taskId);
 }
 
 function removeTask(task: LocalPreviewTask): void {
@@ -308,63 +385,207 @@ function removeTask(task: LocalPreviewTask): void {
 function updateModel(task: LocalPreviewTask): void {
   lastModelId.value = task.modelId;
   task.error = "";
+  if (!supportsImageEditSize(task.modelId)) {
+    task.aspectRatio = "auto";
+    task.outputSize = "auto";
+  } else if (task.aspectRatio !== "auto" && task.aspectRatio !== "custom") {
+    task.outputSize = IMAGE_EDIT_SIZE_PRESETS[task.aspectRatio][0];
+  }
 }
 
-function scheduleStatus(task: LocalPreviewTask, delay: number, status: ImageEditPreviewStatus): void {
-  const timer = window.setTimeout(() => {
-    const current = tasks.value.find((candidate) => candidate.id === task.id);
-    if (!current) return;
-    current.status = status;
-    if (status === "succeeded") {
-      current.resultUrl = current.sourceUrl;
-      if (current.id === activeTaskId.value) canvasView.value = "result";
-    }
-  }, delay);
-  simulationTimers.set(task.id, [...(simulationTimers.get(task.id) ?? []), timer]);
-}
-
-function generatePreview(task: LocalPreviewTask): void {
+function updateAspectRatio(task: LocalPreviewTask): void {
+  if (task.aspectRatio === "auto") task.outputSize = "auto";
+  else if (task.aspectRatio === "custom") task.outputSize = "custom";
+  else task.outputSize = IMAGE_EDIT_SIZE_PRESETS[task.aspectRatio][0];
   task.error = "";
+}
+
+function requestPayload(task: LocalPreviewTask): ImageEditRequestPayload | null {
   if (!task.prompt.trim()) {
     task.error = "请先填写编辑指令。";
-    return;
+    return null;
   }
-  clearTaskTimers(task.id);
-  task.resultUrl = "";
-  task.status = "queued";
-  canvasView.value = "source";
-  scheduleStatus(task, 350, "uploading");
-  scheduleStatus(task, 950, "generating");
-  scheduleStatus(task, 2100, "downloading");
-  scheduleStatus(task, 2850, "succeeded");
+  if (!outputDirectory.value) {
+    task.error = "请先选择生成结果的输出目录。";
+    return null;
+  }
+  if (!isQwenImageThree(task.modelId) && task.negativePrompt.length > 500) {
+    task.error = "当前模型的反向提示词最多为 500 个字符。";
+    return null;
+  }
+
+  let size: string | undefined;
+  if (supportsImageEditSize(task.modelId) && task.aspectRatio !== "auto") {
+    if (task.aspectRatio === "custom") {
+      const width = Number(task.widthInput);
+      const height = Number(task.heightInput);
+      const dimensionError = validateImageEditDimensions(task.modelId, width, height);
+      if (dimensionError) {
+        task.error = dimensionError;
+        return null;
+      }
+      size = `${width}*${height}`;
+    } else {
+      size = task.outputSize;
+    }
+  }
+
+  let seed: number | undefined;
+  if (task.seed.trim()) {
+    seed = Number(task.seed);
+    if (!Number.isInteger(seed) || seed < 0 || seed > 2_147_483_647) {
+      task.error = "随机种子必须是 0 到 2147483647 之间的整数。";
+      return null;
+    }
+  }
+  return {
+    model: task.modelId,
+    prompt: task.prompt.trim(),
+    negative_prompt: task.negativePrompt.trim(),
+    ...(size ? { size } : {}),
+    ...(seed === undefined ? {} : { seed }),
+    prompt_extend: supportsPromptExtension(task.modelId) && task.promptExtend,
+  };
 }
 
-function duplicateSucceededTask(task: LocalPreviewTask): void {
-  const duplicate = createTask(task.name, task.sourceUrl, task.sizeBytes, false);
-  duplicate.width = task.width;
-  duplicate.height = task.height;
-  duplicate.prompt = task.prompt;
-  duplicate.modelId = task.modelId;
-  duplicate.negativePrompt = task.negativePrompt;
-  duplicate.aspectRatio = task.aspectRatio;
-  duplicate.sizeMode = task.sizeMode;
-  duplicate.widthInput = task.widthInput;
-  duplicate.heightInput = task.heightInput;
-  duplicate.seed = task.seed;
-  duplicate.promptExtend = task.promptExtend;
-  duplicate.watermark = task.watermark;
-  tasks.value = [...tasks.value, duplicate];
-  activeTaskId.value = duplicate.id;
+function applyTaskUpdate(task: LocalPreviewTask, wire: ImageEditTaskWire): void {
+  task.backendTaskId = wire.id;
+  task.status = wire.status;
+  task.error = wire.error?.message ?? "";
+  task.resultUrl = wire.result?.image_url ?? "";
+  task.outputFilename = wire.result?.output_filename ?? "";
+  if (wire.status === "succeeded" && wire.result?.preview_error) {
+    task.error = wire.result.preview_error;
+  }
+  if (wire.status === "succeeded" && task.resultUrl && task.id === activeTaskId.value) {
+    canvasView.value = "result";
+  }
+}
+
+function gatewayMessage(error: unknown): string {
+  if (error instanceof GatewayError) return error.message;
+  if (error instanceof Error && error.name === "AbortError") return "操作已取消。";
+  return "图片编辑请求失败，请稍后重试。";
+}
+
+async function generatePreview(task: LocalPreviewTask): Promise<void> {
+  task.error = "";
+  const metadata = requestPayload(task);
+  if (!metadata) return;
+  const controller = new AbortController();
+  submitControllers.set(task.id, controller);
+  task.status = "queued";
+  task.backendTaskId = "";
+  task.resultUrl = "";
+  task.outputFilename = "";
   canvasView.value = "source";
+  try {
+    const wire = task.file
+      ? await imageEditApi.submitFile(task.file, metadata, controller.signal)
+      : await imageEditApi.submitRegistered(task.sourceImageId, metadata, controller.signal);
+    applyTaskUpdate(task, wire);
+    schedulePoll(250);
+  } catch (error) {
+    if (controller.signal.aborted) {
+      task.status = "cancelled";
+      return;
+    }
+    task.status = "failed";
+    task.error = gatewayMessage(error);
+  } finally {
+    submitControllers.delete(task.id);
+  }
+}
+
+function schedulePoll(delay = 900): void {
+  if (destroyed || pollTimer !== null || polling) return;
+  if (!tasks.value.some((task) => ACTIVE_STATUSES.has(task.status) && task.backendTaskId)) return;
+  pollTimer = window.setTimeout(() => {
+    pollTimer = null;
+    void pollTasks();
+  }, delay);
+}
+
+async function pollTasks(): Promise<void> {
+  if (destroyed || polling) return;
+  const activeBackendIds = new Set(tasks.value
+    .filter((task) => ACTIVE_STATUSES.has(task.status) && task.backendTaskId)
+    .map((task) => task.backendTaskId));
+  if (activeBackendIds.size === 0) return;
+  polling = true;
+  try {
+    const payload = await imageEditApi.list();
+    const byId = new Map(payload.tasks.map((wire) => [wire.id, wire]));
+    for (const task of tasks.value) {
+      if (!activeBackendIds.has(task.backendTaskId)) continue;
+      const wire = byId.get(task.backendTaskId);
+      if (wire) applyTaskUpdate(task, wire);
+    }
+    pollErrorShown = false;
+  } catch (error) {
+    if (!pollErrorShown) {
+      pollErrorShown = true;
+      emit("toast", "任务状态暂不可用", gatewayMessage(error), "error");
+    }
+  } finally {
+    polling = false;
+    schedulePoll();
+  }
+}
+
+async function cancelTask(task: LocalPreviewTask): Promise<void> {
+  if (!ACTIVE_STATUSES.has(task.status)) {
+    removeTask(task);
+    return;
+  }
+  if (!task.backendTaskId) return;
+  task.status = "cancelling";
+  try {
+    applyTaskUpdate(task, await imageEditApi.cancel(task.backendTaskId));
+    schedulePoll(250);
+  } catch (error) {
+    task.error = gatewayMessage(error);
+    emit("toast", "取消失败", task.error, "error");
+    schedulePoll();
+  }
+}
+
+async function abandonActiveTasks(): Promise<void> {
+  if (!canAbandonActive.value || activeCount.value === 0) return;
+  if (!window.confirm("确定放弃全部运行中的图片编辑任务吗？未保存的结果不会保留。")) return;
+  try {
+    await imageEditApi.abandonAll();
+    for (const task of tasks.value) {
+      if (ACTIVE_STATUSES.has(task.status)) task.status = "cancelled";
+    }
+    emit("toast", "已放弃运行任务", "原图和编辑指令仍保留在当前页面。", "info");
+  } catch (error) {
+    emit("toast", "无法放弃任务", gatewayMessage(error), "error");
+  }
 }
 
 function chooseOutputDirectory(): void {
-  emit(
-    "toast",
-    "本地前端预览",
-    "此预览不会访问文件系统；正式 WebView 版本会在这里打开 Windows 文件夹选择器。",
-    "info",
-  );
+  emit("selectDirectory", (path) => {
+    if (!path) return;
+    void imageEditApi.updateSettings(path).then((settings) => {
+      outputDirectory.value = settings.output_directory ?? "";
+      emit("toast", "输出目录已保存", outputDirectory.value, "success");
+    }).catch((error) => {
+      emit("toast", "无法保存输出目录", gatewayMessage(error), "error");
+    });
+  });
+}
+
+async function loadSettings(): Promise<void> {
+  settingsLoading.value = true;
+  try {
+    const settings = await imageEditApi.settings();
+    outputDirectory.value = settings.output_directory ?? "";
+  } catch (error) {
+    emit("toast", "无法读取输出目录", gatewayMessage(error), "error");
+  } finally {
+    settingsLoading.value = false;
+  }
 }
 
 watch(
@@ -381,10 +602,17 @@ watch(
   () => props.visible,
   (visible) => {
     if (!visible) dragActive.value = false;
+    else schedulePoll(100);
   },
 );
 
+onMounted(() => {
+  void loadSettings();
+});
+
 onBeforeUnmount(() => {
+  destroyed = true;
+  if (pollTimer !== null) window.clearTimeout(pollTimer);
   for (const task of tasks.value) {
     clearTaskTimers(task.id);
     if (task.ownsSourceUrl) URL.revokeObjectURL(task.sourceUrl);
@@ -418,16 +646,22 @@ onBeforeUnmount(() => {
         <p>Qwen 图片编辑</p>
         <h1 id="image-edit-title">图片编辑</h1>
       </div>
-      <div class="preview-notice" role="status">
-        <strong>前端本地预览</strong>
-        <span>不上传、不调用模型、不产生费用</span>
+      <div class="task-overview" role="status">
+        <span>进行中 {{ activeCount }}</span>
+        <button
+          v-if="activeCount > 0"
+          class="button danger compact"
+          type="button"
+          :disabled="!canAbandonActive"
+          @click="abandonActiveTasks"
+        >放弃运行任务</button>
       </div>
       <div class="header-actions">
-        <div class="directory-summary" title="正式版本将在任务提交时锁定此目录">
+        <div class="directory-summary" title="任务提交时使用当前目录">
           <span>输出目录</span>
-          <strong>{{ outputDirectory }}</strong>
+          <strong>{{ settingsLoading ? "正在读取…" : outputDirectory || "未选择" }}</strong>
         </div>
-        <button class="button secondary" type="button" @click="chooseOutputDirectory">更改目录</button>
+        <button class="button secondary" type="button" :disabled="settingsLoading" @click="chooseOutputDirectory">更改目录</button>
         <button class="button primary" type="button" @click="openFilePicker">导入图片</button>
       </div>
     </header>
@@ -441,7 +675,7 @@ onBeforeUnmount(() => {
         <p>拖放图片到此处，使用剪贴板粘贴，或一次选择最多 50 张。</p>
       </div>
       <button class="button primary" type="button" @click="openFilePicker">选择图片</button>
-      <small>每张图片建立一个独立草稿；导入不会上传到阿里云。</small>
+      <small>每张图片建立一个独立草稿；只有手动提交的任务才会开始处理。</small>
     </div>
 
     <div v-else class="workspace-body">
@@ -466,39 +700,60 @@ onBeforeUnmount(() => {
 
           <label class="ratio-field">
             <span>画幅比例</span>
-            <select v-model="activeTask.aspectRatio" :disabled="activeTaskLocked || !activeSupportsSize">
-              <option value="auto">自动</option>
-              <option value="1:1">1:1</option>
-              <option value="4:3">4:3</option>
-              <option value="3:4">3:4</option>
-              <option value="16:9">16:9</option>
-              <option value="9:16">9:16</option>
+            <select
+              v-model="activeTask.aspectRatio"
+              :disabled="activeTaskLocked || !activeSupportsSize"
+              @change="updateAspectRatio(activeTask)"
+            >
+              <option v-for="ratio in IMAGE_EDIT_ASPECT_RATIOS" :key="ratio" :value="ratio">
+                {{ ratio === "auto" ? "跟随原图" : ratio === "custom" ? "自定义" : ratio }}
+              </option>
             </select>
             <small v-if="!activeSupportsSize">当前模型不支持指定比例</small>
           </label>
 
           <label class="size-field">
             <span>图片尺寸</span>
-            <select v-model="activeTask.sizeMode" :disabled="activeTaskLocked || !activeSupportsSize">
-              <option value="auto">自动推荐</option>
-              <option value="1024">长边 1024 px</option>
-              <option value="1536">长边 1536 px</option>
-              <option value="2048">长边 2048 px</option>
-              <option value="custom">自定义宽高</option>
+            <select v-model="activeTask.outputSize" :disabled="activeTaskLocked || !activeSupportsSize">
+              <option v-for="option in activeSizeOptions" :key="option.value" :value="option.value">
+                {{ option.label }}
+              </option>
             </select>
             <small v-if="!activeSupportsSize">当前模型不支持指定尺寸</small>
+            <small v-else-if="activeTask.aspectRatio !== 'auto' && activeTask.aspectRatio !== 'custom'">
+              {{ activeIsQwenThree ? "常用有效尺寸" : "阿里云推荐尺寸" }}
+            </small>
           </label>
 
-          <div v-if="activeTask.sizeMode === 'custom' && activeSupportsSize" class="size-inputs">
+          <div v-if="activeTask.aspectRatio === 'custom' && activeSupportsSize" class="size-inputs">
             <label>
               <span>宽</span>
-              <input v-model.number="activeTask.widthInput" :disabled="activeTaskLocked" type="number" min="512" max="2048" />
+              <input
+                v-model.number="activeTask.widthInput"
+                :disabled="activeTaskLocked"
+                type="number"
+                :min="activeSizeRule === 'side-range' ? 512 : 1"
+                :max="activeSizeRule === 'side-range' ? 2048 : undefined"
+              />
             </label>
             <span aria-hidden="true">×</span>
             <label>
               <span>高</span>
-              <input v-model.number="activeTask.heightInput" :disabled="activeTaskLocked" type="number" min="512" max="2048" />
+              <input
+                v-model.number="activeTask.heightInput"
+                :disabled="activeTaskLocked"
+                type="number"
+                :min="activeSizeRule === 'side-range' ? 512 : 1"
+                :max="activeSizeRule === 'side-range' ? 2048 : undefined"
+              />
             </label>
+            <small>
+              {{ activeSizeRule === "side-range"
+                ? "宽高均为 512–2048 px"
+                : activeIsQwenThree
+                  ? "总像素为 512×512–2048×2048，宽高比为 1:8–8:1"
+                  : "总像素为 512×512–2048×2048" }}；服务可能调整为 16 px 的倍数
+            </small>
           </div>
 
           <label>
@@ -567,15 +822,15 @@ onBeforeUnmount(() => {
           >
             <img
               :src="canvasImageUrl"
-              :alt="canvasView === 'result' ? '本地模拟生成结果' : `原图：${activeTask.name}`"
+              :alt="canvasView === 'result' ? '图片编辑生成结果' : `原图：${activeTask.name}`"
             />
             <div v-if="ACTIVE_STATUSES.has(activeTask.status)" class="canvas-progress">
               <span class="progress-mark" aria-hidden="true"></span>
               <strong>{{ statusLabel(activeTask.status) }}</strong>
-              <p>本地预览正在模拟任务状态，不会发送网络请求。</p>
+              <p>{{ statusDescription(activeTask.status) }}</p>
             </div>
-            <p v-if="canvasView === 'result' && activeTask.resultUrl" class="simulation-label">
-              界面模拟结果，不代表模型效果
+            <p v-if="canvasView === 'result' && activeTask.outputFilename" class="result-label">
+              已保存：{{ activeTask.outputFilename }}
             </p>
           </div>
         </section>
@@ -595,19 +850,24 @@ onBeforeUnmount(() => {
 
           <footer class="composer-footer">
             <div class="submit-actions">
-              <span v-if="activeTask.status === 'succeeded'">已模拟完成，本地未写入文件</span>
               <button
-                v-if="activeTask.status === 'succeeded'"
+                v-if="activeTaskLocked && activeTask.backendTaskId"
                 class="button secondary"
                 type="button"
-                @click="duplicateSucceededTask(activeTask)"
-              >再次生成</button>
+                :disabled="activeTask.status === 'cancelling'"
+                @click="cancelTask(activeTask)"
+              >取消任务</button>
               <button
-                v-else
                 class="button primary generate-button"
                 type="submit"
-                :disabled="activeTaskLocked || !activeTask.prompt.trim()"
-              >{{ activeTaskLocked ? statusLabel(activeTask.status) : "生成图片" }}</button>
+                :disabled="activeTaskLocked || !activeTask.prompt.trim() || !outputDirectory"
+              >{{ activeTaskLocked
+                ? statusLabel(activeTask.status)
+                : activeTask.status === "failed"
+                  ? "重新生成"
+                  : activeTask.status === "succeeded"
+                    ? "再次生成"
+                    : "生成图片" }}</button>
             </div>
           </footer>
         </form>
@@ -642,10 +902,10 @@ onBeforeUnmount(() => {
             <button
               class="task-remove"
               type="button"
-              :disabled="ACTIVE_STATUSES.has(task.status)"
-              :aria-label="'移除 ' + task.name"
-              title="移除任务，不删除原图或已保存文件"
-              @click="removeTask(task)"
+              :disabled="ACTIVE_STATUSES.has(task.status) && !task.backendTaskId"
+              :aria-label="(ACTIVE_STATUSES.has(task.status) ? '取消 ' : '移除 ') + task.name"
+              :title="ACTIVE_STATUSES.has(task.status) ? '取消任务' : '移除任务，不删除原图或已保存文件'"
+              @click="cancelTask(task)"
             >×</button>
           </article>
         </div>
@@ -653,7 +913,7 @@ onBeforeUnmount(() => {
     </div>
 
     <div v-if="dragActive" class="drop-overlay" aria-hidden="true">
-      <div><strong>松开即可建立编辑草稿</strong><span>图片只保留在本地预览中</span></div>
+      <div><strong>松开即可建立编辑草稿</strong><span>每张图片会成为独立任务</span></div>
     </div>
   </section>
 </template>
@@ -708,8 +968,7 @@ onBeforeUnmount(() => {
 .title-copy h1 { margin: 0; }
 .title-copy p { color: var(--ie-muted); font-size: 11px; letter-spacing: .07em; text-transform: uppercase; }
 .title-copy h1 { margin-top: 2px; font-size: 21px; font-weight: 620; letter-spacing: -.02em; }
-.preview-notice { display: flex; min-width: 0; align-items: baseline; gap: 8px; color: var(--ie-muted); font-size: 12px; }
-.preview-notice strong { color: #6d5317; font-weight: 650; }
+.task-overview { display: flex; min-width: 0; align-items: center; justify-content: center; gap: 10px; color: var(--ie-muted); font-size: 12px; }
 .header-actions { display: flex; min-width: 0; align-items: center; justify-content: flex-end; gap: 8px; }
 .directory-summary { display: grid; min-width: 150px; max-width: 260px; gap: 1px; text-align: right; }
 .directory-summary span { color: var(--ie-muted); font-size: 11px; }
@@ -731,6 +990,8 @@ onBeforeUnmount(() => {
 .button.primary { color: var(--ie-accent-text); border-color: var(--ie-accent); background: var(--ie-accent); }
 .button.primary:hover:not(:disabled) { background: #050505; }
 .button.secondary { background: var(--ie-surface-soft); }
+.button.danger { color: var(--ie-danger); border-color: color-mix(in srgb, var(--ie-danger) 35%, transparent); background: transparent; }
+.button.compact { min-height: 30px; padding-inline: 10px; font-size: 11px; }
 .button:disabled { opacity: .45; }
 
 .empty-workspace {
@@ -790,6 +1051,7 @@ onBeforeUnmount(() => {
 .model-field { width: 100%; }
 .size-inputs { display: grid; grid-template-columns: minmax(64px, 1fr) auto minmax(64px, 1fr); align-items: end; gap: 6px; }
 .size-inputs > span { padding-bottom: 9px; color: var(--ie-muted); }
+.size-inputs > small { grid-column: 1 / -1; color: var(--ie-faint); font-size: 10px; line-height: 1.45; }
 .negative-field textarea { min-height: 104px; }
 .check-setting {
   display: flex !important;
@@ -839,7 +1101,7 @@ onBeforeUnmount(() => {
 .canvas-progress strong { color: var(--ie-text); font-size: 13px; }
 .canvas-progress p { max-width: 320px; margin: 0; font-size: 11px; }
 .progress-mark { border-color: var(--ie-line-strong) !important; border-top-color: var(--ie-accent) !important; border-radius: 50% !important; animation: ie-spin .9s linear infinite; }
-.simulation-label { position: absolute; right: 10px; bottom: 10px; margin: 0; padding: 4px 7px; border-radius: 6px; color: #fff; font-size: 10px; background: rgb(0 0 0 / 68%); }
+.result-label { position: absolute; right: 10px; bottom: 10px; max-width: calc(100% - 20px); overflow: hidden; margin: 0; padding: 4px 7px; border-radius: 6px; color: #fff; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; background: rgb(0 0 0 / 68%); }
 
 .prompt-composer { display: grid; gap: 10px; padding: 12px 16px 14px; border-top: 1px solid var(--ie-line); background: var(--ie-surface); }
 .prompt-composer textarea { min-height: 74px; }
@@ -882,7 +1144,7 @@ onBeforeUnmount(() => {
 
 @media (max-width: 1180px) {
   .workspace-header { grid-template-columns: auto 1fr; }
-  .preview-notice { justify-self: end; }
+  .task-overview { justify-self: end; }
   .header-actions { grid-column: 1 / -1; justify-content: stretch; }
   .directory-summary { max-width: none; flex: 1; text-align: left; }
   .workspace-body { grid-template-columns: 232px minmax(0, 1fr) 92px; }
@@ -893,7 +1155,7 @@ onBeforeUnmount(() => {
 @media (max-width: 820px) {
   .image-edit-page { overflow: auto; }
   .workspace-header { position: sticky; z-index: 5; top: 0; grid-template-columns: 1fr auto; }
-  .preview-notice span { display: none; }
+  .task-overview > span { display: none; }
   .workspace-body {
     grid-template-columns: minmax(0, 1fr);
     grid-template-rows: auto auto auto;
@@ -954,7 +1216,6 @@ onBeforeUnmount(() => {
     --ie-accent-text: #171714;
     --ie-danger: #ff9aa7;
   }
-  .preview-notice strong { color: #e2bd68; }
   .button.primary:hover:not(:disabled) { background: #fff; }
   .image-canvas { background-color: #161713; }
   .checkerboard { background-image: linear-gradient(45deg, #20211d 25%, transparent 25%), linear-gradient(-45deg, #20211d 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #20211d 75%), linear-gradient(-45deg, transparent 75%, #20211d 75%); }
