@@ -66,6 +66,8 @@ describe("ImageEditPage local preview", () => {
     expect(wrapper.find(".comparison").exists()).toBe(false);
     expect(wrapper.find(".image-canvas").exists()).toBe(true);
     expect(wrapper.text()).not.toContain("添加 Qwen-Image 水印");
+    expect(wrapper.text()).not.toContain("我已知晓");
+    expect(wrapper.find(".consent-check").exists()).toBe(false);
     expect(wrapper.text()).toContain("前端本地预览");
     expect(wrapper.emitted("toast")?.[0]).toEqual([
       "图片已导入",
@@ -115,12 +117,11 @@ describe("ImageEditPage local preview", () => {
       new File([new Uint8Array([1])], "street.webp", { type: "image/webp" }),
     ]);
     await wrapper.get(".prompt-field textarea").setValue("把背景改为雨后的东京街道");
-    await wrapper.get(".consent-check input").setValue(true);
+    expect(wrapper.get(".generate-button").attributes("disabled")).toBeUndefined();
 
     await wrapper.get(".generate-button").trigger("click");
     expect(wrapper.get(".canvas-status").text()).toContain("排队中");
     expect(wrapper.find(".canvas-progress").exists()).toBe(true);
-    expect((wrapper.get(".consent-check input").element as HTMLInputElement).checked).toBe(false);
 
     await vi.advanceTimersByTimeAsync(1000);
     expect(wrapper.get(".canvas-status").text()).toContain("正在生成");

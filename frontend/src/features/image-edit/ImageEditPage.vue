@@ -31,7 +31,6 @@ interface LocalPreviewTask {
   seed: string;
   promptExtend: boolean;
   watermark: boolean;
-  consent: boolean;
   status: ImageEditPreviewStatus;
   error: string;
   resultUrl: string;
@@ -151,7 +150,6 @@ function createTask(
     seed: "",
     promptExtend: true,
     watermark: false,
-    consent: false,
     status: "draft",
     error: "",
     resultUrl: "",
@@ -309,7 +307,6 @@ function removeTask(task: LocalPreviewTask): void {
 
 function updateModel(task: LocalPreviewTask): void {
   lastModelId.value = task.modelId;
-  task.consent = false;
   task.error = "";
 }
 
@@ -332,12 +329,7 @@ function generatePreview(task: LocalPreviewTask): void {
     task.error = "请先填写编辑指令。";
     return;
   }
-  if (!task.consent) {
-    task.error = "请先确认上传与费用说明。";
-    return;
-  }
   clearTaskTimers(task.id);
-  task.consent = false;
   task.resultUrl = "";
   task.status = "queued";
   canvasView.value = "source";
@@ -602,13 +594,6 @@ onBeforeUnmount(() => {
           <p v-if="activeTask.error" class="form-error" role="alert">{{ activeTask.error }}</p>
 
           <footer class="composer-footer">
-            <label class="consent-check">
-              <input v-model="activeTask.consent" :disabled="activeTaskLocked" type="checkbox" />
-              <span>
-                我已知晓：图片将上传至阿里云临时存储并发送给
-                <strong>{{ activeTask.modelId }}</strong>；成功生成可能消耗免费额度或产生费用。
-              </span>
-            </label>
             <div class="submit-actions">
               <span v-if="activeTask.status === 'succeeded'">已模拟完成，本地未写入文件</span>
               <button
@@ -621,7 +606,7 @@ onBeforeUnmount(() => {
                 v-else
                 class="button primary generate-button"
                 type="submit"
-                :disabled="activeTaskLocked || !activeTask.prompt.trim() || !activeTask.consent"
+                :disabled="activeTaskLocked || !activeTask.prompt.trim()"
               >{{ activeTaskLocked ? statusLabel(activeTask.status) : "生成图片" }}</button>
             </div>
           </footer>
@@ -859,10 +844,7 @@ onBeforeUnmount(() => {
 .prompt-composer { display: grid; gap: 10px; padding: 12px 16px 14px; border-top: 1px solid var(--ie-line); background: var(--ie-surface); }
 .prompt-composer textarea { min-height: 74px; }
 .form-error { margin: 0; color: var(--ie-danger); font-size: 12px; }
-.composer-footer { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
-.consent-check { display: flex !important; max-width: 720px; align-items: flex-start; gap: 9px !important; color: var(--ie-muted) !important; line-height: 1.45; }
-.consent-check input { width: 16px !important; min-height: 16px !important; margin-top: 2px; }
-.consent-check strong { color: var(--ie-text); font-weight: 600; }
+.composer-footer { display: flex; align-items: center; justify-content: flex-end; gap: 16px; }
 .submit-actions { display: flex; flex: 0 0 auto; align-items: center; gap: 8px; }
 .submit-actions > span { color: var(--ie-muted); font-size: 11px; }
 .generate-button { min-width: 106px; }
