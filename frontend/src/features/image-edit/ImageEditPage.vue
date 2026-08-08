@@ -40,7 +40,7 @@ interface LocalPreviewTask {
   outputSize: string;
   widthInput: number;
   heightInput: number;
-  seed: string;
+  seed: string | number;
   promptExtend: boolean;
   status: ImageEditPreviewStatus;
   error: string;
@@ -431,8 +431,9 @@ function requestPayload(task: LocalPreviewTask): ImageEditRequestPayload | null 
   }
 
   let seed: number | undefined;
-  if (task.seed.trim()) {
-    seed = Number(task.seed);
+  const seedInput = String(task.seed).trim();
+  if (seedInput) {
+    seed = Number(seedInput);
     if (!Number.isInteger(seed) || seed < 0 || seed > 2_147_483_647) {
       task.error = "随机种子必须是 0 到 2147483647 之间的整数。";
       return null;
@@ -859,8 +860,9 @@ onBeforeUnmount(() => {
               >取消任务</button>
               <button
                 class="button primary generate-button"
-                type="submit"
+                type="button"
                 :disabled="activeTaskLocked || !activeTask.prompt.trim() || !outputDirectory"
+                @click="generatePreview(activeTask)"
               >{{ activeTaskLocked
                 ? statusLabel(activeTask.status)
                 : activeTask.status === "failed"

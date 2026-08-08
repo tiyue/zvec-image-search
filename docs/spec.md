@@ -110,7 +110,7 @@ Vue 3 + TypeScript + Vite SPA：
 Windows WebView 提供独立的 Qwen 单图编辑模块。前端、WebView 网关、宿主客户端和核心服务使用独立的 `image-edit` 协议边界；该模块只复用现有 DashScope API Key 与 API URL，不依赖图库排序、推荐或 ARW 流程。
 
 - 仅支持 Windows WebView。修改范围限定为 `frontend/src/features/image-edit/`、搜索结果单图右键入口及必要的 `App.vue` 接线、`image_vector_service/image_edit/`、必要的 Backend/WebView 路由和退出保护、对应测试与本规格文档；不得修改或耦合 ARW、推荐算法、搜索排序、Android、发布矩阵及其他无关模块，唯一复用项为现有 DashScope 凭证。
-- 支持文件选择、拖放、剪贴板粘贴和搜索结果单图右键导入。一次最多导入 50 张，按每张图建立一个本地草稿；导入不上传，用户为每张图写完指令并手动提交后才建立后端任务。会话最多保留 200 个任务，后端以 4 个独立工作线程并行处理，不提供自动批量提交。
+- 支持文件选择、拖放、剪贴板粘贴和搜索结果单图右键导入。一次最多导入 50 张，按每张图建立一个本地草稿；导入不上传，用户为每张图写完指令并显式点击生成按钮后才建立后端任务，原生 WebView 不依赖隐式表单提交。会话最多保留 200 个任务，后端以 4 个独立工作线程并行处理，不提供自动批量提交。
 - 输入仅允许 JPG/JPEG、PNG、BMP、TIFF、WebP 和 GIF，单文件不超过 10 MiB；GIF 由模型按首帧处理。每个任务严格为单图输入、单图输出，`n` 固定为 1，`watermark` 固定为 `false`。阿里云临时上传文件最多保留 48 小时且不保存为应用历史；生成结果链接仅保留 24 小时，任务进入 `downloading` 后立即下载并校验为 PNG。
 - 原图只读，生成结果以唯一文件名和原子替换写入用户指定目录。目录保存于应用配置目录下的 `image-edit/settings.json` 并跨应用重启保留；任务提交时快照当前目录。浏览器只接收 ImageRegistry 的不透明结果 ID，不接收绝对输出路径。
 - 面向专业用户的工作流不显示上传/费用提醒，也不设置确认门禁。任务状态为 `queued`、`uploading`、`generating`、`downloading`、`cancelling` 以及三个终态 `succeeded`、`failed`、`cancelled`；失败或取消不修改原图，前端继续保留原图、编辑指令和参数，允许手动重新生成。

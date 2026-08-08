@@ -231,6 +231,10 @@ describe("ImageEditPage", () => {
         }
         if (url === "api/image-edit/tasks" && method === "POST") {
           expect(init?.body).toBeInstanceOf(FormData);
+          const metadata = JSON.parse(
+            String((init?.body as FormData).get("metadata")),
+          ) as { seed?: number };
+          expect(metadata.seed).toBe(1234);
           return jsonResponse({ task: taskWire("queued") }, 202);
         }
         if (url === "api/image-edit/tasks?limit=200") {
@@ -257,8 +261,9 @@ describe("ImageEditPage", () => {
     await wrapper
       .get(".prompt-field textarea")
       .setValue("把背景改成雨后的东京街道");
+    await wrapper.get("input[placeholder='随机']").setValue("1234");
 
-    await wrapper.get(".prompt-composer").trigger("submit");
+    await wrapper.get(".generate-button").trigger("click");
     await flushPromises();
     expect(wrapper.get(".canvas-status").text()).toBe("排队中");
 
@@ -275,6 +280,29 @@ describe("ImageEditPage", () => {
     expect(wrapper.findAll(".canvas-mode button")[1]?.classes()).toContain(
       "active",
     );
+  });
+
+  it("shows the seed validation error from the explicit generate click", async () => {
+    wrapper = mountPage();
+    await flushPromises();
+    await importFiles(wrapper, [
+      new File([new Uint8Array([1])], "portrait.png", { type: "image/png" }),
+    ]);
+    await wrapper.get(".prompt-field textarea").setValue("修改背景");
+    await wrapper
+      .get("input[placeholder='随机']")
+      .setValue("2147483648");
+
+    await wrapper.get(".generate-button").trigger("click");
+    await flushPromises();
+
+    expect(wrapper.get(".form-error").text()).toContain(
+      "随机种子必须是 0 到 2147483647 之间的整数",
+    );
+    expect(
+      fetchMock.mock.calls.some(([input, init]) =>
+        String(input) === "api/image-edit/tasks" && init?.method === "POST"),
+    ).toBe(false);
   });
 
   it("keeps the source and prompt after a provider failure so the task can retry", async () => {
