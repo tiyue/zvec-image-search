@@ -10,6 +10,9 @@ import {
 } from "./modelCatalog";
 import type { ImageEditIncomingSource, ImageEditPreviewStatus } from "./types";
 
+type ImageEditAspectRatio = "auto" | "1:1" | "4:3" | "3:4" | "16:9" | "9:16";
+type ImageEditSizeMode = "auto" | "1024" | "1536" | "2048" | "custom";
+
 interface LocalPreviewTask {
   id: string;
   name: string;
@@ -21,7 +24,8 @@ interface LocalPreviewTask {
   prompt: string;
   modelId: string;
   negativePrompt: string;
-  sizeMode: "auto" | "custom";
+  aspectRatio: ImageEditAspectRatio;
+  sizeMode: ImageEditSizeMode;
   widthInput: number;
   heightInput: number;
   seed: string;
@@ -58,6 +62,7 @@ const ACTIVE_STATUSES = new Set<ImageEditPreviewStatus>([
 
 const tasks = ref<LocalPreviewTask[]>([]);
 const activeTaskId = ref("");
+const canvasView = ref<"source" | "result">("source");
 const fileInput = ref<HTMLInputElement | null>(null);
 const dragActive = ref(false);
 const outputDirectory = ref("D:\\Pictures\\Qwen 编辑结果（预览）");
@@ -70,6 +75,11 @@ let dragDepth = 0;
 const activeTask = computed(
   () => tasks.value.find((task) => task.id === activeTaskId.value) ?? null,
 );
+const canvasImageUrl = computed(() => {
+  const task = activeTask.value;
+  if (!task) return "";
+  return canvasView.value === "result" && task.resultUrl ? task.resultUrl : task.sourceUrl;
+});
 const activeTaskLocked = computed(
   () => Boolean(activeTask.value && ACTIVE_STATUSES.has(activeTask.value.status)),
 );
@@ -134,6 +144,7 @@ function createTask(
     prompt: "",
     modelId: lastModelId.value,
     negativePrompt: "",
+    aspectRatio: "auto",
     sizeMode: "auto",
     widthInput: 1024,
     heightInput: 1024,
@@ -165,6 +176,7 @@ function appendTasks(newTasks: LocalPreviewTask[]): void {
   tasks.value = [...tasks.value, ...newTasks];
   for (const task of newTasks) readDimensions(task);
   activeTaskId.value = newTasks[0]?.id ?? activeTaskId.value;
+  canvasView.value = "source";
 }
 
 function importFiles(files: File[]): void {
@@ -273,6 +285,9 @@ function handlePaste(event: ClipboardEvent): void {
 
 function selectTask(taskId: string): void {
   activeTaskId.value = taskId;
+  canvasView.value = tasks.value.find((task) => task.id === taskId)?.resultUrl
+    ? "result"
+    : "source";
 }
 
 function clearTaskTimers(taskId: string): void {
@@ -288,6 +303,7 @@ function removeTask(task: LocalPreviewTask): void {
   tasks.value = tasks.value.filter((candidate) => candidate.id !== task.id);
   if (activeTaskId.value === task.id) {
     activeTaskId.value = tasks.value[Math.min(index, tasks.value.length - 1)]?.id ?? "";
+    canvasView.value = activeTask.value?.resultUrl ? "result" : "source";
   }
 }
 
@@ -302,7 +318,10 @@ function scheduleStatus(task: LocalPreviewTask, delay: number, status: ImageEdit
     const current = tasks.value.find((candidate) => candidate.id === task.id);
     if (!current) return;
     current.status = status;
-    if (status === "succeeded") current.resultUrl = current.sourceUrl;
+    if (status === "succeeded") {
+      current.resultUrl = current.sourceUrl;
+      if (current.id === activeTaskId.value) canvasView.value = "result";
+    }
   }, delay);
   simulationTimers.set(task.id, [...(simulationTimers.get(task.id) ?? []), timer]);
 }
@@ -321,6 +340,7 @@ function generatePreview(task: LocalPreviewTask): void {
   task.consent = false;
   task.resultUrl = "";
   task.status = "queued";
+  canvasView.value = "source";
   scheduleStatus(task, 350, "uploading");
   scheduleStatus(task, 950, "generating");
   scheduleStatus(task, 2100, "downloading");
@@ -334,6 +354,7 @@ function duplicateSucceededTask(task: LocalPreviewTask): void {
   duplicate.prompt = task.prompt;
   duplicate.modelId = task.modelId;
   duplicate.negativePrompt = task.negativePrompt;
+  duplicate.aspectRatio = task.aspectRatio;
   duplicate.sizeMode = task.sizeMode;
   duplicate.widthInput = task.widthInput;
   duplicate.heightInput = task.heightInput;
@@ -342,6 +363,7 @@ function duplicateSucceededTask(task: LocalPreviewTask): void {
   duplicate.watermark = task.watermark;
   tasks.value = [...tasks.value, duplicate];
   activeTaskId.value = duplicate.id;
+  canvasView.value = "source";
 }
 
 function chooseOutputDirectory(): void {
@@ -431,158 +453,155 @@ onBeforeUnmount(() => {
     </div>
 
     <div v-else class="workspace-body">
-      <aside class="task-rail" aria-label="图片编辑任务">
-        <header>
-          <div>
-            <strong>本次任务</strong>
-            <span>{{ tasks.length }} / {{ MAX_SESSION_TASKS }}</span>
-          </div>
-          <button type="button" aria-label="继续导入图片" title="继续导入图片" @click="openFilePicker">＋</button>
+      <aside v-if="activeTask" class="settings-panel" aria-label="图片编辑参数">
+        <header class="settings-heading">
+          <span>当前任务</span>
+          <strong :title="activeTask.name">{{ activeTask.name }}</strong>
+          <small>{{ dimensionsLabel(activeTask) }} · {{ formatBytes(activeTask.sizeBytes) }}</small>
         </header>
-        <div class="task-summary" aria-live="polite">
-          <span>进行中 {{ activeCount }}</span>
-          <span>等待 {{ waitingCount }}</span>
-        </div>
-        <div class="task-list">
-          <article
-            v-for="task in tasks"
-            :key="task.id"
-            class="task-row"
-            :class="{ active: task.id === activeTaskId }"
-          >
-            <button class="task-select" type="button" @click="selectTask(task.id)">
-              <img :src="task.sourceUrl" alt="" />
-              <span class="task-copy">
-                <strong :title="task.name">{{ task.name }}</strong>
-                <small>{{ statusLabel(task.status) }}</small>
-              </span>
-            </button>
-            <button
-              class="task-remove"
-              type="button"
-              :disabled="ACTIVE_STATUSES.has(task.status)"
-              :aria-label="`移除 ${task.name}`"
-              title="移除任务，不删除原图或已保存文件"
-              @click="removeTask(task)"
-            >×</button>
-          </article>
+
+        <div class="settings-fields">
+          <label class="model-field">
+            <span>模型</span>
+            <select v-model="activeTask.modelId" :disabled="activeTaskLocked" @change="updateModel(activeTask)">
+              <optgroup v-for="group in IMAGE_EDIT_MODEL_GROUPS" :key="group.label" :label="group.label">
+                <option v-for="model in group.models" :key="model.id" :value="model.id">
+                  {{ model.id }} · {{ model.release === "snapshot" ? "固定快照" : "浮动别名" }}
+                </option>
+              </optgroup>
+            </select>
+          </label>
+
+          <label class="ratio-field">
+            <span>画幅比例</span>
+            <select v-model="activeTask.aspectRatio" :disabled="activeTaskLocked || !activeSupportsSize">
+              <option value="auto">自动</option>
+              <option value="1:1">1:1</option>
+              <option value="4:3">4:3</option>
+              <option value="3:4">3:4</option>
+              <option value="16:9">16:9</option>
+              <option value="9:16">9:16</option>
+            </select>
+            <small v-if="!activeSupportsSize">当前模型不支持指定比例</small>
+          </label>
+
+          <label class="size-field">
+            <span>图片尺寸</span>
+            <select v-model="activeTask.sizeMode" :disabled="activeTaskLocked || !activeSupportsSize">
+              <option value="auto">自动推荐</option>
+              <option value="1024">长边 1024 px</option>
+              <option value="1536">长边 1536 px</option>
+              <option value="2048">长边 2048 px</option>
+              <option value="custom">自定义宽高</option>
+            </select>
+            <small v-if="!activeSupportsSize">当前模型不支持指定尺寸</small>
+          </label>
+
+          <div v-if="activeTask.sizeMode === 'custom' && activeSupportsSize" class="size-inputs">
+            <label>
+              <span>宽</span>
+              <input v-model.number="activeTask.widthInput" :disabled="activeTaskLocked" type="number" min="512" max="2048" />
+            </label>
+            <span aria-hidden="true">×</span>
+            <label>
+              <span>高</span>
+              <input v-model.number="activeTask.heightInput" :disabled="activeTaskLocked" type="number" min="512" max="2048" />
+            </label>
+          </div>
+
+          <label>
+            <span>随机种子</span>
+            <input
+              v-model="activeTask.seed"
+              :disabled="activeTaskLocked"
+              type="number"
+              min="0"
+              max="2147483647"
+              placeholder="随机"
+            />
+          </label>
+
+          <label class="negative-field">
+            <span>反向提示词</span>
+            <textarea
+              v-model="activeTask.negativePrompt"
+              :disabled="activeTaskLocked"
+              :maxlength="activeIsQwenThree ? undefined : 500"
+              rows="4"
+              placeholder="例如：模糊、低清晰度、多余手指"
+            ></textarea>
+            <small v-if="!activeIsQwenThree">最多 500 字符</small>
+          </label>
+
+          <label class="check-setting" :class="{ disabled: !activeSupportsPromptExtension }">
+            <input v-model="activeTask.promptExtend" :disabled="activeTaskLocked || !activeSupportsPromptExtension" type="checkbox" />
+            <span>
+              <strong>提示词智能改写</strong>
+              <small>{{ activeSupportsPromptExtension ? "默认开启" : "当前模型不支持" }}</small>
+            </span>
+          </label>
         </div>
       </aside>
 
       <main v-if="activeTask" class="editor-workspace">
-        <section class="comparison" aria-label="原图与结果预览">
-          <article class="image-pane">
-            <header>
-              <div><strong>原图</strong><span>{{ dimensionsLabel(activeTask) }} · {{ formatBytes(activeTask.sizeBytes) }}</span></div>
-              <span class="plain-status">本地</span>
-            </header>
-            <div class="image-stage checkerboard">
-              <img :src="activeTask.sourceUrl" :alt="`原图：${activeTask.name}`" />
+        <section class="canvas-section" aria-label="图片画布">
+          <header class="canvas-toolbar">
+            <div class="canvas-meta">
+              <strong :title="activeTask.name">{{ activeTask.name }}</strong>
+              <small>{{ dimensionsLabel(activeTask) }}</small>
             </div>
-          </article>
+            <div class="canvas-mode" role="group" aria-label="画布内容">
+              <button
+                type="button"
+                :class="{ active: canvasView === 'source' }"
+                :aria-pressed="canvasView === 'source'"
+                @click="canvasView = 'source'"
+              >原图</button>
+              <button
+                type="button"
+                :class="{ active: canvasView === 'result' }"
+                :aria-pressed="canvasView === 'result'"
+                :disabled="!activeTask.resultUrl"
+                @click="canvasView = 'result'"
+              >结果</button>
+            </div>
+            <span class="canvas-status">{{ statusLabel(activeTask.status) }}</span>
+          </header>
 
-          <article class="image-pane result-pane">
-            <header>
-              <div><strong>结果</strong><span>{{ statusLabel(activeTask.status) }}</span></div>
-              <span v-if="activeTask.resultUrl" class="plain-status">模拟结果</span>
-            </header>
-            <div class="image-stage result-stage" :aria-busy="ACTIVE_STATUSES.has(activeTask.status)">
-              <img v-if="activeTask.resultUrl" :src="activeTask.resultUrl" alt="本地模拟结果，复用原图" />
-              <div v-else-if="ACTIVE_STATUSES.has(activeTask.status)" class="result-message progress-message">
-                <span class="progress-mark" aria-hidden="true"></span>
-                <strong>{{ statusLabel(activeTask.status) }}</strong>
-                <p>本地预览正在模拟任务状态，不会发送网络请求。</p>
-              </div>
-              <div v-else class="result-message">
-                <span aria-hidden="true">□</span>
-                <strong>生成结果将在这里显示</strong>
-                <p>本地预览完成后会复用原图，仅用于检查布局。</p>
-              </div>
-              <p v-if="activeTask.resultUrl" class="simulation-label">界面模拟结果，不代表模型效果</p>
+          <div
+            class="image-canvas checkerboard"
+            :aria-busy="ACTIVE_STATUSES.has(activeTask.status)"
+            :aria-label="canvasView === 'result' ? '生成结果画布' : '原图画布'"
+          >
+            <img
+              :src="canvasImageUrl"
+              :alt="canvasView === 'result' ? '本地模拟生成结果' : `原图：${activeTask.name}`"
+            />
+            <div v-if="ACTIVE_STATUSES.has(activeTask.status)" class="canvas-progress">
+              <span class="progress-mark" aria-hidden="true"></span>
+              <strong>{{ statusLabel(activeTask.status) }}</strong>
+              <p>本地预览正在模拟任务状态，不会发送网络请求。</p>
             </div>
-          </article>
+            <p v-if="canvasView === 'result' && activeTask.resultUrl" class="simulation-label">
+              界面模拟结果，不代表模型效果
+            </p>
+          </div>
         </section>
 
-        <form class="editor-form" @submit.prevent="generatePreview(activeTask)">
-          <div class="form-heading">
-            <div>
-              <strong>{{ activeTask.name }}</strong>
-              <span>每个任务单独填写并手动提交</span>
-            </div>
-            <label class="model-field">
-              <span>模型</span>
-              <select v-model="activeTask.modelId" :disabled="activeTaskLocked" @change="updateModel(activeTask)">
-                <optgroup v-for="group in IMAGE_EDIT_MODEL_GROUPS" :key="group.label" :label="group.label">
-                  <option v-for="model in group.models" :key="model.id" :value="model.id">
-                    {{ model.id }} · {{ model.release === "snapshot" ? "固定快照" : "浮动别名" }}
-                  </option>
-                </optgroup>
-              </select>
-            </label>
-          </div>
-
+        <form class="prompt-composer" @submit.prevent="generatePreview(activeTask)">
           <label class="prompt-field">
             <span>编辑指令</span>
             <textarea
               v-model="activeTask.prompt"
               :disabled="activeTaskLocked"
-              rows="4"
-              placeholder="例如：保留人物和构图，将背景改为雨后的东京街道，电影感光线"
+              rows="3"
+              placeholder="描述希望如何修改这张图片，例如：保留人物和构图，将背景改为雨后的东京街道"
             ></textarea>
           </label>
 
-          <details class="advanced-settings" open>
-            <summary>高级参数 <span>仅显示当前模型支持的选项</span></summary>
-            <div class="advanced-grid">
-              <label class="negative-field">
-                <span>反向提示词</span>
-                <input
-                  v-model="activeTask.negativePrompt"
-                  :disabled="activeTaskLocked"
-                  :maxlength="activeIsQwenThree ? undefined : 500"
-                  type="text"
-                  placeholder="例如：模糊、低清晰度、多余手指"
-                />
-                <small v-if="!activeIsQwenThree">最多 500 字符</small>
-              </label>
-              <label>
-                <span>输出尺寸</span>
-                <select v-model="activeTask.sizeMode" :disabled="activeTaskLocked || !activeSupportsSize">
-                  <option value="auto">自动推荐</option>
-                  <option value="custom">自定义</option>
-                </select>
-                <small v-if="!activeSupportsSize">当前模型不支持指定尺寸</small>
-              </label>
-              <div v-if="activeTask.sizeMode === 'custom' && activeSupportsSize" class="size-inputs">
-                <label><span>宽</span><input v-model.number="activeTask.widthInput" :disabled="activeTaskLocked" type="number" min="512" max="2048" /></label>
-                <span aria-hidden="true">×</span>
-                <label><span>高</span><input v-model.number="activeTask.heightInput" :disabled="activeTaskLocked" type="number" min="512" max="2048" /></label>
-              </div>
-              <label>
-                <span>Seed</span>
-                <input
-                  v-model="activeTask.seed"
-                  :disabled="activeTaskLocked"
-                  type="number"
-                  min="0"
-                  max="2147483647"
-                  placeholder="随机"
-                />
-              </label>
-              <label class="check-setting" :class="{ disabled: !activeSupportsPromptExtension }">
-                <input v-model="activeTask.promptExtend" :disabled="activeTaskLocked || !activeSupportsPromptExtension" type="checkbox" />
-                <span><strong>提示词智能改写</strong><small>{{ activeSupportsPromptExtension ? "默认开启" : "当前模型不支持" }}</small></span>
-              </label>
-              <label class="check-setting">
-                <input v-model="activeTask.watermark" :disabled="activeTaskLocked" type="checkbox" />
-                <span><strong>添加 Qwen-Image 水印</strong><small>默认关闭</small></span>
-              </label>
-            </div>
-          </details>
-
           <p v-if="activeTask.error" class="form-error" role="alert">{{ activeTask.error }}</p>
 
-          <footer class="submit-row">
+          <footer class="composer-footer">
             <label class="consent-check">
               <input v-model="activeTask.consent" :disabled="activeTaskLocked" type="checkbox" />
               <span>
@@ -608,6 +627,44 @@ onBeforeUnmount(() => {
           </footer>
         </form>
       </main>
+
+      <aside class="task-rail" aria-label="图片编辑任务">
+        <header>
+          <button type="button" aria-label="继续导入图片" title="继续导入图片" @click="openFilePicker">＋</button>
+          <span>{{ tasks.length }} 个任务</span>
+        </header>
+        <div class="task-summary" aria-live="polite">
+          <span>进行中 {{ activeCount }}</span>
+          <span>等待 {{ waitingCount }}</span>
+        </div>
+        <div class="task-list">
+          <article
+            v-for="task in tasks"
+            :key="task.id"
+            class="task-row"
+            :class="{ active: task.id === activeTaskId }"
+          >
+            <button
+              class="task-select"
+              type="button"
+              :aria-label="task.name + '，' + statusLabel(task.status)"
+              :title="task.name"
+              @click="selectTask(task.id)"
+            >
+              <img :src="task.sourceUrl" alt="" />
+              <small>{{ statusLabel(task.status) }}</small>
+            </button>
+            <button
+              class="task-remove"
+              type="button"
+              :disabled="ACTIVE_STATUSES.has(task.status)"
+              :aria-label="'移除 ' + task.name"
+              title="移除任务，不删除原图或已保存文件"
+              @click="removeTask(task)"
+            >×</button>
+          </article>
+        </div>
+      </aside>
     </div>
 
     <div v-if="dragActive" class="drop-overlay" aria-hidden="true">
@@ -705,84 +762,134 @@ onBeforeUnmount(() => {
 .empty-visual { display: grid; width: 72px; height: 72px; place-items: center; border: 1px dashed var(--ie-line-strong); border-radius: 18px; color: var(--ie-muted); background: var(--ie-surface); }
 .empty-visual span { font-size: 28px; font-weight: 300; }
 
-.workspace-body { display: grid; min-width: 0; min-height: 0; grid-template-columns: 236px minmax(0, 1fr); }
-.task-rail { display: grid; min-width: 0; min-height: 0; grid-template-rows: auto auto minmax(0, 1fr); border-right: 1px solid var(--ie-line); background: var(--ie-surface); }
-.task-rail > header { display: flex; min-height: 54px; align-items: center; justify-content: space-between; padding: 8px 12px; border-bottom: 1px solid var(--ie-line); }
-.task-rail > header div { display: grid; }
-.task-rail > header strong { font-size: 13px; }
-.task-rail > header span { color: var(--ie-muted); font-size: 11px; }
-.task-rail > header button { width: 32px; height: 32px; padding: 0; border: 0; border-radius: 8px; color: var(--ie-muted); font-size: 20px; background: transparent; }
-.task-rail > header button:hover { color: var(--ie-text); background: var(--ie-surface-soft); }
-.task-summary { display: flex; min-height: 34px; align-items: center; gap: 12px; padding: 0 12px; border-bottom: 1px solid var(--ie-line); color: var(--ie-muted); font-size: 11px; }
-.task-list { min-height: 0; overflow: auto; padding: 6px; }
-.task-row { position: relative; display: grid; grid-template-columns: minmax(0, 1fr) 28px; align-items: center; border-radius: 9px; }
-.task-row:hover,
-.task-row.active { background: var(--ie-surface-soft); }
-.task-select { display: grid; min-width: 0; min-height: 60px; grid-template-columns: 42px minmax(0, 1fr); align-items: center; gap: 9px; padding: 7px; border: 0; color: inherit; text-align: left; background: transparent; }
-.task-select img { width: 42px; height: 42px; border-radius: 7px; object-fit: cover; background: var(--ie-surface-soft); }
-.task-copy { display: grid; min-width: 0; gap: 2px; }
-.task-copy strong { overflow: hidden; font-size: 12px; font-weight: 590; text-overflow: ellipsis; white-space: nowrap; }
-.task-copy small { color: var(--ie-muted); font-size: 11px; }
-.task-remove { width: 26px; height: 26px; padding: 0; border: 0; border-radius: 7px; color: var(--ie-faint); background: transparent; }
-.task-remove:hover:not(:disabled) { color: var(--ie-danger); background: var(--ie-surface); }
+.workspace-body {
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  grid-template-columns: 260px minmax(0, 1fr) 104px;
+  grid-template-areas: "settings canvas tasks";
+}
 
-.editor-workspace { display: grid; min-width: 0; min-height: 0; grid-template-rows: minmax(240px, 1fr) auto; overflow: auto; scrollbar-gutter: stable; }
-.comparison { display: grid; min-width: 0; min-height: 0; grid-template-columns: repeat(2, minmax(0, 1fr)); border-bottom: 1px solid var(--ie-line); background: #deded9; }
-.image-pane { display: grid; min-width: 0; min-height: 0; grid-template-rows: auto minmax(0, 1fr); background: var(--ie-bg); }
-.image-pane + .image-pane { border-left: 1px solid var(--ie-line); }
-.image-pane > header { display: flex; min-height: 48px; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 12px; border-bottom: 1px solid var(--ie-line); background: var(--ie-surface); }
-.image-pane > header div { display: grid; gap: 1px; }
-.image-pane > header strong { font-size: 13px; }
-.image-pane > header span { color: var(--ie-muted); font-size: 11px; }
-.plain-status { padding: 3px 7px; border-radius: 6px; color: var(--ie-muted) !important; background: var(--ie-surface-soft); }
-.image-stage { position: relative; display: grid; min-height: 220px; place-items: center; overflow: hidden; padding: 16px; }
-.checkerboard { background-color: #d9d9d4; background-image: linear-gradient(45deg, #e4e4df 25%, transparent 25%), linear-gradient(-45deg, #e4e4df 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #e4e4df 75%), linear-gradient(-45deg, transparent 75%, #e4e4df 75%); background-position: 0 0, 0 8px, 8px -8px, -8px 0; background-size: 16px 16px; }
-.image-stage img { display: block; width: 100%; height: 100%; min-height: 0; object-fit: contain; }
-.result-stage { background: var(--ie-bg); }
-.result-message { display: grid; max-width: 320px; place-items: center; gap: 7px; color: var(--ie-muted); text-align: center; }
-.result-message > span { display: grid; width: 42px; height: 42px; place-items: center; border: 1px solid var(--ie-line-strong); border-radius: 11px; font-size: 20px; }
-.result-message strong { color: var(--ie-text); font-size: 13px; }
-.result-message p { margin: 0; font-size: 11px; }
-.progress-mark { border-color: var(--ie-line-strong) !important; border-top-color: var(--ie-accent) !important; border-radius: 50% !important; animation: ie-spin .9s linear infinite; }
-.simulation-label { position: absolute; right: 10px; bottom: 10px; margin: 0; padding: 4px 7px; border-radius: 6px; color: #fff; font-size: 10px; background: rgb(0 0 0 / 68%); }
-
-.editor-form { display: grid; gap: 14px; padding: 14px 16px 16px; background: var(--ie-surface); }
-.form-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; }
-.form-heading > div { display: grid; min-width: 0; gap: 2px; }
-.form-heading > div strong { overflow: hidden; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
-.form-heading > div span { color: var(--ie-muted); font-size: 11px; }
-.model-field { width: min(430px, 52%); }
-.editor-form label { display: grid; gap: 5px; color: var(--ie-muted); font-size: 11px; }
-.editor-form :is(input, select, textarea) { width: 100%; border: 1px solid var(--ie-line-strong); border-radius: 8px; color: var(--ie-text); background: var(--ie-surface); }
-.editor-form :is(input, select) { min-height: 36px; padding: 0 9px; }
-.editor-form textarea { min-height: 88px; resize: vertical; padding: 9px 10px; line-height: 1.5; }
-.editor-form :is(input, select, textarea):focus { outline: 0; border-color: #77776f; box-shadow: 0 0 0 3px rgb(80 80 74 / 9%); }
-.prompt-field > span,
-.model-field > span,
-.advanced-grid label > span { color: var(--ie-text); font-weight: 580; }
-
-.advanced-settings { border-top: 1px solid var(--ie-line); border-bottom: 1px solid var(--ie-line); }
-.advanced-settings summary { display: flex; min-height: 42px; align-items: center; gap: 8px; color: var(--ie-text); font-size: 12px; font-weight: 620; cursor: pointer; }
-.advanced-settings summary span { color: var(--ie-muted); font-size: 11px; font-weight: 400; }
-.advanced-grid { display: grid; grid-template-columns: minmax(240px, 1.5fr) minmax(150px, .8fr) minmax(150px, .8fr); gap: 12px; padding: 0 0 14px; }
-.negative-field { grid-column: span 1; }
-.advanced-grid label small { color: var(--ie-faint); }
+.settings-panel {
+  grid-area: settings;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  border-right: 1px solid var(--ie-line);
+  background: var(--ie-surface);
+  scrollbar-gutter: stable;
+}
+.settings-heading { display: grid; gap: 2px; padding: 14px 16px; border-bottom: 1px solid var(--ie-line); }
+.settings-heading span { color: var(--ie-muted); font-size: 10px; letter-spacing: .06em; text-transform: uppercase; }
+.settings-heading strong { overflow: hidden; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
+.settings-heading small { color: var(--ie-muted); font-size: 10px; }
+.settings-fields { display: grid; gap: 14px; padding: 14px 16px 20px; }
+.settings-fields label,
+.prompt-composer label { display: grid; gap: 5px; color: var(--ie-muted); font-size: 11px; }
+.settings-fields label > span,
+.prompt-field > span { color: var(--ie-text); font-weight: 580; }
+.settings-fields :is(input, select, textarea),
+.prompt-composer textarea {
+  width: 100%;
+  border: 1px solid var(--ie-line-strong);
+  border-radius: 8px;
+  color: var(--ie-text);
+  background: var(--ie-surface);
+}
+.settings-fields :is(input, select) { min-height: 36px; padding: 0 9px; }
+.settings-fields textarea,
+.prompt-composer textarea { resize: vertical; padding: 9px 10px; line-height: 1.5; }
+.settings-fields :is(input, select, textarea):focus,
+.prompt-composer textarea:focus { outline: 0; border-color: #77776f; box-shadow: 0 0 0 3px rgb(80 80 74 / 9%); }
+.settings-fields label small { color: var(--ie-faint); }
+.model-field { width: 100%; }
 .size-inputs { display: grid; grid-template-columns: minmax(64px, 1fr) auto minmax(64px, 1fr); align-items: end; gap: 6px; }
 .size-inputs > span { padding-bottom: 9px; color: var(--ie-muted); }
-.check-setting { display: flex !important; min-height: 52px; grid-template-columns: auto 1fr; align-items: center; gap: 9px !important; padding: 7px 9px; border: 1px solid var(--ie-line); border-radius: 8px; }
+.negative-field textarea { min-height: 104px; }
+.check-setting {
+  display: flex !important;
+  min-height: 52px;
+  align-items: center;
+  gap: 9px !important;
+  padding: 8px 9px;
+  border-top: 1px solid var(--ie-line);
+  border-bottom: 1px solid var(--ie-line);
+}
 .check-setting input { width: 16px !important; min-height: 16px !important; }
 .check-setting span { display: grid; gap: 1px; }
 .check-setting strong { color: var(--ie-text); font-size: 11px; }
 .check-setting.disabled { opacity: .55; }
-.form-error { margin: -4px 0 0; color: var(--ie-danger); font-size: 12px; }
 
-.submit-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
-.consent-check { display: flex !important; max-width: 720px; grid-template-columns: auto 1fr; align-items: flex-start; gap: 9px !important; color: var(--ie-muted) !important; line-height: 1.45; }
+.editor-workspace {
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  grid-area: canvas;
+  grid-template-rows: minmax(320px, 1fr) auto;
+  overflow: hidden;
+}
+.canvas-section { display: grid; min-width: 0; min-height: 0; grid-template-rows: 48px minmax(0, 1fr); overflow: hidden; padding: 0 16px 16px; }
+.canvas-toolbar { display: grid; min-width: 0; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); align-items: center; gap: 12px; }
+.canvas-meta { display: flex; min-width: 0; align-items: baseline; gap: 7px; }
+.canvas-meta strong { overflow: hidden; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.canvas-meta small { flex: 0 0 auto; color: var(--ie-muted); font-size: 10px; }
+.canvas-mode { display: inline-flex; padding: 3px; border-radius: 10px; background: var(--ie-surface-soft); }
+.canvas-mode button { min-height: 28px; padding: 0 12px; border: 0; border-radius: 7px; color: var(--ie-muted); font-size: 11px; background: transparent; }
+.canvas-mode button.active { color: var(--ie-text); background: var(--ie-surface); box-shadow: 0 1px 3px rgb(0 0 0 / 8%); }
+.canvas-mode button:disabled { opacity: .38; }
+.canvas-status { justify-self: end; color: var(--ie-muted); font-size: 11px; }
+.image-canvas { position: relative; display: grid; min-width: 0; min-height: 0; place-items: center; overflow: hidden; padding: 20px; background-color: #e5e8e4; }
+.image-canvas img { display: block; width: 100%; height: 100%; min-height: 0; object-fit: contain; }
+.checkerboard {
+  background-image:
+    linear-gradient(45deg, rgb(255 255 255 / 32%) 25%, transparent 25%),
+    linear-gradient(-45deg, rgb(255 255 255 / 32%) 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, rgb(255 255 255 / 32%) 75%),
+    linear-gradient(-45deg, transparent 75%, rgb(255 255 255 / 32%) 75%);
+  background-position: 0 0, 0 10px, 10px -10px, -10px 0;
+  background-size: 20px 20px;
+}
+.canvas-progress { position: absolute; inset: 0; display: grid; place-content: center; place-items: center; gap: 7px; padding: 24px; color: var(--ie-muted); text-align: center; background: rgb(246 246 244 / 88%); backdrop-filter: blur(4px); }
+.canvas-progress > span { display: grid; width: 42px; height: 42px; place-items: center; border: 1px solid var(--ie-line-strong); }
+.canvas-progress strong { color: var(--ie-text); font-size: 13px; }
+.canvas-progress p { max-width: 320px; margin: 0; font-size: 11px; }
+.progress-mark { border-color: var(--ie-line-strong) !important; border-top-color: var(--ie-accent) !important; border-radius: 50% !important; animation: ie-spin .9s linear infinite; }
+.simulation-label { position: absolute; right: 10px; bottom: 10px; margin: 0; padding: 4px 7px; border-radius: 6px; color: #fff; font-size: 10px; background: rgb(0 0 0 / 68%); }
+
+.prompt-composer { display: grid; gap: 10px; padding: 12px 16px 14px; border-top: 1px solid var(--ie-line); background: var(--ie-surface); }
+.prompt-composer textarea { min-height: 74px; }
+.form-error { margin: 0; color: var(--ie-danger); font-size: 12px; }
+.composer-footer { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.consent-check { display: flex !important; max-width: 720px; align-items: flex-start; gap: 9px !important; color: var(--ie-muted) !important; line-height: 1.45; }
 .consent-check input { width: 16px !important; min-height: 16px !important; margin-top: 2px; }
 .consent-check strong { color: var(--ie-text); font-weight: 600; }
 .submit-actions { display: flex; flex: 0 0 auto; align-items: center; gap: 8px; }
 .submit-actions > span { color: var(--ie-muted); font-size: 11px; }
 .generate-button { min-width: 106px; }
+
+.task-rail {
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  grid-area: tasks;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  border-left: 1px solid var(--ie-line);
+  background: var(--ie-surface);
+}
+.task-rail > header { display: grid; justify-items: center; gap: 6px; padding: 10px 8px 8px; border-bottom: 1px solid var(--ie-line); }
+.task-rail > header button { display: grid; width: 68px; height: 58px; place-items: center; padding: 0; border: 1px dashed var(--ie-line-strong); border-radius: 9px; color: var(--ie-muted); font-size: 22px; background: var(--ie-surface-soft); }
+.task-rail > header button:hover { color: var(--ie-text); border-style: solid; }
+.task-rail > header span { color: var(--ie-muted); font-size: 10px; }
+.task-summary { display: grid; gap: 1px; padding: 7px 4px; border-bottom: 1px solid var(--ie-line); color: var(--ie-muted); font-size: 9px; text-align: center; }
+.task-list { display: grid; min-height: 0; align-content: start; gap: 8px; overflow: auto; padding: 8px; }
+.task-row { position: relative; min-width: 0; padding: 4px; border: 1px solid transparent; border-radius: 10px; }
+.task-row:hover { background: var(--ie-surface-soft); }
+.task-row.active { border-color: var(--ie-accent); background: var(--ie-surface-soft); }
+.task-select { display: grid; width: 100%; min-width: 0; gap: 4px; padding: 0; border: 0; color: inherit; text-align: center; background: transparent; }
+.task-select img { width: 100%; aspect-ratio: 1; border-radius: 6px; object-fit: cover; background: var(--ie-surface-soft); }
+.task-select small { overflow: hidden; color: var(--ie-muted); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.task-remove { position: absolute; top: 0; right: 0; display: grid; width: 22px; height: 22px; place-items: center; padding: 0; border: 0; border-radius: 50%; color: var(--ie-faint); background: var(--ie-surface); box-shadow: 0 1px 4px rgb(0 0 0 / 12%); }
+.task-remove:hover:not(:disabled) { color: var(--ie-danger); }
 
 .drop-overlay { position: absolute; z-index: 50; inset: 10px; display: grid; place-items: center; border: 2px dashed #77776f; border-radius: 14px; color: var(--ie-text); background: rgb(246 246 244 / 94%); backdrop-filter: blur(5px); pointer-events: none; }
 .drop-overlay div { display: grid; gap: 5px; text-align: center; }
@@ -796,23 +903,40 @@ onBeforeUnmount(() => {
   .preview-notice { justify-self: end; }
   .header-actions { grid-column: 1 / -1; justify-content: stretch; }
   .directory-summary { max-width: none; flex: 1; text-align: left; }
-  .advanced-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .workspace-body { grid-template-columns: 232px minmax(0, 1fr) 92px; }
+  .settings-fields { padding-inline: 12px; }
+  .task-rail > header button { width: 60px; }
 }
 
 @media (max-width: 820px) {
   .image-edit-page { overflow: auto; }
   .workspace-header { position: sticky; z-index: 5; top: 0; grid-template-columns: 1fr auto; }
   .preview-notice span { display: none; }
-  .workspace-body { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
-  .task-rail { position: relative; z-index: 3; grid-template-rows: auto auto auto; border-right: 0; border-bottom: 1px solid var(--ie-line); }
-  .task-list { display: flex; gap: 5px; overflow-x: auto; }
-  .task-row { min-width: 190px; }
-  .editor-workspace { display: block; overflow: visible; }
-  .comparison { min-height: 620px; grid-template-columns: 1fr; grid-template-rows: repeat(2, minmax(300px, 1fr)); }
-  .image-pane + .image-pane { border-top: 1px solid var(--ie-line); border-left: 0; }
-  .form-heading,
-  .submit-row { align-items: stretch; flex-direction: column; }
-  .model-field { width: 100%; }
+  .workspace-body {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto auto auto;
+    grid-template-areas: "tasks" "canvas" "settings";
+  }
+  .task-rail {
+    position: relative;
+    z-index: 3;
+    height: 88px;
+    min-height: 88px;
+    grid-template-columns: 90px 92px minmax(0, 1fr);
+    grid-template-rows: auto;
+    overflow: hidden;
+    border-bottom: 1px solid var(--ie-line);
+    border-left: 0;
+  }
+  .task-rail > header { align-items: center; padding: 7px; border-right: 1px solid var(--ie-line); border-bottom: 0; }
+  .task-rail > header button { width: 52px; height: 52px; }
+  .task-rail > header span { display: none; }
+  .task-summary { align-content: center; border-right: 1px solid var(--ie-line); border-bottom: 0; }
+  .task-list { display: flex; gap: 6px; overflow-x: auto; padding: 6px; }
+  .task-row { width: 76px; min-width: 76px; }
+  .task-select small { display: none; }
+  .settings-panel { border-top: 1px solid var(--ie-line); border-right: 0; }
+  .editor-workspace { min-height: 700px; grid-template-rows: minmax(430px, 1fr) auto; overflow: visible; }
   .submit-actions { justify-content: flex-end; }
 }
 
@@ -821,9 +945,15 @@ onBeforeUnmount(() => {
   .title-copy p { display: none; }
   .header-actions { display: grid; grid-template-columns: 1fr 1fr; }
   .directory-summary { grid-column: 1 / -1; }
-  .editor-form { padding-inline: 12px; }
-  .advanced-grid { grid-template-columns: 1fr; }
-  .comparison { min-height: 540px; grid-template-rows: repeat(2, minmax(260px, 1fr)); }
+  .task-rail { grid-template-columns: 72px minmax(0, 1fr); }
+  .task-rail > header { grid-template-columns: 1fr; }
+  .task-summary { display: none; }
+  .canvas-section { padding: 0 8px 8px; }
+  .canvas-toolbar { grid-template-columns: minmax(0, 1fr) auto auto; gap: 8px; }
+  .canvas-meta small { display: none; }
+  .image-canvas { padding: 10px; }
+  .prompt-composer { padding-inline: 12px; }
+  .composer-footer { align-items: stretch; flex-direction: column; }
   .submit-actions { align-items: stretch; flex-direction: column; }
 }
 
@@ -844,8 +974,9 @@ onBeforeUnmount(() => {
   }
   .preview-notice strong { color: #e2bd68; }
   .button.primary:hover:not(:disabled) { background: #fff; }
-  .comparison { background: #11120f; }
-  .checkerboard { background-color: #161713; background-image: linear-gradient(45deg, #20211d 25%, transparent 25%), linear-gradient(-45deg, #20211d 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #20211d 75%), linear-gradient(-45deg, transparent 75%, #20211d 75%); }
+  .image-canvas { background-color: #161713; }
+  .checkerboard { background-image: linear-gradient(45deg, #20211d 25%, transparent 25%), linear-gradient(-45deg, #20211d 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #20211d 75%), linear-gradient(-45deg, transparent 75%, #20211d 75%); }
+  .canvas-progress { background: rgb(28 29 26 / 88%); }
   .drop-overlay { background: rgb(28 29 26 / 95%); }
 }
 

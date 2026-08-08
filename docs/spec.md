@@ -112,7 +112,7 @@ Vue 3 + TypeScript + Vite SPA：
 - 仅支持 Windows WebView；不得修改或耦合 ARW、推荐算法、搜索排序、Android、发布矩阵及其他无关模块，唯一复用项为现有 DashScope 凭证。
 - 支持文件选择、拖放和剪贴板粘贴导入；一次导入多张图片时自动按每张图建立一个独立任务，各任务分别保留编辑指令并由用户手动提交，可并发运行。
 - 第一版任务仍为单图输入、单图输出，不修改原图；成功结果下载为 PNG 到用户指定且跨重启记忆的目录。上传前逐任务明确提示图片将上传至阿里云临时存储并可能产生模型费用，必须由用户确认。
-- 页面提供原图、结果预览、编辑指令、模型和当前模型支持的高级参数；提示词智能改写默认开启。图片编辑模型目录同时保留浮动别名和固定快照：`qwen-image-3.0-pro`、`qwen-image-3.0`、`qwen-image-2.0-pro`、`qwen-image-2.0-pro-2026-06-22`、`qwen-image-2.0-pro-2026-04-22`、`qwen-image-2.0-pro-2026-03-03`、`qwen-image-2.0`、`qwen-image-2.0-2026-03-03`、`qwen-image-edit-max`、`qwen-image-edit-max-2026-01-16`、`qwen-image-edit-plus`、`qwen-image-edit-plus-2025-12-15`、`qwen-image-edit-plus-2025-10-30`、`qwen-image-edit`；默认使用 `qwen-image-edit-plus`，不得加入仅文生图用途的模型。
+- 页面采用左侧参数、中间单画布、右侧任务缩略图和底部编辑指令的布局；原图与结果在同一画布切换，不再并排显示两个图片框。左侧提供模型、画幅比例、图片尺寸、随机种子、反向提示词和提示词智能改写；提示词智能改写默认开启，Qwen 水印固定关闭且不显示开关。图片编辑模型目录同时保留浮动别名和固定快照：`qwen-image-3.0-pro`、`qwen-image-3.0`、`qwen-image-2.0-pro`、`qwen-image-2.0-pro-2026-06-22`、`qwen-image-2.0-pro-2026-04-22`、`qwen-image-2.0-pro-2026-03-03`、`qwen-image-2.0`、`qwen-image-2.0-2026-03-03`、`qwen-image-edit-max`、`qwen-image-edit-max-2026-01-16`、`qwen-image-edit-plus`、`qwen-image-edit-plus-2025-12-15`、`qwen-image-edit-plus-2025-10-30`、`qwen-image-edit`；默认使用 `qwen-image-edit-plus`，不得加入仅文生图用途的模型。
 - 失败时保留原图与编辑指令并允许重新生成；阿里云错误码须转换成用户可执行的实际原因。应用完全退出时，如仍有运行中或等待下载的任务，默认阻止退出，直至任务完成或用户明确放弃未保存结果。
 - 第一版明确不做多图融合、自动批量提交、局部蒙版、历史记录或 Android 支持。
 
