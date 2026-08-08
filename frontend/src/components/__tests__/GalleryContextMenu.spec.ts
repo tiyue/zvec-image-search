@@ -30,6 +30,7 @@ describe("GalleryContextMenu", () => {
     expect(document.body.textContent).toContain("✓ 已标记为相关");
     expect(document.body.textContent).toContain("标记为不相关");
     expect(document.body.textContent).toContain("复制所选文件");
+    expect(document.body.textContent).toContain("用当前图片编辑");
     expect(document.body.textContent).toContain("清除选择");
     expect(wrapper.emitted("like")).toBeUndefined();
   });
@@ -40,9 +41,23 @@ describe("GalleryContextMenu", () => {
     expect(document.body.textContent).not.toContain("已选择");
     expect(document.body.textContent).not.toContain("相关");
     expect(document.body.textContent).not.toContain("清除选择");
+    expect(document.body.textContent).not.toContain("用当前图片编辑");
     expect(document.body.textContent).toContain("✓ 已喜欢");
     expect(document.body.textContent).toContain("不喜欢");
     expect(document.body.textContent).toContain("复制文件");
+  });
+
+  it("emits the single-image edit action and closes the menu", async () => {
+    const wrapper = mountMenu();
+    const edit = Array.from(document.body.querySelectorAll("button"))
+      .find((button) => button.textContent?.trim() === "用当前图片编辑");
+
+    expect(edit).toBeDefined();
+    edit?.click();
+    await wrapper.vm.$nextTick();
+
+    expect(wrapper.emitted("editImage")).toHaveLength(1);
+    expect(wrapper.emitted("close")).toHaveLength(1);
   });
 
   it("emits recommendation preference actions and closes the menu", async () => {

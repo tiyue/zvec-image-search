@@ -169,6 +169,26 @@ const RawSelectionStub = defineComponent({
   },
 });
 
+const ImageEditStub = defineComponent({
+  name: "ImageEditPage",
+  props: {
+    visible: { type: Boolean, default: true },
+    incomingSource: { type: Object, default: null },
+  },
+  emits: ["toast"],
+  setup(props) {
+    return () => h("section", {
+      "data-testid": "image-edit-page",
+      "data-visible": String(props.visible),
+    }, [
+      "图片编辑内容",
+      props.incomingSource && typeof props.incomingSource === "object"
+        ? String((props.incomingSource as { name?: string }).name ?? "")
+        : "",
+    ]);
+  },
+});
+
 function jsonResponse(payload: unknown): Response {
   return new Response(JSON.stringify(payload), {
     status: 200,
@@ -185,6 +205,7 @@ function mountApp(): VueWrapper {
         OrganizePage: OrganizeStub,
         RecommendationPage: RecommendationStub,
         RawSelectionPage: RawSelectionStub,
+        ImageEditPage: ImageEditStub,
         SettingsPage: SettingsStub,
       },
     },
@@ -252,7 +273,7 @@ describe("App page shell", () => {
     wrapper = mountApp();
     await flushPromises();
 
-    expect(wrapper.findAll(".nav-item")).toHaveLength(7);
+    expect(wrapper.findAll(".nav-item")).toHaveLength(8);
     expect(wrapper.get(".nav-item[data-page='search']").attributes("aria-current")).toBe("page");
     expect(wrapper.get("[data-page-section='search']").isVisible()).toBe(true);
     expect(wrapper.find("[data-page-section='search'] .page-heading").exists()).toBe(false);
@@ -276,7 +297,7 @@ describe("App page shell", () => {
 
     await wrapper.get(".sidebar-toggle").trigger("click");
     expect(wrapper.get(".app-shell").classes()).toContain("sidebar-collapsed");
-    expect(wrapper.findAll(".nav-item")).toHaveLength(7);
+    expect(wrapper.findAll(".nav-item")).toHaveLength(8);
   });
 
   it("keeps the requested result count uncapped without a redundant fixed-page summary", async () => {
@@ -387,7 +408,7 @@ describe("App page shell", () => {
     expect(wrapper.find(".gallery-panel").exists()).toBe(true);
   });
 
-  it("supports Alt+1 through Alt+7 plus slash, Ctrl+K and Ctrl+G", async () => {
+  it("supports Alt+1 through Alt+8 plus slash, Ctrl+K and Ctrl+G", async () => {
     latestPayload = {
       ...latestPayload,
       total_items: 30,
@@ -404,6 +425,7 @@ describe("App page shell", () => {
       "learning",
       "recommendations",
       "raw-selection",
+      "image-edit",
     ];
     for (const [index, page] of destinations.entries()) {
       const digit = String(index + 1);
@@ -411,7 +433,7 @@ describe("App page shell", () => {
         new KeyboardEvent("keydown", { key: digit, code: `Digit${digit}`, altKey: true }),
       );
       await wrapper.vm.$nextTick();
-      const section = page === "search" || page === "tasks" || page === "recommendations" || page === "raw-selection"
+      const section = page === "search" || page === "tasks" || page === "recommendations" || page === "raw-selection" || page === "image-edit"
         ? page
         : "organize";
       expect(wrapper.get(`[data-page-section='${section}']`).isVisible()).toBe(true);
@@ -578,6 +600,45 @@ describe("App page shell", () => {
 
     expect(nativeActionMocks.registerQueryImage).toHaveBeenCalledWith(file);
     expect(wrapper.get(".query-image-chip").text()).toContain("粘贴图片.png");
+  });
+
+  it("opens one context image as an isolated image-edit draft", async () => {
+    latestPayload = {
+      id: "latest-image-edit",
+      status: "succeeded",
+      page: 1,
+      page_size: 15,
+      total_items: 1,
+      total_pages: 1,
+      items: [
+        {
+          id: "image-edit-source-1",
+          name: "待编辑照片.jpg",
+          relative_path: "人物/待编辑照片.jpg",
+          library_name: "图片数据库",
+          rank: 1,
+          thumbnail_url: "api/image/image-edit-source-1?variant=thumbnail",
+          image_url: "api/image/image-edit-source-1?variant=preview",
+          size_bytes: 4096,
+        },
+      ],
+    };
+    wrapper = mountApp();
+    await flushPromises();
+    await wrapper.get("input[type='search']").setValue("人物写真");
+    await wrapper.get("[data-testid='submit-search']").trigger("click");
+    await flushPromises();
+
+    await wrapper.get(".image-card").trigger("contextmenu", { clientX: 400, clientY: 300 });
+    const edit = Array.from(
+      document.body.querySelectorAll<HTMLButtonElement>(".gallery-context-menu button"),
+    ).find((button) => button.textContent?.trim() === "用当前图片编辑");
+    expect(edit).toBeDefined();
+    edit?.click();
+    await flushPromises();
+
+    expect(wrapper.get("[data-page-section='image-edit']").isVisible()).toBe(true);
+    expect(wrapper.get("[data-testid='image-edit-page']").text()).toContain("待编辑照片.jpg");
   });
 
   it("keeps Ctrl multi-selection and exposes right-click batch actions", async () => {

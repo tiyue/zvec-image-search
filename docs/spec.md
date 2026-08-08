@@ -1,6 +1,6 @@
 # 曜镜（YaoLens）项目规格文档
 
-> 版本：0.3（机器 SemVer：0.3.0）| 最后更新：2026-08-04
+> 版本：0.3（机器 SemVer：0.3.0）| 最后更新：2026-08-08
 
 ## 概述
 
@@ -103,6 +103,18 @@ Vue 3 + TypeScript + Vite SPA：
 - 运行时管理（`runtime.py`）
 - production `ImageRegistry` 使用 4 个有界 render slot；通用 registry 默认值仍为 2。2/3/4/6/8/12/16 的同输入压力矩阵中，4 是首个通过冷前 6 张 1.5 秒门禁且没有让搜索缩略图、preview 或 bootstrap P95 回退超过 10% 的档位；6 对关键 P95 只再改善 2.96%，却显著增加 CPU/RSS，因此不采用更高值。4 档压力峰值 RSS 比 2 档高 231.191 MiB（58.33%），真实源码版联合冒烟必须继续检查这一明确瞬时内存代价。
 - Windows UI 大批量导出由 `NativeBridge._export_worker` 后台逐项执行 capability 解析、重名避让、`copy2`、错误清单和进度更新，production 复制并发保持 1。当前同盘 SATA SSD 的 1/2/4 矩阵中，2 虽提高中位吞吐约 61%，但搜索缩略图、preview、bootstrap 和纯推荐选择 worst P95 均回退超过 10%，因此不得启用；`copy_files` 只写 CF_HDROP 剪贴板列表，不属于应用内复制并发。
+
+### 图片编辑模块（image-edit）
+
+当前仅完成 Windows WebView 前端本地预览，用于确认信息架构与交互；预览不会上传图片、调用模型、扣减免费额度、产生费用或写入输出文件，生成结果仅复用原图模拟任务状态。正式后端、阿里云适配、持久化输出目录、退出拦截和错误码转换尚未实现。
+
+- 前端模块限定为 `frontend/src/features/image-edit/`，仅允许搜索结果单图右键入口及必要的 `App.vue` 接线；正式实现的后端范围限定为 `image_vector_service/image_edit/`、阿里云图像编辑适配及必要路由、对应测试和本规格文档。
+- 仅支持 Windows WebView；不得修改或耦合 ARW、推荐算法、搜索排序、Android、发布矩阵及其他无关模块，唯一复用项为现有 DashScope 凭证。
+- 支持文件选择、拖放和剪贴板粘贴导入；一次导入多张图片时自动按每张图建立一个独立任务，各任务分别保留编辑指令并由用户手动提交，可并发运行。
+- 第一版任务仍为单图输入、单图输出，不修改原图；成功结果下载为 PNG 到用户指定且跨重启记忆的目录。上传前逐任务明确提示图片将上传至阿里云临时存储并可能产生模型费用，必须由用户确认。
+- 页面提供原图、结果预览、编辑指令、模型和当前模型支持的高级参数；提示词智能改写默认开启。图片编辑模型目录同时保留浮动别名和固定快照：`qwen-image-3.0-pro`、`qwen-image-3.0`、`qwen-image-2.0-pro`、`qwen-image-2.0-pro-2026-06-22`、`qwen-image-2.0-pro-2026-04-22`、`qwen-image-2.0-pro-2026-03-03`、`qwen-image-2.0`、`qwen-image-2.0-2026-03-03`、`qwen-image-edit-max`、`qwen-image-edit-max-2026-01-16`、`qwen-image-edit-plus`、`qwen-image-edit-plus-2025-12-15`、`qwen-image-edit-plus-2025-10-30`、`qwen-image-edit`；默认使用 `qwen-image-edit-plus`，不得加入仅文生图用途的模型。
+- 失败时保留原图与编辑指令并允许重新生成；阿里云错误码须转换成用户可执行的实际原因。应用完全退出时，如仍有运行中或等待下载的任务，默认阻止退出，直至任务完成或用户明确放弃未保存结果。
+- 第一版明确不做多图融合、自动批量提交、局部蒙版、历史记录或 Android 支持。
 
 ### ARW 选片模块（raw_selection）
 

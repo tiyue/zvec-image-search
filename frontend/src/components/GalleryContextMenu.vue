@@ -27,6 +27,7 @@ const emit = defineEmits<{
   open: [];
   reveal: [];
   copyImage: [];
+  editImage: [];
   copyFiles: [];
   copyPaths: [];
   export: [];
@@ -69,6 +70,12 @@ const emit = defineEmits<{
         @click="emit('reveal'); emit('close')"
       >所在文件夹</button>
       <hr />
+      <button
+        v-if="!recommendationMode"
+        type="button"
+        role="menuitem"
+        @click="emit('editImage'); emit('close')"
+      >用当前图片编辑</button>
       <template v-if="feedbackAvailable">
         <template v-if="recommendationMode">
           <button

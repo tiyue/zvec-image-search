@@ -12,6 +12,8 @@ import { useNativeImageActions } from "./composables/useNativeImageActions";
 import { useSearch } from "./composables/useSearch";
 import { installGlobalDiagnostics, reportFrontendDiagnostic } from "./diagnostics";
 import { OrganizePage } from "./features/organize";
+import { ImageEditPage } from "./features/image-edit";
+import type { ImageEditIncomingSource } from "./features/image-edit";
 import { RawSelectionPage } from "./features/raw-selection";
 import { RecommendationPage } from "./features/recommendations";
 import { canRecordFeedback, useSearchFeedback } from "./features/search-learning";
@@ -28,14 +30,14 @@ import type {
   ToastMessage,
 } from "./types/contracts";
 
-type PageName = "search" | "tasks" | "batch" | "groups" | "learning" | "recommendations" | "raw-selection" | "settings";
+type PageName = "search" | "tasks" | "batch" | "groups" | "learning" | "recommendations" | "raw-selection" | "image-edit" | "settings";
 
 const pageDefinitions: Array<{
   id: PageName;
   label: string;
   description: string;
   icon: "search" | "tasks" | "tags" | "groups" | "learning" | "image";
-  shortcut: `Alt+${1 | 2 | 3 | 4 | 5 | 6 | 7}`;
+  shortcut: `Alt+${1 | 2 | 3 | 4 | 5 | 6 | 7 | 8}`;
 }> = [
   {
     id: "search",
@@ -86,6 +88,13 @@ const pageDefinitions: Array<{
     icon: "image",
     shortcut: "Alt+7",
   },
+  {
+    id: "image-edit",
+    label: "图片编辑",
+    description: "Qwen 单图指令编辑",
+    icon: "image",
+    shortcut: "Alt+8",
+  },
 ];
 
 const activePage = ref<PageName>("search");
@@ -124,11 +133,13 @@ const previewVisible = ref(false);
 const queryDropActive = ref(false);
 const modeMenuOpen = ref(false);
 const selectedImageIds = ref<string[]>([]);
+const incomingImageEditSource = ref<ImageEditIncomingSource | null>(null);
 const selectionAnchorId = ref("");
 const contextMenu = ref({ visible: false, x: 0, y: 0, imageId: "" });
 const knownSearchItems = new Map<string, SearchResultItem>();
 let knownFeedbackSessions = "";
 let removeGlobalDiagnostics: (() => void) | null = null;
+let imageEditImportSequence = 0;
 
 const selectedCount = computed(() => selectedImageIds.value.length);
 const hasSearchActivity = computed(
@@ -368,6 +379,24 @@ function closeImageDetails(): void {
 
 function contextImageId(): string {
   return contextMenu.value.imageId || activeActionIds.value[0] || "";
+}
+
+function editContextImage(): void {
+  const imageId = contextImageId();
+  const item = searchItemForId(imageId);
+  const url = item?.imageUrl || item?.thumbnailUrl;
+  if (!item || !url) {
+    addToast("无法加入图片编辑", "当前图片没有可用的本地预览地址。", "error");
+    return;
+  }
+  imageEditImportSequence += 1;
+  incomingImageEditSource.value = {
+    key: `${imageId}-${Date.now()}-${imageEditImportSequence}`,
+    name: item.name,
+    url,
+    sizeBytes: item.sizeBytes,
+  };
+  setPage("image-edit");
 }
 
 function searchItemForId(imageId: string): SearchResultItem | null {
@@ -618,12 +647,12 @@ function handleLibrariesUpdated(libraries: SettingsLibrary[]): void {
 function handleGlobalKeydown(event: KeyboardEvent): void {
   // Use the physical digit code as a fallback so Alt shortcuts work under
   // keyboard layouts that transform event.key. Ignore AltGr (Ctrl+Alt).
-  const shortcutKey = /^Digit([1-7])$/u.exec(event.code)?.[1] ?? event.key;
+  const shortcutKey = /^Digit([1-8])$/u.exec(event.code)?.[1] ?? event.key;
   if (
     event.altKey &&
     !event.ctrlKey &&
     !event.metaKey &&
-    ["1", "2", "3", "4", "5", "6", "7"].includes(shortcutKey)
+    ["1", "2", "3", "4", "5", "6", "7", "8"].includes(shortcutKey)
   ) {
     event.preventDefault();
     const page = pageDefinitions[Number(shortcutKey) - 1]?.id;
@@ -722,6 +751,7 @@ watch(
     :class="{
       'sidebar-collapsed': sidebarCollapsed,
       'raw-selection-active': activePage === 'raw-selection',
+      'image-edit-active': activePage === 'image-edit',
     }"
   >
     <aside class="sidebar" aria-label="主导航">
@@ -784,7 +814,13 @@ watch(
       </button>
     </aside>
 
-    <main class="page-host" :class="{ 'raw-selection-active': activePage === 'raw-selection' }">
+    <main
+      class="page-host"
+      :class="{
+        'raw-selection-active': activePage === 'raw-selection',
+        'image-edit-active': activePage === 'image-edit',
+      }"
+    >
       <header class="app-topbar">
         <div v-if="activePage === 'search' || activePage === 'tasks'" class="top-switch" aria-label="主要视图">
           <button type="button" :class="{ active: activePage === 'search' }" @click="setPage('search')">搜索</button>
@@ -958,6 +994,14 @@ watch(
         />
       </div>
 
+      <div v-if="visitedPages.includes('image-edit')" v-show="activePage === 'image-edit'" class="feature-page" data-page-section="image-edit">
+        <ImageEditPage
+          :visible="activePage === 'image-edit'"
+          :incoming-source="incomingImageEditSource"
+          @toast="handleFeatureToast"
+        />
+      </div>
+
       <div v-if="organizeVisited" v-show="activePage === 'batch' || activePage === 'groups' || activePage === 'learning'" class="feature-page" data-page-section="organize">
         <OrganizePage :active-tab="organizeTab" :show-tabs="false" @toast="handleFeatureToast" @open-image="nativeActions.open" />
       </div>
@@ -984,6 +1028,7 @@ watch(
       @open="openSearchImage(contextImageId())"
       @reveal="nativeActions.reveal(contextImageId())"
       @copy-image="copySelectedImage"
+      @edit-image="editContextImage"
       @copy-files="copySelectedFiles(activeActionIds, 'context_menu_copy_files')"
       @copy-paths="copySelectedPaths(activeActionIds)"
       @export="exportSelectedImages(activeActionIds, 'context_menu_export')"
