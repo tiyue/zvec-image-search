@@ -111,7 +111,7 @@ Windows WebView 提供独立的 Qwen 单图编辑模块。前端、WebView 网�
 
 - 仅支持 Windows WebView。修改范围限定为 `frontend/src/features/image-edit/`、搜索结果单图右键入口及必要的 `App.vue` 接线、`image_vector_service/image_edit/`、必要的 Backend/WebView 路由和退出保护、对应测试与本规格文档；不得修改或耦合 ARW、推荐算法、搜索排序、Android、发布矩阵及其他无关模块，唯一复用项为现有 DashScope 凭证。
 - 支持文件选择、拖放、剪贴板粘贴和搜索结果单图右键导入。一次最多导入 50 张，按每张图建立一个本地草稿；导入不上传，用户为每张图写完指令并显式点击生成按钮后才建立后端任务，原生 WebView 不依赖隐式表单提交。会话最多保留 200 个任务，后端以 4 个独立工作线程并行处理，不提供自动批量提交。
-- 输入仅允许 JPG/JPEG、PNG、BMP、TIFF、WebP 和 GIF，单文件不超过 10 MiB；GIF 由模型按首帧处理。每个任务严格为单图输入、单图输出，`n` 固定为 1，`watermark` 固定为 `false`。阿里云临时上传文件最多保留 48 小时且不保存为应用历史；生成结果链接仅保留 24 小时，任务进入 `downloading` 后立即下载并校验为 PNG。
+- 输入仅允许 JPG/JPEG、PNG、BMP、TIFF、WebP 和 GIF，单文件不超过 10 MiB；带 MPF/MPO 辅助帧的 JPG 仍按 JPEG 接受，GIF 由模型按首帧处理。每个任务严格为单图输入、单图输出，`n` 固定为 1，`watermark` 固定为 `false`。阿里云临时上传文件最多保留 48 小时且不保存为应用历史；生成结果链接仅保留 24 小时，任务进入 `downloading` 后立即下载并校验为 PNG。
 - 原图只读，生成结果以唯一文件名和原子替换写入用户指定目录。目录保存于应用配置目录下的 `image-edit/settings.json` 并跨应用重启保留；任务提交时快照当前目录。浏览器只接收 ImageRegistry 的不透明结果 ID，不接收绝对输出路径。
 - 面向专业用户的工作流不显示上传/费用提醒，也不设置确认门禁。任务状态为 `queued`、`uploading`、`generating`、`downloading`、`cancelling` 以及三个终态 `succeeded`、`failed`、`cancelled`；失败或取消不修改原图，前端继续保留原图、编辑指令和参数，允许手动重新生成。
 - 页面采用左侧参数、中间单画布、右侧任务缩略图和底部编辑指令的布局；原图与结果在同一画布切换，不再并排显示两个图片框。左侧提供模型、画幅比例、图片尺寸、随机种子、反向提示词和提示词智能改写；提示词智能改写默认开启，Qwen 水印固定关闭且不显示开关。图片编辑模型目录同时保留浮动别名和固定快照：`qwen-image-3.0-pro`、`qwen-image-3.0`、`qwen-image-2.0-pro`、`qwen-image-2.0-pro-2026-06-22`、`qwen-image-2.0-pro-2026-04-22`、`qwen-image-2.0-pro-2026-03-03`、`qwen-image-2.0`、`qwen-image-2.0-2026-03-03`、`qwen-image-edit-max`、`qwen-image-edit-max-2026-01-16`、`qwen-image-edit-plus`、`qwen-image-edit-plus-2025-12-15`、`qwen-image-edit-plus-2025-10-30`、`qwen-image-edit`；默认使用 `qwen-image-edit-plus`，不得加入仅文生图用途的模型。

@@ -18,7 +18,24 @@ def _png_bytes(color: tuple[int, int, int] = (12, 34, 56)) -> bytes:
     return output.getvalue()
 
 
-def _multipart(metadata: dict[str, object], content: bytes) -> tuple[str, bytes]:
+def _mpo_bytes() -> bytes:
+    output = BytesIO()
+    Image.new("RGB", (20, 16), (12, 34, 56)).save(
+        output,
+        format="MPO",
+        save_all=True,
+        append_images=[Image.new("RGB", (4, 4), (65, 43, 21))],
+    )
+    return output.getvalue()
+
+
+def _multipart(
+    metadata: dict[str, object],
+    content: bytes,
+    *,
+    filename: str = "source.png",
+    media_type: str = "image/png",
+) -> tuple[str, bytes]:
     boundary = "----zvec-image-edit-test"
     body = b"".join(
         [
@@ -27,8 +44,11 @@ def _multipart(metadata: dict[str, object], content: bytes) -> tuple[str, bytes]
             json.dumps(metadata, ensure_ascii=False).encode("utf-8"),
             b"\r\n",
             f"--{boundary}\r\n".encode(),
-            b'Content-Disposition: form-data; name="file"; filename="source.png"\r\n',
-            b"Content-Type: image/png\r\n\r\n",
+            (
+                'Content-Disposition: form-data; name="file"; '
+                f'filename="{filename}"\r\n'
+            ).encode(),
+            f"Content-Type: {media_type}\r\n\r\n".encode(),
             content,
             b"\r\n",
             f"--{boundary}--\r\n".encode(),
@@ -119,6 +139,46 @@ def test_settings_persist_and_success_means_the_png_is_already_saved(
         )
     finally:
         restarted.close()
+
+
+def test_jpeg_with_mpf_auxiliary_frame_is_accepted_as_jpeg(tmp_path: Path) -> None:
+    output_directory = tmp_path / "output"
+    output_directory.mkdir()
+    source = _mpo_bytes()
+
+    with Image.open(BytesIO(source)) as image:
+        assert image.format == "MPO"
+
+    class SuccessfulMpoProvider:
+        def edit(self, source_path, request, output_path, *, progress, cancel_event):
+            del request, cancel_event
+            assert source_path.suffix == ".jpg"
+            assert source_path.read_bytes() == source
+            progress("generating")
+            progress("downloading")
+            output_path.write_bytes(_png_bytes())
+            return {
+                "output_path": str(output_path),
+                "output_filename": output_path.name,
+            }
+
+    manager = ImageEditTaskManager(
+        config_home=tmp_path / "config",
+        api_key_getter=lambda: "secret",
+        api_url_getter=lambda: "https://dashscope.aliyuncs.com/api/v1/x",
+        provider_factory=SuccessfulMpoProvider,
+        worker_count=1,
+    )
+    manager.update_settings({"output_directory": str(output_directory)})
+    content_type, body = _multipart(
+        _request(), source, filename="source.JPG", media_type="image/jpeg"
+    )
+    try:
+        submitted = manager.submit_multipart(content_type, body)
+        terminal = _wait_terminal(manager, str(submitted["id"]))
+        assert terminal["status"] == "succeeded"
+    finally:
+        manager.close()
 
 
 def test_multiple_tasks_can_run_at_the_same_time(tmp_path: Path) -> None:

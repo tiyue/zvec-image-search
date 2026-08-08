@@ -33,6 +33,7 @@ _ACTIVE_STATUSES: Final = frozenset(
     {"queued", "uploading", "generating", "downloading", "cancelling"}
 )
 _SUPPORTED_FORMATS: Final = frozenset({"JPEG", "PNG", "BMP", "TIFF", "WEBP", "GIF"})
+_FORMAT_ALIASES: Final = {"MPO": "JPEG"}
 _FORMAT_SUFFIXES: Final = {
     "JPEG": ".jpg",
     "PNG": ".png",
@@ -591,6 +592,7 @@ def _validate_source_image(content: bytes) -> str:
         raise ImageEditServiceError(
             "invalid_image", "图片格式无效或文件已损坏。"
         ) from exc
+    image_format = _FORMAT_ALIASES.get(image_format, image_format)
     if image_format not in _SUPPORTED_FORMATS:
         raise ImageEditServiceError(
             "unsupported_image_format",
