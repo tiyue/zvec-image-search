@@ -1,0 +1,411 @@
+import { flushPromises, mount, type DOMWrapper } from "@vue/test-utils";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import type {
+  SearchLearningApi,
+  SearchLearningStatus,
+} from "../../search-learning";
+import SettingsPage from "../SettingsPage.vue";
+import type { LanAccessApi } from "../lanTypes";
+import type { SettingsApi, SettingsResponse } from "../types";
+
+function settingsPayload(overrides: Partial<SettingsResponse> = {}): SettingsResponse {
+  return {
+    libraries: [{
+      id: "lib-1",
+      name: "人物图库",
+      image_root: "D:\\Pictures",
+      workspace_directory: "D:\\Zvec\\workspace",
+      enabled: true,
+      is_default: true,
+    }],
+    results_directory: "D:\\Zvec\\results",
+    models: {
+      provider: "aliyun",
+      embedding_model: "qwen3-vl-embedding",
+      auto_tag_primary_model: "qwen3-vl-flash",
+      auto_tag_escalation_model: "qwen3-vl-plus",
+      embedding_concurrency: 2,
+      auto_tag_concurrency: 4,
+      catalog: [
+        { id: "qwen3-vl-embedding", display_name: "Qwen3 VL Embedding", roles: ["embedding"] },
+        { id: "qwen3-vl-flash", display_name: "Qwen3 VL Flash", roles: ["auto_tag_primary"] },
+        { id: "qwen3-vl-plus", display_name: "Qwen3 VL Plus", roles: ["auto_tag_escalation"] },
+      ],
+    },
+    credentials: { configured: true, persistent: true },
+    ...overrides,
+  };
+}
+
+function fakeApi(): SettingsApi {
+  return {
+    settings: vi.fn(async () => settingsPayload()),
+    addLibrary: vi.fn(async (body) => settingsPayload({
+      libraries: [
+        ...(settingsPayload().libraries ?? []),
+        {
+          id: "lib-2",
+          name: body.name ?? "新增图库",
+          image_root: body.image_root,
+          workspace_directory: body.workspace_directory ?? "E:\\Zvec\\workspace",
+          enabled: body.enabled ?? true,
+          is_default: false,
+        },
+      ],
+      results_directory: body.results_directory ?? "D:\\Zvec\\results",
+    })),
+    updateLibrary: vi.fn(async (_libraryId, body) => settingsPayload({
+      libraries: [{
+        id: "lib-1",
+        name: body.name ?? "人物图库",
+        image_root: body.image_root ?? "D:\\Pictures",
+        workspace_directory: body.workspace_directory ?? "D:\\Zvec\\workspace",
+        enabled: body.enabled ?? true,
+        is_default: body.is_default ?? true,
+      }],
+      results_directory: body.results_directory ?? "D:\\Zvec\\results",
+      restart_required: true,
+      restart: { required: true, active_jobs: false },
+    })),
+    updateModels: vi.fn(async (body) => ({
+      ...body,
+      provider: "aliyun",
+      catalog: [],
+      restart_required: true,
+      restart: { required: true, active_jobs: false },
+    })),
+    saveCredentials: vi.fn(async () => ({ configured: true, persistent: true })),
+    deleteCredentials: vi.fn(async () => ({ configured: false, persistent: true })),
+    folderNameTagSettings: vi.fn(async () => ({
+      schema_version: 1,
+      blacklist: ["自拍", "V"],
+      revision: "rule-v1",
+      using_defaults: false,
+    })),
+    updateFolderNameTagSettings: vi.fn(async (blacklist) => ({
+      schema_version: 1,
+      blacklist,
+      revision: "rule-v2",
+      using_defaults: false,
+    })),
+  };
+}
+
+function fakeLearningApi(): SearchLearningApi {
+  const status: SearchLearningStatus = {
+    available: true,
+    database: "search-learning.sqlite3",
+    online_weight_updates: false,
+    fixed_evaluation_gate_required: true,
+    training_running: false,
+    settings: {
+      learning_enabled: true,
+      implicit_feedback_enabled: false,
+      save_query_text: false,
+      shadow_mode: true,
+    },
+    training_counts: {
+      query_sessions: 0,
+      explicit_samples: 0,
+      positive_samples: 0,
+      negative_samples: 0,
+    },
+    minimum_requirements: {
+      query_sessions: 100,
+      explicit_samples: 300,
+      positive_and_negative_required: true,
+    },
+  };
+  return {
+    status: vi.fn().mockResolvedValue(status),
+    updateSettings: vi.fn().mockImplementation(async (body) => ({
+      ...status.settings,
+      ...body,
+    })),
+    feedback: vi.fn(),
+    revoke: vi.fn(),
+    listFeedback: vi.fn(),
+    train: vi.fn(),
+    installEvaluation: vi.fn(),
+    activate: vi.fn(),
+    rollback: vi.fn(),
+    clear: vi.fn(),
+    exportData: vi.fn(),
+  };
+}
+
+function fakeLanApi(): LanAccessApi {
+  const status = {
+    enabled: false,
+    running: false,
+    bind_host: "192.168.1.20",
+    port: 38522,
+    display_name: "YaoLens",
+    discovery_port: 38521,
+    available_hosts: [{ address: "192.168.1.20", label: "以太网" }],
+    pending_pairings: [],
+    device: null,
+  };
+  return {
+    status: vi.fn(async () => status),
+    update: vi.fn(async () => status),
+    start: vi.fn(async () => ({ ...status, enabled: true, running: true })),
+    stop: vi.fn(async () => status),
+    approve: vi.fn(async () => status),
+    reject: vi.fn(async () => status),
+    revokeDevice: vi.fn(async () => status),
+  };
+}
+
+function buttonWithText(
+  wrapper: Pick<DOMWrapper<Element>, "findAll">,
+  label: string,
+) {
+  const button = wrapper.findAll("button").find((item) => item.text().includes(label));
+  if (!button) throw new Error(`button not found: ${label}`);
+  return button;
+}
+
+describe("SettingsPage", () => {
+  beforeEach(() => vi.clearAllMocks());
+  afterEach(() => Reflect.deleteProperty(window, "pywebview"));
+
+  it("loads editable library fields while never displaying the stored API key", async () => {
+    const wrapper = mount(SettingsPage, { props: { api: fakeApi(), lanApi: fakeLanApi() } });
+    await flushPromises();
+
+    expect(wrapper.get('.library-editor input[name="name"]').element).toHaveProperty("value", "人物图库");
+    expect(wrapper.get('.library-editor input[name="image_root"]').element).toHaveProperty("value", "D:\\Pictures");
+    expect(wrapper.get('.library-editor input[name="workspace_directory"]').element).toHaveProperty("value", "D:\\Zvec\\workspace");
+    expect(wrapper.get('.results-form input[name="results_directory"]').attributes("placeholder"))
+      .toBe("D:\\YaoLens\\results");
+    await buttonWithText(wrapper, "新增图库").trigger("click");
+    expect(wrapper.get('input[name="new_workspace_directory"]').attributes("placeholder"))
+      .toBe("D:\\YaoLens\\workspace");
+    expect(wrapper.get('input[name="api_key"]').attributes("type")).toBe("password");
+    expect((wrapper.get('input[name="api_key"]').element as HTMLInputElement).value).toBe("");
+    expect(wrapper.text()).not.toContain("sk-");
+    expect(wrapper.text()).toContain("已配置");
+  });
+
+  it("validates and saves all editable library fields plus the global results directory", async () => {
+    const api = fakeApi();
+    const wrapper = mount(SettingsPage, { props: { api, lanApi: fakeLanApi() } });
+    await flushPromises();
+
+    await wrapper.get('.library-editor input[name="name"]').setValue("Cosplay 图库");
+    await wrapper.get('.library-editor input[name="image_root"]').setValue("E:\\Cosplay");
+    await wrapper.get('.library-editor input[name="workspace_directory"]').setValue("E:\\Zvec\\workspace");
+    await wrapper.get('.results-form input[name="results_directory"]').setValue("E:\\Zvec\\results");
+    await wrapper.get(".library-editor").trigger("submit");
+    await flushPromises();
+
+    expect(api.updateLibrary).toHaveBeenCalledWith("lib-1", {
+      name: "Cosplay 图库",
+      image_root: "E:\\Cosplay",
+      workspace_directory: "E:\\Zvec\\workspace",
+      enabled: true,
+      is_default: true,
+      auto_index_enabled: false,
+      results_directory: "E:\\Zvec\\results",
+    });
+    expect(wrapper.emitted("libraries-updated")?.at(-1)?.[0]).toEqual([
+      expect.objectContaining({ id: "lib-1", name: "Cosplay 图库", imageRoot: "E:\\Cosplay" }),
+    ]);
+    expect(wrapper.text()).toContain("重启软件后新路径生效");
+  });
+
+  it("rejects relative Windows paths without sending a save request", async () => {
+    const api = fakeApi();
+    const wrapper = mount(SettingsPage, { props: { api, lanApi: fakeLanApi() } });
+    await flushPromises();
+
+    await wrapper.get('.library-editor input[name="image_root"]').setValue("relative/images");
+    await wrapper.get(".library-editor").trigger("submit");
+    await flushPromises();
+
+    expect(api.updateLibrary).not.toHaveBeenCalled();
+    expect(wrapper.emitted("toast")?.at(-1)?.[0]).toBe("图库设置无效");
+    expect(String(wrapper.emitted("toast")?.at(-1)?.[1])).toContain("Windows 绝对路径");
+    expect(String(wrapper.emitted("toast")?.at(-1)?.[1])).toContain("D:\\YaoLens\\data");
+  });
+
+  it("saves the global result directory through the default library endpoint", async () => {
+    const api = fakeApi();
+    const wrapper = mount(SettingsPage, { props: { api, lanApi: fakeLanApi() } });
+    await flushPromises();
+
+    await wrapper.get('.results-form input[name="results_directory"]').setValue("F:\\SearchResults");
+    await wrapper.get(".results-form").trigger("submit");
+    await flushPromises();
+
+    expect(api.updateLibrary).toHaveBeenCalledWith("lib-1", {
+      results_directory: "F:\\SearchResults",
+    });
+  });
+
+  it("shows model concurrency defaults, options, and role group membership", async () => {
+    const wrapper = mount(SettingsPage, {
+      props: { api: fakeApi(), lanApi: fakeLanApi() },
+    });
+    await flushPromises();
+
+    const embeddingConcurrency = wrapper.get(
+      'select[name="embedding_concurrency"]',
+    );
+    const autoTagConcurrency = wrapper.get(
+      'select[name="auto_tag_concurrency"]',
+    );
+    expect((embeddingConcurrency.element as HTMLSelectElement).value).toBe("2");
+    expect((autoTagConcurrency.element as HTMLSelectElement).value).toBe("4");
+    for (const select of [embeddingConcurrency, autoTagConcurrency]) {
+      expect(
+        select.findAll("option").map((option) => option.attributes("value")),
+      ).toEqual(["1", "2", "4", "6"]);
+    }
+
+    const groups = wrapper.findAll("fieldset.model-role-group");
+    expect(groups).toHaveLength(2);
+    expect(groups[0].get("legend").text()).toBe("向量角色");
+    expect(groups[0].find('select[name="embedding_model"]').exists()).toBe(true);
+    expect(groups[0].find('select[name="embedding_concurrency"]').exists()).toBe(true);
+    expect(groups[1].get("legend").text()).toBe("智能标注角色");
+    expect(groups[1].find('select[name="auto_tag_primary_model"]').exists()).toBe(true);
+    expect(groups[1].find('select[name="auto_tag_escalation_model"]').exists()).toBe(true);
+    expect(groups[1].find('select[name="auto_tag_concurrency"]').exists()).toBe(true);
+  });
+
+  it("updates three model roles, both concurrency limits, and credentials", async () => {
+    const api = fakeApi();
+    const wrapper = mount(SettingsPage, { props: { api, lanApi: fakeLanApi() } });
+    await flushPromises();
+
+    await wrapper.get('select[name="embedding_concurrency"]').setValue("4");
+    await wrapper.get('select[name="auto_tag_concurrency"]').setValue("6");
+    await wrapper.get(".model-form").trigger("submit");
+    await flushPromises();
+    expect(api.updateModels).toHaveBeenCalledWith({
+      embedding_model: "qwen3-vl-embedding",
+      auto_tag_primary_model: "qwen3-vl-flash",
+      auto_tag_escalation_model: "qwen3-vl-plus",
+      embedding_concurrency: 4,
+      auto_tag_concurrency: 6,
+    });
+    expect(wrapper.emitted("toast")?.at(-1)).toEqual([
+      "模型配置已保存",
+      "重启 YaoLens 后生效，不会重算已有向量。",
+      "success",
+    ]);
+
+    const keyInput = wrapper.get('input[name="api_key"]');
+    await keyInput.setValue("sk-test-secret");
+    await wrapper.get(".credential-form").trigger("submit");
+    expect((keyInput.element as HTMLInputElement).value).toBe("");
+    await flushPromises();
+    expect(api.saveCredentials).toHaveBeenCalledWith("sk-test-secret");
+    expect(wrapper.text()).not.toContain("sk-test-secret");
+
+    await buttonWithText(wrapper, "删除已保存密钥").trigger("click");
+    await flushPromises();
+    expect(api.deleteCredentials).toHaveBeenCalledOnce();
+    expect(wrapper.text()).toContain("未配置");
+  });
+
+  it("edits the global folder-tag blacklist one rule per line", async () => {
+    const api = fakeApi();
+    const wrapper = mount(SettingsPage, { props: { api, lanApi: fakeLanApi() } });
+    await flushPromises();
+
+    await buttonWithText(wrapper, "标签规则").trigger("click");
+    const textarea = wrapper.get('textarea[name="folder_tag_blacklist"]');
+    expect((textarea.element as HTMLTextAreaElement).value).toBe("自拍\nV");
+    expect(wrapper.text()).toContain("规则“V”会过滤 V/v 开头");
+
+    await textarea.setValue("自拍\nV\nv\n日期");
+    await wrapper.get(".folder-tag-settings-form").trigger("submit");
+    await flushPromises();
+
+    expect(api.updateFolderNameTagSettings).toHaveBeenCalledWith([
+      "自拍",
+      "V",
+      "日期",
+    ]);
+    expect(wrapper.text()).toContain("rule-v2");
+  });
+
+  it("rejects an unsupported model concurrency before sending the request", async () => {
+    const api = fakeApi();
+    const wrapper = mount(SettingsPage, { props: { api, lanApi: fakeLanApi() } });
+    await flushPromises();
+
+    const select = wrapper.get('select[name="embedding_concurrency"]');
+    const invalid = document.createElement("option");
+    invalid.value = "3";
+    invalid.textContent = "3 路";
+    (select.element as HTMLSelectElement).append(invalid);
+    await select.setValue("3");
+    await wrapper.get(".model-form").trigger("submit");
+    await flushPromises();
+
+    expect(api.updateModels).not.toHaveBeenCalled();
+    expect(wrapper.emitted("toast")?.at(-1)).toEqual([
+      "模型并发无效",
+      "向量并发和智能标注并发必须选择 1、2、4 或 6。",
+      "error",
+    ]);
+  });
+
+  it("includes search-learning settings and forwards its action toasts", async () => {
+    const learningApi = fakeLearningApi();
+    const wrapper = mount(SettingsPage, {
+      props: { api: fakeApi(), learningApi, lanApi: fakeLanApi() },
+    });
+    await flushPromises();
+
+    expect(wrapper.get("#search-learning-title").text()).toBe("搜索学习");
+    const learningCard = wrapper.get(".learning-card");
+    const implicitToggle = learningCard.findAll("input[type='checkbox']")[1];
+    await implicitToggle.setValue(true);
+    await flushPromises();
+
+    expect(learningApi.updateSettings).toHaveBeenCalledWith({
+      implicit_feedback_enabled: true,
+    });
+    expect(wrapper.emitted("toast")?.at(-1)).toEqual([
+      "设置已保存",
+      "隐式反馈已开启。",
+      "success",
+    ]);
+  });
+
+  it("requires confirmation and reports a busy refusal from explicit exit", async () => {
+    const exitApplication = vi.fn().mockResolvedValue({
+      ok: false,
+      error: "仍有任务运行，请先等待完成或取消任务。",
+    });
+    Object.defineProperty(window, "pywebview", {
+      configurable: true,
+      value: { api: { exit_application: exitApplication } },
+    });
+    const wrapper = mount(SettingsPage, {
+      props: { api: fakeApi(), lanApi: fakeLanApi() },
+    });
+    await flushPromises();
+
+    await buttonWithText(wrapper, "应用").trigger("click");
+    expect(wrapper.text()).toContain("关闭主窗口后，YaoLens 会继续在后台运行");
+    await buttonWithText(wrapper, "退出 YaoLens").trigger("click");
+    expect(exitApplication).not.toHaveBeenCalled();
+
+    await buttonWithText(wrapper, "确认退出").trigger("click");
+    await flushPromises();
+
+    expect(exitApplication).toHaveBeenCalledOnce();
+    expect(wrapper.emitted("toast")?.at(-1)).toEqual([
+      "无法退出 YaoLens",
+      "仍有任务运行，请先等待完成或取消任务。",
+      "error",
+    ]);
+  });
+});

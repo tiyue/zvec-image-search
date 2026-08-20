@@ -1,0 +1,8 @@
+schema_version: 1
+module_path: webview_bridge
+title: webview_bridge
+scope:
+    - zvec_webview/
+source_files: []
+depends_on: []
+related_to: []

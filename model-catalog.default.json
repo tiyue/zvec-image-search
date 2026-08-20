@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "provider": "aliyun_dashscope",
+  "models": [
+    {
+      "id": "qwen3-vl-embedding",
+      "display_name": "Qwen3-VL Embedding",
+      "roles": [
+        "embedding"
+      ],
+      "protocol": "dashscope_multimodal_embedding",
+      "dimension": 1024,
+      "enabled": true
+    },
+    {
+      "id": "qwen3-vl-flash",
+      "display_name": "Qwen3-VL Flash",
+      "roles": [
+        "auto_tag_primary",
+        "auto_tag_escalation"
+      ],
+      "protocol": "dashscope_multimodal_conversation",
+      "enabled": true,
+      "pricing": {
+        "input_yuan_per_million": 0.15,
+        "output_yuan_per_million": 1.5,
+        "effective_from": "2026-07-14"
+      }
+    },
+    {
+      "id": "qwen3-vl-plus",
+      "display_name": "Qwen3-VL Plus",
+      "roles": [
+        "auto_tag_primary",
+        "auto_tag_escalation"
+      ],
+      "protocol": "dashscope_multimodal_conversation",
+      "enabled": true,
+      "pricing": {
+        "input_yuan_per_million": 1.0,
+        "output_yuan_per_million": 10.0,
+        "effective_from": "2026-07-14"
+      }
+    }
+  ],
+  "roles": {
+    "embedding": "qwen3-vl-embedding",
+    "auto_tag_primary": "qwen3-vl-flash",
+    "auto_tag_escalation": "qwen3-vl-plus"
+  },
+  "embedding_concurrency": 2,
+  "auto_tag_concurrency": 4
+}

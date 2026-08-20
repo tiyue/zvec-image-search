@@ -3,47 +3,304 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_call:
 
 jobs:
   test:
+    name: Full tests (${{ matrix.os }}, Python 3.12)
     strategy:
+      fail-fast: false
       matrix:
         os:
           - windows-latest
           - ubuntu-latest
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Validate GitHub Actions workflows
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/actionlint.tar.gz"
+          curl --fail --silent --show-error --location \
+            "https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz" \
+            --output "$archive"
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  $archive" \
+            | sha256sum --check --strict
+          tar -xzf "$archive" -C "$RUNNER_TEMP" actionlint
+          "$RUNNER_TEMP/actionlint" -color
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
           cache: pip
       - name: Install dependencies
-        run: python -m pip install -e . -r requirements-dev.txt
+        run: >-
+          python -m pip install
+          --constraint requirements-lock.txt
+          --editable .
+          --requirement requirements-dev.txt
       - name: Ruff
         run: python -m ruff check .
+      - name: Ruff format
+        run: python -m ruff format --check .
       - name: Mypy
-        run: python -m mypy image_vector_service image_service.py zvec_logging.py
+        run: >-
+          python -m mypy
+          image_vector_service
+          zvec_host
+          zvec_lan
+          zvec_webview
+          image_service.py
+          zvec_launcher.py
+          zvec_logging.py
+          scripts/build_webview_preview.py
+          scripts/webview_preview_packaging.py
+          scripts/verify_webview_preview_release.py
+          scripts/prepare_python_release.py
+          scripts/assemble_python_release.py
+          scripts/provision_nsis.py
+          scripts/run_large_library_gates.py
+      - name: Mypy WebView entry
+        run: >-
+          python -m mypy
+          release/webview_preview/frozen_entry.py
+          release/webview_preview/runtime_hook.py
+      - name: Mypy search-quality tools
+        run: python -m mypy tests/search_quality scripts/verify_search_quality_gate.py
       - name: Tests
         run: python -m unittest discover -s tests -v
-      - name: Windows launcher tests
-        if: runner.os == 'Windows'
-        shell: powershell
-        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\test_launcher.ps1
+      - name: Native CLI and legacy-workspace migration smoke
+        run: >-
+          python -m unittest
+          tests.test_native_launcher
+          tests.test_native_cli_smoke
+          tests.test_native_package
+          -v
 
-  docker:
+  android-lan-viewer:
+    name: Android LAN Viewer (JDK 17)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - name: Build image
-        uses: docker/build-push-action@v6
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4
         with:
-          context: .
-          load: true
-          tags: zvec-image-search:ci
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          provenance: false
-      - name: Docker end-to-end smoke test
-        run: python tests/docker_smoke.py zvec-image-search:ci --max-size-mib 100
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+          cache-dependency-path: |
+            android/*.gradle.kts
+            android/app/*.gradle.kts
+            android/gradle.properties
+            android/gradle/wrapper/gradle-wrapper.properties
+      - name: Test, lint, and assemble Android APK
+        working-directory: android
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          ./gradlew --no-daemon testDebugUnitTest assembleDebug lintDebug
+      - name: Stage Android APK and checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          output="$RUNNER_TEMP/yaolens-android"
+          apk_name="YaoLens-ci-${GITHUB_SHA}-android.apk"
+          mkdir -p "$output"
+          cp -- android/app/build/outputs/apk/debug/app-debug.apk "$output/$apk_name"
+          (
+            cd "$output"
+            sha256sum -- "$apk_name" > SHA256SUMS.txt
+          )
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: yaolens-android-${{ github.sha }}
+          path: ${{ runner.temp }}/yaolens-android/*
+          if-no-files-found: error
+          retention-days: 14
+
+  large-library-gates:
+    name: Large-library bounded I/O gates (Windows x64)
+    runs-on: windows-latest
+    env:
+      DASHSCOPE_API_KEY: ""
+      PYTHONUTF8: "1"
+      ZVEC_RUN_MILLION_SCAN_STAGING_TEST: "0"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install exact native runtime closure
+        shell: cmd
+        run: >-
+          python -m pip install
+          --constraint requirements-lock.txt
+          --editable .
+      - name: Run curated 100k large-library gates
+        shell: cmd
+        run: >-
+          python scripts\run_large_library_gates.py
+          --profile pr
+          --json-report "%RUNNER_TEMP%\large-library-gates.json"
+      - name: Upload structured gate summary
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: large-library-gates-${{ github.sha }}-win-x64
+          path: ${{ runner.temp }}\large-library-gates.json
+          if-no-files-found: warn
+          retention-days: 14
+
+  webview-frontend:
+    name: Vite webview frontend (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24.4.1"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Use the locked npm release
+        shell: cmd
+        run: npm install --global npm@11.13.0
+      - name: Install locked frontend dependencies
+        shell: cmd
+        working-directory: frontend
+        run: npm ci
+      - name: Typecheck frontend
+        shell: cmd
+        working-directory: frontend
+        run: npm run typecheck
+      - name: Test frontend
+        shell: cmd
+        working-directory: frontend
+        run: npm test
+      - name: Build manifest-driven frontend
+        shell: cmd
+        working-directory: frontend
+        run: npm run build
+      - name: Verify the Vite manifest and local asset closure
+        shell: cmd
+        run: >-
+          node -e "const fs=require('fs'),p=require('path'),r='zvec_webview/frontend_dist',m=JSON.parse(fs.readFileSync(p.join(r,'.vite/manifest.json'),'utf8')),e=m['index.html'];if(!e||!e.isEntry)throw Error('missing Vite entry');for(const f of [e.file,...(e.css||[])])if(!fs.existsSync(p.join(r,f)))throw Error('missing '+f);if(fs.existsSync(p.join(r,'node_modules')))throw Error('node_modules packaged')"
+      - name: Require committed frontend assets to match the source build
+        shell: cmd
+        run: git diff --exit-code -- zvec_webview/frontend_dist
+
+  windows-package:
+    name: Windows package (win-x64)
+    needs: webview-frontend
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements-lock.txt
+            requirements-packaging.txt
+            requirements-webview-preview-lock.txt
+      - name: Install the locked WebView packaging closure
+        shell: cmd
+        run: python -m pip install --requirement requirements-webview-preview-lock.txt
+      - name: Resolve version and 7-Zip
+        id: metadata
+        shell: python
+        run: |
+          import os
+          import shutil
+          import sys
+          import tomllib
+          from pathlib import Path
+
+          sys.path.insert(0, str(Path.cwd()))
+          from scripts.webview_preview_packaging import public_version
+
+          version = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
+          seven_zip = shutil.which("7z.exe") or shutil.which("7z")
+          if seven_zip is None:
+              raise SystemExit("7-Zip is required to verify the NSIS installer")
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8", newline="\n") as stream:
+              stream.write(f"version={version}\n")
+              stream.write(f"public_version={public_version(version)}\n")
+              stream.write(f"seven_zip={Path(seven_zip).resolve()}\n")
+      - name: Provision pinned NSIS with Python
+        id: nsis
+        shell: cmd
+        run: >-
+          python scripts\provision_nsis.py
+          --output-directory "%RUNNER_TEMP%\zvec-nsis-3.12"
+          --github-output "%GITHUB_OUTPUT%"
+      - name: Build the tested WebView payload, ZIP, and installer
+        shell: cmd
+        run: >-
+          python scripts\build_webview_preview.py
+          --output-root "%RUNNER_TEMP%\yaolens-windows"
+          --makensis "${{ steps.nsis.outputs.makensis_path }}"
+          --use-existing-frontend
+      - name: Verify payload, portable archive, and installer inventory
+        shell: cmd
+        env:
+          PUBLIC_VERSION: ${{ steps.metadata.outputs.public_version }}
+          PACKAGE_ROOT: ${{ runner.temp }}\yaolens-windows
+        run: >-
+          python scripts\verify_webview_preview_release.py
+          --payload "%PACKAGE_ROOT%\YaoLens"
+          --portable "%PACKAGE_ROOT%\YaoLens-%PUBLIC_VERSION%-win-x64-portable.zip"
+          --installer "%PACKAGE_ROOT%\YaoLens-%PUBLIC_VERSION%-win-x64-setup.exe"
+          --seven-zip "${{ steps.metadata.outputs.seven_zip }}"
+          --output-json "%PACKAGE_ROOT%\WINDOWS-RELEASE-VERIFICATION.json"
+          --output-checksums "%PACKAGE_ROOT%\SHA256SUMS.txt"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: yaolens-windows-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}\yaolens-windows\*
+            !${{ runner.temp }}\yaolens-windows\YaoLens\**
+          if-no-files-found: error
+          retention-days: 14
+
+  native-python-compatibility:
+    name: Native Python ${{ matrix.python-version }} on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - windows-latest
+          - ubuntu-latest
+        python-version:
+          - "3.10"
+          - "3.14"
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install exact native runtime closure
+        run: >-
+          python -m pip install
+          --constraint requirements-lock.txt
+          --editable .
+      - name: Verify native launcher and built wheel entry point
+        run: >-
+          python -m unittest
+          tests.test_native_launcher
+          tests.test_native_cli_smoke
+          tests.test_native_package
+          -v
+      - name: Smoke installed command
+        run: zvec help

@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "kind": "zvec-search-quality-baseline-placeholder",
+  "status": "pending",
+  "dataset": "dataset.json",
+  "evaluation_report": null,
+  "note": "No human-labelled baseline is committed. Generate baseline.local.json from dataset.local.json after human verification."
+}

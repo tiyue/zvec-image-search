@@ -1,0 +1,22 @@
+schema_version: 1
+module_path: image_vector_service/search_ranking
+title: 搜索排序与结果融合层
+scope:
+    - image_vector_service/hybrid_search.py
+    - image_vector_service/metadata_search.py
+    - image_vector_service/tag_search.py
+    - image_vector_service/rank_fusion.py
+    - image_vector_service/result_diversity.py
+    - image_vector_service/search_features.py
+    - image_vector_service/federated_search.py
+    - image_vector_service/library_browser.py
+    - image_vector_service/source_resolver.py
+    - image_vector_service/logical_paths.py
+    - image_vector_service/tags.py
+    - image_vector_service/tag_aliases.py
+    - image_vector_service/tag_rank_query.py
+    - image_vector_service/metadata_text.py
+    - image_vector_service/image_data_uri.py
+source_files: []
+depends_on: []
+related_to: []

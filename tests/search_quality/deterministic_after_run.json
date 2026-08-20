@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "name": "deterministic-improved-run",
+  "score_semantics": {
+    "text": "lower_is_better",
+    "image": "lower_is_better",
+    "combined": "higher_is_better"
+  },
+  "cases": [
+    {
+      "id": "text-red",
+      "latency_ms": 11.0,
+      "api_requests": 1,
+      "results": [{"image_id": "fixture:a", "score": 0.1}]
+    },
+    {
+      "id": "text-shapes",
+      "latency_ms": 22.0,
+      "api_requests": 1,
+      "results": [
+        {"image_id": "fixture:c", "score": 0.2},
+        {"image_id": "fixture:d", "score": 0.3}
+      ]
+    },
+    {
+      "id": "text-no-answer",
+      "latency_ms": 6.0,
+      "api_requests": 1,
+      "results": []
+    },
+    {
+      "id": "image-similar",
+      "latency_ms": 16.0,
+      "api_requests": 1,
+      "results": [{"image_id": "fixture:i1", "score": 0.1}]
+    },
+    {
+      "id": "image-no-answer",
+      "latency_ms": 8.0,
+      "api_requests": 1,
+      "results": []
+    },
+    {
+      "id": "combined-match",
+      "latency_ms": 13.0,
+      "api_requests": 2,
+      "results": [{"image_id": "fixture:m1", "score": 0.9}]
+    },
+    {
+      "id": "combined-no-answer",
+      "latency_ms": 7.0,
+      "api_requests": 2,
+      "results": []
+    }
+  ]
+}

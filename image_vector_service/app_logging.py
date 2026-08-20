@@ -5,7 +5,12 @@ import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-LOG_FILE_SIZE = 1024 * 1024 * 1024
+# The text log is only a last-resort diagnostic source.  Searchable product
+# activity lives in activity.sqlite3, so keeping 1 GiB x 1000 text rotations
+# would waste disk space without improving the UI.  Five 20 MiB generations
+# are ample for support diagnostics and remain bounded on long-running hosts.
+LOG_FILE_SIZE = 20 * 1024 * 1024
+LOG_BACKUP_COUNT = 5
 LOG_RETENTION_DAYS = 7
 
 
@@ -19,7 +24,7 @@ def get_app_logger(log_dir: Path) -> logging.Logger:
         handler = RotatingFileHandler(
             log_path,
             maxBytes=LOG_FILE_SIZE,
-            backupCount=1000,
+            backupCount=LOG_BACKUP_COUNT,
             encoding="utf-8",
         )
         handler.setFormatter(

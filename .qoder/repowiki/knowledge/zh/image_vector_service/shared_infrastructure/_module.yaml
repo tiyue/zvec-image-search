@@ -1,0 +1,15 @@
+schema_version: 1
+module_path: image_vector_service/shared_infrastructure
+title: shared_infrastructure
+scope:
+    - image_vector_service/config.py
+    - image_vector_service/models.py
+    - image_vector_service/process_lock.py
+    - image_vector_service/backend_instance_lock.py
+    - image_vector_service/rate_limiter.py
+    - image_vector_service/app_logging.py
+    - image_vector_service/failure_sink.py
+    - image_vector_service/large_library_policy.py
+source_files: []
+depends_on: []
+related_to: []

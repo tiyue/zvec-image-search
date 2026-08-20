@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "name": "deterministic-search-quality-fixture",
+  "description": "Synthetic fixture for evaluator and calibrator tests only.",
+  "items": [
+    {
+      "id": "text-red",
+      "query_type": "text",
+      "mode": "text",
+      "query": {"text": "synthetic red image"},
+      "library_scope": {"mode": "selected", "library_ids": ["fixture"]},
+      "relevant_images": [{"image_id": "fixture:a"}],
+      "annotation": {"status": "synthetic_fixture", "notes": "Not a human label."}
+    },
+    {
+      "id": "text-shapes",
+      "query_type": "text",
+      "mode": "text",
+      "query": {"text": "synthetic shapes"},
+      "library_scope": {"mode": "selected", "library_ids": ["fixture"]},
+      "relevant_images": [
+        {"image_id": "fixture:c"},
+        {"image_id": "fixture:d"}
+      ],
+      "annotation": {"status": "synthetic_fixture", "notes": "Not a human label."}
+    },
+    {
+      "id": "text-no-answer",
+      "query_type": "no-answer",
+      "mode": "text",
+      "query": {"text": "synthetic absent object"},
+      "library_scope": {"mode": "selected", "library_ids": ["fixture"]},
+      "relevant_images": [],
+      "annotation": {"status": "synthetic_fixture", "notes": "Known-empty synthetic case."}
+    },
+    {
+      "id": "image-similar",
+      "query_type": "image",
+      "mode": "image",
+      "query": {"image": "fixtures/query-image.png"},
+      "library_scope": {"mode": "selected", "library_ids": ["fixture"]},
+      "relevant_images": [{"image_id": "fixture:i1"}],
+      "annotation": {"status": "synthetic_fixture", "notes": "Not a human label."}
+    },
+    {
+      "id": "image-no-answer",
+      "query_type": "no-answer",
+      "mode": "image",
+      "query": {"image": "fixtures/query-image-absent.png"},
+      "library_scope": {"mode": "selected", "library_ids": ["fixture"]},
+      "relevant_images": [],
+      "annotation": {"status": "synthetic_fixture", "notes": "Known-empty synthetic case."}
+    },
+    {
+      "id": "combined-match",
+      "query_type": "combined",
+      "mode": "combined",
+      "query": {
+        "text": "synthetic combined query",
+        "image": "fixtures/query-combined.png"
+      },
+      "library_scope": {"mode": "selected", "library_ids": ["fixture"]},
+      "relevant_images": [{"image_id": "fixture:m1"}],
+      "annotation": {"status": "synthetic_fixture", "notes": "Not a human label."}
+    },
+    {
+      "id": "combined-no-answer",
+      "query_type": "no-answer",
+      "mode": "combined",
+      "query": {
+        "text": "synthetic impossible combination",
+        "image": "fixtures/query-combined-absent.png"
+      },
+      "library_scope": {"mode": "selected", "library_ids": ["fixture"]},
+      "relevant_images": [],
+      "annotation": {"status": "synthetic_fixture", "notes": "Known-empty synthetic case."}
+    }
+  ]
+}

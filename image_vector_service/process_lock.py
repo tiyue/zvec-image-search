@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import BinaryIO
+from typing import Any, BinaryIO, cast
 
 from .config import ConfigurationError
 
@@ -23,15 +23,15 @@ class ProcessLock:
         handle.seek(0)
         try:
             if os.name == "nt":
-                import msvcrt
+                msvcrt = cast(Any, __import__("msvcrt"))
 
                 msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
             else:
-                import fcntl
+                fcntl = cast(Any, __import__("fcntl"))
 
-                fcntl.flock(  # type: ignore[attr-defined]
+                fcntl.flock(
                     handle.fileno(),
-                    fcntl.LOCK_EX | fcntl.LOCK_NB,  # type: ignore[attr-defined]
+                    fcntl.LOCK_EX | fcntl.LOCK_NB,
                 )
         except OSError as exc:
             handle.close()
@@ -46,15 +46,15 @@ class ProcessLock:
         try:
             self._handle.seek(0)
             if os.name == "nt":
-                import msvcrt
+                msvcrt = cast(Any, __import__("msvcrt"))
 
                 msvcrt.locking(self._handle.fileno(), msvcrt.LK_UNLCK, 1)
             else:
-                import fcntl
+                fcntl = cast(Any, __import__("fcntl"))
 
-                fcntl.flock(  # type: ignore[attr-defined]
+                fcntl.flock(
                     self._handle.fileno(),
-                    fcntl.LOCK_UN,  # type: ignore[attr-defined]
+                    fcntl.LOCK_UN,
                 )
         finally:
             self._handle.close()

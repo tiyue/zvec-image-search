@@ -19,6 +19,7 @@ from .zvec_repository import (
     COLLECTION_SCHEMA_VERSION,
     OUTPUT_FIELDS,
     collection_schema,
+    empty_metadata_embedding,
 )
 
 LEGACY_FIELDS = (
@@ -57,8 +58,13 @@ def _migrate_locked(config: ServiceConfig, dry_run: bool) -> dict[str, Any]:
             "documents": _state_count(config.state_path),
             "api_requests": 0,
         }
-    if schema_version == 2:
-        return _migrate_v2_to_current(config, metadata, dry_run)
+    if schema_version in {2, 3}:
+        return _migrate_v2_or_v3_to_current(
+            config,
+            metadata,
+            dry_run,
+            source_schema=schema_version,
+        )
     if schema_version != 1:
         raise ConfigurationError(f"Unsupported Collection schema: {schema_version}")
     expected_metadata = {
@@ -170,13 +176,20 @@ def _migrate_locked(config: ServiceConfig, dry_run: bool) -> dict[str, Any]:
                     "relative_path": str(entry["relative_path"]),
                     "model": config.model,
                     "tags": [],
+                    "metadata_text": "",
+                    "metadata_text_hash": "",
                     **{field: entry[field] for field in LEGACY_FIELDS},
                 }
                 new_documents.append(
                     zvec.Doc(
                         id=new_id,
                         fields=fields,
-                        vectors={"embedding": list(vector)},
+                        vectors={
+                            "embedding": list(vector),
+                            "metadata_embedding": empty_metadata_embedding(
+                                config.dimension
+                            ),
+                        },
                     )
                 )
                 migrated_entries.append(
@@ -276,10 +289,12 @@ def _migrate_locked(config: ServiceConfig, dry_run: bool) -> dict[str, Any]:
     }
 
 
-def _migrate_v2_to_current(
+def _migrate_v2_or_v3_to_current(
     config: ServiceConfig,
     metadata: dict[str, Any],
     dry_run: bool,
+    *,
+    source_schema: int,
 ) -> dict[str, Any]:
     expected_metadata = {
         "model": config.model,
@@ -293,9 +308,13 @@ def _migrate_v2_to_current(
         if metadata.get(key) != expected
     }
     if mismatches:
-        raise ConfigurationError(f"V2 Collection metadata mismatch: {mismatches}")
+        raise ConfigurationError(
+            f"V{source_schema} Collection metadata mismatch: {mismatches}"
+        )
     if not config.collection_path.is_dir() or not config.state_path.is_file():
-        raise ConfigurationError("The V2 Collection or state database is missing.")
+        raise ConfigurationError(
+            f"The V{source_schema} Collection or state database is missing."
+        )
 
     state = sqlite3.connect(config.state_path, timeout=5)
     try:
@@ -310,14 +329,16 @@ def _migrate_v2_to_current(
         if not state_collection_uuid or str(state_collection_uuid[0]) != str(
             metadata["collection_uuid"]
         ):
-            raise ConfigurationError("V2 Collection/state identity mismatch.")
+            raise ConfigurationError(
+                f"V{source_schema} Collection/state identity mismatch."
+            )
         doc_ids = [str(row[0]) for row in state.execute("SELECT doc_id FROM entries")]
     finally:
         state.close()
 
     preview = {
         "status": "ready",
-        "from_schema": 2,
+        "from_schema": source_schema,
         "to_schema": COLLECTION_SCHEMA_VERSION,
         "dry_run": dry_run,
         "documents": len(doc_ids),
@@ -337,17 +358,22 @@ def _migrate_v2_to_current(
     old_count = int(old_collection.stats.doc_count)
     if old_count != len(doc_ids):
         raise ConfigurationError(
-            f"V2 Collection/state count mismatch: {old_count} != {len(doc_ids)}."
+            f"V{source_schema} Collection/state count mismatch: "
+            f"{old_count} != {len(doc_ids)}."
         )
 
     new_collection = zvec.create_and_open(
         str(temp_collection), collection_schema(config)
     )
-    v2_fields = [field for field in OUTPUT_FIELDS if field != "tags"]
+    source_fields = [
+        field for field in OUTPUT_FIELDS if source_schema >= 3 or field != "tags"
+    ]
     try:
         for batch in _chunks(doc_ids, 128):
             old_documents = old_collection.fetch(
-                batch, output_fields=v2_fields, include_vector=True
+                batch,
+                output_fields=source_fields,
+                include_vector=True,
             )
             new_documents = []
             for doc_id in batch:
@@ -355,21 +381,30 @@ def _migrate_v2_to_current(
                 vector = old_doc.vectors.get("embedding") if old_doc else None
                 if vector is None or len(vector) != config.dimension:
                     raise ConfigurationError(
-                        f"Missing or invalid vector for V2 document {doc_id}."
+                        f"Missing or invalid vector for V{source_schema} "
+                        f"document {doc_id}."
                     )
                 fields = dict(old_doc.fields)
-                missing_fields = set(v2_fields) - fields.keys()
+                missing_fields = set(source_fields) - fields.keys()
                 if missing_fields:
                     raise ConfigurationError(
-                        f"Missing V2 fields for document {doc_id}: "
+                        f"Missing V{source_schema} fields for document {doc_id}: "
                         f"{sorted(missing_fields)}"
                     )
-                fields["tags"] = []
+                if source_schema == 2:
+                    fields["tags"] = []
+                fields["metadata_text"] = ""
+                fields["metadata_text_hash"] = ""
                 new_documents.append(
                     zvec.Doc(
                         id=doc_id,
                         fields=fields,
-                        vectors={"embedding": list(vector)},
+                        vectors={
+                            "embedding": list(vector),
+                            "metadata_embedding": empty_metadata_embedding(
+                                config.dimension
+                            ),
+                        },
                     )
                 )
             statuses = new_collection.upsert(new_documents)
@@ -389,7 +424,7 @@ def _migrate_v2_to_current(
         migrated_metadata = {
             **metadata,
             "schema_version": COLLECTION_SCHEMA_VERSION,
-            "migrated_from_schema": 2,
+            "migrated_from_schema": source_schema,
             "migrated_at": datetime.now(timezone.utc).isoformat(),
         }
         temp_meta.write_text(
@@ -408,10 +443,10 @@ def _migrate_v2_to_current(
     gc.collect()
     backup_suffix = datetime.now().strftime("%Y%m%d_%H%M%S") + f"_{token[:8]}"
     backup_collection = config.workspace / (
-        f"image_collection.v2.backup_{backup_suffix}"
+        f"image_collection.v{source_schema}.backup_{backup_suffix}"
     )
     backup_meta = config.workspace / (
-        f"image_collection.meta.v2.backup_{backup_suffix}.json"
+        f"image_collection.meta.v{source_schema}.backup_{backup_suffix}.json"
     )
     moved: list[tuple[Path, Path]] = []
     try:

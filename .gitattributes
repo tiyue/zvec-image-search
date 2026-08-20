@@ -1,0 +1,9 @@
+# Vite asset hashes and generated HTML must be reproducible on Windows CI.
+frontend/** text eol=lf
+zvec_webview/frontend_dist/** text eol=lf
+frontend/**/*.png binary
+zvec_webview/frontend_dist/**/*.png binary
+
+# Keep both Gradle launchers usable from their native shells.
+android/gradlew text eol=lf
+android/gradlew.bat text eol=crlf
