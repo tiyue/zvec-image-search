@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import threading
 import unittest
 from collections.abc import Callable
@@ -194,6 +195,7 @@ class BackendAutoIndexWatcherTest(unittest.TestCase):
         finally:
             worker.close()
 
+    @unittest.skipUnless(os.name == "nt", "requires watchdog Windows API")
     def test_windows_watcher_ignores_last_access_only_notifications(self) -> None:
         from watchdog.observers import winapi
 
