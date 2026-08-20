@@ -31,6 +31,7 @@ from image_vector_service.auto_tag_cache import SharedAutoTagCache
 from image_vector_service.auto_tagging_assets import FIELD_SPECS, FIELD_TAG_LABELS
 from image_vector_service.config import ServiceConfig
 from image_vector_service.dashscope_client import EmbeddingResponse
+from image_vector_service.folder_name_tags import FolderNameTagPolicy
 from image_vector_service.service import ImageVectorService
 from image_vector_service.vision_tagging_client import (
     TaggingContext,
@@ -371,6 +372,29 @@ class FolderInheritanceAggregateTest(unittest.TestCase):
                 for occurrence in bucket.values()
             )
         )
+
+    def test_blacklist_filters_future_inheritance_without_mutating_donor_sources(
+        self,
+    ) -> None:
+        aggregate = _FolderInheritanceAggregate(
+            frozenset(),
+            blacklist_policy=FolderNameTagPolicy(("V", "自拍")),
+        )
+        donor = self._donor(
+            "peer",
+            manual_tags=("自拍预览", "原神"),
+            accepted_auto_tags=("VIP模型", "雷电将军"),
+        )
+
+        aggregate.consume(donor, self._accepted_annotation(donor))
+        payload = aggregate.payload()
+
+        self.assertEqual(donor["tags"], ["自拍预览", "原神"])
+        self.assertEqual(donor["accepted_auto_tags"], ["VIP模型", "雷电将军"])
+        self.assertNotIn("自拍预览", payload["accepted_tags"])
+        self.assertNotIn("VIP模型", payload["accepted_tags"])
+        self.assertIn("原神", payload["accepted_tags"])
+        self.assertIn("雷电将军", payload["accepted_tags"])
 
     def test_one_hundred_thousand_donors_keep_only_bounded_audit_samples(self) -> None:
         walking = FIELD_TAG_LABELS[FIELD_SPECS["action"].values[1]]

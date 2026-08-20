@@ -139,6 +139,7 @@ function errorReason(item: ActivityLogItem): string {
           <option value="sync">同步图库</option>
           <option value="auto_tag">智能标注</option>
           <option value="index_and_auto_tag">索引并智能标注</option>
+          <option value="auto_index_and_auto_tag">自动增量索引与标注</option>
           <option value="manual_tag_batch">批量标签</option>
           <option value="folder_name_tag_apply">文件夹名称标签</option>
           <option value="folder_delete_commit">文件夹清理</option>

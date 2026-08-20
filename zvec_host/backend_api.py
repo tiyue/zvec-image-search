@@ -11,7 +11,7 @@ import http.client
 import json
 import math
 import secrets
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, TypeAlias
 from urllib.parse import quote, urlencode, urljoin, urlsplit, urlunsplit
@@ -354,6 +354,45 @@ class BackendApiClient:
                 "PUT",
                 relative_path,
                 "the response did not contain image-edit settings",
+                status_code=200,
+                payload=payload,
+            )
+        return settings
+
+    def get_folder_name_tag_settings(self) -> JsonObject:
+        relative_path = "v1/folder-name-tags/settings"
+        payload = self._request_json("GET", relative_path, expected_statuses={200})
+        settings = payload.get("settings")
+        if not isinstance(settings, dict):
+            raise self._protocol_error(
+                "GET",
+                relative_path,
+                "the response did not contain folder-name tag settings",
+                status_code=200,
+                payload=payload,
+            )
+        return settings
+
+    def update_folder_name_tag_settings(
+        self, blacklist: Sequence[str]
+    ) -> JsonObject:
+        if isinstance(blacklist, (str, bytes)) or not isinstance(
+            blacklist, Sequence
+        ):
+            raise ValueError("blacklist must be a sequence of strings")
+        relative_path = "v1/folder-name-tags/settings"
+        payload = self._request_json(
+            "PUT",
+            relative_path,
+            json_body={"blacklist": list(blacklist)},
+            expected_statuses={200},
+        )
+        settings = payload.get("settings")
+        if not isinstance(settings, dict):
+            raise self._protocol_error(
+                "PUT",
+                relative_path,
+                "the response did not contain folder-name tag settings",
                 status_code=200,
                 payload=payload,
             )

@@ -27,6 +27,7 @@ from .activity_store import ActivityStore
 from .backend_instance_lock import BackendInstanceLock
 from .config import RuntimeCredentials, ServiceConfig, default_config_home
 from .federated_search import LibraryCandidateSet, export_federated_search
+from .folder_name_tag_settings import FolderNameTagSettingsStore
 from .image_edit import ImageEditTaskManager
 from .image_edit.service import ImageEditServiceError
 from .large_cluster_adapter import DEFAULT_CLUSTER_TYPES
@@ -122,6 +123,8 @@ _CAPABILITIES = {
     "manual_tag_undo": True,
     "folder_name_tagging": True,
     "folder_name_tag_preview": True,
+    "folder_name_tag_settings": True,
+    "auto_index_task_history": True,
     "search_results_cleanup": True,
     "fuzzy_tag_search": True,
     "tag_only_search": True,
@@ -234,6 +237,7 @@ _BATCH_PRIORITY_COMMANDS = frozenset(
         "index",
         "sync",
         "index_and_auto_tag",
+        "auto_index_and_auto_tag",
         "auto_tag",
         "auto_tag_policy_migrate",
         "folder_tag_backfill",
@@ -510,6 +514,8 @@ class _LibraryWorker:
         *,
         queue_capacity: int,
         cooperative_batch_size: int,
+        submit_auto_index_cycle: Callable[[LibraryDefinition, str], None]
+        | None = None,
     ) -> None:
         self.library = library
         self._service_factory = service_factory
@@ -527,6 +533,7 @@ class _LibraryWorker:
         self._cooperative_checkpoints = 0
         self._cooperative_last_yield = monotonic()
         self._cooperative_depth = 0
+        self._submit_auto_index_cycle = submit_auto_index_cycle
         self._watcher: Any = None
         self._thread = threading.Thread(
             target=self._main,
@@ -655,6 +662,17 @@ class _LibraryWorker:
             return
         if self._startup_error is not None:
             return
+        if self._submit_auto_index_cycle is not None:
+            try:
+                self._submit_auto_index_cycle(self.library, root_id)
+            except Exception:
+                service = self._service
+                if service is not None:
+                    service.logger.exception(
+                        "auto_index_job_submit_failed root_id=%s",
+                        root_id,
+                    )
+            return
 
         def callback(service: Any) -> Any:
             root_path = service.state.root_path(root_id)
@@ -705,6 +723,20 @@ class _LibraryWorker:
             return
         if pending > 0:
             self._on_changes_settled(root_id)
+
+    def schedule_pending_auto_index(self, root_id: str) -> None:
+        watcher = self._watcher
+        service = self._service
+        if watcher is None or service is None or self._stop.is_set():
+            return
+        try:
+            if service.state.count_pending_changes(root_id) > 0:
+                watcher.schedule_pending(root_id)
+        except Exception:
+            service.logger.exception(
+                "auto_index_pending_reschedule_failed root_id=%s",
+                root_id,
+            )
 
     def _main(self) -> None:
         service: Any = None
@@ -926,6 +958,10 @@ class BackendJobManager:
         self._config = replace(self._config, runtime_credentials=self._credentials)
         self._image_edit_manager: ImageEditTaskManager | None = None
         self._image_edit_lock = threading.Lock()
+        self._folder_name_tag_settings = FolderNameTagSettingsStore(
+            self._config.config_home_path
+        )
+        self._folder_name_tag_settings_lock = threading.Lock()
         # Keep the native default inside the selected workspace. Desktop callers pass
         # an isolated per-process staging directory explicitly.
         self._query_root = Path(
@@ -961,6 +997,7 @@ class BackendJobManager:
                 self._check_cancel,
                 queue_capacity=self._library_queue_capacity,
                 cooperative_batch_size=self._cooperative_batch_size,
+                submit_auto_index_cycle=self._submit_auto_index_cycle,
             )
             for library in self._catalog.enabled
         }
@@ -982,6 +1019,8 @@ class BackendJobManager:
         )
         self._job_futures: dict[str, Future[Any]] = {}
         self._job_worker_ids: dict[str, str] = {}
+        self._active_auto_index_jobs: dict[tuple[str, str], str] = {}
+        self._auto_index_job_keys: dict[str, tuple[str, str]] = {}
 
     def _adapt_service_factory(
         self, service_factory: ServiceFactory | None
@@ -1150,6 +1189,97 @@ class BackendJobManager:
                 },
             )
 
+    def _record_terminal_job_summary(self, snapshot: dict[str, Any]) -> None:
+        command = str(snapshot.get("command") or "")
+        status = str(snapshot.get("status") or "unknown")
+        result = snapshot.get("result")
+        result = result if isinstance(result, dict) else {}
+        library_id, library_name = self._job_library_context(snapshot)
+        job_id = str(snapshot.get("id") or "") or None
+        if command == "auto_index_and_auto_tag":
+            changes = result.get("changes")
+            changes = changes if isinstance(changes, dict) else {}
+            index = result.get("index")
+            index = index if isinstance(index, dict) else {}
+            auto_tag = result.get("auto_tag")
+            auto_tag = auto_tag if isinstance(auto_tag, dict) else {}
+            processed = int(changes.get("processed") or 0)
+            inserted = int(index.get("inserted") or 0)
+            updated = int(index.get("updated") or 0)
+            deleted = int(index.get("deleted") or 0)
+            auto_succeeded = int(
+                auto_tag.get("succeeded")
+                or auto_tag.get("updated")
+                or auto_tag.get("processed")
+                or 0
+            )
+            failed = int(result.get("failed") or 0)
+            if status in {"succeeded", "partial", "needs_attention"}:
+                message = (
+                    f"自动索引完成：处理 {processed} 个文件变化，新增 {inserted} 张、"
+                    f"更新 {updated} 张、删除 {deleted} 张；自动标注成功 "
+                    f"{auto_succeeded} 张、失败 {failed} 张；共 "
+                    f"{int(result.get('batches') or 0)} 批。"
+                )
+            elif status == "cancelled":
+                message = (
+                    f"自动索引已取消：本轮已处理 {processed} 个文件变化，"
+                    "监听仍保持启用。"
+                )
+            else:
+                message = "自动索引本轮失败，未处理的文件变化将保留等待重试。"
+            self._activity_log(
+                level=(
+                    "error"
+                    if status == "failed"
+                    else "warning"
+                    if failed
+                    else "info"
+                ),
+                category="auto_index",
+                event=f"auto_index_cycle_{status}",
+                message=message,
+                library_id=library_id,
+                library_name=library_name,
+                job_id=job_id,
+                details={
+                    "task_type": command,
+                    "status": status,
+                    "changes": changes,
+                    "index": index,
+                    "auto_tag": auto_tag,
+                    "batches": int(result.get("batches") or 0),
+                    "pending_remaining": int(result.get("pending_remaining") or 0),
+                },
+            )
+        elif command == "folder_name_tag_apply" and result:
+            self._activity_log(
+                level="warning" if int(result.get("failed") or 0) else "info",
+                category="manual_tag",
+                event=f"folder_name_tag_{status}",
+                message=(
+                    "文件夹名称标签处理完成：检查 "
+                    f"{int(result.get('processed') or 0)} 张，"
+                    f"更新 {int(result.get('updated') or 0)} 张，失败 "
+                    f"{int(result.get('failed') or 0)} 张；移除黑名单标签 "
+                    f"{int(result.get('removed_blacklist') or 0)} 个。"
+                ),
+                library_id=library_id,
+                library_name=library_name,
+                job_id=job_id,
+                details={
+                    "task_type": command,
+                    "status": status,
+                    "run_id": result.get("run_id"),
+                    "mode": result.get("mode"),
+                    "folders_scanned": result.get("folders_scanned"),
+                    "updated": result.get("updated"),
+                    "failed": result.get("failed"),
+                    "removed_blacklist": result.get("removed_blacklist"),
+                    "removed_legacy": result.get("removed_legacy"),
+                    "removed_duplicates": result.get("removed_duplicates"),
+                },
+            )
     def _record_health_transition(
         self,
         status: str,
@@ -1391,6 +1521,33 @@ class BackendJobManager:
                 self._activity.add_redactions(normalized_key)
         self._credentials.configure(normalized_key, api_url)
         return {"credentials_configured": True}
+
+    def folder_name_tag_settings(self) -> dict[str, Any]:
+        with self._folder_name_tag_settings_lock:
+            return self._folder_name_tag_settings.load()
+
+    def update_folder_name_tag_settings(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        try:
+            with self._folder_name_tag_settings_lock:
+                settings = self._folder_name_tag_settings.save(payload)
+        except (OSError, ValueError) as exc:
+            raise BackendRequestError(
+                "invalid_folder_name_tag_settings",
+                str(exc) or "Folder-name tag settings are invalid.",
+            ) from exc
+        self._activity_log(
+            level="info",
+            category="settings",
+            event="folder_name_tag_settings_updated",
+            message="文件夹名称标签黑名单已更新。",
+            details={
+                "blacklist_count": len(settings.get("blacklist", ())),
+                "rule_revision": str(settings.get("revision") or ""),
+            },
+        )
+        return settings
 
     def image_edit_settings(self) -> dict[str, object]:
         return self._image_edit_call(lambda manager: manager.get_settings())
@@ -2064,6 +2221,39 @@ class BackendJobManager:
                 result.append(payload)
         return result
 
+    def _submit_auto_index_cycle(
+        self,
+        library: LibraryDefinition,
+        root_id: str,
+    ) -> None:
+        key = (library.library_id, str(root_id))
+        with self._jobs_lock:
+            if self._stop_requested.is_set() or key in self._active_auto_index_jobs:
+                return
+            job = BackendJob(
+                id=uuid.uuid4().hex,
+                command="auto_index_and_auto_tag",
+                params={
+                    "library_id": library.library_id,
+                    "root_id": str(root_id),
+                    "source": "watcher",
+                },
+            )
+            self._jobs[job.id] = job
+            self._active_auto_index_jobs[key] = job.id
+            self._auto_index_job_keys[job.id] = key
+        try:
+            self._schedule(job)
+        except BaseException:
+            with self._jobs_lock:
+                self._jobs.pop(job.id, None)
+                self._active_auto_index_jobs.pop(key, None)
+                self._auto_index_job_keys.pop(job.id, None)
+            raise
+        with self._jobs_lock:
+            snapshot = self._job_view_locked(job)
+        self._record_job_history(snapshot, force=True)
+
     def submit(self, payload: dict[str, Any]) -> dict[str, Any]:
         command, params = _normalize_job(payload, self._query_root)
         if command in {"index_and_auto_tag", "auto_tag_estimate", "auto_tag"}:
@@ -2470,14 +2660,22 @@ class BackendJobManager:
                     "updated_at": _utc_now(),
                 }
         finally:
+            auto_index_key: tuple[str, str] | None = None
             with self._jobs_lock:
                 job = self._jobs[job_id]
                 if job.status in _TERMINAL_STATUSES:
                     job.finished_at = job.finished_at or _utc_now()
                 self._job_futures.pop(job_id, None)
                 self._job_worker_ids.pop(job_id, None)
+                auto_index_key = self._auto_index_job_keys.pop(job_id, None)
+                if (
+                    auto_index_key is not None
+                    and self._active_auto_index_jobs.get(auto_index_key) == job_id
+                ):
+                    self._active_auto_index_jobs.pop(auto_index_key, None)
                 snapshot = job.to_dict()
             self._record_job_history(snapshot, force=True)
+            self._record_terminal_job_summary(snapshot)
             if snapshot.get("status") in {
                 "partial",
                 "needs_attention",
@@ -2498,6 +2696,10 @@ class BackendJobManager:
                         "error_type": failure_type,
                     },
                 )
+            if auto_index_key is not None:
+                worker = self._library_workers.get(auto_index_key[0])
+                if worker is not None:
+                    worker.schedule_pending_auto_index(auto_index_key[1])
 
     def _execute_federated_search(
         self, job: BackendJob, libraries: list[LibraryDefinition]
@@ -2588,6 +2790,88 @@ class BackendJobManager:
         command: str,
         params: dict[str, Any],
     ) -> Any:
+        if command == "auto_index_and_auto_tag":
+            root_id = str(params["root_id"])
+            root_path = service.state.root_path(root_id)
+            if root_path is None:
+                raise BackendRequestError(
+                    "root_not_found",
+                    "The watched library root is no longer registered.",
+                    status=HTTPStatus.CONFLICT,
+                )
+            snapshot = service.state.pending_change_snapshot(root_id)
+            cutoff = int(snapshot.get("cutoff_sequence") or 0)
+            total = int(snapshot.get("total") or 0)
+            processed = 0
+            batches = 0
+            index_totals: dict[str, Any] = {}
+            auto_tag_totals: dict[str, Any] = {}
+            failures: list[dict[str, Any]] = []
+            needs_attention = False
+            while processed < total:
+                service.cancel_check()
+                batch = service.index_and_auto_tag_incremental(
+                    folder_path=root_path,
+                    root_id=root_id,
+                    max_images=min(200, total - processed),
+                    external_processing_confirmed=True,
+                    queued_before_sequence=cutoff,
+                )
+                changes = batch.get("changes") if isinstance(batch, dict) else {}
+                batch_processed = int(
+                    changes.get("processed") if isinstance(changes, dict) else 0
+                )
+                if batch_processed < 1:
+                    break
+                processed += batch_processed
+                batches += 1
+                _merge_numeric_result(
+                    index_totals,
+                    batch.get("index") if isinstance(batch, dict) else None,
+                )
+                _merge_numeric_result(
+                    auto_tag_totals,
+                    batch.get("auto_tag") if isinstance(batch, dict) else None,
+                )
+                needs_attention = needs_attention or bool(
+                    isinstance(batch, dict) and batch.get("needs_attention")
+                )
+                raw_failures = (
+                    batch.get("failures") if isinstance(batch, dict) else None
+                )
+                if isinstance(raw_failures, list):
+                    failures.extend(
+                        item for item in raw_failures if isinstance(item, dict)
+                    )
+                    del failures[200:]
+                service.progress(
+                    f"Automatic index processed {processed}/{total} file changes."
+                )
+            failed = int(index_totals.get("failed") or 0) + int(
+                auto_tag_totals.get("failed") or 0
+            )
+            return {
+                "source": "watcher",
+                "root_id": root_id,
+                "processed": processed,
+                "total": total,
+                "failed": failed,
+                "needs_attention": needs_attention,
+                "batches": batches,
+                "changes": {
+                    "total": total,
+                    "processed": processed,
+                    "created": int(snapshot.get("created") or 0),
+                    "modified": int(snapshot.get("modified") or 0),
+                    "deleted": int(snapshot.get("deleted") or 0),
+                    "cutoff_sequence": cutoff,
+                },
+                "index": index_totals,
+                "auto_tag": auto_tag_totals,
+                "failures": failures,
+                "failures_truncated": failed > len(failures),
+                "pending_remaining": service.state.count_pending_changes(root_id),
+            }
         if command in {"index", "folder_tag_backfill"}:
             folder = self._library_folder(library, params["folder"])
             return service.index_folder(
@@ -2666,11 +2950,16 @@ class BackendJobManager:
             return service.estimate_folder_name_tags(
                 library_id=library.library_id,
                 selection=params["selection"],
+                mode=params["mode"],
+                force=params["force"],
             )
         if command == "folder_name_tag_apply":
             return service.apply_folder_name_tags(
                 library_id=library.library_id,
                 selection=params["selection"],
+                mode=params["mode"],
+                force=params["force"],
+                expected_rule_revision=params["expected_rule_revision"],
             )
         if command == "search_results_cleanup":
             return service.cleanup_search_results(
@@ -3008,6 +3297,14 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
                 )
             )
             return
+        if path == "/v1/folder-name-tags/settings":
+            self._run_request(
+                lambda: (
+                    HTTPStatus.OK,
+                    {"settings": self.backend.manager.folder_name_tag_settings()},
+                )
+            )
+            return
         if path == "/v1/image-edit/tasks":
 
             def list_image_edit_tasks() -> tuple[HTTPStatus, dict[str, Any]]:
@@ -3201,6 +3498,19 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
                 return HTTPStatus.OK, {"settings": settings}
 
             self._run_request(update_image_edit_settings)
+            return
+        if path == "/v1/folder-name-tags/settings":
+
+            def update_folder_name_tag_settings() -> tuple[
+                HTTPStatus, dict[str, Any]
+            ]:
+                payload = self._read_json_object()
+                settings = self.backend.manager.update_folder_name_tag_settings(
+                    payload
+                )
+                return HTTPStatus.OK, {"settings": settings}
+
+            self._run_request(update_folder_name_tag_settings)
             return
         if path != "/v1/session/credentials":
             self._send_error(
@@ -3846,11 +4156,26 @@ def _normalize_job(
         }
 
     if command in {"folder_name_tag_estimate", "folder_name_tag_apply"}:
-        _reject_unknown(params, {"library_id", "selection"})
-        return command, {
+        allowed = {"library_id", "selection", "mode", "force"}
+        if command == "folder_name_tag_apply":
+            allowed.add("expected_rule_revision")
+        _reject_unknown(params, allowed)
+        mode = str(params.get("mode") or "normal").strip().lower()
+        if mode not in {"normal", "clean", "mark_all"}:
+            raise BackendRequestError(
+                "invalid_params", "mode must be normal, clean, or mark_all."
+            )
+        normalized = {
             "library_id": _optional_string(params, "library_id"),
             "selection": _folder_name_tag_selection(params.get("selection")),
+            "mode": mode,
+            "force": _boolean(params, "force", True),
         }
+        if command == "folder_name_tag_apply":
+            normalized["expected_rule_revision"] = _optional_string(
+                params, "expected_rule_revision"
+            )
+        return command, normalized
 
     if command == "search_results_cleanup":
         _reject_unknown(params, {"library_id", "keep_latest", "dry_run"})
@@ -5512,6 +5837,18 @@ def _recommendation_response(
         "diversity": dict(diversity),
         "personalization": dict(personalization),
     }
+
+
+def _merge_numeric_result(target: dict[str, Any], value: Any) -> None:
+    if not isinstance(value, Mapping):
+        return
+    for key, current in value.items():
+        if isinstance(current, bool):
+            target[key] = bool(target.get(key)) or current
+        elif isinstance(current, (int, float)):
+            target[key] = target.get(key, 0) + current
+        elif key not in target and isinstance(current, (str, type(None))):
+            target[key] = current
 
 
 def _result_failure_count(value: Any) -> int:

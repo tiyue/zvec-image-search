@@ -266,6 +266,38 @@ class HostBackendApiClientTests(unittest.TestCase):
             self.assertEqual(abandoned["count"], 1)
             self.assertEqual(json.loads(server.requests[-1]["body"]), {"confirm": True})
 
+    def test_folder_name_tag_settings_use_dedicated_routes(self) -> None:
+        with _running_server() as server:
+            client = BackendApiClient(
+                f"http://127.0.0.1:{server.server_port}", "token"
+            )
+            settings = {
+                "blacklist": ["自拍", "V"],
+                "revision": "a" * 64,
+                "using_defaults": False,
+            }
+            _set_json_response(server, {"settings": settings})
+
+            self.assertEqual(client.get_folder_name_tag_settings(), settings)
+            self.assertEqual(
+                server.requests[-1]["path"],
+                "/v1/folder-name-tags/settings",
+            )
+            self.assertEqual(server.requests[-1]["method"], "GET")
+
+            self.assertEqual(
+                client.update_folder_name_tag_settings(["自拍", "V"]),
+                settings,
+            )
+            self.assertEqual(server.requests[-1]["method"], "PUT")
+            self.assertEqual(
+                json.loads(server.requests[-1]["body"]),
+                {"blacklist": ["自拍", "V"]},
+            )
+
+            with self.assertRaises(ValueError):
+                client.update_folder_name_tag_settings("自拍")  # type: ignore[arg-type]
+
     def test_get_list_and_delete_job_routes(self) -> None:
         with _running_server() as server:
             client = BackendApiClient(f"http://127.0.0.1:{server.server_port}", "token")

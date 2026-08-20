@@ -21,6 +21,7 @@ import {
 import SimilarityGroupsPanel from "./SimilarityGroupsPanel.vue";
 
 import type {
+  FolderNameTagMode,
   FolderNameTagSelection,
   ManualTagOperation,
   OrganizeAlias,
@@ -66,6 +67,8 @@ const deleteConfirmation = ref("");
 const deleteTargetKey = ref("");
 const folderNameTagModalOpen = ref(false);
 const folderNameTagScope = ref<"folder" | "library">("folder");
+const folderNameTagMode = ref<FolderNameTagMode>("normal");
+const folderNameTagForce = ref(true);
 const folderPanelCollapsed = ref(false);
 const activeWorkspaceTab = ref<WorkspaceTab>(props.activeTab);
 const visitedWorkspaceTabs = ref<Set<WorkspaceTab>>(
@@ -214,7 +217,9 @@ async function confirmFolderDeletion(): Promise<void> {
 
 function openFolderNameTagModal(): void {
   organize.cancelFolderNameTags();
-  folderNameTagScope.value = organize.selectedFolderKey.value ? "folder" : "library";
+  folderNameTagScope.value = "library";
+  folderNameTagMode.value = "normal";
+  folderNameTagForce.value = true;
   folderNameTagModalOpen.value = true;
 }
 
@@ -235,7 +240,12 @@ function folderNameTagSelection(): FolderNameTagSelection | null {
 
 function requestFolderNameTagPreview(): void {
   const selection = folderNameTagSelection();
-  if (selection) void organize.previewFolderNameTags(selection);
+  if (selection) {
+    void organize.previewFolderNameTags(selection, {
+      mode: folderNameTagMode.value,
+      force: folderNameTagForce.value,
+    });
+  }
 }
 
 async function applyFolderNameTags(): Promise<void> {
@@ -877,7 +887,7 @@ onBeforeUnmount(() => {
           <button type="button" aria-label="关闭" @click="closeFolderNameTagModal">×</button>
         </header>
         <p>
-          仅替换文件夹来源标签，不修改人工标签、模型标签和继承标签；不调用模型，也不会重新生成图片向量。
+          默认会清理手工与继承标签中的黑名单、历史脏标签和大小写重复项，再完整重建文件夹来源标签。模型标签与系统元数据保持原值；不调用模型，也不会重新生成图片向量。
         </p>
         <fieldset class="folder-tag-scope">
           <legend>作用范围</legend>
@@ -907,6 +917,25 @@ onBeforeUnmount(() => {
             </span>
           </label>
         </fieldset>
+        <fieldset class="folder-tag-scope folder-tag-mode">
+          <legend>处理方式</legend>
+          <label>
+            <input v-model="folderNameTagMode" type="radio" value="normal" @change="organize.cancelFolderNameTags" />
+            <span><strong>清理并重建</strong><small>推荐：按当前规则完整重跑</small></span>
+          </label>
+          <label>
+            <input v-model="folderNameTagMode" type="radio" value="clean" @change="organize.cancelFolderNameTags" />
+            <span><strong>仅清理旧标签</strong><small>不改文件夹来源标签</small></span>
+          </label>
+          <label>
+            <input v-model="folderNameTagMode" type="radio" value="mark_all" @change="organize.cancelFolderNameTags" />
+            <span><strong>仅标记已处理</strong><small>不写任何图片标签</small></span>
+          </label>
+        </fieldset>
+        <label class="folder-tag-force">
+          <input v-model="folderNameTagForce" type="checkbox" @change="organize.cancelFolderNameTags" />
+          <span><strong>重新处理已完成文件夹</strong><small>本次首次整库重跑保持勾选；取消后只重试失败项和新文件夹。</small></span>
+        </label>
         <div class="folder-tag-preview-action">
           <button
             class="button secondary"
@@ -943,6 +972,22 @@ onBeforeUnmount(() => {
               <dt>涉及文件夹</dt>
               <dd>{{ organize.folderNameTagPreview.value.changedFolders }}</dd>
             </div>
+            <div>
+              <dt>黑名单移除</dt>
+              <dd>{{ organize.folderNameTagPreview.value.removedBlacklist }}</dd>
+            </div>
+            <div>
+              <dt>脏标签移除</dt>
+              <dd>{{ organize.folderNameTagPreview.value.removedLegacy }}</dd>
+            </div>
+            <div>
+              <dt>重复项合并</dt>
+              <dd>{{ organize.folderNameTagPreview.value.removedDuplicates }}</dd>
+            </div>
+            <div>
+              <dt>规则数</dt>
+              <dd>{{ organize.folderNameTagPreview.value.blacklistCount }}</dd>
+            </div>
           </dl>
           <div
             v-if="organize.folderNameTagPreview.value.samples.length"
@@ -970,7 +1015,9 @@ onBeforeUnmount(() => {
               </tbody>
             </table>
           </div>
-          <p v-else class="folder-tag-no-changes">当前范围不需要更新文件夹来源标签。</p>
+          <p v-else class="folder-tag-no-changes">
+            {{ folderNameTagMode === "mark_all" ? "当前范围将只记录处理状态，不修改标签。" : "当前范围不需要更新标签。" }}
+          </p>
           <p
             v-if="organize.folderNameTagPreview.value.samplesTruncated"
             class="folder-tag-preview-note"
@@ -986,7 +1033,7 @@ onBeforeUnmount(() => {
             class="button primary"
             type="button"
             :disabled="
-              !organize.folderNameTagPreview.value?.changed ||
+              (!organize.folderNameTagPreview.value?.changed && folderNameTagMode !== 'mark_all') ||
               organize.folderNameTagPreviewLoading.value ||
               taskSubmissionLocked
             "
@@ -1222,6 +1269,11 @@ textarea { resize: vertical; line-height: 1.5; }
 .folder-tag-scope label > span { display: grid; min-width: 0; gap: 2px; }
 .folder-tag-scope strong { font-size: 12px; }
 .folder-tag-scope small { overflow: hidden; color: #777; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.folder-tag-mode { grid-template-columns: repeat(3,minmax(0,1fr)); }
+.folder-tag-force { display: flex; align-items: flex-start; gap: 9px; padding: 10px 0; border-top: 1px solid #e8e8e8; color: #444; cursor: pointer; }
+.folder-tag-force input { width: auto; flex: 0 0 auto; margin-top: 2px; accent-color: #666; }
+.folder-tag-force > span { display: grid; gap: 2px; }
+.folder-tag-force small { color: #777; font-size: 10px; }
 .folder-tag-preview-action { align-items: flex-start; }
 .folder-tag-preview-action > span { max-width: 470px; color: #777; font-size: 10px; line-height: 1.5; }
 .folder-tag-preview-status,.folder-tag-no-changes { margin: 0; padding: 12px 0; border-top: 1px solid #e8e8e8; color: #666; font-size: 11px; text-align: center; }
@@ -1321,7 +1373,7 @@ textarea { resize: vertical; line-height: 1.5; }
   .delete-modal dl { grid-template-columns: repeat(2,minmax(0,1fr)); }
   .folder-tag-modal-backdrop { padding: 12px; }
   .folder-tag-modal { max-height: calc(100vh - 24px); padding: 16px; }
-  .folder-tag-scope,.folder-tag-summary { grid-template-columns: repeat(2,minmax(0,1fr)); }
+  .folder-tag-scope,.folder-tag-mode,.folder-tag-summary { grid-template-columns: repeat(2,minmax(0,1fr)); }
   .folder-tag-summary > div:nth-child(2) { border-right: 0; }
   .folder-tag-summary > div:nth-child(-n+2) { border-bottom: 1px solid #e8e8e8; }
   .folder-tag-preview-action { align-items: stretch; flex-direction: column; }
@@ -1329,10 +1381,16 @@ textarea { resize: vertical; line-height: 1.5; }
   .workspace-tabs button { min-width: 0; padding-inline: 8px; }
 }
 
+@media (max-width: 520px) {
+  .folder-tag-scope,.folder-tag-mode { grid-template-columns: 1fr; }
+  .folder-tag-scope small { white-space: normal; }
+}
+
 @media (prefers-color-scheme: dark) {
   .folder-tag-modal { border-color: #444; color: #f2f2f2; background: #202020; }
   .folder-tag-modal > header button,.folder-tag-sample-table th { color: #ddd; background: #333; }
   .folder-tag-modal > p,.folder-tag-scope legend,.folder-tag-scope small,.folder-tag-preview-action > span,.folder-tag-preview-status,.folder-tag-no-changes,.folder-tag-summary dt { color: #bbb; }
-  .folder-tag-scope label,.folder-tag-summary,.folder-tag-summary > div,.folder-tag-sample-table,.folder-tag-sample-table th,.folder-tag-sample-table td { border-color: #3d3d3d; }
+  .folder-tag-scope label,.folder-tag-force,.folder-tag-summary,.folder-tag-summary > div,.folder-tag-sample-table,.folder-tag-sample-table th,.folder-tag-sample-table td { border-color: #3d3d3d; }
+  .folder-tag-force,.folder-tag-force small { color: #bbb; }
 }
 </style>

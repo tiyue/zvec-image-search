@@ -77,6 +77,18 @@ function fakeApi(): SettingsApi {
     })),
     saveCredentials: vi.fn(async () => ({ configured: true, persistent: true })),
     deleteCredentials: vi.fn(async () => ({ configured: false, persistent: true })),
+    folderNameTagSettings: vi.fn(async () => ({
+      schema_version: 1,
+      blacklist: ["自拍", "V"],
+      revision: "rule-v1",
+      using_defaults: false,
+    })),
+    updateFolderNameTagSettings: vi.fn(async (blacklist) => ({
+      schema_version: 1,
+      blacklist,
+      revision: "rule-v2",
+      using_defaults: false,
+    })),
   };
 }
 
@@ -298,6 +310,28 @@ describe("SettingsPage", () => {
     await flushPromises();
     expect(api.deleteCredentials).toHaveBeenCalledOnce();
     expect(wrapper.text()).toContain("未配置");
+  });
+
+  it("edits the global folder-tag blacklist one rule per line", async () => {
+    const api = fakeApi();
+    const wrapper = mount(SettingsPage, { props: { api, lanApi: fakeLanApi() } });
+    await flushPromises();
+
+    await buttonWithText(wrapper, "标签规则").trigger("click");
+    const textarea = wrapper.get('textarea[name="folder_tag_blacklist"]');
+    expect((textarea.element as HTMLTextAreaElement).value).toBe("自拍\nV");
+    expect(wrapper.text()).toContain("规则“V”会过滤 V/v 开头");
+
+    await textarea.setValue("自拍\nV\nv\n日期");
+    await wrapper.get(".folder-tag-settings-form").trigger("submit");
+    await flushPromises();
+
+    expect(api.updateFolderNameTagSettings).toHaveBeenCalledWith([
+      "自拍",
+      "V",
+      "日期",
+    ]);
+    expect(wrapper.text()).toContain("rule-v2");
   });
 
   it("rejects an unsupported model concurrency before sending the request", async () => {

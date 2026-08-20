@@ -5,7 +5,11 @@ import unicodedata
 from collections.abc import Iterable
 from pathlib import Path
 
-from .folder_name_tags import folder_name_tags_for_relative_path
+from .folder_name_tags import (
+    DEFAULT_FOLDER_NAME_TAG_POLICY,
+    FolderNameTagPolicy,
+    folder_name_tags_for_relative_path,
+)
 
 _IMAGE_COUNT_PATTERN = re.compile(
     r"(?i)\d+(?:\.\d+)?\s*(?:p|张|枚|幅|图|pics?|pictures?|images?|files?)"
@@ -90,10 +94,16 @@ def folder_tags_for_image(image_path: Path, root_path: Path) -> tuple[str, ...]:
 def folder_tags_for_relative_path(
     relative_path: str,
     root_name: str,
+    *,
+    policy: FolderNameTagPolicy = DEFAULT_FOLDER_NAME_TAG_POLICY,
 ) -> tuple[str, ...]:
     """Derive deterministic folder-source tags from a portable relative path."""
 
-    return folder_name_tags_for_relative_path(relative_path, root_name)
+    return folder_name_tags_for_relative_path(
+        relative_path,
+        root_name,
+        policy=policy,
+    )
 
 
 def build_tags_filter(tags: Iterable[str] | None, mode: str = "all") -> str | None:

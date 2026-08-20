@@ -43,7 +43,7 @@ const choosingDirectory = ref("");
 const confirmingExit = ref(false);
 const exiting = ref(false);
 const activeSection = ref<
-  "libraries" | "models" | "credentials" | "learning" | "lan" | "migration" | "application"
+  "libraries" | "models" | "credentials" | "tags" | "learning" | "lan" | "migration" | "application"
 >("libraries");
 
 function selectDefault(libraryId: string): void {
@@ -165,6 +165,9 @@ async function exitApplication(): Promise<void> {
         </button>
         <button type="button" :class="{ active: activeSection === 'credentials' }" @click="activeSection = 'credentials'">
           <span>安全凭据</span>
+        </button>
+        <button type="button" :class="{ active: activeSection === 'tags' }" @click="activeSection = 'tags'">
+          <span>标签规则</span>
         </button>
         <button type="button" :class="{ active: activeSection === 'lan' }" @click="activeSection = 'lan'">
           <span>局域网访问</span>
@@ -420,6 +423,47 @@ async function exitApplication(): Promise<void> {
       @toast="(title, message, kind) => emit('toast', title, message, kind)"
     />
 
+    <section
+      v-show="activeSection === 'tags'"
+      class="settings-card panel folder-tag-settings"
+      aria-labelledby="folder-tag-settings-title"
+    >
+      <header class="section-heading">
+        <div>
+          <p class="eyebrow">文件夹名称标签</p>
+          <h2 id="folder-tag-settings-title">标签黑名单</h2>
+        </div>
+        <span class="status-pill" :class="settings.folderTagUsingDefaults.value ? '' : 'success'">
+          {{ settings.folderTagUsingDefaults.value ? "内置默认" : "已保存" }}
+        </span>
+      </header>
+      <p class="section-copy">
+        每行一条。普通规则对标签做不区分大小写的前缀匹配；含空格的规则只匹配规范化后的完整文件夹名。
+      </p>
+      <form class="folder-tag-settings-form" @submit.prevent="settings.saveFolderTagSettings">
+        <label>
+          <span>全局黑名单</span>
+          <textarea
+            v-model="settings.folderTagBlacklistText.value"
+            name="folder_tag_blacklist"
+            rows="16"
+            required
+            spellcheck="false"
+            aria-describedby="folder-tag-blacklist-warning"
+          />
+          <small id="folder-tag-blacklist-warning">
+            注意：规则“V”会过滤 V/v 开头的所有手工、继承和新生成文件夹标签；模型标签原值不会被删除。
+          </small>
+        </label>
+        <div class="folder-tag-settings-actions">
+          <small>规则版本：{{ settings.folderTagRuleRevision.value.slice(0, 12) || "未读取" }}</small>
+          <button class="button primary" type="submit" :disabled="settings.savingFolderTagSettings.value">
+            {{ settings.savingFolderTagSettings.value ? "保存中…" : "保存标签规则" }}
+          </button>
+        </div>
+      </form>
+    </section>
+
     <div v-show="activeSection === 'models' || activeSection === 'credentials'" class="settings-grid">
       <section v-show="activeSection === 'models'" class="settings-card panel" aria-labelledby="models-title">
         <header class="section-heading">
@@ -623,8 +667,9 @@ async function exitApplication(): Promise<void> {
 .primary { background: linear-gradient(135deg, #7364eb, #5b4bd6); color: white; }
 .secondary { background: #efedff; color: #5647ce; }
 .danger { background: #fff0f1; color: #be3b4b; }
-input, select { width: 100%; min-width: 0; box-sizing: border-box; border: 1px solid #d9deea; border-radius: 9px; background: #fbfcff; color: #17203a; padding: 9px 10px; font: inherit; outline: none; }
-input:focus, select:focus { border-color: #796cf0; box-shadow: 0 0 0 3px rgba(121,108,240,.12); }
+input, select, textarea { width: 100%; min-width: 0; box-sizing: border-box; border: 1px solid #d9deea; border-radius: 9px; background: #fbfcff; color: #17203a; padding: 9px 10px; font: inherit; outline: none; }
+input:focus, select:focus, textarea:focus { border-color: #796cf0; box-shadow: 0 0 0 3px rgba(121,108,240,.12); }
+textarea { resize: vertical; line-height: 1.5; }
 .path-control { display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 7px; }
 .path-picker { border: 1px solid #d8d4ff; border-radius: 9px; background: #f0eeff; color: #5748cf; padding: 0 12px; font: inherit; font-weight: 800; cursor: pointer; }
 .path-picker:hover:not(:disabled) { background: #e8e4ff; }
@@ -657,6 +702,8 @@ label small { color: #8a91a2; font-weight: 500; }
 .model-form .button { justify-self: start; }
 .credential-form { display: grid; grid-template-columns: minmax(220px,1fr) auto; gap: 10px; align-items: end; margin-top: 14px; }
 .credential-note { margin-top: 14px; padding: 11px; border-radius: 10px; background: #f7f8fc; color: #6f788e; font-size: 12px; }
+.folder-tag-settings-form { display: grid; gap: 12px; margin-top: 14px; max-width: 760px; }
+.folder-tag-settings-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: #777; }
 .application-action { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-top: 16px; padding: 12px 0; border-top: 1px solid #e7e7e7; }
 .application-action > div:first-child { display: grid; gap: 4px; }
 .application-action small { color: #777; }

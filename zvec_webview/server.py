@@ -1036,6 +1036,20 @@ def _handler_type(gateway: GatewayServer) -> type[BaseHTTPRequestHandler]:
             if method == "GET" and segments == ("settings",):
                 self._json(HTTPStatus.OK, gateway._facade.settings())
                 return
+            if method == "GET" and segments == ("folder-name-tag-settings",):
+                self._json(
+                    HTTPStatus.OK,
+                    gateway._facade.folder_name_tag_settings(),
+                )
+                return
+            if method == "PUT" and segments == ("folder-name-tag-settings",):
+                self._json(
+                    HTTPStatus.OK,
+                    gateway._facade.update_folder_name_tag_settings(
+                        self._read_json()
+                    ),
+                )
+                return
             if method == "GET" and segments == ("lan-access",):
                 _reject_unknown_query(query_values, set())
                 self._json(HTTPStatus.OK, gateway._facade.lan_access_status())
@@ -1146,7 +1160,7 @@ def _handler_type(gateway: GatewayServer) -> type[BaseHTTPRequestHandler]:
                 and segments[2:4] == ("folder-name-tags", "preview")
             ):
                 body = self._read_json()
-                unknown = sorted(set(body) - {"selection"})
+                unknown = sorted(set(body) - {"selection", "mode", "force"})
                 if unknown:
                     raise FacadeError(
                         "invalid_request",
@@ -1165,6 +1179,8 @@ def _handler_type(gateway: GatewayServer) -> type[BaseHTTPRequestHandler]:
                     gateway._facade.preview_folder_name_tags(
                         segments[1],
                         selection=selection,
+                        mode=str(body.get("mode") or "normal"),
+                        force=body.get("force", True),
                     ),
                 )
                 return

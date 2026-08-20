@@ -25,6 +25,8 @@ class FolderNameTagTaskContractTest(unittest.TestCase):
             {
                 "library_id": "library-a",
                 "selection": {"mode": "library"},
+                "mode": "normal",
+                "force": True,
             },
         )
         apply = FolderNameTagApplyRequest(
@@ -87,6 +89,27 @@ class FolderNameTagTaskContractTest(unittest.TestCase):
         self.assertEqual(library_id, "library-a")
         self.assertIsInstance(request, FolderNameTagApplyRequest)
         self.assertEqual(request.to_params()["selection"]["mode"], "folder")
+
+    def test_mode_force_and_rule_revision_cross_all_contract_boundaries(self) -> None:
+        task_type, request, _library_id = _library_request(
+            {
+                "task_type": "folder_name_tag_apply",
+                "library_id": "library-a",
+                "selection": {"mode": "library"},
+                "mode": "clean",
+                "force": False,
+                "expected_rule_revision": "a" * 64,
+            }
+        )
+        command, params = _normalize_job(
+            {"command": task_type, "params": request.to_params()},
+            Path.cwd(),
+        )
+
+        self.assertEqual(command, "folder_name_tag_apply")
+        self.assertEqual(params["mode"], "clean")
+        self.assertFalse(params["force"])
+        self.assertEqual(params["expected_rule_revision"], "a" * 64)
 
 
 if __name__ == "__main__":

@@ -38,6 +38,12 @@ class _Facade:
         self.folder_image_query: dict[str, Any] | None = None
         self.folder_delete_query: dict[str, Any] | None = None
         self.folder_name_tag_query: dict[str, Any] | None = None
+        self.folder_name_tag_settings_value = {
+            "schema_version": 1,
+            "blacklist": ["自拍", "V"],
+            "revision": "a" * 64,
+            "using_defaults": True,
+        }
         self.job_history_query: dict[str, Any] | None = None
         self.activity_log_query: dict[str, Any] | None = None
         self.frontend_activities: list[dict[str, Any]] = []
@@ -59,6 +65,19 @@ class _Facade:
 
     def settings(self) -> dict[str, Any]:
         return {"credentials": {"configured": False}}
+
+    def folder_name_tag_settings(self) -> dict[str, Any]:
+        return dict(self.folder_name_tag_settings_value)
+
+    def update_folder_name_tag_settings(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        self.folder_name_tag_settings_value = {
+            **self.folder_name_tag_settings_value,
+            "blacklist": list(payload["blacklist"]),
+            "using_defaults": False,
+        }
+        return dict(self.folder_name_tag_settings_value)
 
     def _lan_status(self, message: str = "ready") -> dict[str, Any]:
         return {
@@ -425,10 +444,14 @@ class _Facade:
         library_id: str,
         *,
         selection: dict[str, Any],
+        mode: str = "normal",
+        force: bool = True,
     ) -> dict[str, Any]:
         self.folder_name_tag_query = {
             "library_id": library_id,
             "selection": dict(selection),
+            "mode": mode,
+            "force": force,
         }
         return {
             "selected": 10,
@@ -1556,8 +1579,26 @@ class GatewayTests(unittest.TestCase):
                     "folder_key": "zvec-folder-v1.preview",
                     "include_subfolders": True,
                 },
+                "mode": "normal",
+                "force": True,
             },
         )
+
+    def test_folder_name_tag_settings_routes_keep_the_blacklist_array(self) -> None:
+        status, _headers, initial = _json(
+            self.server.url + "api/folder-name-tag-settings"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(initial["blacklist"], ["自拍", "V"])
+
+        status, _headers, saved = _json(
+            self.server.url + "api/folder-name-tag-settings",
+            method="PUT",
+            body={"blacklist": ["图包", "V"]},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(saved["blacklist"], ["图包", "V"])
+        self.assertFalse(saved["using_defaults"])
 
     def test_data_migration_recovery_routes_are_separate_from_job_lookup(self) -> None:
         status, _headers, payload = _json(

@@ -110,6 +110,10 @@ export function useSettings(api: SettingsApi = settingsApi, events: SettingsEven
   const savingModels = ref(false);
   const savingCredentials = ref(false);
   const deletingCredentials = ref(false);
+  const folderTagBlacklistText = ref("");
+  const folderTagRuleRevision = ref("");
+  const folderTagUsingDefaults = ref(false);
+  const savingFolderTagSettings = ref(false);
   const lastError = ref("");
   const saveStatus = ref("");
   let controller: AbortController | null = null;
@@ -169,6 +173,16 @@ export function useSettings(api: SettingsApi = settingsApi, events: SettingsEven
     credentialsPersistent.value = credentialState.persistent === true;
   }
 
+  function applyFolderTagSettings(payload: {
+    blacklist?: unknown;
+    revision?: unknown;
+    using_defaults?: unknown;
+  }): void {
+    folderTagBlacklistText.value = stringArray(payload.blacklist).join("\n");
+    folderTagRuleRevision.value = text(payload.revision);
+    folderTagUsingDefaults.value = payload.using_defaults === true;
+  }
+
   async function load(): Promise<boolean> {
     loading.value = true;
     controller?.abort();
@@ -176,6 +190,11 @@ export function useSettings(api: SettingsApi = settingsApi, events: SettingsEven
     try {
       const payload = await api.settings(controller.signal);
       applySettings(payload);
+      if (api.folderNameTagSettings) {
+        applyFolderTagSettings(
+          await api.folderNameTagSettings(controller.signal),
+        );
+      }
       lastError.value = "";
       saveStatus.value = "设置已刷新";
       return true;
@@ -473,6 +492,45 @@ export function useSettings(api: SettingsApi = settingsApi, events: SettingsEven
     }
   }
 
+  async function saveFolderTagSettings(): Promise<boolean> {
+    if (!api.updateFolderNameTagSettings || savingFolderTagSettings.value) {
+      return false;
+    }
+    const values: string[] = [];
+    const seen = new Set<string>();
+    for (const line of folderTagBlacklistText.value.split(/\r?\n/u)) {
+      const value = line.normalize("NFKC").trim().replace(/\s+/gu, " ");
+      if (!value) continue;
+      const key = value.toLocaleLowerCase();
+      if (!seen.has(key)) {
+        seen.add(key);
+        values.push(value);
+      }
+    }
+    if (!values.length || values.length > 256) {
+      notify("黑名单无效", "请保留 1 至 256 条非空规则，每行一条。", "error");
+      return false;
+    }
+    savingFolderTagSettings.value = true;
+    try {
+      const payload = await api.updateFolderNameTagSettings(values);
+      applyFolderTagSettings(payload);
+      lastError.value = "";
+      notify(
+        "标签黑名单已保存",
+        "新规则立即用于后续预览、重建和继承候选；正在运行的文件夹标签任务继续使用启动时快照。",
+        "success",
+      );
+      return true;
+    } catch (error) {
+      lastError.value = errorMessage(error);
+      notify("无法保存标签黑名单", lastError.value, "error");
+      return false;
+    } finally {
+      savingFolderTagSettings.value = false;
+    }
+  }
+
   onMounted(() => {
     if (events.autoLoad !== false) void load();
   });
@@ -498,6 +556,10 @@ export function useSettings(api: SettingsApi = settingsApi, events: SettingsEven
     savingModels,
     savingCredentials,
     deletingCredentials,
+    folderTagBlacklistText,
+    folderTagRuleRevision,
+    folderTagUsingDefaults,
+    savingFolderTagSettings,
     lastError,
     saveStatus,
     load,
@@ -510,5 +572,6 @@ export function useSettings(api: SettingsApi = settingsApi, events: SettingsEven
     saveModels,
     saveCredentials,
     deleteCredentials,
+    saveFolderTagSettings,
   };
 }

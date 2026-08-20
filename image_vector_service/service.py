@@ -55,6 +55,14 @@ from .collection_write_coordinator import (
 from .config import ConfigurationError, ServiceConfig
 from .failure_sink import IndexFailureSink
 from .folder_deletion import FolderDeletionManager
+from .folder_name_tag_settings import FolderNameTagSettingsStore
+from .folder_name_tags import (
+    DEFAULT_FOLDER_NAME_TAG_POLICY,
+    ExistingTagCleanup,
+    FolderNameTagPolicy,
+    clean_existing_tags,
+    merge_effective_tags,
+)
 from .hybrid_search import (
     HybridTagIntent,
     detect_hybrid_tag_intent,
@@ -240,8 +248,18 @@ class _ManualTagPlan:
 @dataclass(frozen=True)
 class _FolderNameTagPlan:
     entry: dict[str, Any]
-    before_tags: tuple[str, ...]
-    after_tags: tuple[str, ...]
+    before_folder_tags: tuple[str, ...]
+    after_folder_tags: tuple[str, ...]
+    before_manual_tags: tuple[str, ...]
+    after_manual_tags: tuple[str, ...]
+    before_inherited_tags: tuple[str, ...]
+    after_inherited_tags: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _FolderNameTagCleanup:
+    manual: ExistingTagCleanup
+    inherited: ExistingTagCleanup
 
 
 @dataclass
@@ -1180,9 +1198,15 @@ class ImageVectorService:
         *,
         library_id: str,
         selection: Mapping[str, Any],
+        mode: str = "normal",
+        force: bool = True,
     ) -> dict[str, Any]:
-        """Preview deterministic folder-source changes without writing data."""
+        """Preview a folder-name run without writing tags or run state."""
 
+        normalized_mode, normalized_force = _normalize_folder_name_tag_options(
+            mode, force
+        )
+        policy = self._folder_name_tag_policy()
         selection_view, total, chunks = self._folder_name_tag_selection(
             library_id=library_id,
             selection=selection,
@@ -1192,8 +1216,13 @@ class ImageVectorService:
         changed = 0
         unchanged = 0
         untagged = 0
+        skipped = 0
+        removed_blacklist = 0
+        removed_legacy = 0
+        removed_duplicates = 0
         scanned_folder_keys: set[tuple[str, str]] = set()
         changed_folder_keys: set[tuple[str, str]] = set()
+        state_cache: dict[tuple[str, str], str | None] = {}
         sample_indexes: dict[tuple[str, str], int] = {}
         samples: list[dict[str, Any]] = []
 
@@ -1205,11 +1234,42 @@ class ImageVectorService:
                     str(entry.get("parent_directory") or ""),
                 )
                 scanned_folder_keys.add(folder_key)
-                before = normalize_tags(entry.get("folder_tags", ()))
-                after = self._folder_name_tags_for_entry(entry, root_names)
-                if not after:
+                if not normalized_force:
+                    if folder_key not in state_cache:
+                        state_cache[folder_key] = (
+                            self.state.folder_name_tag_folder_status(
+                                root_id=folder_key[0],
+                                relative_folder=folder_key[1],
+                                rule_revision=policy.revision,
+                            )
+                        )
+                    if state_cache[folder_key] in {
+                        "succeeded",
+                        "untagged",
+                        "marked",
+                    }:
+                        skipped += 1
+                        continue
+                plan, cleanup = self._folder_name_tag_plan(
+                    entry,
+                    root_names,
+                    policy=policy,
+                    mode=normalized_mode,
+                )
+                removed_blacklist += (
+                    cleanup.manual.removed_blacklist
+                    + cleanup.inherited.removed_blacklist
+                )
+                removed_legacy += (
+                    cleanup.manual.removed_legacy + cleanup.inherited.removed_legacy
+                )
+                removed_duplicates += (
+                    cleanup.manual.removed_duplicates
+                    + cleanup.inherited.removed_duplicates
+                )
+                if not plan.after_folder_tags:
                     untagged += 1
-                if before == after:
+                if not _folder_name_tag_plan_changed(plan):
                     unchanged += 1
                     continue
                 changed += 1
@@ -1222,8 +1282,12 @@ class ImageVectorService:
                         {
                             "root_id": folder_key[0],
                             "relative_folder": folder_key[1],
-                            "current_tags": list(before),
-                            "proposed_tags": list(after),
+                            "current_tags": list(plan.before_folder_tags),
+                            "proposed_tags": list(plan.after_folder_tags),
+                            "manual_removed": len(plan.before_manual_tags)
+                            - len(plan.after_manual_tags),
+                            "inherited_removed": len(plan.before_inherited_tags)
+                            - len(plan.after_inherited_tags),
                             "affected_images": 0,
                         }
                     )
@@ -1240,8 +1304,16 @@ class ImageVectorService:
             "changed": changed,
             "unchanged": unchanged,
             "untagged": untagged,
+            "skipped": skipped,
             "folders_scanned": len(scanned_folder_keys),
             "changed_folders": len(changed_folder_keys),
+            "removed_blacklist": removed_blacklist,
+            "removed_legacy": removed_legacy,
+            "removed_duplicates": removed_duplicates,
+            "mode": normalized_mode,
+            "force": normalized_force,
+            "rule_revision": policy.revision,
+            "blacklist_count": len(policy.blacklist),
             "samples": samples,
             "samples_truncated": len(changed_folder_keys) > len(samples),
             "api_requests": 0,
@@ -1252,12 +1324,32 @@ class ImageVectorService:
         *,
         library_id: str,
         selection: Mapping[str, Any],
+        mode: str = "normal",
+        force: bool = True,
+        expected_rule_revision: str | None = None,
     ) -> dict[str, Any]:
-        """Replace only folder-source tags using existing indexed vectors."""
+        """Apply a previewed rebuild while leaving model/system sources intact."""
 
+        normalized_mode, normalized_force = _normalize_folder_name_tag_options(
+            mode, force
+        )
+        policy = self._folder_name_tag_policy()
+        if (
+            expected_rule_revision is not None
+            and str(expected_rule_revision) != policy.revision
+        ):
+            raise ValueError(
+                "Folder-name tag rules changed after preview; generate a new preview."
+            )
         selection_view, total, chunks = self._folder_name_tag_selection(
             library_id=library_id,
             selection=selection,
+        )
+        run_id = self.state.start_folder_name_tag_run(
+            mode=normalized_mode,
+            selection=selection_view,
+            rule_revision=policy.revision,
+            total=total,
         )
         root_names = self._folder_name_tag_root_names()
         processed = 0
@@ -1265,68 +1357,173 @@ class ImageVectorService:
         unchanged = 0
         untagged = 0
         failed = 0
+        skipped = 0
+        removed_blacklist = 0
+        removed_legacy = 0
+        removed_duplicates = 0
         scanned_folder_keys: set[tuple[str, str]] = set()
+        folder_outcomes: dict[tuple[str, str], dict[str, Any]] = {}
+        state_cache: dict[tuple[str, str], str | None] = {}
         failures: list[dict[str, str]] = []
         needs_attention = False
 
-        for entries in chunks:
-            self.cancel_check()
-            plans: list[_FolderNameTagPlan] = []
-            for entry in entries:
-                folder_key = (
-                    str(entry.get("root_id") or ""),
-                    str(entry.get("parent_directory") or ""),
-                )
-                scanned_folder_keys.add(folder_key)
-                before = normalize_tags(entry.get("folder_tags", ()))
-                after = self._folder_name_tags_for_entry(entry, root_names)
-                if not after:
-                    untagged += 1
-                if before == after:
-                    unchanged += 1
-                    continue
-                plans.append(_FolderNameTagPlan(entry, before, after))
-
-            if plans:
-                succeeded, plan_failures, inconsistent = (
-                    self._apply_folder_name_tag_plans(plans)
-                )
-                needs_attention = needs_attention or inconsistent
-                succeeded_set = set(succeeded)
-                updated += len(succeeded_set)
-                for plan in plans:
-                    doc_id = str(plan.entry["doc_id"])
-                    if doc_id in succeeded_set:
-                        continue
-                    failed += 1
-                    _append_manual_failure(
-                        failures,
-                        doc_id=doc_id,
-                        relative_path=str(plan.entry.get("relative_path") or ""),
-                        error=plan_failures.get(
-                            doc_id, "The folder-name tag update failed."
-                        ),
+        try:
+            for entries in chunks:
+                self.cancel_check()
+                plans: list[_FolderNameTagPlan] = []
+                cleanup_by_doc_id: dict[str, _FolderNameTagCleanup] = {}
+                folder_by_doc_id: dict[str, tuple[str, str]] = {}
+                for entry in entries:
+                    folder_key = (
+                        str(entry.get("root_id") or ""),
+                        str(entry.get("parent_directory") or ""),
                     )
+                    scanned_folder_keys.add(folder_key)
+                    if not normalized_force:
+                        if folder_key not in state_cache:
+                            state_cache[folder_key] = (
+                                self.state.folder_name_tag_folder_status(
+                                    root_id=folder_key[0],
+                                    relative_folder=folder_key[1],
+                                    rule_revision=policy.revision,
+                                )
+                            )
+                        if state_cache[folder_key] in {
+                            "succeeded",
+                            "untagged",
+                            "marked",
+                        }:
+                            skipped += 1
+                            continue
+                    outcome = folder_outcomes.setdefault(
+                        folder_key,
+                        {"failed": False, "tagged": False, "error": ""},
+                    )
+                    plan, cleanup = self._folder_name_tag_plan(
+                        entry,
+                        root_names,
+                        policy=policy,
+                        mode=normalized_mode,
+                    )
+                    outcome["tagged"] = outcome["tagged"] or bool(
+                        plan.after_folder_tags
+                    )
+                    if not plan.after_folder_tags:
+                        untagged += 1
+                    if normalized_mode == "mark_all" or not (
+                        _folder_name_tag_plan_changed(plan)
+                    ):
+                        unchanged += 1
+                        continue
+                    doc_id = str(entry["doc_id"])
+                    plans.append(plan)
+                    cleanup_by_doc_id[doc_id] = cleanup
+                    folder_by_doc_id[doc_id] = folder_key
 
-            processed += len(entries)
-            self.progress(f"Updated folder-name tags {processed}/{total} images.")
+                if plans:
+                    succeeded, plan_failures, inconsistent = (
+                        self._apply_folder_name_tag_plans(plans)
+                    )
+                    needs_attention = needs_attention or inconsistent
+                    succeeded_set = set(succeeded)
+                    updated += len(succeeded_set)
+                    for plan in plans:
+                        doc_id = str(plan.entry["doc_id"])
+                        folder_key = folder_by_doc_id[doc_id]
+                        if doc_id in succeeded_set:
+                            cleanup = cleanup_by_doc_id[doc_id]
+                            removed_blacklist += (
+                                cleanup.manual.removed_blacklist
+                                + cleanup.inherited.removed_blacklist
+                            )
+                            removed_legacy += (
+                                cleanup.manual.removed_legacy
+                                + cleanup.inherited.removed_legacy
+                            )
+                            removed_duplicates += (
+                                cleanup.manual.removed_duplicates
+                                + cleanup.inherited.removed_duplicates
+                            )
+                            continue
+                        failed += 1
+                        error = plan_failures.get(
+                            doc_id, "The folder-name tag update failed."
+                        )
+                        folder_outcomes[folder_key]["failed"] = True
+                        folder_outcomes[folder_key]["error"] = error
+                        _append_manual_failure(
+                            failures,
+                            doc_id=doc_id,
+                            relative_path=str(plan.entry.get("relative_path") or ""),
+                            error=error,
+                        )
+
+                processed += len(entries)
+                self.progress(f"Updated folder-name tags {processed}/{total} images.")
+        except BaseException:
+            self.state.finish_folder_name_tag_run(
+                run_id,
+                status="interrupted",
+                processed=processed,
+                updated=updated,
+                failed=failed,
+            )
+            raise
+
+        for (root_id, relative_folder), outcome in folder_outcomes.items():
+            status = (
+                "failed"
+                if outcome["failed"]
+                else "marked"
+                if normalized_mode == "mark_all"
+                else "succeeded"
+                if outcome["tagged"] or normalized_mode == "clean"
+                else "untagged"
+            )
+            self.state.record_folder_name_tag_folder(
+                root_id=root_id,
+                relative_folder=relative_folder,
+                rule_revision=policy.revision,
+                status=status,
+                run_id=run_id,
+                error=str(outcome["error"]),
+            )
 
         if updated:
             self._refresh_tag_catalog()
-        return {
+        result = {
+            "run_id": run_id,
             "selection": selection_view,
             "selected": total,
             "processed": processed,
             "updated": updated,
             "unchanged": unchanged,
             "untagged": untagged,
+            "skipped": skipped,
             "failed": failed,
             "folders_scanned": len(scanned_folder_keys),
+            "removed_blacklist": removed_blacklist,
+            "removed_legacy": removed_legacy,
+            "removed_duplicates": removed_duplicates,
+            "mode": normalized_mode,
+            "force": normalized_force,
+            "rule_revision": policy.revision,
             "failures": failures,
             "failures_truncated": failed > len(failures),
             "needs_attention": needs_attention,
             "api_requests": 0,
         }
+        self.state.finish_folder_name_tag_run(
+            run_id,
+            status=(
+                "partial" if failed and updated else "failed" if failed else "succeeded"
+            ),
+            processed=processed,
+            updated=updated,
+            failed=failed,
+            result=result,
+        )
+        return result
 
     def undo_latest_manual_tag_batch(self) -> dict[str, Any]:
         """Restore both SQLite and Zvec for the most recent manual batch."""
@@ -1654,15 +1851,65 @@ class ImageVectorService:
             )
         return names
 
+    def _folder_name_tag_policy(self) -> FolderNameTagPolicy:
+        config_home = getattr(self.config, "config_home_path", None)
+        if config_home is None:
+            return DEFAULT_FOLDER_NAME_TAG_POLICY
+        return FolderNameTagSettingsStore(Path(config_home)).policy()
+
+    @classmethod
+    def _folder_name_tag_plan(
+        cls,
+        entry: Mapping[str, Any],
+        root_names: Mapping[str, str],
+        *,
+        policy: FolderNameTagPolicy,
+        mode: str,
+    ) -> tuple[_FolderNameTagPlan, _FolderNameTagCleanup]:
+        before_folder = normalize_tags(entry.get("folder_tags", ()))
+        before_manual = normalize_tags(entry.get("tags", ()))
+        before_inherited = normalize_tags(entry.get("inherited_tags", ()))
+        clean_sources = mode in {"normal", "clean"}
+        manual_cleanup = (
+            clean_existing_tags(before_manual, policy=policy)
+            if clean_sources
+            else ExistingTagCleanup(before_manual)
+        )
+        inherited_cleanup = (
+            clean_existing_tags(before_inherited, policy=policy)
+            if clean_sources
+            else ExistingTagCleanup(before_inherited)
+        )
+        after_folder = (
+            cls._folder_name_tags_for_entry(entry, root_names, policy=policy)
+            if mode == "normal"
+            else before_folder
+        )
+        return (
+            _FolderNameTagPlan(
+                entry=dict(entry),
+                before_folder_tags=before_folder,
+                after_folder_tags=after_folder,
+                before_manual_tags=before_manual,
+                after_manual_tags=manual_cleanup.tags,
+                before_inherited_tags=before_inherited,
+                after_inherited_tags=inherited_cleanup.tags,
+            ),
+            _FolderNameTagCleanup(manual_cleanup, inherited_cleanup),
+        )
+
     @staticmethod
     def _folder_name_tags_for_entry(
         entry: Mapping[str, Any],
         root_names: Mapping[str, str],
+        *,
+        policy: FolderNameTagPolicy = DEFAULT_FOLDER_NAME_TAG_POLICY,
     ) -> tuple[str, ...]:
         root_id = str(entry.get("root_id") or "")
         return folder_tags_for_relative_path(
             str(entry.get("relative_path") or ""),
             str(root_names.get(root_id) or ""),
+            policy=policy,
         )
 
     def _apply_manual_tag_plans(
@@ -1728,19 +1975,19 @@ class ImageVectorService:
                 continue
             state_entry = {
                 **plan.entry,
-                "folder_tags": list(plan.after_tags),
+                "tags": list(plan.after_manual_tags),
+                "folder_tags": list(plan.after_folder_tags),
+                "inherited_tags": list(plan.after_inherited_tags),
             }
             prepared.append(
                 PreparedCollectionUpsert(
                     record=_record_from_state_entry(plan.entry),
                     image_vector=vector,
-                    effective_tags=normalize_tags(
-                        [
-                            *plan.entry.get("tags", ()),
-                            *plan.after_tags,
-                            *plan.entry.get("accepted_auto_tags", ()),
-                            *plan.entry.get("inherited_tags", ()),
-                        ]
+                    effective_tags=merge_effective_tags(
+                        plan.after_manual_tags,
+                        plan.after_folder_tags,
+                        normalize_tags(plan.entry.get("accepted_auto_tags", ())),
+                        plan.after_inherited_tags,
                     ),
                     state_entry=state_entry,
                 )
@@ -2446,6 +2693,7 @@ class ImageVectorService:
         max_images: int = 200,
         max_budget_cny: float | None = None,
         external_processing_confirmed: bool = False,
+        queued_before_sequence: int | None = None,
     ) -> dict[str, Any]:
         """Incremental index+auto-tag, consuming only the fs_change_queue."""
 
@@ -2457,8 +2705,18 @@ class ImageVectorService:
             external_processing_confirmed=external_processing_confirmed,
             activity_callback=metrics.set_flash_active,
         )
-        changes = self.state.claim_pending_changes(root_id, limit=max_images)
+        changes = self.state.claim_pending_changes(
+            root_id,
+            limit=max_images,
+            sequence_at_most=queued_before_sequence,
+        )
         change_ids = [int(change["id"]) for change in changes]
+        change_counts = {
+            event_type: sum(
+                1 for change in changes if change.get("event_type") == event_type
+            )
+            for event_type in ("created", "modified", "deleted")
+        }
         try:
             index_report = self._index_incremental(
                 folder_path,
@@ -2522,6 +2780,10 @@ class ImageVectorService:
             "index": index_payload,
             "auto_tag": auto_tag_report,
             "pipeline": pipeline,
+            "changes": {
+                "processed": len(changes),
+                **change_counts,
+            },
         }
 
     def _iter_staged_group_plans(
@@ -2776,8 +3038,8 @@ class ImageVectorService:
                 return False
         return True
 
-    @staticmethod
     def _folder_tags_for_staged_path(
+        self,
         relative_path: str,
         root: Path,
         cache: dict[str, tuple[str, ...]] | None,
@@ -2786,7 +3048,11 @@ class ImageVectorService:
         parent_key = portable.rpartition("/")[0]
         if cache is not None and parent_key in cache:
             return cache[parent_key]
-        tags = folder_tags_for_relative_path(portable, root.name)
+        tags = folder_tags_for_relative_path(
+            portable,
+            root.name,
+            policy=self._folder_name_tag_policy(),
+        )
         if cache is not None:
             cache[parent_key] = tags
         return tags
@@ -8045,6 +8311,23 @@ def _exclude_content_hash(
     return [
         hit for hit in hits if str(hit.fields.get("sha256") or "") != exclude_sha256
     ]
+
+
+def _normalize_folder_name_tag_options(mode: object, force: object) -> tuple[str, bool]:
+    normalized_mode = str(mode or "normal").strip().lower()
+    if normalized_mode not in {"normal", "clean", "mark_all"}:
+        raise ValueError("Folder-name tag mode must be normal, clean, or mark_all.")
+    if not isinstance(force, bool):
+        raise ValueError("Folder-name tag force must be a boolean.")
+    return normalized_mode, force
+
+
+def _folder_name_tag_plan_changed(plan: _FolderNameTagPlan) -> bool:
+    return bool(
+        plan.before_folder_tags != plan.after_folder_tags
+        or plan.before_manual_tags != plan.after_manual_tags
+        or plan.before_inherited_tags != plan.after_inherited_tags
+    )
 
 
 def _manual_tags_after_operation(

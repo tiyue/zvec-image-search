@@ -784,6 +784,10 @@ describe("OrganizePage batch tags", () => {
         },
       ],
       samples_truncated: false,
+      mode: "normal",
+      force: true,
+      rule_revision: "rule-v1",
+      blacklist_count: 20,
     }));
     const submitJob = vi.fn(async () => ({
       job: {
@@ -800,18 +804,15 @@ describe("OrganizePage batch tags", () => {
 
     await buttonWithText(wrapper, "从文件夹名生成").trigger("click");
     const dialog = wrapper.get(".folder-tag-modal");
-    expect(dialog.text()).toContain("不修改人工标签、模型标签和继承标签");
+    expect(dialog.text()).toContain("模型标签与系统元数据保持原值");
 
     await buttonWithText(wrapper, "生成预览").trigger("click");
     await flushPromises();
 
     expect(previewFolderNameTags).toHaveBeenCalledWith(
       "lib-1",
-      {
-        mode: "folder",
-        folder_key: "folder-raiden",
-        include_subfolders: true,
-      },
+      { mode: "library" },
+      { mode: "normal", force: true },
       expect.any(AbortSignal),
     );
     expect(dialog.text()).toContain("Raiden雷电将军、雷电将军、写真");
@@ -822,11 +823,10 @@ describe("OrganizePage batch tags", () => {
     expect(submitJob).toHaveBeenCalledWith({
       task_type: "folder_name_tag_apply",
       library_id: "lib-1",
-      selection: {
-        mode: "folder",
-        folder_key: "folder-raiden",
-        include_subfolders: true,
-      },
+      selection: { mode: "library" },
+      mode: "normal",
+      force: true,
+      expected_rule_revision: "rule-v1",
     });
   });
 

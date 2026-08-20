@@ -8,6 +8,7 @@ from typing import Any
 from unittest.mock import patch
 
 from image_vector_service.backend_server import _LibraryWorker
+from image_vector_service.file_watcher import _disable_windows_last_access_notifications
 from image_vector_service.library_config import LibraryDefinition
 
 
@@ -192,6 +193,26 @@ class BackendAutoIndexWatcherTest(unittest.TestCase):
             self.assertEqual(service.state.pending_changes, 0)
         finally:
             worker.close()
+
+    def test_windows_watcher_ignores_last_access_only_notifications(self) -> None:
+        from watchdog.observers import winapi
+
+        original = int(winapi.WATCHDOG_FILE_NOTIFY_FLAGS)
+        try:
+            winapi.WATCHDOG_FILE_NOTIFY_FLAGS = (
+                original | int(winapi.FILE_NOTIFY_CHANGE_LAST_ACCESS)
+            )
+
+            changed = _disable_windows_last_access_notifications()
+
+            self.assertTrue(changed)
+            self.assertEqual(
+                int(winapi.WATCHDOG_FILE_NOTIFY_FLAGS)
+                & int(winapi.FILE_NOTIFY_CHANGE_LAST_ACCESS),
+                0,
+            )
+        finally:
+            winapi.WATCHDOG_FILE_NOTIFY_FLAGS = original
 
 
 if __name__ == "__main__":

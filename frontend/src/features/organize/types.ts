@@ -161,6 +161,12 @@ export type FolderNameTagSelection =
       folder_key: string;
       include_subfolders: boolean;
     };
+export type FolderNameTagMode = "normal" | "clean" | "mark_all";
+
+export interface FolderNameTagRunOptions {
+  mode: FolderNameTagMode;
+  force: boolean;
+}
 
 export interface FolderNameTagSampleWire {
   root_id?: unknown;
@@ -168,6 +174,8 @@ export interface FolderNameTagSampleWire {
   current_tags?: unknown;
   proposed_tags?: unknown;
   affected_images?: unknown;
+  manual_removed?: unknown;
+  inherited_removed?: unknown;
   [key: string]: unknown;
 }
 
@@ -179,6 +187,14 @@ export interface FolderNameTagPreviewWire {
   untagged?: unknown;
   folders_scanned?: unknown;
   changed_folders?: unknown;
+  skipped?: unknown;
+  removed_blacklist?: unknown;
+  removed_legacy?: unknown;
+  removed_duplicates?: unknown;
+  mode?: unknown;
+  force?: unknown;
+  rule_revision?: unknown;
+  blacklist_count?: unknown;
   samples?: unknown;
   samples_truncated?: unknown;
   result?: FolderNameTagPreviewWire;
@@ -279,6 +295,7 @@ export interface OrganizeApi {
   previewFolderNameTags?(
     libraryId: string,
     selection: FolderNameTagSelection,
+    options: FolderNameTagRunOptions,
     signal?: AbortSignal,
   ): Promise<FolderNameTagPreviewWire>;
 }
@@ -356,6 +373,8 @@ export interface FolderNameTagSample {
   currentTags: string[];
   proposedTags: string[];
   affectedImages: number;
+  manualRemoved: number;
+  inheritedRemoved: number;
 }
 
 export interface FolderNameTagPreview {
@@ -366,6 +385,14 @@ export interface FolderNameTagPreview {
   untagged: number;
   foldersScanned: number;
   changedFolders: number;
+  skipped: number;
+  removedBlacklist: number;
+  removedLegacy: number;
+  removedDuplicates: number;
+  mode: FolderNameTagMode;
+  force: boolean;
+  ruleRevision: string;
+  blacklistCount: number;
   samples: FolderNameTagSample[];
   samplesTruncated: boolean;
 }

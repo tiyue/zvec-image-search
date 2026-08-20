@@ -1968,6 +1968,40 @@ class PreviewFacade:
         self._record_job_snapshot(job)
         return self._job_view(job)
 
+    def folder_name_tag_settings(self) -> JsonObject:
+        try:
+            return self._ready_client().get_folder_name_tag_settings()
+        except Exception as exc:
+            raise _facade_error(
+                exc, code="folder_name_tag_settings_failed"
+            ) from exc
+
+    def update_folder_name_tag_settings(
+        self, payload: Mapping[str, Any]
+    ) -> JsonObject:
+        unknown = sorted(set(payload) - {"blacklist"})
+        if unknown:
+            raise FacadeError(
+                "invalid_request",
+                "文件夹名称标签设置包含不支持的字段。",
+                details={"unknown_fields": unknown},
+            )
+        blacklist = payload.get("blacklist")
+        if isinstance(blacklist, (str, bytes)) or not isinstance(
+            blacklist, Sequence
+        ):
+            raise FacadeError(
+                "invalid_request", "blacklist 必须是字符串数组。"
+            )
+        try:
+            return self._ready_client().update_folder_name_tag_settings(
+                cast(Sequence[str], blacklist)
+            )
+        except Exception as exc:
+            raise _facade_error(
+                exc, code="folder_name_tag_settings_failed"
+            ) from exc
+
     def assign_models(self, payload: Mapping[str, Any]) -> JsonObject:
         try:
             snapshot = self._models.assign_roles(
@@ -2435,6 +2469,8 @@ class PreviewFacade:
         library_id: str,
         *,
         selection: Mapping[str, Any],
+        mode: str = "normal",
+        force: bool = True,
     ) -> JsonObject:
         """Return a model-free preview before folder-source tags are replaced."""
 
@@ -2443,6 +2479,8 @@ class PreviewFacade:
                 "task_type": "folder_name_tag_estimate",
                 "library_id": library_id,
                 "selection": dict(selection),
+                "mode": mode,
+                "force": force,
             }
         )
         if not isinstance(request, FolderNameTagEstimateRequest):
@@ -4189,10 +4227,30 @@ def _library_request(
                 "selection.include_subfolders",
             ),
         )
+        folder_name_tag_mode = _choice(
+            payload.get("mode"),
+            "mode",
+            supported=("normal", "clean", "mark_all"),
+            default="normal",
+        )
+        force = _boolean(payload.get("force", True), "force")
         request = (
-            FolderNameTagEstimateRequest(library_id, folder_selection)
+            FolderNameTagEstimateRequest(
+                library_id,
+                folder_selection,
+                mode=cast(Any, folder_name_tag_mode),
+                force=force,
+            )
             if task_type == "folder_name_tag_estimate"
-            else FolderNameTagApplyRequest(library_id, folder_selection)
+            else FolderNameTagApplyRequest(
+                library_id,
+                folder_selection,
+                mode=cast(Any, folder_name_tag_mode),
+                force=force,
+                expected_rule_revision=_optional_string(
+                    payload.get("expected_rule_revision"), maximum=64
+                ),
+            )
         )
     elif task_type == "folder_delete_preview":
         request = FolderDeletePreviewRequest(
@@ -5270,6 +5328,8 @@ def _safe_relative_path(value: Any) -> str:
 
 
 def _activity_task_category(command: str) -> str:
+    if command == "auto_index_and_auto_tag":
+        return "auto_index"
     if command.startswith("auto_tag") or command == "index_and_auto_tag":
         return "auto_tag"
     if command.startswith(("manual_tag", "folder_name_tag", "tag_alias", "organize_")):
@@ -5286,6 +5346,7 @@ def _activity_task_label(command: str) -> str:
         "index": "建立索引",
         "sync": "同步图库",
         "index_and_auto_tag": "索引并智能标注",
+        "auto_index_and_auto_tag": "自动增量索引与标注",
         "auto_tag": "智能标注",
         "auto_tag_estimate": "智能标注估算",
         "manual_tag_batch": "批量标签",

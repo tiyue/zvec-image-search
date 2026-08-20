@@ -448,6 +448,7 @@ class BackendServerTest(unittest.TestCase):
             instance_id=self.instance_id,
             config_fingerprint=self.config_fingerprint,
             instance_lock_path=self.instance_lock_path,
+            config=ServiceConfig(config_home=self.temp_dir / "config"),
             query_root=self.query_root,
             service_factory=factory,
         )
@@ -604,6 +605,36 @@ class BackendServerTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(health["credentials_configured"])
         self.assertNotIn(secret, json.dumps(health))
+
+    def test_folder_name_tag_settings_round_trip_and_deduplicate(self):
+        status, initial = self.request("GET", "/v1/folder-name-tags/settings")
+        self.assertEqual(status, 200, initial)
+        self.assertTrue(initial["settings"]["using_defaults"])
+
+        status, saved = self.request(
+            "PUT",
+            "/v1/folder-name-tags/settings",
+            {"blacklist": ["自拍", "V", "v"]},
+        )
+        self.assertEqual(status, 200, saved)
+        self.assertEqual(saved["settings"]["blacklist"], ["自拍", "V"])
+        self.assertFalse(saved["settings"]["using_defaults"])
+        self.assertRegex(saved["settings"]["revision"], r"^[0-9a-f]{64}$")
+
+        status, reloaded = self.request("GET", "/v1/folder-name-tags/settings")
+        self.assertEqual(status, 200, reloaded)
+        self.assertEqual(reloaded["settings"], saved["settings"])
+
+        status, rejected = self.request(
+            "PUT",
+            "/v1/folder-name-tags/settings",
+            {"blacklist": []},
+        )
+        self.assertEqual(status, 400, rejected)
+        self.assertEqual(
+            rejected["error"]["code"],
+            "invalid_folder_name_tag_settings",
+        )
 
     def test_json_endpoints_require_content_length(self):
         for method, path in (

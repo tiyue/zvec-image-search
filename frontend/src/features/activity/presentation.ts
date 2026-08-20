@@ -5,6 +5,7 @@ const TASK_LABELS: Record<string, string> = {
   sync: "同步图库",
   auto_tag: "智能标注",
   index_and_auto_tag: "索引并智能标注",
+  auto_index_and_auto_tag: "自动增量索引与标注",
   manual_tag_batch: "批量标签",
   folder_name_tag_apply: "文件夹名称标签",
   folder_delete: "文件夹清理",

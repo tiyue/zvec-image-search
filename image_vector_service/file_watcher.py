@@ -13,6 +13,7 @@ layer, keeping only the latest event type and timestamp.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from collections.abc import Callable
 from pathlib import Path
@@ -59,6 +60,7 @@ class FileChangeWatcher:
         """
         if self._running:
             return
+        _disable_windows_last_access_notifications()
         self._overflowed = False
         self._observer = Observer(timeout=1.0)
         for root_id, image_root, recursive in roots:
@@ -188,3 +190,21 @@ class _ChangeEventHandler(FileSystemEventHandler):
                 exc_info=True,
             )
         self._watcher._schedule_debounce(self._root_id)
+
+
+def _disable_windows_last_access_notifications() -> bool:
+    """Avoid re-queuing images merely because indexing read their contents."""
+
+    if os.name != "nt":
+        return False
+    try:
+        from watchdog.observers import winapi
+
+        before = int(winapi.WATCHDOG_FILE_NOTIFY_FLAGS)
+        winapi.WATCHDOG_FILE_NOTIFY_FLAGS = (
+            before & ~int(winapi.FILE_NOTIFY_CHANGE_LAST_ACCESS)
+        )
+        return int(winapi.WATCHDOG_FILE_NOTIFY_FLAGS) != before
+    except (AttributeError, ImportError):
+        _logger.warning("watcher_last_access_filter_unavailable", exc_info=True)
+        return False

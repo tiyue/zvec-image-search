@@ -110,6 +110,13 @@ export interface CredentialsResponse {
   restart_required?: boolean;
 }
 
+export interface FolderNameTagSettingsResponse {
+  schema_version?: unknown;
+  blacklist?: unknown;
+  revision?: unknown;
+  using_defaults?: unknown;
+}
+
 export interface SettingsApi {
   settings(signal?: AbortSignal): Promise<SettingsResponse>;
   addLibrary(body: LibraryCreate, signal?: AbortSignal): Promise<SettingsResponse>;
@@ -127,6 +134,11 @@ export interface SettingsApi {
   }, signal?: AbortSignal): Promise<ModelSettingsWire>;
   saveCredentials(apiKey: string, signal?: AbortSignal): Promise<CredentialsResponse>;
   deleteCredentials(signal?: AbortSignal): Promise<CredentialsResponse>;
+  folderNameTagSettings?(signal?: AbortSignal): Promise<FolderNameTagSettingsResponse>;
+  updateFolderNameTagSettings?(
+    blacklist: string[],
+    signal?: AbortSignal,
+  ): Promise<FolderNameTagSettingsResponse>;
 }
 
 export type ToastKind = "info" | "success" | "error";

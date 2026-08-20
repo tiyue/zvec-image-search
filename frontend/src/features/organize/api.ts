@@ -2,6 +2,7 @@ import type {
   FolderDeleteCommitRequest,
   FolderDeletePreviewWire,
   FolderNameTagPreviewWire,
+  FolderNameTagRunOptions,
   FolderNameTagSelection,
   OrganizeApi,
   OrganizeBootstrapResponse,
@@ -85,13 +86,14 @@ export const organizeApi: OrganizeApi = {
   previewFolderNameTags: (
     libraryId,
     selection: FolderNameTagSelection,
+    options: FolderNameTagRunOptions,
     signal,
   ) =>
     requestJson<FolderNameTagPreviewWire>(
       `api/libraries/${encodeURIComponent(libraryId)}/folder-name-tags/preview`,
       {
         method: "POST",
-        body: { selection },
+        body: { selection, ...options },
         signal,
       },
     ),

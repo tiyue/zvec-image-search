@@ -140,6 +140,44 @@ class _CombinedProgressService(_ScriptedService):
         }
 
 
+class _WatcherCycleState:
+    def root_path(self, root_id: str) -> str | None:
+        return "D:\\images" if root_id == "root-1" else None
+
+    def pending_change_snapshot(self, root_id: str) -> dict[str, int | str]:
+        return {
+            "root_id": root_id,
+            "cutoff_sequence": 2,
+            "total": 2,
+            "created": 1,
+            "modified": 1,
+            "deleted": 0,
+        }
+
+    def count_pending_changes(self, _root_id: str) -> int:
+        return 0
+
+
+class _WatcherCycleService:
+    def __init__(self, progress: Any, cancel_check: Any) -> None:
+        self.progress = progress
+        self.cancel_check = cancel_check
+        self.state = _WatcherCycleState()
+
+    def index_and_auto_tag_incremental(self, **_kwargs: Any) -> dict[str, Any]:
+        self.cancel_check()
+        return {
+            "failed": 0,
+            "needs_attention": False,
+            "changes": {"processed": 2, "created": 1, "modified": 1, "deleted": 0},
+            "index": {"inserted": 1, "updated": 1, "deleted": 0, "failed": 0},
+            "auto_tag": {"processed": 1, "succeeded": 1, "failed": 0},
+        }
+
+    def close(self) -> None:
+        return None
+
+
 class BackendActivityIntegrationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(
@@ -312,6 +350,54 @@ class BackendActivityIntegrationTests(unittest.TestCase):
             cleanup_service = service_holder.get("service")
             if cleanup_service is not None:
                 cleanup_service.release_index.set()
+            manager.close()
+            store.close()
+
+    def test_watcher_cycle_is_a_durable_task_with_one_aggregate_log(self) -> None:
+        store = ActivityStore(self.config_home)
+
+        def factory(
+            _library: LibraryDefinition,
+            progress: Any,
+            cancel_check: Any,
+        ) -> _WatcherCycleService:
+            return _WatcherCycleService(progress, cancel_check)
+
+        manager = BackendJobManager(
+            instance_id="activity-watcher-cycle",
+            config_fingerprint="9" * 64,
+            config=self.config,
+            query_root=self.query_root,
+            library_catalog=self.catalog,
+            library_service_factory=factory,
+            activity_store=store,
+        )
+        try:
+            manager.start()
+            manager._submit_auto_index_cycle(self.catalog.enabled[0], "root-1")
+            jobs = manager.list_jobs(limit=10)["jobs"]
+            job_id = next(
+                item["id"]
+                for item in jobs
+                if item["command"] == "auto_index_and_auto_tag"
+            )
+            completed = self._wait_for_job(manager, job_id)
+
+            self.assertEqual(completed["status"], "succeeded")
+            self.assertEqual(completed["result"]["changes"]["processed"], 2)
+            history = self._history_item(
+                store, job_id, expected_status="succeeded"
+            )
+            self.assertEqual(history["task_type"], "auto_index_and_auto_tag")
+            store.flush(timeout=1.0)
+            logs = store.list_operation_logs(category="auto_index", limit=10)[
+                "items"
+            ]
+            matching = [item for item in logs if item["job_id"] == job_id]
+            self.assertEqual(len(matching), 1)
+            self.assertIn("处理 2 个文件变化", matching[0]["message"])
+            self.assertIn("新增 1 张", matching[0]["message"])
+        finally:
             manager.close()
             store.close()
 

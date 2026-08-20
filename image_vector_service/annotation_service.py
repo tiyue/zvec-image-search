@@ -34,6 +34,11 @@ from .collection_write_coordinator import (
 )
 from .config import ConfigurationError, ServiceConfig
 from .failure_sink import FailureSink
+from .folder_name_tag_settings import FolderNameTagSettingsStore
+from .folder_name_tags import (
+    DEFAULT_FOLDER_NAME_TAG_POLICY,
+    FolderNameTagPolicy,
+)
 from .model_catalog import ModelConfiguration, default_model_configuration
 from .model_services import (
     ModelProviderFactory,
@@ -376,6 +381,7 @@ class _FolderInheritanceAggregate:
     memory_budget: _FolderInheritanceMemoryBudget = field(
         default_factory=_FolderInheritanceMemoryBudget
     )
+    blacklist_policy: FolderNameTagPolicy = DEFAULT_FOLDER_NAME_TAG_POLICY
     tags_by_source: dict[str, dict[str, _FolderTagOccurrences]] = field(
         default_factory=lambda: {
             "manual": {},
@@ -455,9 +461,14 @@ class _FolderInheritanceAggregate:
             # the same comparison key. Count it once so the two provenance
             # slots always represent two different donor documents.
             for tag in _stable_strings(values):
-                blocked_category = _blocked_folder_inheritance_category(
-                    tag,
-                    current_annotation,
+                blacklist_blocked = self.blacklist_policy.blocks_tag(tag)
+                blocked_category = (
+                    "blacklist"
+                    if blacklist_blocked
+                    else _blocked_folder_inheritance_category(
+                        tag,
+                        current_annotation,
+                    )
                 )
                 if blocked_category is not None:
                     self.filtered_count += 1
@@ -475,7 +486,11 @@ class _FolderInheritanceAggregate:
                                 "category": blocked_category,
                                 "source": source,
                                 "source_doc_id": donor_id,
-                                "reason": "transient_category",
+                                "reason": (
+                                    "folder_name_tag_blacklist"
+                                    if blacklist_blocked
+                                    else "transient_category"
+                                ),
                             }
                         )
                     continue
@@ -1839,6 +1854,9 @@ class AutoTaggingCoordinator:
         )
         target_doc_ids = frozenset(candidates)
         memory_budget = _FolderInheritanceMemoryBudget()
+        blacklist_policy = FolderNameTagSettingsStore(
+            self.config.config_home_path
+        ).policy()
         donors_by_folder: dict[tuple[str, str], _FolderInheritanceAggregate] = {}
 
         def consume_donor(
@@ -1854,6 +1872,7 @@ class AutoTaggingCoordinator:
                 candidate = _FolderInheritanceAggregate(
                     target_doc_ids,
                     memory_budget,
+                    blacklist_policy,
                 )
                 if candidate.consume(member, member_annotation):
                     donors_by_folder[identity] = candidate

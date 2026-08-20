@@ -17,6 +17,7 @@ from .collection_write_outbox import (
     CollectionWriteItem,
     ReplayCollectionWrite,
 )
+from .folder_name_tags import merge_effective_tags
 from .logical_paths import normalize_relative_path
 from .models import ImageRecord
 from .state import IndexState
@@ -241,7 +242,7 @@ class CollectionWriteCoordinator:
             raise ValueError(
                 f"Embedding dimension mismatch: {len(vector)} != {self.dimension}."
             )
-        tags = list(normalize_tags(item.effective_tags))
+        tags = list(merge_effective_tags(item.effective_tags))
         state_entry = {
             key: item.state_entry[key]
             for key in _STATE_ENTRY_FIELDS

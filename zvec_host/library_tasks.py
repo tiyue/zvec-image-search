@@ -45,6 +45,7 @@ BatchAcceptanceMode = Literal[
     "all_non_conflicting",
 ]
 ManualTagOperation = Literal["add", "remove", "replace_manual"]
+FolderNameTagMode = Literal["normal", "clean", "mark_all"]
 ClusterScope = Literal["new_or_changed", "all"]
 ClusterRunType = Literal["exact", "perceptual", "semantic", "near_duplicate"]
 ClusterType = Literal[
@@ -674,6 +675,8 @@ class FolderNameTagSelection:
 class FolderNameTagEstimateRequest:
     library_id: str
     selection: FolderNameTagSelection
+    mode: FolderNameTagMode = "normal"
+    force: bool = True
 
     command: ClassVar[str] = "folder_name_tag_estimate"
 
@@ -683,11 +686,18 @@ class FolderNameTagEstimateRequest:
             raise _validation(
                 "selection must be a FolderNameTagSelection.", "selection"
             )
+        if self.mode not in {"normal", "clean", "mark_all"}:
+            raise _validation(
+                "mode must be normal, clean, or mark_all.", "mode"
+            )
+        _require_boolean(self.force, "force")
 
     def to_params(self) -> JsonObject:
         return {
             "library_id": self.library_id,
             "selection": self.selection.to_params(),
+            "mode": self.mode,
+            "force": self.force,
         }
 
 
@@ -695,6 +705,9 @@ class FolderNameTagEstimateRequest:
 class FolderNameTagApplyRequest:
     library_id: str
     selection: FolderNameTagSelection
+    mode: FolderNameTagMode = "normal"
+    force: bool = True
+    expected_rule_revision: str | None = None
 
     command: ClassVar[str] = "folder_name_tag_apply"
 
@@ -704,11 +717,28 @@ class FolderNameTagApplyRequest:
             raise _validation(
                 "selection must be a FolderNameTagSelection.", "selection"
             )
+        if self.mode not in {"normal", "clean", "mark_all"}:
+            raise _validation(
+                "mode must be normal, clean, or mark_all.", "mode"
+            )
+        _require_boolean(self.force, "force")
+        object.__setattr__(
+            self,
+            "expected_rule_revision",
+            _optional_display_text(
+                self.expected_rule_revision,
+                "expected_rule_revision",
+                maximum=64,
+            ),
+        )
 
     def to_params(self) -> JsonObject:
         return {
             "library_id": self.library_id,
             "selection": self.selection.to_params(),
+            "mode": self.mode,
+            "force": self.force,
+            "expected_rule_revision": self.expected_rule_revision,
         }
 
 

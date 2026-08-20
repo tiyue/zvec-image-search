@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from image_vector_service.collection_write_coordinator import CollectionWriteResult
+from image_vector_service.folder_name_tag_settings import FolderNameTagSettingsStore
 from image_vector_service.service import ImageVectorService
 from image_vector_service.state import IndexState
 
@@ -178,6 +179,100 @@ class FolderNameTaggingServiceTest(unittest.TestCase):
         self.assertEqual(preview["selected"], 6)
         self.assertEqual(preview["folders_scanned"], 4)
         self.assertEqual(preview["changed_folders"], 4)
+
+    def test_normal_run_cleans_only_manual_and_inherited_sources(self) -> None:
+        entry = self.state.get("doc-a")
+        entry["tags"] = ["原神", "Foo", "foo", "VIP预览", "[35P-1GB]"]
+        entry["accepted_auto_tags"] = ["VIP模型", "原神", "foo"]
+        entry["inherited_tags"] = ["继承", "Bar", "bar", "自拍预览", "_jpg"]
+        self.state.set_many([entry])
+
+        preview = self.service.estimate_folder_name_tags(
+            library_id="library-a",
+            selection={"mode": "library"},
+        )
+        applied = self.service.apply_folder_name_tags(
+            library_id="library-a",
+            selection={"mode": "library"},
+            expected_rule_revision=preview["rule_revision"],
+        )
+
+        updated = self.state.get("doc-a")
+        self.assertEqual(updated["tags"], ["原神", "Foo"])
+        self.assertEqual(updated["inherited_tags"], ["继承", "Bar"])
+        self.assertEqual(updated["accepted_auto_tags"], ["VIP模型", "原神", "foo"])
+        self.assertEqual(applied["removed_blacklist"], 2)
+        self.assertEqual(applied["removed_legacy"], 2)
+        self.assertEqual(applied["removed_duplicates"], 2)
+        self.assertEqual(self.repository.tags["doc-a"].count("原神"), 1)
+        self.assertIn("Foo", updated["effective_tags"])
+        self.assertNotIn("foo", updated["effective_tags"])
+        self.assertIn("VIP模型", self.repository.tags["doc-a"])
+
+    def test_non_forced_run_keeps_completed_folder_state(self) -> None:
+        first = self.service.apply_folder_name_tags(
+            library_id="library-a",
+            selection={"mode": "library"},
+        )
+
+        repeated = self.service.apply_folder_name_tags(
+            library_id="library-a",
+            selection={"mode": "library"},
+            force=False,
+            expected_rule_revision=first["rule_revision"],
+        )
+
+        self.assertEqual(repeated["skipped"], 3)
+        self.assertEqual(repeated["updated"], 0)
+        self.assertEqual(
+            self.state.folder_name_tag_folder_status(
+                root_id="root-a",
+                relative_folder="原神/Raiden雷电将军 写真 [35P-417MB]_jpg",
+                rule_revision=first["rule_revision"],
+            ),
+            "succeeded",
+        )
+
+    def test_normal_index_uses_the_saved_blacklist(self) -> None:
+        config_home = Path(self.temporary.name) / "config"
+        FolderNameTagSettingsStore(config_home).save({"blacklist": ["雷电"]})
+        self.service.config = SimpleNamespace(
+            state_path=self.state_path,
+            config_home_path=config_home,
+        )
+
+        tags = self.service._folder_tags_for_staged_path(
+            "原神/雷电将军/a.jpg",
+            Path(self.state.root_path("root-a")),
+            {},
+        )
+
+        self.assertEqual(tags, ("原神",))
+
+    def test_mark_all_records_state_without_writing_tags(self) -> None:
+        preview = self.service.estimate_folder_name_tags(
+            library_id="library-a",
+            selection={"mode": "library"},
+            mode="mark_all",
+        )
+
+        applied = self.service.apply_folder_name_tags(
+            library_id="library-a",
+            selection={"mode": "library"},
+            mode="mark_all",
+            expected_rule_revision=preview["rule_revision"],
+        )
+
+        self.assertEqual(applied["updated"], 0)
+        self.assertEqual(self.collection_writes.calls, 0)
+        self.assertEqual(
+            self.state.folder_name_tag_folder_status(
+                root_id="root-a",
+                relative_folder="原神/Vol.12",
+                rule_revision=preview["rule_revision"],
+            ),
+            "marked",
+        )
 
 
 if __name__ == "__main__":

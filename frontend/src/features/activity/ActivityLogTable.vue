@@ -132,6 +132,7 @@ function detailEntries(item: ActivityLogItem): Array<[string, string]> {
           <option value="search">搜索</option>
           <option value="library_task">图库任务</option>
           <option value="auto_tag">智能标注</option>
+          <option value="auto_index">自动索引</option>
           <option value="manual_tag">手工标签</option>
           <option value="folder_cleanup">文件夹清理</option>
           <option value="image_failure">错误图片</option>

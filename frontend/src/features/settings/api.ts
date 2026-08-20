@@ -1,5 +1,6 @@
 import type {
   CredentialsResponse,
+  FolderNameTagSettingsResponse,
   LibraryCreate,
   LibraryUpdate,
   ModelSettingsWire,
@@ -34,4 +35,14 @@ export const settingsApi: SettingsApi = {
     }),
   deleteCredentials: (signal) =>
     requestJson<CredentialsResponse>("api/credentials", { method: "DELETE", signal }),
+  folderNameTagSettings: (signal) =>
+    requestJson<FolderNameTagSettingsResponse>("api/folder-name-tag-settings", {
+      signal,
+    }),
+  updateFolderNameTagSettings: (blacklist, signal) =>
+    requestJson<FolderNameTagSettingsResponse>("api/folder-name-tag-settings", {
+      method: "PUT",
+      body: { blacklist },
+      signal,
+    }),
 };

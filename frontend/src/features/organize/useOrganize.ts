@@ -16,6 +16,7 @@ import type {
   FolderDeletePreviewWire,
   FolderNameTagPreview,
   FolderNameTagPreviewWire,
+  FolderNameTagRunOptions,
   FolderNameTagSelection,
   ManualTagOperation,
   OrganizeAlias,
@@ -384,6 +385,8 @@ function normalizeFolderNameTagPreview(
           currentTags: strings(item.current_tags),
           proposedTags: strings(item.proposed_tags),
           affectedImages: Math.max(0, integer(item.affected_images)),
+          manualRemoved: Math.max(0, integer(item.manual_removed)),
+          inheritedRemoved: Math.max(0, integer(item.inherited_removed)),
         }))
     : [];
   return {
@@ -394,6 +397,16 @@ function normalizeFolderNameTagPreview(
     untagged: Math.max(0, integer(raw.untagged)),
     foldersScanned: Math.max(0, integer(raw.folders_scanned)),
     changedFolders: Math.max(0, integer(raw.changed_folders)),
+    skipped: Math.max(0, integer(raw.skipped)),
+    removedBlacklist: Math.max(0, integer(raw.removed_blacklist)),
+    removedLegacy: Math.max(0, integer(raw.removed_legacy)),
+    removedDuplicates: Math.max(0, integer(raw.removed_duplicates)),
+    mode: ["normal", "clean", "mark_all"].includes(String(raw.mode))
+      ? raw.mode as FolderNameTagPreview["mode"]
+      : "normal",
+    force: raw.force !== false,
+    ruleRevision: text(raw.rule_revision),
+    blacklistCount: Math.max(0, integer(raw.blacklist_count)),
     samples,
     samplesTruncated: raw.samples_truncated === true,
   };
@@ -572,6 +585,8 @@ export function useOrganize(api: OrganizeApi = organizeApi, events: OrganizeEven
   const folderNameTagPreview = shallowRef<FolderNameTagPreview | null>(null);
   const folderNameTagPreviewSelection =
     shallowRef<FolderNameTagSelection | null>(null);
+  const folderNameTagPreviewOptions =
+    shallowRef<FolderNameTagRunOptions | null>(null);
   const folderNameTagPreviewLoading = ref(false);
   const lastError = ref("");
   const legacy = shallowRef<OrganizeImage[]>([]);
@@ -1237,6 +1252,7 @@ export function useOrganize(api: OrganizeApi = organizeApi, events: OrganizeEven
 
   async function previewFolderNameTags(
     selection: FolderNameTagSelection,
+    options: FolderNameTagRunOptions,
   ): Promise<boolean> {
     const libraryId = selectedLibraryId.value;
     if (!libraryId) return false;
@@ -1264,10 +1280,12 @@ export function useOrganize(api: OrganizeApi = organizeApi, events: OrganizeEven
       const payload = await api.previewFolderNameTags(
         libraryId,
         selection,
+        options,
         controller.signal,
       );
       folderNameTagPreview.value = normalizeFolderNameTagPreview(payload);
       folderNameTagPreviewSelection.value = selection;
+      folderNameTagPreviewOptions.value = options;
       lastError.value = "";
       return true;
     } catch (error) {
@@ -1286,6 +1304,7 @@ export function useOrganize(api: OrganizeApi = organizeApi, events: OrganizeEven
     folderNameTagController?.abort();
     folderNameTagPreview.value = null;
     folderNameTagPreviewSelection.value = null;
+    folderNameTagPreviewOptions.value = null;
     folderNameTagPreviewLoading.value = false;
   }
 
@@ -1293,19 +1312,29 @@ export function useOrganize(api: OrganizeApi = organizeApi, events: OrganizeEven
     const libraryId = selectedLibraryId.value;
     const preview = folderNameTagPreview.value;
     const selection = folderNameTagPreviewSelection.value;
-    if (!libraryId || !preview || !selection || preview.changed < 1) return false;
+    const options = folderNameTagPreviewOptions.value;
+    if (
+      !libraryId
+      || !preview
+      || !selection
+      || !options
+      || (preview.changed < 1 && options.mode !== "mark_all")
+    ) return false;
     const submitted = await submitTrackedJob(
       "folder-tags",
       {
         task_type: "folder_name_tag_apply",
         library_id: libraryId,
         selection,
+        ...options,
+        expected_rule_revision: preview.ruleRevision,
       },
       preview.selected,
     );
     if (submitted) {
       folderNameTagPreview.value = null;
       folderNameTagPreviewSelection.value = null;
+      folderNameTagPreviewOptions.value = null;
     }
     return submitted;
   }

@@ -12,6 +12,7 @@ from typing import Any
 
 from .collection_write_outbox import CollectionWriteOutbox, CollectionWriteOutboxError
 from .config import ConfigurationError
+from .folder_name_tags import merge_effective_tags
 from .logical_paths import logical_document_id, normalize_path, resolve_under_root
 from .tags import normalize_tags
 
@@ -305,12 +306,45 @@ class IndexState:
                 root_id TEXT NOT NULL,
                 relative_path TEXT NOT NULL,
                 event_type TEXT NOT NULL,
+                event_sequence INTEGER NOT NULL DEFAULT 0,
                 queued_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
                 processed INTEGER NOT NULL DEFAULT 0,
                 UNIQUE(root_id, relative_path)
             );
-            CREATE INDEX IF NOT EXISTS idx_fcq_pending
-                ON fs_change_queue(processed, queued_at);
+            CREATE TABLE IF NOT EXISTS fs_change_clock (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                sequence INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT OR IGNORE INTO fs_change_clock(singleton, sequence) VALUES(1, 0);
+            CREATE TABLE IF NOT EXISTS folder_name_tag_runs (
+                run_id TEXT PRIMARY KEY,
+                mode TEXT NOT NULL,
+                selection_json TEXT NOT NULL DEFAULT '{}',
+                rule_revision TEXT NOT NULL,
+                status TEXT NOT NULL,
+                total_count INTEGER NOT NULL DEFAULT 0,
+                processed_count INTEGER NOT NULL DEFAULT 0,
+                updated_count INTEGER NOT NULL DEFAULT 0,
+                failed_count INTEGER NOT NULL DEFAULT 0,
+                result_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                finished_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS folder_name_tag_folders (
+                root_id TEXT NOT NULL,
+                relative_folder TEXT NOT NULL,
+                rule_revision TEXT NOT NULL,
+                status TEXT NOT NULL,
+                last_run_id TEXT NOT NULL,
+                error TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(root_id, relative_folder, rule_revision)
+            );
+            CREATE INDEX IF NOT EXISTS idx_folder_name_tag_folders_status
+                ON folder_name_tag_folders(
+                    rule_revision, status, root_id, relative_folder
+                );
             """
         )
         root_columns = {
@@ -333,6 +367,40 @@ class IndexState:
             str(row[1])
             for row in self.connection.execute("PRAGMA table_info(folder_catalog)")
         }
+        fs_change_columns = {
+            str(row[1])
+            for row in self.connection.execute("PRAGMA table_info(fs_change_queue)")
+        }
+        if "event_sequence" not in fs_change_columns:
+            self.connection.execute(
+                "ALTER TABLE fs_change_queue ADD COLUMN event_sequence "
+                "INTEGER NOT NULL DEFAULT 0"
+            )
+        self.connection.execute(
+            "UPDATE fs_change_queue SET event_sequence = id "
+            "WHERE event_sequence = 0"
+        )
+        self.connection.execute(
+            "UPDATE fs_change_clock SET sequence = MAX(sequence, "
+            "COALESCE((SELECT MAX(event_sequence) FROM fs_change_queue), 0)) "
+            "WHERE singleton = 1"
+        )
+        fs_change_index_columns = tuple(
+            str(row["name"])
+            for row in self.connection.execute(
+                "PRAGMA index_info('idx_fcq_pending')"
+            )
+        )
+        if fs_change_index_columns != (
+            "processed",
+            "event_sequence",
+            "queued_at",
+        ):
+            self.connection.execute("DROP INDEX IF EXISTS idx_fcq_pending")
+            self.connection.execute(
+                "CREATE INDEX idx_fcq_pending ON fs_change_queue("
+                "processed, event_sequence, queued_at)"
+            )
         if "tags_json" not in entry_columns:
             self.connection.execute(
                 "ALTER TABLE entries ADD COLUMN tags_json TEXT NOT NULL DEFAULT '[]'"
@@ -2547,13 +2615,11 @@ class IndexState:
 
     @staticmethod
     def _effective_tags(entry: dict[str, Any]) -> tuple[str, ...]:
-        return normalize_tags(
-            [
-                *entry.get("tags", ()),
-                *entry.get("folder_tags", ()),
-                *entry.get("accepted_auto_tags", ()),
-                *entry.get("inherited_tags", ()),
-            ]
+        return merge_effective_tags(
+            entry.get("tags", ()),
+            entry.get("folder_tags", ()),
+            entry.get("accepted_auto_tags", ()),
+            entry.get("inherited_tags", ()),
         )
 
     def _replace_indexed_tags(self, entry: dict[str, Any]) -> None:
@@ -2718,6 +2784,100 @@ class IndexState:
         if hasattr(self, "connection"):
             self.connection.close()
 
+    # ---- Folder-name tag run state ----
+
+    def start_folder_name_tag_run(
+        self,
+        *,
+        mode: str,
+        selection: Mapping[str, Any],
+        rule_revision: str,
+        total: int,
+    ) -> str:
+        run_id = uuid.uuid4().hex
+        with self.connection:
+            self.connection.execute(
+                "INSERT INTO folder_name_tag_runs("
+                "run_id, mode, selection_json, rule_revision, status, total_count"
+                ") VALUES(?, ?, ?, ?, 'running', ?)",
+                (
+                    run_id,
+                    mode,
+                    json.dumps(dict(selection), ensure_ascii=False),
+                    rule_revision,
+                    max(0, int(total)),
+                ),
+            )
+        return run_id
+
+    def finish_folder_name_tag_run(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        processed: int,
+        updated: int,
+        failed: int,
+        result: Mapping[str, Any] | None = None,
+    ) -> None:
+        with self.connection:
+            self.connection.execute(
+                "UPDATE folder_name_tag_runs SET status = ?, processed_count = ?, "
+                "updated_count = ?, failed_count = ?, result_json = ?, "
+                "updated_at = CURRENT_TIMESTAMP, finished_at = CURRENT_TIMESTAMP "
+                "WHERE run_id = ?",
+                (
+                    status,
+                    max(0, int(processed)),
+                    max(0, int(updated)),
+                    max(0, int(failed)),
+                    json.dumps(dict(result or {}), ensure_ascii=False),
+                    run_id,
+                ),
+            )
+
+    def folder_name_tag_folder_status(
+        self,
+        *,
+        root_id: str,
+        relative_folder: str,
+        rule_revision: str,
+    ) -> str | None:
+        row = self._read_connection().execute(
+            "SELECT status FROM folder_name_tag_folders "
+            "WHERE root_id = ? AND relative_folder = ? AND rule_revision = ?",
+            (root_id, relative_folder, rule_revision),
+        ).fetchone()
+        return str(row[0]) if row else None
+
+    def record_folder_name_tag_folder(
+        self,
+        *,
+        root_id: str,
+        relative_folder: str,
+        rule_revision: str,
+        status: str,
+        run_id: str,
+        error: str = "",
+    ) -> None:
+        with self.connection:
+            self.connection.execute(
+                "INSERT INTO folder_name_tag_folders("
+                "root_id, relative_folder, rule_revision, status, last_run_id, error"
+                ") VALUES(?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(root_id, relative_folder, rule_revision) DO UPDATE SET "
+                "status = excluded.status, last_run_id = excluded.last_run_id, "
+                "error = excluded.error, updated_at = CURRENT_TIMESTAMP",
+                (
+                    root_id,
+                    relative_folder,
+                    rule_revision,
+                    status,
+                    run_id,
+                    str(error)[:2000],
+                ),
+            )
+
     # ---- File-system change queue (watchdog incremental index) ----
 
     def enqueue_change(self, root_id: str, relative_path: str, event_type: str) -> None:
@@ -2728,51 +2888,99 @@ class IndexState:
         """
         with self.connection:
             self.connection.execute(
-                "INSERT INTO fs_change_queue(root_id, relative_path, event_type) "
-                "VALUES(?, ?, ?) "
+                "UPDATE fs_change_clock SET sequence = sequence + 1 "
+                "WHERE singleton = 1"
+            )
+            sequence_row = self.connection.execute(
+                "SELECT sequence FROM fs_change_clock WHERE singleton = 1"
+            ).fetchone()
+            event_sequence = int(sequence_row[0])
+            self.connection.execute(
+                "INSERT INTO fs_change_queue("
+                "root_id, relative_path, event_type, event_sequence"
+                ") VALUES(?, ?, ?, ?) "
                 "ON CONFLICT(root_id, relative_path) DO UPDATE SET "
                 "event_type=excluded.event_type, "
+                "event_sequence=excluded.event_sequence, "
                 "queued_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'), "
                 "processed=0",
-                (root_id, relative_path, event_type),
+                (root_id, relative_path, event_type, event_sequence),
             )
+
+    def pending_change_snapshot(self, root_id: str) -> dict[str, Any]:
+        rows = self._read_connection().execute(
+            "SELECT event_type, COUNT(*) AS count, MAX(event_sequence) AS cutoff "
+            "FROM fs_change_queue WHERE root_id = ? AND processed = ? "
+            "GROUP BY event_type",
+            (root_id, _FS_CHANGE_PENDING),
+        ).fetchall()
+        counts = {str(row["event_type"]): int(row["count"]) for row in rows}
+        return {
+            "root_id": root_id,
+            "cutoff_sequence": max(
+                (int(row["cutoff"] or 0) for row in rows),
+                default=0,
+            ),
+            "total": sum(counts.values()),
+            "created": counts.get("created", 0),
+            "modified": counts.get("modified", 0),
+            "deleted": counts.get("deleted", 0),
+        }
 
     def claim_pending_changes(
         self,
         root_id: str,
         *,
         limit: int | None = None,
+        sequence_at_most: int | None = None,
     ) -> list[dict[str, Any]]:
         """Atomically claim pending changes without marking them complete."""
 
         if limit is not None and limit < 1:
             raise ValueError("limit must be positive.")
         limit_clause = " LIMIT ?" if limit is not None else ""
+        sequence_clause = (
+            " AND event_sequence <= ?" if sequence_at_most is not None else ""
+        )
         parameters: list[object] = [
             _FS_CHANGE_CLAIMED,
             root_id,
             _FS_CHANGE_PENDING,
         ]
         if limit is not None:
+            if sequence_at_most is not None:
+                parameters.append(max(0, int(sequence_at_most)))
             parameters.append(limit)
+        elif sequence_at_most is not None:
+            parameters.append(max(0, int(sequence_at_most)))
         parameters.append(_FS_CHANGE_PENDING)
         with self.connection:
             rows = self.connection.execute(
                 "UPDATE fs_change_queue SET processed = ? WHERE id IN ("
                 "SELECT id FROM fs_change_queue "
                 "WHERE root_id = ? AND processed = ? "
-                f"ORDER BY queued_at, id{limit_clause}"
+                f"{sequence_clause} ORDER BY event_sequence, queued_at, id"
+                f"{limit_clause}"
                 ") AND processed = ? "
-                "RETURNING id, root_id, relative_path, event_type, queued_at",
+                "RETURNING id, root_id, relative_path, event_type, "
+                "event_sequence, queued_at",
                 parameters,
             ).fetchall()
-        rows = sorted(rows, key=lambda row: (str(row["queued_at"]), int(row["id"])))
+        rows = sorted(
+            rows,
+            key=lambda row: (
+                int(row["event_sequence"]),
+                str(row["queued_at"]),
+                int(row["id"]),
+            ),
+        )
         return [
             {
                 "id": int(row["id"]),
                 "root_id": str(row["root_id"]),
                 "relative_path": str(row["relative_path"]),
                 "event_type": str(row["event_type"]),
+                "event_sequence": int(row["event_sequence"]),
                 "queued_at": str(row["queued_at"]),
             }
             for row in rows
@@ -2843,13 +3051,23 @@ class IndexState:
         self.acknowledge_claimed_changes(int(change["id"]) for change in changes)
         return changes
 
-    def count_pending_changes(self, root_id: str) -> int:
+    def count_pending_changes(
+        self, root_id: str, *, sequence_at_most: int | None = None
+    ) -> int:
+        sequence_clause = (
+            " AND event_sequence <= ?" if sequence_at_most is not None else ""
+        )
+        parameters: tuple[object, ...] = (
+            (root_id, max(0, int(sequence_at_most)))
+            if sequence_at_most is not None
+            else (root_id,)
+        )
         row = (
             self._read_connection()
             .execute(
                 "SELECT COUNT(*) FROM fs_change_queue "
-                "WHERE root_id = ? AND processed = 0",
-                (root_id,),
+                f"WHERE root_id = ? AND processed = 0{sequence_clause}",
+                parameters,
             )
             .fetchone()
         )
