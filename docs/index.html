@@ -3,22 +3,22 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="description" content="曜镜（YaoLens）是面向 Windows 的本地优先智能图片库，支持 Sony A7M4 ARW 快速选片、多模态搜索、AI 标注、批量整理与 Android 局域网查看。">
+  <meta name="description" content="曜镜（YaoLens）是面向 Windows 的本地优先智能图片库，支持 Qwen 图片编辑、Sony A7M4 ARW 快速选片、多模态搜索、全库标签整理与 Android 局域网查看。">
   <link rel="canonical" href="https://www.yubanyuban.com/">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://www.yubanyuban.com/">
-  <meta property="og:title" content="曜镜 YaoLens 0.3 — Sony A7M4 ARW 选片">
-  <meta property="og:description" content="本地优先的 A7M4 ARW 快速选片、评级、对比与智能图片库。">
+  <meta property="og:title" content="曜镜 YaoLens 0.5 — Qwen 图片编辑与智能图库">
+  <meta property="og:description" content="本地优先的 Qwen 图片编辑、A7M4 ARW 快速选片、多模态检索与全库标签整理。">
   <meta property="og:image" content="https://www.yubanyuban.com/assets/images/og.png">
-  <meta property="og:image:alt" content="曜镜 YaoLens 0.3 的 Sony A7M4 ARW 选片界面">
+  <meta property="og:image:alt" content="曜镜 YaoLens 0.5 的本地智能图片库界面">
   <meta name="twitter:card" content="summary_large_image">
-  <meta name="twitter:title" content="曜镜 YaoLens 0.3 — Sony A7M4 ARW 选片">
-  <meta name="twitter:description" content="本地优先的 A7M4 ARW 快速选片、评级、对比与智能图片库。">
+  <meta name="twitter:title" content="曜镜 YaoLens 0.5 — Qwen 图片编辑与智能图库">
+  <meta name="twitter:description" content="本地优先的 Qwen 图片编辑、A7M4 ARW 快速选片、多模态检索与全库标签整理。">
   <meta name="twitter:image" content="https://www.yubanyuban.com/assets/images/og.png">
   <meta name="theme-color" content="#f7f7f5" media="(prefers-color-scheme: light)">
   <meta name="theme-color" content="#14181b" media="(prefers-color-scheme: dark)">
   <link rel="icon" type="image/png" href="assets/images/yaolens-logo.png">
-  <title>曜镜 YaoLens 0.3 — A7M4 ARW 选片与本地智能图片库</title>
+  <title>曜镜 YaoLens 0.5 — Qwen 图片编辑、A7M4 ARW 选片与本地智能图库</title>
   <style>
     :root{
       color-scheme:light;
@@ -351,11 +351,11 @@
 <!-- Hero -->
 <section class="hero">
   <div class="hero-inner">
-    <span class="release-badge">YaoLens 0.3 · Sony A7M4 ARW 选片</span>
+    <span class="release-badge">YaoLens 0.5 · Qwen 图片编辑与全库智能整理</span>
     <h1>快速选片，也看懂图片内容，<br>把大图库管起来</h1>
-    <p>面向人物摄影、Cosplay、写真和二次元收藏的本地智能图片库。直接导入 Sony A7M4 ARW 快速浏览、评级和对比，也可用文字、图片与标签搜索完整图库。</p>
+    <p>面向人物摄影、Cosplay、写真和二次元收藏的本地智能图片库。既能用 Qwen 编辑单图、导入 Sony A7M4 ARW 快速选片，也能用文字、图片与标签搜索和整理完整图库。</p>
     <div class="hero-btns">
-      <a href="https://github.com/tiyue/zvec-image-search/releases/latest/download/YaoLens-0.3-win-x64-setup.exe" class="btn btn-primary" target="_blank" rel="noopener noreferrer">
+      <a href="https://github.com/tiyue/zvec-image-search/releases/latest/download/YaoLens-0.5-win-x64-setup.exe" class="btn btn-primary" target="_blank" rel="noopener noreferrer">
         <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>
         下载 Windows 版
       </a>
@@ -406,14 +406,19 @@
         <p>使用 qwen3-vl-flash 生成真人、Cosplayer、角色、作品、服装和场景等结构化标签。运行前可估算候选数、缓存命中与费用；已有标注自动跳过。</p>
       </div>
       <div class="card reveal">
+        <div class="card-icon" style="background:var(--accent-soft);color:var(--accent)">◩</div>
+        <h3>Qwen 单图编辑</h3>
+        <p>通过选择、拖放、剪贴板或搜索结果建立本地草稿，明确点击后才上传当前图片。支持 Qwen Image 3.0、2.0 与 Edit 系列；原图只读，生成结果校验后保存为独立 PNG。</p>
+      </div>
+      <div class="card reveal">
         <div class="card-icon" style="background:var(--accent-soft);color:var(--accent)">↻</div>
         <h3>自动增量索引与标注</h3>
-        <p>开启图库监控后，新增、修改和删除会进入持久化变更队列，只处理发生变化的文件；新增或修改的图片可自动完成索引与智能标注，无需反复全盘扫描。</p>
+        <p>开启图库监控后只处理发生变化的文件；每个自动批次都会进入任务历史，并在完成后汇总新增、修改、删除和失败数量，无需反复全盘扫描，也不会静默丢失事件。</p>
       </div>
       <div class="card reveal">
         <div class="card-icon" style="background:var(--accent-soft);color:var(--accent)">◫</div>
         <h3>文件夹名生成与批量标签</h3>
-        <p>先预览文件夹名生成的标签，再应用到当前文件夹或整个图库；规则会过滤数量、容量等噪声，不调用模型或重建向量。也可批量增删、替换标签并撤销。</p>
+        <p>先预览文件夹名生成的标签，再对当前文件夹或整个图库清理重建。全局黑名单会移除手工与继承标签中的噪声、脏标签和大小写重复项，不修改模型标签或重建向量。</p>
       </div>
       <div class="card reveal">
         <div class="card-icon" style="background:var(--accent-soft);color:var(--accent)">✓</div>
@@ -592,7 +597,7 @@
                   <div class="mini-table">
                     <div class="mini-table-row is-head"><span>任务</span><span>图库</span><span>状态</span><span>进度</span></div>
                     <div class="mini-table-row">
-                      <span><strong>增量索引</strong><small>index_incremental · 10:42</small></span><span>人物摄影</span><span class="mini-task-status is-running">运行中</span><span><small>68%</small><span class="mini-progress"><span style="width:68%"></span></span></span>
+                      <span><strong>自动索引与智能标注</strong><small>auto_index_and_auto_tag · 10:42</small></span><span>人物摄影</span><span class="mini-task-status is-running">运行中</span><span><small>68%</small><span class="mini-progress"><span style="width:68%"></span></span></span>
                     </div>
                     <div class="mini-table-row">
                       <span><strong>智能标注</strong><small>auto_tag · 09:18</small></span><span>角色收藏</span><span class="mini-task-status">已完成</span><span><small>1,248 / 1,248</small></span>
@@ -601,15 +606,15 @@
                       <span><strong>同步图库</strong><small>sync · 昨天</small></span><span>全部图库</span><span class="mini-task-status">已完成</span><span><small>无变化</small></span>
                     </div>
                     <div class="mini-table-row">
-                      <span><strong>文件夹名称标签</strong><small>folder_name_tags · 昨天</small></span><span>人物摄影</span><span class="mini-task-status">需注意</span><span><small>跳过 3 项</small></span>
+                      <span><strong>文件夹名称标签</strong><small>folder_name_tag_apply · 昨天</small></span><span>人物摄影</span><span class="mini-task-status">需注意</span><span><small>跳过 3 项</small></span>
                     </div>
                   </div>
                 </section>
                 <section class="mini-panel mini-log-panel">
                   <header class="mini-panel-heading"><div><strong>最近操作</strong><small>凭据与路径已脱敏</small></div><span>实时</span></header>
                   <div class="mini-log-list">
-                    <div class="mini-log-item"><time>10:44</time><span>增量索引已处理 3,412 张图片</span></div>
-                    <div class="mini-log-item"><time>10:43</time><span>检测到 28 个新增文件，已进入写入队列</span></div>
+                    <div class="mini-log-item"><time>10:44</time><span>自动批次完成：新增 28，修改 4，删除 2，失败 0</span></div>
+                    <div class="mini-log-item"><time>10:43</time><span>已领取 34 个稳定文件事件并进入处理队列</span></div>
                     <div class="mini-log-item"><time>10:42</time><span>图库任务开始：人物摄影</span></div>
                     <div class="mini-log-item"><time>09:36</time><span>智能标注完成，缓存命中 317 项</span></div>
                     <div class="mini-log-item"><time>09:18</time><span>费用估算通过，任务进入后台队列</span></div>
@@ -824,11 +829,11 @@
     <h2>先用一小批图片<br>验证你的工作流</h2>
     <p>当前项目面向 Windows 10/11 x64，配套局域网查看端支持 Android 8.0 及以上。A7M4 ARW 选片不修改源文件；建议首次先导入一个小项目，确认预览、评级和导出流程后再处理完整拍摄批次。</p>
     <div class="hero-btns" style="justify-content:center">
-      <a href="https://github.com/tiyue/zvec-image-search/releases/latest/download/YaoLens-0.3-win-x64-setup.exe" class="btn btn-primary" target="_blank" rel="noopener noreferrer">
+      <a href="https://github.com/tiyue/zvec-image-search/releases/latest/download/YaoLens-0.5-win-x64-setup.exe" class="btn btn-primary" target="_blank" rel="noopener noreferrer">
         <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>
         下载 Windows 版
       </a>
-      <a href="https://github.com/tiyue/zvec-image-search/releases/latest/download/YaoLens-0.3-android.apk" class="btn btn-secondary" target="_blank" rel="noopener noreferrer">
+      <a href="https://github.com/tiyue/zvec-image-search/releases/latest/download/YaoLens-0.5-android.apk" class="btn btn-secondary" target="_blank" rel="noopener noreferrer">
         <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="5" y="2" width="14" height="20" rx="2"/><path d="M9 18h6"/></svg>
         下载 Android 版
       </a>
@@ -870,12 +875,12 @@ const showcaseData = {
     desc: '输入任意正整数决定本次搜索数量。结果按置信度为主、原始分数为辅排序，默认每页显示 15 张；双击打开原图，也可以定位文件夹、复制、多选和导出。'
   },
   tasks: {
-    title: '后台任务持续运行，失败项单独处理',
-    desc: '索引、同步、智能标注进入有界任务队列。任务历史与操作日志跨重启保留，单图失败不会中断整批，取消或网络失败后按钮会恢复。'
+    title: '手工与自动任务都能持续追踪',
+    desc: '索引、同步、智能标注及 watcher 自动批次统一进入任务历史。操作日志跨重启保留并聚合本次新增、修改、删除和失败数量，单图失败不会中断整批。'
   },
   organize: {
-    title: '按文件夹批量设置多标签',
-    desc: '以文件夹为筛选依据，对当前页、选中图片或整文件夹执行人工标签操作。模型标签自动批准，来源清晰可见；相似分组、别名词典和撤销能力降低重复劳动。'
+    title: '预览后重建全库文件夹标签',
+    desc: '既可对当前选择增删人工标签，也可按文件夹名预览并重建整个图库。黑名单、脏标签和重复项只从手工与继承来源清理，模型标签保持原值。'
   },
   settings: {
     title: '模型、路径和迁移集中管理',

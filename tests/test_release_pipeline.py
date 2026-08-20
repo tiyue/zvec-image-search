@@ -89,7 +89,7 @@ class ReleaseRequestPolicyTest(unittest.TestCase):
         )
         self.assertEqual(outputs["exact_tag_ref"], "false")
         self.assertEqual(outputs["search_quality_certified"], "false")
-        self.assertEqual(outputs["public_version"], "0.3")
+        self.assertEqual(outputs["public_version"], "0.5")
 
     def test_uncertified_release_must_be_explicit(self) -> None:
         root = repository_root()
@@ -123,13 +123,13 @@ class ReleaseAssemblyTest(unittest.TestCase):
     def test_assembles_only_webview_and_android_products(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            webview, android = _artifact_directories(root, "0.3.0")
+            webview, android = _artifact_directories(root, "0.5.0")
 
             outputs = assemble_release(
                 webview_directory=webview,
                 android_directory=android,
                 output_directory=root / "candidate",
-                version="0.3.0",
+                version="0.5.0",
                 revision="a" * 40,
                 version_prerelease=False,
                 exact_tag_ref=True,
@@ -137,21 +137,21 @@ class ReleaseAssemblyTest(unittest.TestCase):
                 search_quality_certified=True,
             )
 
-            self.assertEqual(outputs["release_title"], "YaoLens 0.3")
+            self.assertEqual(outputs["release_title"], "YaoLens 0.5")
             assets = root / "candidate/release-assets"
             policy = json.loads(
                 (assets / "RELEASE-POLICY.json").read_text(encoding="utf-8")
             )
             self.assertEqual(policy["schema_version"], 4)
-            self.assertEqual(policy["version"], "0.3.0")
-            self.assertEqual(policy["public_version"], "0.3")
+            self.assertEqual(policy["version"], "0.5.0")
+            self.assertEqual(policy["public_version"], "0.5")
             self.assertEqual(policy["release_channel"], "stable")
             self.assertFalse(policy["prerelease"])
             self.assertNotIn("desktop_runtime", policy)
             names = {path.name for path in assets.iterdir() if path.is_file()}
-            self.assertIn("YaoLens-0.3-win-x64-portable.zip", names)
-            self.assertIn("YaoLens-0.3-win-x64-setup.exe", names)
-            self.assertIn("YaoLens-0.3-android.apk", names)
+            self.assertIn("YaoLens-0.5-win-x64-portable.zip", names)
+            self.assertIn("YaoLens-0.5-win-x64-setup.exe", names)
+            self.assertIn("YaoLens-0.5-android.apk", names)
             self.assertIn("WEBVIEW-SHA256SUMS.txt", names)
             self.assertIn("ANDROID-SHA256SUMS.txt", names)
             self.assertFalse(any("Desktop" in name for name in names))
@@ -341,15 +341,15 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
 
     def test_public_version_and_android_version_are_synchronized(self) -> None:
         root = repository_root()
-        self.assertEqual(read_project_version(root), "0.3.0")
-        self.assertEqual(public_version(read_project_version(root)), "0.3")
+        self.assertEqual(read_project_version(root), "0.5.0")
+        self.assertEqual(public_version(read_project_version(root)), "0.5")
         android = (root / "android/app/build.gradle.kts").read_text(encoding="utf-8")
-        self.assertIn("versionCode = 500009", android)
-        self.assertIn('versionName = "0.3.0"', android)
+        self.assertIn("versionCode = 500010", android)
+        self.assertIn('versionName = "0.5.0"', android)
         frontend = json.loads(
             (root / "frontend/package.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(frontend["version"], "0.3.0")
+        self.assertEqual(frontend["version"], "0.5.0")
 
     def test_public_release_documents_use_stable_yaolens_names(self) -> None:
         root = repository_root()
@@ -359,9 +359,9 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
         )
         folded = documents.casefold()
         for expected in (
-            "YaoLens-0.3-win-x64-portable.zip",
-            "YaoLens-0.3-win-x64-setup.exe",
-            "YaoLens-0.3-android.apk",
+            "YaoLens-0.5-win-x64-portable.zip",
+            "YaoLens-0.5-win-x64-setup.exe",
+            "YaoLens-0.5-android.apk",
         ):
             self.assertIn(expected, documents)
         for forbidden in (
@@ -376,7 +376,7 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
         self.assertNotRegex(folded, r"\bsigned\b")
 
         spec = (root / "docs/spec.md").read_text(encoding="utf-8")
-        self.assertIn("版本：0.3（机器 SemVer：0.3.0）", spec)
+        self.assertIn("版本：0.5（机器 SemVer：0.5.0）", spec)
         self.assertIn("公开主程序 `YaoLens.exe`", spec)
 
 

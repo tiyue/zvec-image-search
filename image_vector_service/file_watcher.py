@@ -201,8 +201,8 @@ def _disable_windows_last_access_notifications() -> bool:
         from watchdog.observers import winapi
 
         before = int(winapi.WATCHDOG_FILE_NOTIFY_FLAGS)
-        winapi.WATCHDOG_FILE_NOTIFY_FLAGS = (
-            before & ~int(winapi.FILE_NOTIFY_CHANGE_LAST_ACCESS)
+        winapi.WATCHDOG_FILE_NOTIFY_FLAGS = before & ~int(
+            winapi.FILE_NOTIFY_CHANGE_LAST_ACCESS
         )
         return int(winapi.WATCHDOG_FILE_NOTIFY_FLAGS) != before
     except (AttributeError, ImportError):

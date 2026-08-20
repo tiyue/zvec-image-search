@@ -1972,13 +1972,9 @@ class PreviewFacade:
         try:
             return self._ready_client().get_folder_name_tag_settings()
         except Exception as exc:
-            raise _facade_error(
-                exc, code="folder_name_tag_settings_failed"
-            ) from exc
+            raise _facade_error(exc, code="folder_name_tag_settings_failed") from exc
 
-    def update_folder_name_tag_settings(
-        self, payload: Mapping[str, Any]
-    ) -> JsonObject:
+    def update_folder_name_tag_settings(self, payload: Mapping[str, Any]) -> JsonObject:
         unknown = sorted(set(payload) - {"blacklist"})
         if unknown:
             raise FacadeError(
@@ -1987,20 +1983,14 @@ class PreviewFacade:
                 details={"unknown_fields": unknown},
             )
         blacklist = payload.get("blacklist")
-        if isinstance(blacklist, (str, bytes)) or not isinstance(
-            blacklist, Sequence
-        ):
-            raise FacadeError(
-                "invalid_request", "blacklist 必须是字符串数组。"
-            )
+        if isinstance(blacklist, (str, bytes)) or not isinstance(blacklist, Sequence):
+            raise FacadeError("invalid_request", "blacklist 必须是字符串数组。")
         try:
             return self._ready_client().update_folder_name_tag_settings(
                 cast(Sequence[str], blacklist)
             )
         except Exception as exc:
-            raise _facade_error(
-                exc, code="folder_name_tag_settings_failed"
-            ) from exc
+            raise _facade_error(exc, code="folder_name_tag_settings_failed") from exc
 
     def assign_models(self, payload: Mapping[str, Any]) -> JsonObject:
         try:
@@ -5137,7 +5127,7 @@ def _package_version() -> str:
     try:
         return metadata.version("zvec-image-search")
     except metadata.PackageNotFoundError:
-        return "0.3.0"
+        return "0.5.0"
 
 
 def _operation_id(value: str) -> str:

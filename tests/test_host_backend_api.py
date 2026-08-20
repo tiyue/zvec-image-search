@@ -268,9 +268,7 @@ class HostBackendApiClientTests(unittest.TestCase):
 
     def test_folder_name_tag_settings_use_dedicated_routes(self) -> None:
         with _running_server() as server:
-            client = BackendApiClient(
-                f"http://127.0.0.1:{server.server_port}", "token"
-            )
+            client = BackendApiClient(f"http://127.0.0.1:{server.server_port}", "token")
             settings = {
                 "blacklist": ["自拍", "V"],
                 "revision": "a" * 64,

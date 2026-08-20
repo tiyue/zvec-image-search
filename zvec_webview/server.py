@@ -1045,9 +1045,7 @@ def _handler_type(gateway: GatewayServer) -> type[BaseHTTPRequestHandler]:
             if method == "PUT" and segments == ("folder-name-tag-settings",):
                 self._json(
                     HTTPStatus.OK,
-                    gateway._facade.update_folder_name_tag_settings(
-                        self._read_json()
-                    ),
+                    gateway._facade.update_folder_name_tag_settings(self._read_json()),
                 )
                 return
             if method == "GET" and segments == ("lan-access",):

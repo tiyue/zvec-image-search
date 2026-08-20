@@ -56,9 +56,9 @@ class FolderNameTagSettingsStore:
             "schema_version": 1,
             "blacklist": list(policy.blacklist),
         }
-        encoded = (
-            json.dumps(document, ensure_ascii=False, indent=2) + "\n"
-        ).encode("utf-8")
+        encoded = (json.dumps(document, ensure_ascii=False, indent=2) + "\n").encode(
+            "utf-8"
+        )
         if len(encoded) > MAX_SETTINGS_BYTES:
             raise ValueError("Folder-name tag settings are too large.")
         self.path.parent.mkdir(parents=True, exist_ok=True)

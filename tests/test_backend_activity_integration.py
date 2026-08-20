@@ -385,14 +385,10 @@ class BackendActivityIntegrationTests(unittest.TestCase):
 
             self.assertEqual(completed["status"], "succeeded")
             self.assertEqual(completed["result"]["changes"]["processed"], 2)
-            history = self._history_item(
-                store, job_id, expected_status="succeeded"
-            )
+            history = self._history_item(store, job_id, expected_status="succeeded")
             self.assertEqual(history["task_type"], "auto_index_and_auto_tag")
             store.flush(timeout=1.0)
-            logs = store.list_operation_logs(category="auto_index", limit=10)[
-                "items"
-            ]
+            logs = store.list_operation_logs(category="auto_index", limit=10)["items"]
             matching = [item for item in logs if item["job_id"] == job_id]
             self.assertEqual(len(matching), 1)
             self.assertIn("处理 2 个文件变化", matching[0]["message"])

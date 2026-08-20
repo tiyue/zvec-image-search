@@ -687,9 +687,7 @@ class FolderNameTagEstimateRequest:
                 "selection must be a FolderNameTagSelection.", "selection"
             )
         if self.mode not in {"normal", "clean", "mark_all"}:
-            raise _validation(
-                "mode must be normal, clean, or mark_all.", "mode"
-            )
+            raise _validation("mode must be normal, clean, or mark_all.", "mode")
         _require_boolean(self.force, "force")
 
     def to_params(self) -> JsonObject:
@@ -718,9 +716,7 @@ class FolderNameTagApplyRequest:
                 "selection must be a FolderNameTagSelection.", "selection"
             )
         if self.mode not in {"normal", "clean", "mark_all"}:
-            raise _validation(
-                "mode must be normal, clean, or mark_all.", "mode"
-            )
+            raise _validation("mode must be normal, clean, or mark_all.", "mode")
         _require_boolean(self.force, "force")
         object.__setattr__(
             self,

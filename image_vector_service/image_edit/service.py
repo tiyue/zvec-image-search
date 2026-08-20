@@ -549,7 +549,8 @@ def _parse_multipart(
     for part in message.iter_parts():
         field_name = part.get_param("name", header="content-disposition")
         if field_name == "metadata" and metadata is None:
-            raw = part.get_payload(decode=True) or b""
+            raw_payload = part.get_payload(decode=True)
+            raw = raw_payload if isinstance(raw_payload, bytes) else b""
             try:
                 decoded = json.loads(raw.decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -563,7 +564,8 @@ def _parse_multipart(
             metadata = decoded
         elif field_name == "file" and source_bytes is None:
             source_name = part.get_filename() or source_name
-            source_bytes = part.get_payload(decode=True) or b""
+            file_payload = part.get_payload(decode=True)
+            source_bytes = file_payload if isinstance(file_payload, bytes) else b""
         else:
             raise ImageEditServiceError(
                 "invalid_multipart", "上传表单只能包含 metadata 和单个图片文件。"

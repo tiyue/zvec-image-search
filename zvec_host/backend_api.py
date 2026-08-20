@@ -373,12 +373,8 @@ class BackendApiClient:
             )
         return settings
 
-    def update_folder_name_tag_settings(
-        self, blacklist: Sequence[str]
-    ) -> JsonObject:
-        if isinstance(blacklist, (str, bytes)) or not isinstance(
-            blacklist, Sequence
-        ):
+    def update_folder_name_tag_settings(self, blacklist: Sequence[str]) -> JsonObject:
+        if isinstance(blacklist, (str, bytes)) or not isinstance(blacklist, Sequence):
             raise ValueError("blacklist must be a sequence of strings")
         relative_path = "v1/folder-name-tags/settings"
         payload = self._request_json(

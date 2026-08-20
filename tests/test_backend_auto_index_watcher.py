@@ -199,8 +199,8 @@ class BackendAutoIndexWatcherTest(unittest.TestCase):
 
         original = int(winapi.WATCHDOG_FILE_NOTIFY_FLAGS)
         try:
-            winapi.WATCHDOG_FILE_NOTIFY_FLAGS = (
-                original | int(winapi.FILE_NOTIFY_CHANGE_LAST_ACCESS)
+            winapi.WATCHDOG_FILE_NOTIFY_FLAGS = original | int(
+                winapi.FILE_NOTIFY_CHANGE_LAST_ACCESS
             )
 
             changed = _disable_windows_last_access_notifications()

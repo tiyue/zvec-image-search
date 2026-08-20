@@ -172,7 +172,7 @@ _CAPABILITIES = {
 try:
     _APP_VERSION = version("zvec-image-search")
 except PackageNotFoundError:
-    _APP_VERSION = "0.3.0"
+    _APP_VERSION = "0.5.0"
 
 
 def _utc_now() -> str:
@@ -514,8 +514,7 @@ class _LibraryWorker:
         *,
         queue_capacity: int,
         cooperative_batch_size: int,
-        submit_auto_index_cycle: Callable[[LibraryDefinition, str], None]
-        | None = None,
+        submit_auto_index_cycle: Callable[[LibraryDefinition, str], None] | None = None,
     ) -> None:
         self.library = library
         self._service_factory = service_factory
@@ -1230,11 +1229,7 @@ class BackendJobManager:
                 message = "自动索引本轮失败，未处理的文件变化将保留等待重试。"
             self._activity_log(
                 level=(
-                    "error"
-                    if status == "failed"
-                    else "warning"
-                    if failed
-                    else "info"
+                    "error" if status == "failed" else "warning" if failed else "info"
                 ),
                 category="auto_index",
                 event=f"auto_index_cycle_{status}",
@@ -1280,6 +1275,7 @@ class BackendJobManager:
                     "removed_duplicates": result.get("removed_duplicates"),
                 },
             )
+
     def _record_health_transition(
         self,
         status: str,
@@ -2818,8 +2814,16 @@ class BackendJobManager:
                     queued_before_sequence=cutoff,
                 )
                 changes = batch.get("changes") if isinstance(batch, dict) else {}
-                batch_processed = int(
+                raw_batch_processed = (
                     changes.get("processed") if isinstance(changes, dict) else 0
+                )
+                batch_processed = (
+                    int(raw_batch_processed)
+                    if not isinstance(raw_batch_processed, bool)
+                    and isinstance(
+                        raw_batch_processed, (str, bytes, bytearray, int, float)
+                    )
+                    else 0
                 )
                 if batch_processed < 1:
                     break
@@ -3501,13 +3505,9 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
             return
         if path == "/v1/folder-name-tags/settings":
 
-            def update_folder_name_tag_settings() -> tuple[
-                HTTPStatus, dict[str, Any]
-            ]:
+            def update_folder_name_tag_settings() -> tuple[HTTPStatus, dict[str, Any]]:
                 payload = self._read_json_object()
-                settings = self.backend.manager.update_folder_name_tag_settings(
-                    payload
-                )
+                settings = self.backend.manager.update_folder_name_tag_settings(payload)
                 return HTTPStatus.OK, {"settings": settings}
 
             self._run_request(update_folder_name_tag_settings)

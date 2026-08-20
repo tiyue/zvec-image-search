@@ -377,8 +377,7 @@ class IndexState:
                 "INTEGER NOT NULL DEFAULT 0"
             )
         self.connection.execute(
-            "UPDATE fs_change_queue SET event_sequence = id "
-            "WHERE event_sequence = 0"
+            "UPDATE fs_change_queue SET event_sequence = id WHERE event_sequence = 0"
         )
         self.connection.execute(
             "UPDATE fs_change_clock SET sequence = MAX(sequence, "
@@ -387,9 +386,7 @@ class IndexState:
         )
         fs_change_index_columns = tuple(
             str(row["name"])
-            for row in self.connection.execute(
-                "PRAGMA index_info('idx_fcq_pending')"
-            )
+            for row in self.connection.execute("PRAGMA index_info('idx_fcq_pending')")
         )
         if fs_change_index_columns != (
             "processed",
@@ -2843,11 +2840,15 @@ class IndexState:
         relative_folder: str,
         rule_revision: str,
     ) -> str | None:
-        row = self._read_connection().execute(
-            "SELECT status FROM folder_name_tag_folders "
-            "WHERE root_id = ? AND relative_folder = ? AND rule_revision = ?",
-            (root_id, relative_folder, rule_revision),
-        ).fetchone()
+        row = (
+            self._read_connection()
+            .execute(
+                "SELECT status FROM folder_name_tag_folders "
+                "WHERE root_id = ? AND relative_folder = ? AND rule_revision = ?",
+                (root_id, relative_folder, rule_revision),
+            )
+            .fetchone()
+        )
         return str(row[0]) if row else None
 
     def record_folder_name_tag_folder(
@@ -2888,8 +2889,7 @@ class IndexState:
         """
         with self.connection:
             self.connection.execute(
-                "UPDATE fs_change_clock SET sequence = sequence + 1 "
-                "WHERE singleton = 1"
+                "UPDATE fs_change_clock SET sequence = sequence + 1 WHERE singleton = 1"
             )
             sequence_row = self.connection.execute(
                 "SELECT sequence FROM fs_change_clock WHERE singleton = 1"
@@ -2908,12 +2908,16 @@ class IndexState:
             )
 
     def pending_change_snapshot(self, root_id: str) -> dict[str, Any]:
-        rows = self._read_connection().execute(
-            "SELECT event_type, COUNT(*) AS count, MAX(event_sequence) AS cutoff "
-            "FROM fs_change_queue WHERE root_id = ? AND processed = ? "
-            "GROUP BY event_type",
-            (root_id, _FS_CHANGE_PENDING),
-        ).fetchall()
+        rows = (
+            self._read_connection()
+            .execute(
+                "SELECT event_type, COUNT(*) AS count, MAX(event_sequence) AS cutoff "
+                "FROM fs_change_queue WHERE root_id = ? AND processed = ? "
+                "GROUP BY event_type",
+                (root_id, _FS_CHANGE_PENDING),
+            )
+            .fetchall()
+        )
         counts = {str(row["event_type"]): int(row["count"]) for row in rows}
         return {
             "root_id": root_id,

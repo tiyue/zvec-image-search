@@ -55,9 +55,7 @@ MAX_FOLDER_NAME_TAGS = 64
 
 
 def _normalized_text(value: str) -> str:
-    return _WHITESPACE_PATTERN.sub(
-        " ", unicodedata.normalize("NFKC", value).strip()
-    )
+    return _WHITESPACE_PATTERN.sub(" ", unicodedata.normalize("NFKC", value).strip())
 
 
 @dataclass(frozen=True)

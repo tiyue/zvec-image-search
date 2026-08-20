@@ -446,10 +446,12 @@ def _text(value: object) -> str:
 
 
 def _non_negative_int(value: object) -> int | None:
-    if isinstance(value, bool):
+    if isinstance(value, bool) or not isinstance(
+        value, (str, bytes, bytearray, int, float)
+    ):
         return None
     try:
-        parsed = int(value)  # type: ignore[arg-type]
+        parsed = int(value)
     except (TypeError, ValueError, OverflowError):
         return None
     return parsed if parsed >= 0 else None
