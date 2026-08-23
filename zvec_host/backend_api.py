@@ -272,6 +272,24 @@ class BackendApiClient:
             expected_statuses={200},
         )
 
+    def create_watch_recommendations(
+        self,
+        viewer_id: str,
+        request_id: str,
+    ) -> JsonObject:
+        return self._request_json(
+            "POST",
+            "v1/watch/recommendations",
+            json_body={
+                "viewer_id": self._validate_recommendation_id(viewer_id, "viewer_id"),
+                "request_id": self._validate_recommendation_id(
+                    request_id,
+                    "request_id",
+                ),
+            },
+            expected_statuses={200},
+        )
+
     def mark_recommendations_shown(
         self,
         viewer_id: str,

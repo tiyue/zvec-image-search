@@ -16,3 +16,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "ZvecLanViewer"
 include(":app")
+include(":wear")

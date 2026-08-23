@@ -241,6 +241,7 @@ The authenticated recommendation routes are:
 
 ```text
 POST /api/v1/recommendations
+POST /api/v1/watch/recommendations
 POST /api/v1/recommendations/{batch_id}/shown
 POST /api/v1/recommendations/{batch_id}/actions
 ```
@@ -252,6 +253,14 @@ Batch creation accepts exactly one opaque request identifier:
   "request_id": "installation-scoped idempotency id"
 }
 ```
+
+`POST /api/v1/recommendations` keeps the existing 15-item target and
+`quality=5`, `low_exposure=6`, `random=4` quotas. The standalone Wear OS client
+uses `POST /api/v1/watch/recommendations`; it accepts the same exact request
+body and returns the same response shape with a five-item target and
+`quality=2`, `low_exposure=2`, `random=1`. A partial batch remains possible
+when the eligible library cannot supply five distinct items. The Wear route
+does not change the desktop or phone Android recommendation contract.
 
 A successful response includes the device-scoped batch and exposure metadata,
 plus the computer-wide explicit preference state:
@@ -339,6 +348,16 @@ fully preloaded next batch that has not been committed is never shown and does
 not affect exposure or the 240-item history. Batch, shown history, and exposure
 counts remain isolated by Android installation and are never merged with
 desktop browsing history.
+
+Wear starts all five thumbnail loads together and may commit the batch after
+any two thumbnails are ready. It keeps the current five-item batch visible
+while a replacement is slow, prepares at most one next batch, and retries a
+failed replacement without clearing the current grid. Opening an item displays
+the cached thumbnail first and requests only that item's `/original`; pending
+next-batch work is paused so the selected original has network priority. The
+Wear client rebases returned media paths onto its currently selected IPv4 and
+port so thumbnail and original requests use the same FRP endpoint as batch
+creation.
 
 After the current visible batch is shown and all its thumbnails settle, the
 client may prepare at most one next batch in memory. Consuming that batch does

@@ -409,6 +409,30 @@ class RecommendationBackendTests(unittest.TestCase):
         for service in self.services.values():
             self.assertEqual(service.candidate_limits, [100])
 
+    def test_watch_create_returns_five_without_changing_standard_batch(self) -> None:
+        watch_status, watch = self.request(
+            "/v1/watch/recommendations",
+            {"viewer_id": "watch-viewer", "request_id": "watch-request"},
+        )
+        standard_status, standard = self.request(
+            "/v1/recommendations",
+            {"viewer_id": "desktop-viewer", "request_id": "desktop-request"},
+        )
+
+        self.assertEqual(watch_status, 200)
+        self.assertEqual(watch["count"], 5)
+        self.assertFalse(watch["partial"])
+        self.assertEqual(
+            watch["quota"],
+            {"quality": 2, "low_exposure": 2, "random": 1},
+        )
+        self.assertEqual(standard_status, 200)
+        self.assertEqual(standard["count"], 15)
+        self.assertEqual(
+            standard["quota"],
+            {"quality": 5, "low_exposure": 6, "random": 4},
+        )
+
     def test_replays_a_persisted_legacy_recent_item(self) -> None:
         doc_id, source = next(iter(self.services["a"].items.items()))
         legacy_item = RecommendationBatchItem(
@@ -902,6 +926,7 @@ class RecommendationBackendTests(unittest.TestCase):
         )
 
         created = client.create_recommendations("desktop-viewer", "request-client")
+        watch = client.create_watch_recommendations("watch-viewer", "watch-client")
         shown = client.mark_recommendations_shown(
             "desktop-viewer",
             created["batch_id"],
@@ -918,6 +943,7 @@ class RecommendationBackendTests(unittest.TestCase):
 
         self.assertTrue(shown["recorded"])
         self.assertTrue(action["recorded"])
+        self.assertEqual(watch["count"], 5)
 
     def test_missing_selected_source_returns_partial_contiguous_idempotent_batch(
         self,

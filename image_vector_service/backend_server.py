@@ -52,6 +52,7 @@ from .recommendation_store import (
 )
 from .recommendations import (
     SLOT_QUOTAS,
+    WATCH_SLOT_QUOTAS,
     PreferenceVector,
     PreparedPersonalizationProfile,
     RecommendationCandidate,
@@ -59,6 +60,7 @@ from .recommendations import (
     apply_personalization_profile,
     prepare_personalization_profile,
     select_recommendations,
+    select_watch_recommendations,
 )
 from .result_exporter import search_report_payload
 from .service import ImageVectorService
@@ -1623,7 +1625,32 @@ class BackendJobManager:
         viewer = _recommendation_identifier(viewer_id, "viewer_id")
         request = _recommendation_identifier(request_id, "request_id")
         return self._recommendation_call(
-            lambda store: self._create_recommendations_on_worker(store, viewer, request)
+            lambda store: self._create_recommendations_on_worker(
+                store,
+                viewer,
+                request,
+                selector=select_recommendations,
+                slot_quotas=SLOT_QUOTAS,
+            )
+        )
+
+    def create_watch_recommendations(
+        self,
+        viewer_id: str,
+        request_id: str,
+    ) -> dict[str, Any]:
+        """Create or replay one five-item Wear OS recommendation batch."""
+
+        viewer = _recommendation_identifier(viewer_id, "viewer_id")
+        request = _recommendation_identifier(request_id, "request_id")
+        return self._recommendation_call(
+            lambda store: self._create_recommendations_on_worker(
+                store,
+                viewer,
+                request,
+                selector=select_watch_recommendations,
+                slot_quotas=WATCH_SLOT_QUOTAS,
+            )
         )
 
     def mark_recommendations_shown(
@@ -1754,6 +1781,9 @@ class BackendJobManager:
         store: RecommendationStore,
         viewer_id: str,
         request_id: str,
+        *,
+        selector: Callable[..., RecommendationSelection],
+        slot_quotas: Mapping[str, int],
     ) -> dict[str, Any]:
         total_started = perf_counter()
         existing = store.batch_for_request(viewer_id, request_id)
@@ -1769,6 +1799,7 @@ class BackendJobManager:
                 history_window=0,
                 diversity=_replayed_recommendation_diversity(),
                 personalization=_replayed_recommendation_personalization(),
+                slot_quotas=slot_quotas,
             )
             result_hydration_ms = (perf_counter() - hydration_started) * 1_000.0
             response["performance"] = _recommendation_performance(
@@ -1795,6 +1826,7 @@ class BackendJobManager:
             recent_sha256,
             rng_seed,
             limit_per_pool=_INITIAL_RECOMMENDATION_POOL_LIMIT,
+            selector=selector,
         )
         initial = replace(
             initial,
@@ -1802,7 +1834,10 @@ class BackendJobManager:
         )
         final_attempt = initial
         expansion: _RecommendationAttempt | None = None
-        if _recommendation_requires_candidate_expansion(initial.selection):
+        if _recommendation_requires_candidate_expansion(
+            initial.selection,
+            slot_quotas,
+        ):
             expansion = self._prepare_recommendation_attempt(
                 store,
                 viewer_id,
@@ -1810,6 +1845,7 @@ class BackendJobManager:
                 recent_sha256,
                 rng_seed,
                 limit_per_pool=_EXPANDED_RECOMMENDATION_POOL_LIMIT,
+                selector=selector,
             )
             final_attempt = expansion
 
@@ -1859,6 +1895,7 @@ class BackendJobManager:
             history_window=selection.history_window,
             diversity=final_attempt.diversity,
             personalization=final_attempt.personalization,
+            slot_quotas=slot_quotas,
         )
         result_hydration_ms = (perf_counter() - hydration_started) * 1_000.0
         response["performance"] = _recommendation_performance(
@@ -1893,6 +1930,7 @@ class BackendJobManager:
         rng_seed: int,
         *,
         limit_per_pool: int,
+        selector: Callable[..., RecommendationSelection],
     ) -> _RecommendationAttempt:
         candidate_started = perf_counter()
         candidates, vector_spaces, request_count = (
@@ -1924,7 +1962,7 @@ class BackendJobManager:
             )
 
         selection_started = perf_counter()
-        selection = select_recommendations(
+        selection = selector(
             candidates,
             recent_sha256=recent_sha256,
             excluded_sha256=preferences,
@@ -3413,7 +3451,8 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
                     # successful request from being cut off mid-body.
                     self.backend.shutdown_async()
             return
-        if path == "/v1/recommendations":
+        if path in {"/v1/recommendations", "/v1/watch/recommendations"}:
+            watch_request = path == "/v1/watch/recommendations"
 
             def create_recommendations() -> tuple[HTTPStatus, dict[str, Any]]:
                 payload = self._read_json_object()
@@ -3421,9 +3460,14 @@ class BackendRequestHandler(BaseHTTPRequestHandler):
                     payload,
                     required={"viewer_id", "request_id"},
                 )
+                create = (
+                    self.backend.manager.create_watch_recommendations
+                    if watch_request
+                    else self.backend.manager.create_recommendations
+                )
                 return (
                     HTTPStatus.OK,
-                    self.backend.manager.create_recommendations(
+                    create(
                         payload["viewer_id"],
                         payload["request_id"],
                     ),
@@ -5481,12 +5525,13 @@ def _recommendation_seed(viewer_id: str, request_id: str) -> int:
 
 def _recommendation_requires_candidate_expansion(
     selection: RecommendationSelection,
+    slot_quotas: Mapping[str, int] = SLOT_QUOTAS,
 ) -> bool:
     if selection.status != "complete" or selection.history_window != 240:
         return True
     return any(
         selection.counts_by_slot.get(slot, 0) < quota
-        for slot, quota in SLOT_QUOTAS.items()
+        for slot, quota in slot_quotas.items()
     )
 
 
@@ -5803,8 +5848,9 @@ def _recommendation_response(
     diversity: Mapping[str, object],
     personalization: Mapping[str, object],
     selection: RecommendationSelection | None = None,
+    slot_quotas: Mapping[str, int] = SLOT_QUOTAS,
 ) -> dict[str, Any]:
-    counts = {slot: 0 for slot in SLOT_QUOTAS}
+    counts = {slot: 0 for slot in slot_quotas}
     if selection is not None:
         counts.update(
             {
@@ -5822,8 +5868,8 @@ def _recommendation_response(
         for item in batch.items:
             if item.item_id in available_item_ids and item.slot in counts:
                 counts[item.slot] += 1
-    partial = len(items) < sum(SLOT_QUOTAS.values())
-    quota_degraded = any(counts[slot] < quota for slot, quota in SLOT_QUOTAS.items())
+    partial = len(items) < sum(slot_quotas.values())
+    quota_degraded = any(counts[slot] < quota for slot, quota in slot_quotas.items())
     return {
         "request_id": batch.request_id,
         "batch_id": batch.batch_id,

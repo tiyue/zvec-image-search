@@ -529,11 +529,17 @@ class _LanRequestHandler(BaseHTTPRequestHandler):
                     return
                 self._method_not_allowed(("GET", "DELETE"))
 
-            if path == "/api/v1/recommendations":
+            if path in {
+                "/api/v1/recommendations",
+                "/api/v1/watch/recommendations",
+            }:
                 self._require_method("POST")
                 self._require_no_query(target.query)
                 client, _token = self._authenticate()
-                self._create_recommendations(client)
+                self._create_recommendations(
+                    client,
+                    watch=path == "/api/v1/watch/recommendations",
+                )
                 return
 
             recommendation_match = re.fullmatch(
@@ -754,7 +760,12 @@ class _LanRequestHandler(BaseHTTPRequestHandler):
             raise
         self._send_json(HTTPStatus.ACCEPTED, {"search_id": search_id})
 
-    def _create_recommendations(self, client: AuthenticatedClient) -> None:
+    def _create_recommendations(
+        self,
+        client: AuthenticatedClient,
+        *,
+        watch: bool,
+    ) -> None:
         self._require_active_session(client)
         payload = self._read_json_object()
         _require_exact_fields(payload, required={"request_id"})
@@ -763,8 +774,13 @@ class _LanRequestHandler(BaseHTTPRequestHandler):
             code="invalid_request",
         )
         backend = self._recommendation_backend_or_problem()
+        create = (
+            backend.create_watch_recommendations
+            if watch
+            else backend.create_recommendations
+        )
         response = self._backend_call(
-            backend.create_recommendations,
+            create,
             request_id,
             client_id=client.session_id,
             device_id=client.device_id,

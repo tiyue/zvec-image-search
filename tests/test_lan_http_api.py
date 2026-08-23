@@ -76,6 +76,7 @@ class _FakeBackend:
         self.deleted: list[tuple[str, str]] = []
         self.deleted_sessions: list[str] = []
         self.recommendation_created: list[tuple[str, str, str]] = []
+        self.watch_recommendation_created: list[tuple[str, str, str]] = []
         self.recommendation_shown: list[tuple[str, str, str, str]] = []
         self.recommendation_actions: list[
             tuple[str, str, str, str, str, str, dict[str, str] | None]
@@ -147,6 +148,30 @@ class _FakeBackend:
                     "media_id": "media-1",
                     "bucket": "random",
                 }
+            ],
+        }
+
+    def create_watch_recommendations(
+        self,
+        request_id: str,
+        *,
+        client_id: str,
+        device_id: str,
+    ) -> dict[str, object]:
+        self.watch_recommendation_created.append(
+            (request_id, client_id, device_id)
+        )
+        return {
+            "request_id": request_id,
+            "batch_id": "watch-batch-1",
+            "count": 5,
+            "items": [
+                {
+                    "item_id": f"watch-item-{index}",
+                    "media_id": f"watch-media-{index}",
+                    "bucket": "random",
+                }
+                for index in range(5)
             ],
         }
 
@@ -944,6 +969,7 @@ class LanHttpApiTests(unittest.TestCase):
             ("GET", "/api/v1/searches/search-1", None),
             ("DELETE", "/api/v1/searches/search-1", None),
             ("POST", "/api/v1/recommendations", b"{}"),
+            ("POST", "/api/v1/watch/recommendations", b"{}"),
             ("POST", "/api/v1/recommendations/batch-1/shown", b"{}"),
             ("POST", "/api/v1/recommendations/batch-1/actions", b"{}"),
             ("GET", "/api/v1/media/media-1/original", None),
@@ -976,6 +1002,11 @@ class LanHttpApiTests(unittest.TestCase):
             "POST",
             "/api/v1/recommendations",
             {"request_id": "request-1"},
+        )
+        watch_created = self.json_request(
+            "POST",
+            "/api/v1/watch/recommendations",
+            {"request_id": "watch-request-1"},
         )
         shown = self.json_request(
             "POST",
@@ -1010,6 +1041,8 @@ class LanHttpApiTests(unittest.TestCase):
             },
         )
         self.assertEqual(shown.status, 200)
+        self.assertEqual(watch_created.status, 200)
+        self.assertEqual(watch_created.json()["count"], 5)
         self.assertEqual(shown.json(), {"ok": True, "event_id": "event-shown-1"})
         self.assertEqual(action.status, 200)
         self.assertEqual(
@@ -1024,6 +1057,10 @@ class LanHttpApiTests(unittest.TestCase):
         self.assertEqual(
             self.backend.recommendation_created,
             [("request-1", self.client_id, "android-install-main")],
+        )
+        self.assertEqual(
+            self.backend.watch_recommendation_created,
+            [("watch-request-1", self.client_id, "android-install-main")],
         )
         self.assertEqual(
             self.backend.recommendation_shown,
@@ -1057,6 +1094,11 @@ class LanHttpApiTests(unittest.TestCase):
         cases = (
             ("/api/v1/recommendations", {"request_id": ""}),
             ("/api/v1/recommendations", {"request_id": "request-1", "viewer_id": "x"}),
+            ("/api/v1/watch/recommendations", {"request_id": ""}),
+            (
+                "/api/v1/watch/recommendations",
+                {"request_id": "watch-request-1", "viewer_id": "x"},
+            ),
             ("/api/v1/recommendations/batch-1/shown", {"event_id": "bad/id"}),
             (
                 "/api/v1/recommendations/batch-1/shown",

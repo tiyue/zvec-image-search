@@ -21,6 +21,9 @@ RecommendationSlot = Literal["quality", "low_exposure", "random"]
 SLOT_QUOTAS: Mapping[RecommendationSlot, int] = MappingProxyType(
     {"quality": 5, "low_exposure": 6, "random": 4}
 )
+WATCH_SLOT_QUOTAS: Mapping[RecommendationSlot, int] = MappingProxyType(
+    {"quality": 2, "low_exposure": 2, "random": 1}
+)
 _HISTORY_WINDOWS = (240, 210, 180, 150, 120, 90, 60, 30, 0)
 _MAX_ALBUM_ITEMS = 3
 _MAX_CHARACTER_ITEMS = 5
@@ -254,6 +257,41 @@ def select_recommendations(
     call and remain eligible.
     """
 
+    return _select_recommendations(
+        candidates,
+        recent_sha256=recent_sha256,
+        excluded_sha256=excluded_sha256,
+        rng_seed=rng_seed,
+        slot_quotas=SLOT_QUOTAS,
+    )
+
+
+def select_watch_recommendations(
+    candidates: Iterable[RecommendationCandidate],
+    *,
+    recent_sha256: Iterable[str] = (),
+    excluded_sha256: Iterable[str] = (),
+    rng_seed: int = 0,
+) -> RecommendationSelection:
+    """Select at most five unique images for the Wear OS surface."""
+
+    return _select_recommendations(
+        candidates,
+        recent_sha256=recent_sha256,
+        excluded_sha256=excluded_sha256,
+        rng_seed=rng_seed,
+        slot_quotas=WATCH_SLOT_QUOTAS,
+    )
+
+
+def _select_recommendations(
+    candidates: Iterable[RecommendationCandidate],
+    *,
+    recent_sha256: Iterable[str],
+    excluded_sha256: Iterable[str],
+    rng_seed: int,
+    slot_quotas: Mapping[RecommendationSlot, int],
+) -> RecommendationSelection:
     prepared = _prepare_selection(candidates, rng_seed)
     history = _normalized_history(recent_sha256)
     explicit = frozenset(_normalized_sha256(excluded_sha256))
@@ -261,7 +299,7 @@ def select_recommendations(
     windows = _HISTORY_WINDOWS
     for window in windows:
         excluded = explicit | frozenset(history[:window])
-        result = _select_once(prepared, excluded, window)
+        result = _select_once(prepared, excluded, window, slot_quotas)
         if result.status == "complete":
             return result
         if best is None or len(result.items) >= len(best.items):
@@ -343,6 +381,7 @@ def _select_once(
     prepared: _PreparedSelection,
     excluded_sha256: frozenset[str],
     history_window: int,
+    slot_quotas: Mapping[RecommendationSlot, int],
 ) -> RecommendationSelection:
     selected: list[RecommendationItem] = []
     selected_doc_ids: set[str] = set()
@@ -351,7 +390,7 @@ def _select_once(
     character_counts: Counter[str] = Counter()
     diversity_penalties: dict[str, float] = {}
 
-    for slot, quota in SLOT_QUOTAS.items():
+    for slot, quota in slot_quotas.items():
         for _index in range(quota):
             choice = _best_candidate(
                 prepared.ranked_by_slot[slot],
@@ -379,7 +418,7 @@ def _select_once(
                 diversity_penalties,
             )
 
-    while len(selected) < sum(SLOT_QUOTAS.values()):
+    while len(selected) < sum(slot_quotas.values()):
         choice = _best_candidate(
             prepared.ranked_by_slot["random"],
             slot="random",
@@ -408,11 +447,11 @@ def _select_once(
 
     counts = Counter(item.slot for item in selected)
     materialized_counts: Mapping[str, int] = MappingProxyType(
-        {str(slot): counts.get(slot, 0) for slot in SLOT_QUOTAS}
+        {str(slot): counts.get(slot, 0) for slot in slot_quotas}
     )
     return RecommendationSelection(
         items=tuple(selected),
-        status="complete" if len(selected) == sum(SLOT_QUOTAS.values()) else "partial",
+        status="complete" if len(selected) == sum(slot_quotas.values()) else "partial",
         history_window=history_window,
         counts_by_slot=materialized_counts,
     )

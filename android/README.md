@@ -20,6 +20,34 @@ The debug APK is written to `app/build/outputs/apk/debug/app-debug.apk`. The
 repository contains only the Gradle Wrapper and debug signing uses the normal
 local Android debug key. No private release signing key is generated or stored.
 
+## Galaxy Watch5 / Wear OS
+
+The `wear` module is a standalone watch application; a phone is not required at
+runtime. It defaults to `39.105.48.52:38522`, permits an editable IPv4 and port,
+and uses the existing six-digit pairing flow confirmed on the computer.
+
+Build and verify the watch APK:
+
+```powershell
+.\gradlew.bat :wear:testDebugUnitTest :wear:assembleDebug :wear:lintDebug
+```
+
+The APK is written to `wear/build/outputs/apk/debug/wear-debug.apk`. It can be
+installed without Android Studio after enabling Developer options and Wireless
+debugging on the watch:
+
+```powershell
+adb pair <watch-ip:pairing-port>
+adb connect <watch-ip:debug-port>
+adb -s <watch-ip:debug-port> install -r wear\build\outputs\apk\debug\wear-debug.apk
+```
+
+The pairing port shown by Wear OS is only for `adb pair`; use the separate
+debug port shown by the watch for `adb connect` and `adb -s`. After installing,
+open YaoLens on the watch, connect, and approve the displayed six-digit code in
+the running Windows application. The watch requests five thumbnails per batch;
+opening a tile requests that selected original image.
+
 ## Implemented baseline
 
 - UDP broadcast discovery on port 38521 plus manual private IPv4/port entry.

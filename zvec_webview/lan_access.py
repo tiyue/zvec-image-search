@@ -369,6 +369,35 @@ class PreviewLanAdapter:
         client_id: str,
         device_id: str,
     ) -> Mapping[str, object]:
+        return self._create_recommendations(
+            request_id,
+            client_id=client_id,
+            device_id=device_id,
+            watch=False,
+        )
+
+    def create_watch_recommendations(
+        self,
+        request_id: str,
+        *,
+        client_id: str,
+        device_id: str,
+    ) -> Mapping[str, object]:
+        return self._create_recommendations(
+            request_id,
+            client_id=client_id,
+            device_id=device_id,
+            watch=True,
+        )
+
+    def _create_recommendations(
+        self,
+        request_id: str,
+        *,
+        client_id: str,
+        device_id: str,
+        watch: bool,
+    ) -> Mapping[str, object]:
         owner = _client_id(client_id)
         backend = self._recommendation_backend
         if backend is None:
@@ -378,7 +407,12 @@ class PreviewLanAdapter:
                 status=503,
             )
         try:
-            response = backend.create_recommendations(
+            create = (
+                backend.create_watch_recommendations
+                if watch
+                else backend.create_recommendations
+            )
+            response = create(
                 request_id,
                 viewer_id=_lan_recommendation_viewer(device_id),
             )

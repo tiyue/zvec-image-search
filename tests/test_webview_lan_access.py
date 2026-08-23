@@ -132,6 +132,13 @@ class _RecommendationBackend:
             ],
         }
 
+    def create_watch_recommendations(
+        self, request_id: str, *, viewer_id: str | None = None
+    ) -> dict[str, object]:
+        response = self.create_recommendations(request_id, viewer_id=viewer_id)
+        self.calls[-1] = ("watch-create", viewer_id, request_id)
+        return response
+
     def mark_recommendations_shown(
         self, batch_id: str, event_id: str, *, viewer_id: str | None = None
     ) -> None:
@@ -184,6 +191,23 @@ class PreviewLanAdapterTests(unittest.TestCase):
             library_ids=("lib-a",),
             top_k=500,
         )
+
+    def test_watch_recommendations_use_the_dedicated_backend_operation(self) -> None:
+        backend = _RecommendationBackend(self.facade.image_id)
+        adapter = PreviewLanAdapter(
+            self.facade,
+            recommendation_backend=backend,
+        )  # type: ignore[arg-type]
+        adapter.set_recommendation_media_origin("http://192.168.1.20:39000")
+
+        payload = adapter.create_watch_recommendations(
+            "watch-request-1",
+            client_id="session-a",
+            device_id="watch-install-a",
+        )
+
+        self.assertEqual(payload["count"], 1)
+        self.assertEqual(backend.calls[0][0], "watch-create")
 
     def test_lists_only_safe_enabled_library_fields(self) -> None:
         libraries = self.adapter.list_libraries(client_id="tablet-a")

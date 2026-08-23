@@ -54,6 +54,13 @@ class _Client:
             ],
         }
 
+    def create_watch_recommendations(
+        self, viewer_id: str, request_id: str
+    ) -> dict[str, Any]:
+        response = self.create_recommendations(viewer_id, request_id)
+        self.calls[-1] = ("watch-create", viewer_id, request_id)
+        return response
+
     def mark_recommendations_shown(
         self, viewer_id: str, batch_id: str, event_id: str
     ) -> dict[str, Any]:
@@ -76,6 +83,24 @@ class _Client:
 
 
 class RecommendationServiceTests(unittest.TestCase):
+    def test_watch_create_uses_the_dedicated_backend_operation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "raiden.png"
+            Image.new("RGB", (80, 120), (50, 80, 150)).save(source)
+            registry = ImageRegistry(cache_directory=root / "cache")
+            self.addCleanup(registry.close)
+            client = _Client(source)
+            service = RecommendationService(lambda: client, registry, root)
+
+            result = service.create_watch_recommendations(
+                "watch-request-1",
+                viewer_id=f"lan-{'a' * 64}",
+            )
+
+            self.assertEqual(result["count"], 1)
+            self.assertEqual(client.calls[0][0], "watch-create")
+
     def test_personalization_forwards_only_safe_reason_codes(self) -> None:
         self.assertEqual(
             _personalization(

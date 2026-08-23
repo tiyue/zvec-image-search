@@ -23,6 +23,10 @@ class RecommendationClient(Protocol):
         self, viewer_id: str, request_id: str
     ) -> Mapping[str, Any]: ...
 
+    def create_watch_recommendations(
+        self, viewer_id: str, request_id: str
+    ) -> Mapping[str, Any]: ...
+
     def mark_recommendations_shown(
         self, viewer_id: str, batch_id: str, event_id: str
     ) -> Mapping[str, Any]: ...
@@ -94,6 +98,22 @@ class RecommendationService:
     ) -> dict[str, Any]:
         viewer = viewer_id or self.desktop_viewer_id()
         response = self._client_provider().create_recommendations(viewer, request_id)
+        if not isinstance(response, Mapping):
+            raise RecommendationServiceError("推荐服务返回无效数据。")
+        return _browser_batch(
+            response,
+            self._registry,
+            include_performance=viewer_id is None,
+        )
+
+    def create_watch_recommendations(
+        self, request_id: str, *, viewer_id: str | None = None
+    ) -> dict[str, Any]:
+        viewer = viewer_id or self.desktop_viewer_id()
+        response = self._client_provider().create_watch_recommendations(
+            viewer,
+            request_id,
+        )
         if not isinstance(response, Mapping):
             raise RecommendationServiceError("推荐服务返回无效数据。")
         return _browser_batch(
