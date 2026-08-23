@@ -31,7 +31,11 @@ class WatchViewModelTest {
             }
             val second = CompletableDeferred<RecommendationsResponse>()
             val repository = FakeRepository(ArrayDeque(listOf(first, second)))
-            val viewModel = WatchViewModel(repository, ThumbnailLoader { true })
+            val viewModel = WatchViewModel(
+                repository,
+                ThumbnailLoader { true },
+                OriginalLoader { true },
+            )
             advanceUntilIdle()
 
             assertEquals("batch-1", viewModel.state.value.recommendations.batchId)
@@ -50,6 +54,32 @@ class WatchViewModelTest {
 
             assertEquals("batch-2", viewModel.state.value.recommendations.batchId)
             assertEquals(5, viewModel.state.value.recommendations.items.size)
+        } finally {
+            Dispatchers.resetMain()
+        }
+    }
+
+    @Test
+    fun preloadsAllFiveOriginalsWithoutOpeningAnItem() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        Dispatchers.setMain(dispatcher)
+        try {
+            val first = CompletableDeferred<RecommendationsResponse>().apply {
+                complete(response("ignored", "batch-1"))
+            }
+            val next = CompletableDeferred<RecommendationsResponse>()
+            val repository = FakeRepository(ArrayDeque(listOf(first, next)))
+            val originals = mutableListOf<String>()
+            val viewModel = WatchViewModel(
+                repository,
+                ThumbnailLoader { true },
+                OriginalLoader { url -> originals += url; true },
+            )
+
+            advanceUntilIdle()
+
+            assertEquals((1..5).map { "original-$it" }, originals)
+            assertEquals(WatchPage.RECOMMENDATIONS, viewModel.state.value.page)
         } finally {
             Dispatchers.resetMain()
         }

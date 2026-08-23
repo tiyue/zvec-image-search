@@ -12,7 +12,11 @@ import com.zvec.lanviewer.wear.ui.WatchViewModelFactory
 class MainActivity : ComponentActivity() {
     private val viewModel: WatchViewModel by viewModels {
         val container = (application as ZvecWearApplication).container
-        WatchViewModelFactory(container.repository, container.thumbnailLoader)
+        WatchViewModelFactory(
+            container.repository,
+            container.thumbnailLoader,
+            container.originalLoader,
+        )
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {

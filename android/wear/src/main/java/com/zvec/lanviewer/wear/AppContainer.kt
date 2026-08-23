@@ -9,6 +9,7 @@ import com.zvec.lanviewer.wear.data.DefaultWatchRepository
 import com.zvec.lanviewer.wear.data.InstallationStore
 import com.zvec.lanviewer.wear.data.KeystoreTokenStore
 import com.zvec.lanviewer.wear.ui.CoilThumbnailLoader
+import com.zvec.lanviewer.wear.ui.CoilOriginalLoader
 
 class AppContainer(context: Context) {
     private val appContext = context.applicationContext
@@ -36,4 +37,5 @@ class AppContainer(context: Context) {
         .build()
 
     val thumbnailLoader = CoilThumbnailLoader(appContext, imageLoader)
+    val originalLoader = CoilOriginalLoader(appContext, imageLoader)
 }

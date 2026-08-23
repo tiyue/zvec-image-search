@@ -20,6 +20,10 @@ fun interface ThumbnailLoader {
     suspend fun preload(url: String): Boolean
 }
 
+fun interface OriginalLoader {
+    suspend fun preload(url: String): Boolean
+}
+
 class CoilThumbnailLoader(
     private val context: Context,
     private val imageLoader: ImageLoader,
@@ -34,6 +38,23 @@ class CoilThumbnailLoader(
         return imageLoader.execute(request) is SuccessResult
     }
 }
+
+class CoilOriginalLoader(
+    private val context: Context,
+    private val imageLoader: ImageLoader,
+) : OriginalLoader {
+    override suspend fun preload(url: String): Boolean {
+        val request = ImageRequest.Builder(context)
+            .data(url)
+            .size(ORIGINAL_CACHE_SIZE, ORIGINAL_CACHE_SIZE)
+            .memoryCachePolicy(CachePolicy.ENABLED)
+            .diskCachePolicy(CachePolicy.ENABLED)
+            .build()
+        return imageLoader.execute(request) is SuccessResult
+    }
+}
+
+internal const val ORIGINAL_CACHE_SIZE = 2048
 
 internal data class PreloadOutcome(val failedCount: Int)
 

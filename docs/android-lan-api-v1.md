@@ -352,12 +352,14 @@ desktop browsing history.
 Wear starts all five thumbnail loads together and may commit the batch after
 any two thumbnails are ready. It keeps the current five-item batch visible
 while a replacement is slow, prepares at most one next batch, and retries a
-failed replacement without clearing the current grid. Opening an item displays
-the cached thumbnail first and requests only that item's `/original`; pending
-next-batch work is paused so the selected original has network priority. The
-Wear client rebases returned media paths onto its currently selected IPv4 and
-port so thumbnail and original requests use the same FRP endpoint as batch
-creation.
+failed replacement without clearing the current grid. After the thumbnails
+settle, Wear sequentially preloads all five `/original` resources into the same
+Coil disk cache without requiring a tap. Opening an item cancels that background
+queue and gives the selected cached original priority. The original viewer has
+no on-screen back control, retains system/hardware back, and supports bounded
+1x-5x pinch zoom plus panning. The Wear client rebases returned media paths onto
+its currently selected IPv4 and port so thumbnail and original requests use the
+same FRP endpoint as batch creation.
 
 After the current visible batch is shown and all its thumbnails settle, the
 client may prepare at most one next batch in memory. Consuming that batch does

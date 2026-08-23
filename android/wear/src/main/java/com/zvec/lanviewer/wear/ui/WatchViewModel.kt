@@ -51,6 +51,7 @@ data class WatchUiState(
 class WatchViewModel(
     private val repository: WatchRepository,
     private val thumbnailLoader: ThumbnailLoader,
+    private val originalLoader: OriginalLoader,
 ) : ViewModel() {
     private val savedAddress = repository.savedConnection()
         ?.let { ServerAddress.hostPort(it.baseUrl) }
@@ -72,6 +73,7 @@ class WatchViewModel(
     private var preparedPreload: RecommendationPreloadTask? = null
     private var preparedMonitor: Job? = null
     private var shownJob: Job? = null
+    private var originalPreloadJob: Job? = null
     private var settledBatchId: String? = null
     private var shownBatchId: String? = null
 
@@ -309,6 +311,10 @@ class WatchViewModel(
 
     fun closeOriginal() {
         _state.update { it.copy(page = WatchPage.RECOMMENDATIONS, selectedItem = null) }
+        val recommendations = _state.value.recommendations
+        recommendations.batchId?.let { batchId ->
+            startOriginalPreload(batchId, recommendations.items)
+        }
         maybePrepareNext()
     }
 
@@ -340,6 +346,7 @@ class WatchViewModel(
                         )
                     }
                 }
+                startOriginalPreload(batchId, _state.value.recommendations.items)
                 maybePrepareNext()
             } catch (_: CancellationException) {
                 Unit
@@ -408,11 +415,32 @@ class WatchViewModel(
         preparedPreload = null
     }
 
+    private fun startOriginalPreload(
+        batchId: String,
+        items: List<RecommendationItem>,
+    ) {
+        originalPreloadJob?.cancel()
+        originalPreloadJob = viewModelScope.launch {
+            for (item in items) {
+                if (_state.value.recommendations.batchId != batchId) return@launch
+                try {
+                    originalLoader.preload(item.previewUrl)
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (_: Throwable) {
+                    Unit
+                }
+            }
+        }
+    }
+
     private fun cancelCurrentTail(markSettled: Boolean) {
         currentMonitor?.cancel()
         currentMonitor = null
         currentPreload?.cancel()
         currentPreload = null
+        originalPreloadJob?.cancel()
+        originalPreloadJob = null
         if (markSettled) settledBatchId = _state.value.recommendations.batchId
     }
 
@@ -440,11 +468,12 @@ class WatchViewModel(
 class WatchViewModelFactory(
     private val repository: WatchRepository,
     private val thumbnailLoader: ThumbnailLoader,
+    private val originalLoader: OriginalLoader,
 ) : ViewModelProvider.Factory {
     @Suppress("UNCHECKED_CAST")
     override fun <T : ViewModel> create(modelClass: Class<T>): T {
         if (modelClass.isAssignableFrom(WatchViewModel::class.java)) {
-            return WatchViewModel(repository, thumbnailLoader) as T
+            return WatchViewModel(repository, thumbnailLoader, originalLoader) as T
         }
         throw IllegalArgumentException("Unknown ViewModel class")
     }

@@ -3,10 +3,11 @@ package com.zvec.lanviewer.wear.ui
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.rememberTransformableState
+import androidx.compose.foundation.gestures.transformable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
@@ -24,14 +25,18 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -40,6 +45,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.foundation.text.KeyboardOptions
@@ -97,7 +103,7 @@ fun WatchApp(viewModel: WatchViewModel) {
                     onOpen = viewModel::openOriginal,
                 )
                 WatchPage.ORIGINAL -> state.selectedItem?.let { item ->
-                    OriginalScreen(item = item, onBack = viewModel::closeOriginal)
+                    OriginalScreen(item = item)
                 }
             }
         }
@@ -372,72 +378,130 @@ private fun RecommendationTile(
 @Composable
 private fun OriginalScreen(
     item: RecommendationItem,
-    onBack: () -> Unit,
 ) {
     val context = LocalContext.current
     var retry by remember(item.itemId) { mutableIntStateOf(0) }
+    var viewport by remember(item.itemId) { mutableStateOf(IntSize.Zero) }
+    var transform by remember(item.itemId) { mutableStateOf(ZoomTransform()) }
+    val transformableState = rememberTransformableState { zoomChange, panChange, _ ->
+        transform = updatedZoomTransform(
+            current = transform,
+            zoomChange = zoomChange,
+            panChange = panChange,
+            viewport = viewport,
+        )
+    }
     Box(
         modifier = Modifier
             .fillMaxSize()
             .background(Color.Black),
     ) {
-        AsyncImage(
-            model = item.thumbnailUrl,
-            contentDescription = null,
-            modifier = Modifier.fillMaxSize(),
-            contentScale = ContentScale.Fit,
-        )
-        key(retry) {
-            SubcomposeAsyncImage(
-                model = ImageRequest.Builder(context)
-                    .data(item.previewUrl)
-                    .memoryCachePolicy(CachePolicy.ENABLED)
-                    .diskCachePolicy(CachePolicy.ENABLED)
-                    .build(),
-                contentDescription = item.name.ifBlank { "原图" },
-                modifier = Modifier.fillMaxSize(),
-                contentScale = ContentScale.Fit,
-                loading = {
-                    Box(modifier = Modifier.fillMaxSize()) {
-                        Column(
-                            modifier = Modifier
-                                .align(Alignment.BottomCenter)
-                                .padding(bottom = 20.dp),
-                            horizontalAlignment = Alignment.CenterHorizontally,
-                        ) {
-                            CircularProgressIndicator(modifier = Modifier.size(22.dp))
-                            Spacer(Modifier.height(WearTokens.Space4))
-                            Text(text = "原图加载中", color = Color.White, fontSize = 11.sp)
-                        }
-                    }
-                },
-                success = { SubcomposeAsyncImageContent() },
-                error = {
-                    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                        Chip(
-                            onClick = { retry += 1 },
-                            label = {
-                                Text(
-                                    text = "原图加载失败，重试",
-                                    modifier = Modifier.fillMaxWidth(),
-                                    textAlign = TextAlign.Center,
-                                )
-                            },
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(horizontal = 36.dp),
-                        )
-                    }
-                },
-            )
-        }
-        CompactChip(
-            onClick = onBack,
-            label = { Text("返回") },
+        Box(
             modifier = Modifier
-                .align(Alignment.TopCenter)
-                .padding(top = WearTokens.Space8),
-            contentPadding = PaddingValues(horizontal = WearTokens.Space12),
-        )
+                .fillMaxSize()
+                .onSizeChanged { viewport = it }
+                .transformable(transformableState),
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .graphicsLayer {
+                        scaleX = transform.scale
+                        scaleY = transform.scale
+                        translationX = transform.offset.x
+                        translationY = transform.offset.y
+                    },
+            ) {
+                AsyncImage(
+                    model = item.thumbnailUrl,
+                    contentDescription = null,
+                    modifier = Modifier.fillMaxSize(),
+                    contentScale = ContentScale.Fit,
+                )
+                key(retry) {
+                    SubcomposeAsyncImage(
+                        model = ImageRequest.Builder(context)
+                            .data(item.previewUrl)
+                            .size(ORIGINAL_CACHE_SIZE, ORIGINAL_CACHE_SIZE)
+                            .memoryCachePolicy(CachePolicy.ENABLED)
+                            .diskCachePolicy(CachePolicy.ENABLED)
+                            .build(),
+                        contentDescription = item.name.ifBlank { "原图" },
+                        modifier = Modifier.fillMaxSize(),
+                        contentScale = ContentScale.Fit,
+                        loading = {
+                            Box(modifier = Modifier.fillMaxSize()) {
+                                Column(
+                                    modifier = Modifier
+                                        .align(Alignment.BottomCenter)
+                                        .padding(bottom = 20.dp),
+                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                ) {
+                                    CircularProgressIndicator(modifier = Modifier.size(22.dp))
+                                    Spacer(Modifier.height(WearTokens.Space4))
+                                    Text(
+                                        text = "原图加载中",
+                                        color = Color.White,
+                                        fontSize = 11.sp,
+                                    )
+                                }
+                            }
+                        },
+                        success = { SubcomposeAsyncImageContent() },
+                        error = {
+                            Box(
+                                modifier = Modifier.fillMaxSize(),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Chip(
+                                    onClick = { retry += 1 },
+                                    label = {
+                                        Text(
+                                            text = "原图加载失败，重试",
+                                            modifier = Modifier.fillMaxWidth(),
+                                            textAlign = TextAlign.Center,
+                                        )
+                                    },
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(horizontal = 36.dp),
+                                )
+                            }
+                        },
+                    )
+                }
+            }
+        }
     }
 }
+
+internal data class ZoomTransform(
+    val scale: Float = MIN_ORIGINAL_SCALE,
+    val offset: Offset = Offset.Zero,
+)
+
+internal fun updatedZoomTransform(
+    current: ZoomTransform,
+    zoomChange: Float,
+    panChange: Offset,
+    viewport: IntSize,
+): ZoomTransform {
+    val nextScale = (current.scale * zoomChange)
+        .coerceIn(MIN_ORIGINAL_SCALE, MAX_ORIGINAL_SCALE)
+    if (nextScale == MIN_ORIGINAL_SCALE) return ZoomTransform()
+    val scaleRatio = nextScale / current.scale
+    val maxOffsetX = viewport.width * (nextScale - 1f) / 2f
+    val maxOffsetY = viewport.height * (nextScale - 1f) / 2f
+    return ZoomTransform(
+        scale = nextScale,
+        offset = Offset(
+            x = (current.offset.x * scaleRatio + panChange.x)
+                .coerceIn(-maxOffsetX, maxOffsetX),
+            y = (current.offset.y * scaleRatio + panChange.y)
+                .coerceIn(-maxOffsetY, maxOffsetY),
+        ),
+    )
+}
+
+private const val MIN_ORIGINAL_SCALE = 1f
+private const val MAX_ORIGINAL_SCALE = 5f
