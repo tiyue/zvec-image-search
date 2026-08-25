@@ -16,6 +16,7 @@ class MainActivity : ComponentActivity() {
             container.repository,
             container.thumbnailLoader,
             container.originalLoader,
+            container.originalSaver,
         )
     }
 

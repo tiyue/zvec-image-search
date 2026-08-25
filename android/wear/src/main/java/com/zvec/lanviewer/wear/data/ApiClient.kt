@@ -147,6 +147,15 @@ class ApiClient(
         )
     }
 
+    suspend fun recordSave(batchId: String, request: RecommendationActionRequest) {
+        executeUnit(
+            Request.Builder()
+                .url(currentEndpoint("api", "v1", "recommendations", batchId, "actions"))
+                .post(json.encodeToString(request).jsonBody())
+                .build(),
+        )
+    }
+
     private fun currentEndpoint(vararg segments: String): HttpUrl {
         val baseUrl = connectionReader.read()?.baseUrl
             ?: throw IllegalStateException("尚未设置服务器地址")

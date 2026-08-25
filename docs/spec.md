@@ -162,7 +162,7 @@ Kotlin + Gradle 构建的安卓应用，通过 LAN API 与 Windows WebView 宿�
 
 - 启动器使用橙黑相机搜索标识，提供白色背景的 Android 自适应图标以及各屏幕密度的传统、圆形兼容资源。
 - 底部栏提供“推荐”入口；推荐界面采用 Material3，随系统使用 light/dark 配色。推荐原图查看器关闭或系统返回后恢复推荐 Tab、原批次与网格滚动位置；列表卡片不提供反馈按钮，喜欢/不喜欢仅位于推荐原图长按菜单并在提交前立即收起。
-- `android/wear` 是 Galaxy Watch5 / Wear OS 独立应用，不依赖手机运行。默认直连 `39.105.48.52:38522`，允许在二级连接页修改 IPv4 和端口，并复用电脑端确认的六位配对流程；主界面只提供五张推荐、换一批和点图查看原图，随系统使用 light/dark 配色。
+- `android/wear` 是 Galaxy Watch5 / Wear OS 独立应用，不依赖手机运行。默认直连 `39.105.48.52:38522`，允许在二级连接页修改 IPv4 和端口，并复用电脑端确认的六位配对流程；主界面提供六张推荐、换一批和点图查看原图，随系统使用 light/dark 配色。原图页在 1× 时左滑下一张、右滑上一张且首尾不循环，放大后手势改为平移；长按把缓存原图保存到手表 `Pictures/YaoLens`。
 
 ### 搜索查询语义
 
@@ -263,7 +263,7 @@ CLI 入口将配置创建、迁移/后端服务、需要 `ImageVectorService` �
 ### 图片推荐
 
 - 每批目标为 15 张，固定池配额为：技术质量（`quality`）5、低曝光（`low_exposure`）6、随机发现（`random`）4。新批次不得生成最近入库（`recent`）来源；某个池不足时，只能以其他合格候选随机补位，并标记 `quota_degraded`。
-- 手表使用独立的五张推荐入口，目标配额为技术质量 2、低曝光 2、随机发现 1；它复用相同候选、去重、历史、个性化、批次和 shown/action 语义，不改变 Windows 与手机 Android 的 15 张及 5/6/4 配额。
+- 手表使用独立的六张推荐入口，目标配额为技术质量 2、低曝光 2、随机发现 2；它复用相同候选、去重、历史、个性化、批次和 shown/action 语义，不改变 Windows 与手机 Android 的 15 张及 5/6/4 配额。
 - 每个已启用图库正常先采样最多 100 条技术质量候选和 100 条稳定随机候选；只有首轮无法在完整 240 条历史下组成 15 张，或固定 5/6/4 配额发生降级时，才对该请求扩到每类 256 并完整重选一次。首轮与扩容共用同一历史和请求 seed，只持久化最终批次；不再执行按入库时间倒序的最近入库采样，也不执行全库加载或全库随机排序。
 - 选择过程按 SHA-256 去重；同一图集（`library_id + root_id + parent_directory`）最多 3 张，同一已确认角色最多 5 张。推荐不含作者字段，也不施加作者维度的限制。
 - 角色只读取与当前 SHA-256 匹配、状态同时为 accepted 和 confirmed 的标注，并且只使用其 `accepted_auto_tags`。
@@ -275,12 +275,12 @@ CLI 入口将配置创建、迁移/后端服务、需要 `ImageVectorService` �
 - 至少 10 个最终偏好具有可用且兼容的现有向量后才启用个性化。排序调整强度为 `min(0.25, effective_count × 0.005)`，候选调整限制在 `[-0.25, +0.25]`；只作用于 `quality` 和 `low_exposure`，`random` 保持稳定随机探索。冷启动、向量不可用或向量空间不兼容时回退到非个性化排序。
 - Windows viewer 与每台 Android viewer 的推荐批次、shown 历史和曝光计数继续完全隔离。只有客户端成功显示并提交 `shown` 后才计入该 viewer 曝光；创建批次本身不计曝光。
 - `recommendations.sqlite3` 仍仅含 `batches`、`items`、`events`、`content_stats` 四表，并保存不透明标识与计数，不保存文件路径、向量或 token。共享偏好直接从既有事件计算；增加精确候选偏好查询使用的 `idx_items_sha256`、`idx_events_item_action_sequence`，以及有界画像事件倒序读取使用的部分覆盖索引 `idx_events_preference_sequence`，不新增偏好表或数据迁移。
-- LAN 契约为已认证的 `POST /api/v1/recommendations`（标准 15 张）、`POST /api/v1/watch/recommendations`（手表 5 张），两者均只接受 `{request_id}`；shown/action 继续使用 `POST /api/v1/recommendations/{batch_id}/shown`（仅 `{event_id}`）和 `POST /api/v1/recommendations/{batch_id}/actions`（`event_id`、`item_id`、`action`，export 可带 metadata）。`request_id` 使批次创建幂等；`event_id` 使 shown 与 action 幂等。
+- LAN 契约为已认证的 `POST /api/v1/recommendations`（标准 15 张）、`POST /api/v1/watch/recommendations`（手表 6 张），两者均只接受 `{request_id}`；shown/action 继续使用 `POST /api/v1/recommendations/{batch_id}/shown`（仅 `{event_id}`）和 `POST /api/v1/recommendations/{batch_id}/actions`（`event_id`、`item_id`、`action`，export 可带 metadata）。`request_id` 使批次创建幂等；`event_id` 使 shown 与 action 幂等。
 - 推荐响应的每个 item 可含最终共享 `preference`（`like`、`dislike` 或 `null`），顶层 `personalization` 返回 `applied`、`effective_count` 和安全 `reason`。降级 reason 为 `insufficient_preferences`、`vectors_unavailable`、`incompatible_vector_spaces`；幂等批次回放使用 `replayed`，并仍重新读取 item 的当前最终偏好。action 成功响应也返回 `recorded` 与原子读取的当前最终 `preference`，客户端不得把较旧 event ID 的幂等回放误显示为新的跨设备偏好。响应不包含 viewer/device ID 或完整反馈历史。
 - 升级前已经持久化的批次允许在幂等回放时继续返回 `bucket=recent`，不得删除或迁移旧批次；Windows 将该旧来源显示为通用“推荐”，Android 继续安全读取，不再向用户显示“最近入库”。
 - Windows 同时启动一批全部 15 张缩略图预载，固定前 6 张成功后即可把含 15 个图片槽位的批次提交为可见并同步 shown；Android 的固定关键组为前 4 张。关键组失败时保留旧批次且不得 shown；尾部失败只汇总一次，不回滚已可见批次。隐藏期间不得提交新批次，恢复可见后同一批只 shown 一次。shown/action 同步失败时必须复用原 `event_id`；Android shown 使用有上限的指数退避自动重试。
 - 当前批 shown 成功且全部缩略图 settle 后，两端都只允许在内存中静默准备一个下一批。未消费的预热批次不算展示、不增加曝光、不进入 240 条历史；点击消费完整或在途预热不得重复 create/preload。推荐页或 document/Activity 隐藏、断开/重新配对和卸载会取消并丢弃预热；最终 `like/dislike` 状态相对操作前实际变化时也会失效，open/export、最终状态相同的反馈和幂等回放不失效。跨设备偏好在页面持续可见期间变化时，最多影响这一批已生成快照，不新增轮询 API。Android 仅在保存原图成功后提交 `export`（`metadata.channel=save`）；分享不记录 export 事件。
-- 手表将响应中的媒体路径统一挂到用户当前填写的服务器 IPv4/端口，确保缩略图和原图继续通过同一个 FRP 公网入口访问。它并行预载五张缩略图，任意两张成功后即可显示整批槽位，尾部继续加载；加载下一批期间必须保留当前五张，并在当前批 settle 后至多静默准备一批。缩略图 settle 后，即使用户不点图，也通过同一 Coil 磁盘缓存单路顺序预载当前五张 `/original`，不得并发占满慢速服务器；点图时取消后台原图队列并优先显示所选缓存。原图页不显示屏幕返回按钮，保留系统/实体返回，并支持 1×–5× 双指缩放及放大后拖动；失败可在原位置重试。
+- 手表将响应中的媒体路径统一挂到用户当前填写的服务器 IPv4/端口，确保缩略图和原图继续通过同一个 FRP 公网入口访问。它并行预载六张缩略图，任意两张成功后即可显示整批槽位，尾部继续加载；加载下一批期间必须保留当前六张，并在当前批 settle 后至多静默准备一批。缩略图 settle 后，即使用户不点图，也通过同一 Coil 磁盘缓存单路顺序预载当前六张 `/original`，不得并发占满慢速服务器；打开或切换原图时取消后台队列并把当前所选原图置于第一优先级。原图页不显示屏幕返回按钮，保留系统/实体返回；1× 时左滑下一张、右滑上一张且首尾停止，放大后横向手势用于平移，同时保留 1×–5× 双指缩放。长按直接把 Coil 磁盘缓存中的原始响应字节以 pending MediaStore 写入 `Pictures/YaoLens`，缓存缺失时才补下载，失败删除未发布项；成功后提交 `export`（`metadata.channel=wear_save`）。地址、认证、连接、超时、服务端、响应、推荐、缩略图、原图和保存失败必须显示“错误类型：具体原因”，不得只显示通用重试文案。
 - LAN 推荐 item 的 `thumbnail_url` 使用经 Bearer、session owner capability 和撤销校验的 `/api/v1/media/{media_id}/thumbnail`，返回共享 `ImageRegistry` 的 640px 持久化 JPEG 缩略图并支持 GET/HEAD、private cache、ETag/304；`preview_url` 与详情、保存、分享继续走 `/original`。推荐 capability 创建只绑定 registry ID 与精确文件版本，不为列表逐项读取完整原图；首次 original 请求才按稳定版本 single-flight 计算并缓存强 SHA-256。响应不泄露路径、token 或内部 registry ID。
 - Windows 推荐卡片仅显示图片及图片右下角的推荐来源角标，不显示文件名、图库名或“打开/喜欢/导出/不喜欢”底部按钮；单击图片继续打开当前图片。右键菜单仅作用于当前单图，推荐详情及既有操作保持可用，菜单提供详情、系统打开、所在文件夹、喜欢/不喜欢、复制图片、复制文件、复制路径和导出；推荐反馈保持 `like/dislike`，搜索菜单仍使用“相关/不相关”且保留原多选语义。菜单受窗口边界约束，并在点击外部、Escape、窗口缩放或离开推荐页时收起。
 - 新批次在后端记录候选首轮/扩容读取、偏好画像、选择、结果回填和总耗时，以及候选读取次数和画像缓存命中。Windows 本地 bridge 仅白名单透传这些非负数值和布尔诊断字段；字段不得含路径、viewer/device ID、请求/批次/图库标识或偏好内容，LAN/Android 推荐契约保持不变。后端阶段耗时不含 HTTP 与缩略图预载；Windows 端到端性能测量另包含 create HTTP、15 张缩略图预载和 shown 同步，DOM commit/paint 只做独立视觉冒烟，不计入计时。

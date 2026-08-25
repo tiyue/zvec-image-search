@@ -17,7 +17,7 @@ import org.junit.Test
 class RecommendationPreloaderTest {
     @Test
     fun anyTwoSuccessfulThumbnailsReleaseTheBatchBeforeTheTailSettles() = runTest {
-        val gates = (1..5).associate { index ->
+        val gates = (1..6).associate { index ->
             "thumb-$index" to CompletableDeferred<Boolean>()
         }
         val task = backgroundScope.startRecommendationPreload(
@@ -31,8 +31,8 @@ class RecommendationPreloaderTest {
         val settled = async { task.awaitSettled() }
         runCurrent()
 
-        gates.getValue("thumb-4").complete(true)
         gates.getValue("thumb-5").complete(true)
+        gates.getValue("thumb-6").complete(true)
         runCurrent()
 
         assertTrue(critical.isCompleted)
@@ -42,6 +42,7 @@ class RecommendationPreloaderTest {
         gates.getValue("thumb-1").complete(true)
         gates.getValue("thumb-2").complete(false)
         gates.getValue("thumb-3").complete(true)
+        gates.getValue("thumb-4").complete(true)
         advanceUntilIdle()
 
         assertEquals(1, settled.await().failedCount)
@@ -52,8 +53,8 @@ internal fun response(requestId: String, batchId: String): RecommendationsRespon
     RecommendationsResponse(
         requestId = requestId,
         batchId = batchId,
-        count = 5,
-        items = (1..5).map { index ->
+        count = 6,
+        items = (1..6).map { index ->
             RecommendationItem(
                 itemId = "$batchId-item-$index",
                 mediaId = "$batchId-media-$index",

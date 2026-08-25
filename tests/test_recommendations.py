@@ -65,22 +65,22 @@ def _selection_digest(candidate_count: int) -> str:
 
 
 class RecommendationSelectionTests(unittest.TestCase):
-    def test_watch_returns_the_fixed_two_two_one_quota(self) -> None:
+    def test_watch_returns_the_fixed_two_two_two_quota(self) -> None:
         candidates = [_candidate(number) for number in range(30)]
 
         result = select_watch_recommendations(candidates, rng_seed=7)
 
         self.assertEqual(result.status, "complete")
-        self.assertEqual(len(result.items), 5)
+        self.assertEqual(len(result.items), 6)
         self.assertEqual(
             result.counts_by_slot,
             {
                 "quality": 2,
                 "low_exposure": 2,
-                "random": 1,
+                "random": 2,
             },
         )
-        self.assertEqual(len({item.candidate.doc_id for item in result.items}), 5)
+        self.assertEqual(len({item.candidate.doc_id for item in result.items}), 6)
 
     def test_returns_the_fixed_five_six_four_quota_without_recent(self) -> None:
         candidates = [_candidate(number) for number in range(30)]

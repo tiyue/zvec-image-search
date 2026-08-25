@@ -147,7 +147,7 @@ class RecommendationBackend(Protocol):
         client_id: str,
         device_id: str,
     ) -> Mapping[str, object]:
-        """Create a five-item device-scoped Wear OS recommendation batch."""
+        """Create a six-item device-scoped Wear OS recommendation batch."""
 
     def mark_recommendations_shown(
         self,

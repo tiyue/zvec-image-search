@@ -257,9 +257,9 @@ Batch creation accepts exactly one opaque request identifier:
 `POST /api/v1/recommendations` keeps the existing 15-item target and
 `quality=5`, `low_exposure=6`, `random=4` quotas. The standalone Wear OS client
 uses `POST /api/v1/watch/recommendations`; it accepts the same exact request
-body and returns the same response shape with a five-item target and
-`quality=2`, `low_exposure=2`, `random=1`. A partial batch remains possible
-when the eligible library cannot supply five distinct items. The Wear route
+body and returns the same response shape with a six-item target and
+`quality=2`, `low_exposure=2`, `random=2`. A partial batch remains possible
+when the eligible library cannot supply six distinct items. The Wear route
 does not change the desktop or phone Android recommendation contract.
 
 A successful response includes the device-scoped batch and exposure metadata,
@@ -349,17 +349,22 @@ not affect exposure or the 240-item history. Batch, shown history, and exposure
 counts remain isolated by Android installation and are never merged with
 desktop browsing history.
 
-Wear starts all five thumbnail loads together and may commit the batch after
-any two thumbnails are ready. It keeps the current five-item batch visible
+Wear starts all six thumbnail loads together and may commit the batch after
+any two thumbnails are ready. It keeps the current six-item batch visible
 while a replacement is slow, prepares at most one next batch, and retries a
 failed replacement without clearing the current grid. After the thumbnails
-settle, Wear sequentially preloads all five `/original` resources into the same
+settle, Wear sequentially preloads all six `/original` resources into the same
 Coil disk cache without requiring a tap. Opening an item cancels that background
-queue and gives the selected cached original priority. The original viewer has
-no on-screen back control, retains system/hardware back, and supports bounded
-1x-5x pinch zoom plus panning. The Wear client rebases returned media paths onto
-its currently selected IPv4 and port so thumbnail and original requests use the
-same FRP endpoint as batch creation.
+queue and gives the selected cached original priority. At 1x the original viewer
+swipes left for the next item and right for the previous item, stopping at the
+batch edges; above 1x the same motion pans the enlarged image. It has no
+on-screen back control, retains system/hardware back, supports bounded 1x-5x
+pinch zoom, and saves the cached original to `Pictures/YaoLens` on long press.
+Only a successful save submits `export` with `metadata.channel=wear_save`.
+Connection, timeout, authentication, server, response, thumbnail, original, and
+save failures are displayed as a typed error plus a concrete reason. The Wear
+client rebases returned media paths onto its currently selected IPv4 and port so
+thumbnail and original requests use the same FRP endpoint as batch creation.
 
 After the current visible batch is shown and all its thumbnails settle, the
 client may prepare at most one next batch in memory. Consuming that batch does

@@ -45,10 +45,13 @@ adb -s <watch-ip:debug-port> install -r wear\build\outputs\apk\debug\wear-debug.
 The pairing port shown by Wear OS is only for `adb pair`; use the separate
 debug port shown by the watch for `adb connect` and `adb -s`. After installing,
 open YaoLens on the watch, connect, and approve the displayed six-digit code in
-the running Windows application. The watch requests five thumbnails per batch;
-after they settle it sequentially caches all five originals without requiring a
-tap. The full-screen viewer uses the watch's hardware/system back action and
-supports 1x-5x pinch zoom with panning.
+the running Windows application. The watch requests six thumbnails per batch;
+after they settle it sequentially caches all six originals without requiring a
+tap. The full-screen viewer uses the watch's hardware/system back action,
+supports bounded left/right navigation, 1x-5x pinch zoom with panning, and saves
+the cached original to `Pictures/YaoLens` on long press. Connection,
+recommendation, image, and save failures show both an error type and a concrete
+reason.
 
 ## Implemented baseline
 

@@ -22,7 +22,7 @@ import java.io.IOException
 @OptIn(ExperimentalCoroutinesApi::class)
 class WatchViewModelTest {
     @Test
-    fun refreshKeepsCurrentFiveImagesWhileThePreparedBatchIsDelayed() = runTest {
+    fun refreshKeepsCurrentSixImagesWhileThePreparedBatchIsDelayed() = runTest {
         val dispatcher = StandardTestDispatcher(testScheduler)
         Dispatchers.setMain(dispatcher)
         try {
@@ -35,11 +35,12 @@ class WatchViewModelTest {
                 repository,
                 ThumbnailLoader { true },
                 OriginalLoader { true },
+                OriginalSaver { },
             )
             advanceUntilIdle()
 
             assertEquals("batch-1", viewModel.state.value.recommendations.batchId)
-            assertEquals(5, viewModel.state.value.recommendations.items.size)
+            assertEquals(6, viewModel.state.value.recommendations.items.size)
             assertTrue(repository.requestCount >= 2)
 
             viewModel.loadRecommendations()
@@ -47,20 +48,20 @@ class WatchViewModelTest {
 
             assertTrue(viewModel.state.value.recommendations.isLoading)
             assertEquals("batch-1", viewModel.state.value.recommendations.batchId)
-            assertEquals(5, viewModel.state.value.recommendations.items.size)
+            assertEquals(6, viewModel.state.value.recommendations.items.size)
 
             second.complete(response("ignored", "batch-2"))
             advanceUntilIdle()
 
             assertEquals("batch-2", viewModel.state.value.recommendations.batchId)
-            assertEquals(5, viewModel.state.value.recommendations.items.size)
+            assertEquals(6, viewModel.state.value.recommendations.items.size)
         } finally {
             Dispatchers.resetMain()
         }
     }
 
     @Test
-    fun preloadsAllFiveOriginalsWithoutOpeningAnItem() = runTest {
+    fun preloadsAllSixOriginalsWithoutOpeningAnItem() = runTest {
         val dispatcher = StandardTestDispatcher(testScheduler)
         Dispatchers.setMain(dispatcher)
         try {
@@ -74,12 +75,85 @@ class WatchViewModelTest {
                 repository,
                 ThumbnailLoader { true },
                 OriginalLoader { url -> originals += url; true },
+                OriginalSaver { },
             )
 
             advanceUntilIdle()
 
-            assertEquals((1..5).map { "original-$it" }, originals)
+            assertEquals((1..6).map { "original-$it" }, originals)
             assertEquals(WatchPage.RECOMMENDATIONS, viewModel.state.value.page)
+        } finally {
+            Dispatchers.resetMain()
+        }
+    }
+
+    @Test
+    fun originalViewerStopsAtTheEdgesAndSavesTheSelectedItem() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        Dispatchers.setMain(dispatcher)
+        try {
+            val first = CompletableDeferred<RecommendationsResponse>().apply {
+                complete(response("ignored", "batch-1"))
+            }
+            val next = CompletableDeferred<RecommendationsResponse>()
+            val repository = FakeRepository(ArrayDeque(listOf(first, next)))
+            val savedItems = mutableListOf<String>()
+            val viewModel = WatchViewModel(
+                repository,
+                ThumbnailLoader { true },
+                OriginalLoader { true },
+                OriginalSaver { item -> savedItems += item.itemId },
+            )
+            advanceUntilIdle()
+
+            viewModel.openOriginal("batch-1-item-1")
+            viewModel.showPreviousOriginal()
+            assertEquals("batch-1-item-1", viewModel.state.value.selectedItem?.itemId)
+
+            repeat(6) { viewModel.showNextOriginal() }
+            assertEquals("batch-1-item-6", viewModel.state.value.selectedItem?.itemId)
+
+            viewModel.saveSelectedOriginal()
+            runCurrent()
+
+            assertEquals(listOf("batch-1-item-6"), savedItems)
+            assertEquals("已保存到相册", viewModel.state.value.originalSaveMessage)
+            assertEquals(listOf("batch-1-item-6"), repository.savedItems)
+        } finally {
+            Dispatchers.resetMain()
+        }
+    }
+
+    @Test
+    fun saveFailureDisplaysItsTypeAndConcreteReason() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        Dispatchers.setMain(dispatcher)
+        try {
+            val first = CompletableDeferred<RecommendationsResponse>().apply {
+                complete(response("ignored", "batch-1"))
+            }
+            val next = CompletableDeferred<RecommendationsResponse>()
+            val viewModel = WatchViewModel(
+                FakeRepository(ArrayDeque(listOf(first, next))),
+                ThumbnailLoader { true },
+                OriginalLoader { true },
+                OriginalSaver {
+                    throw WatchOperationException(
+                        WatchErrorType.STORAGE,
+                        "手表存储空间不足",
+                    )
+                },
+            )
+            advanceUntilIdle()
+
+            viewModel.openOriginal("batch-1-item-1")
+            viewModel.saveSelectedOriginal()
+            runCurrent()
+
+            assertEquals(
+                "保存错误：手表存储空间不足",
+                viewModel.state.value.originalSaveMessage,
+            )
         } finally {
             Dispatchers.resetMain()
         }
@@ -91,6 +165,7 @@ private class FakeRepository(
 ) : WatchRepository {
     var requestCount = 0
         private set
+    val savedItems = mutableListOf<String>()
 
     override fun savedConnection() = SavedConnection("http://39.105.48.52:38522")
     override fun hasToken() = true
@@ -110,4 +185,7 @@ private class FakeRepository(
 
     override suspend fun markShown(batchId: String, eventId: String) = Unit
     override suspend fun recordOpen(batchId: String, itemId: String, eventId: String) = Unit
+    override suspend fun recordSave(batchId: String, itemId: String, eventId: String) {
+        savedItems += itemId
+    }
 }

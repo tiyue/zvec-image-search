@@ -18,7 +18,6 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import java.io.IOException
-import java.net.SocketTimeoutException
 import java.util.UUID
 
 enum class WatchPage {
@@ -46,12 +45,15 @@ data class WatchUiState(
     val canReturnFromSettings: Boolean = false,
     val recommendations: RecommendationUiState = RecommendationUiState(),
     val selectedItem: RecommendationItem? = null,
+    val isSavingOriginal: Boolean = false,
+    val originalSaveMessage: String? = null,
 )
 
 class WatchViewModel(
     private val repository: WatchRepository,
     private val thumbnailLoader: ThumbnailLoader,
     private val originalLoader: OriginalLoader,
+    private val originalSaver: OriginalSaver,
 ) : ViewModel() {
     private val savedAddress = repository.savedConnection()
         ?.let { ServerAddress.hostPort(it.baseUrl) }
@@ -74,6 +76,7 @@ class WatchViewModel(
     private var preparedMonitor: Job? = null
     private var shownJob: Job? = null
     private var originalPreloadJob: Job? = null
+    private var saveOriginalJob: Job? = null
     private var settledBatchId: String? = null
     private var shownBatchId: String? = null
 
@@ -97,7 +100,14 @@ class WatchViewModel(
         val port = current.port.toIntOrNull()
         val baseUrl = port?.let { ServerAddress.fromHostPort(current.host, it) }
         if (baseUrl == null) {
-            _state.update { it.copy(connectionError = "请输入正确的 IPv4 和端口") }
+            _state.update {
+                it.copy(
+                    connectionError = WatchFailure(
+                        WatchErrorType.ADDRESS,
+                        "请输入有效的 IPv4 和端口",
+                    ).displayText,
+                )
+            }
             return
         }
         connectionJob = viewModelScope.launch {
@@ -131,7 +141,14 @@ class WatchViewModel(
                     val status = try {
                         repository.pollPairing(attempt)
                     } catch (error: IOException) {
-                        _state.update { it.copy(pairingMessage = "网络有延迟，继续等待电脑确认") }
+                        _state.update {
+                            it.copy(
+                                pairingMessage = watchErrorMessage(
+                                    error,
+                                    WatchOperation.CONNECTION,
+                                ) + "；继续等待电脑确认",
+                            )
+                        }
                         continue
                     }
                     when (status) {
@@ -149,11 +166,20 @@ class WatchViewModel(
                             loadRecommendations()
                             return@launch
                         }
-                        PairingStatus.REJECTED -> throw IOException("电脑端已拒绝配对")
-                        PairingStatus.EXPIRED -> throw IOException("配对已过期，请重试")
+                        PairingStatus.REJECTED -> throw WatchOperationException(
+                            WatchErrorType.AUTHENTICATION,
+                            "电脑端已拒绝配对",
+                        )
+                        PairingStatus.EXPIRED -> throw WatchOperationException(
+                            WatchErrorType.TIMEOUT,
+                            "配对请求已经过期",
+                        )
                     }
                 }
-                throw IOException("配对已过期，请重试")
+                throw WatchOperationException(
+                    WatchErrorType.TIMEOUT,
+                    "等待电脑端确认超过有效时间",
+                )
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Throwable) {
@@ -164,7 +190,7 @@ class WatchViewModel(
                         comparisonCode = null,
                         pairingMessage = null,
                         canReturnFromSettings = false,
-                        connectionError = friendlyMessage(error),
+                        connectionError = watchErrorMessage(error, WatchOperation.CONNECTION),
                     )
                 }
             }
@@ -261,7 +287,10 @@ class WatchViewModel(
                             items = response.items,
                             isLoading = false,
                             errorMessage = if (response.items.size < RECOMMENDATION_COUNT) {
-                                "本批只有 ${response.items.size} 张可用图片"
+                                WatchFailure(
+                                    WatchErrorType.RECOMMENDATION,
+                                    "服务器只返回 ${response.items.size} 张可用图片",
+                                ).displayText
                             } else {
                                 null
                             },
@@ -281,7 +310,10 @@ class WatchViewModel(
                         it.copy(
                             page = WatchPage.CONNECTION,
                             recommendations = it.recommendations.copy(isLoading = false),
-                            connectionError = "连接已失效，请重新配对",
+                            connectionError = WatchFailure(
+                                WatchErrorType.AUTHENTICATION,
+                                "连接授权已失效，请重新配对",
+                            ).displayText,
                         )
                     }
                 } else {
@@ -289,7 +321,10 @@ class WatchViewModel(
                         it.copy(
                             recommendations = it.recommendations.copy(
                                 isLoading = false,
-                                errorMessage = friendlyMessage(error),
+                                errorMessage = watchErrorMessage(
+                                    error,
+                                    WatchOperation.RECOMMENDATION,
+                                ),
                             ),
                         )
                     }
@@ -299,18 +334,100 @@ class WatchViewModel(
     }
 
     fun openOriginal(itemId: String) {
-        val item = _state.value.recommendations.items.firstOrNull { it.itemId == itemId } ?: return
+        val recommendations = _state.value.recommendations
+        val item = recommendations.items.firstOrNull { it.itemId == itemId } ?: return
         cancelPrepared()
         cancelCurrentTail(markSettled = true)
-        _state.update { it.copy(page = WatchPage.ORIGINAL, selectedItem = item) }
-        val batchId = _state.value.recommendations.batchId ?: return
+        _state.update {
+            it.copy(
+                page = WatchPage.ORIGINAL,
+                selectedItem = item,
+                originalSaveMessage = null,
+            )
+        }
+        val batchId = recommendations.batchId ?: return
+        startOriginalPreload(batchId, prioritizedOriginals(recommendations.items, item.itemId))
+        recordOpen(batchId, item.itemId)
+    }
+
+    fun showPreviousOriginal() = showAdjacentOriginal(-1)
+
+    fun showNextOriginal() = showAdjacentOriginal(1)
+
+    fun saveSelectedOriginal() {
+        if (saveOriginalJob?.isActive == true) return
+        val current = _state.value
+        if (current.page != WatchPage.ORIGINAL) return
+        val item = current.selectedItem ?: return
+        val batchId = current.recommendations.batchId ?: return
+        saveOriginalJob = viewModelScope.launch {
+            _state.update {
+                it.copy(isSavingOriginal = true, originalSaveMessage = "正在保存原图…")
+            }
+            try {
+                originalSaver.save(item)
+                _state.update { state ->
+                    if (state.selectedItem?.itemId == item.itemId) {
+                        state.copy(
+                            isSavingOriginal = false,
+                            originalSaveMessage = "已保存到相册",
+                        )
+                    } else {
+                        state.copy(isSavingOriginal = false, originalSaveMessage = null)
+                    }
+                }
+                viewModelScope.launch {
+                    runCatching {
+                        repository.recordSave(batchId, item.itemId, UUID.randomUUID().toString())
+                    }
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                _state.update { state ->
+                    if (state.selectedItem?.itemId == item.itemId) {
+                        state.copy(
+                            isSavingOriginal = false,
+                            originalSaveMessage = watchErrorMessage(
+                                error,
+                                WatchOperation.SAVE,
+                            ),
+                        )
+                    } else {
+                        state.copy(isSavingOriginal = false, originalSaveMessage = null)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun showAdjacentOriginal(offset: Int) {
+        if (offset != -1 && offset != 1) return
+        val current = _state.value
+        if (current.page != WatchPage.ORIGINAL) return
+        val items = current.recommendations.items
+        val currentIndex = items.indexOfFirst { it.itemId == current.selectedItem?.itemId }
+        val target = items.getOrNull(currentIndex + offset) ?: return
+        _state.update { it.copy(selectedItem = target, originalSaveMessage = null) }
+        val batchId = current.recommendations.batchId ?: return
+        startOriginalPreload(batchId, prioritizedOriginals(items, target.itemId))
+        recordOpen(batchId, target.itemId)
+    }
+
+    private fun recordOpen(batchId: String, itemId: String) {
         viewModelScope.launch {
-            runCatching { repository.recordOpen(batchId, item.itemId, UUID.randomUUID().toString()) }
+            runCatching { repository.recordOpen(batchId, itemId, UUID.randomUUID().toString()) }
         }
     }
 
     fun closeOriginal() {
-        _state.update { it.copy(page = WatchPage.RECOMMENDATIONS, selectedItem = null) }
+        _state.update {
+            it.copy(
+                page = WatchPage.RECOMMENDATIONS,
+                selectedItem = null,
+                originalSaveMessage = null,
+            )
+        }
         val recommendations = _state.value.recommendations
         recommendations.batchId?.let { batchId ->
             startOriginalPreload(batchId, recommendations.items)
@@ -338,10 +455,16 @@ class WatchViewModel(
                 currentPreload = null
                 settledBatchId = batchId
                 if (outcome.failedCount > 0) {
+                    val message = outcome.lastError?.let { error ->
+                        watchErrorMessage(error, WatchOperation.THUMBNAIL)
+                    } ?: WatchFailure(
+                        WatchErrorType.THUMBNAIL,
+                        "${outcome.failedCount} 张缩略图无法显示",
+                    ).displayText
                     _state.update {
                         it.copy(
                             recommendations = it.recommendations.copy(
-                                errorMessage = "部分缩略图加载较慢，可点图直接查看原图",
+                                errorMessage = "$message；可点图直接查看原图",
                             ),
                         )
                     }
@@ -350,8 +473,20 @@ class WatchViewModel(
                 maybePrepareNext()
             } catch (_: CancellationException) {
                 Unit
-            } catch (_: Throwable) {
+            } catch (error: Throwable) {
                 currentPreload = null
+                if (_state.value.recommendations.batchId == batchId) {
+                    _state.update {
+                        it.copy(
+                            recommendations = it.recommendations.copy(
+                                errorMessage = watchErrorMessage(
+                                    error,
+                                    WatchOperation.THUMBNAIL,
+                                ),
+                            ),
+                        )
+                    }
+                }
             }
         }
     }
@@ -434,6 +569,15 @@ class WatchViewModel(
         }
     }
 
+    private fun prioritizedOriginals(
+        items: List<RecommendationItem>,
+        selectedItemId: String,
+    ): List<RecommendationItem> {
+        val selectedIndex = items.indexOfFirst { it.itemId == selectedItemId }
+        if (selectedIndex < 0) return items
+        return items.drop(selectedIndex) + items.take(selectedIndex)
+    }
+
     private fun cancelCurrentTail(markSettled: Boolean) {
         currentMonitor?.cancel()
         currentMonitor = null
@@ -447,18 +591,8 @@ class WatchViewModel(
     private fun isAuthenticationError(error: Throwable): Boolean =
         error is ApiException && error.httpStatus in setOf(401, 403)
 
-    private fun friendlyMessage(error: Throwable): String = when {
-        error is ApiException && error.httpStatus == 502 ->
-            "电脑端暂未响应，请确认电脑端已启动后重试"
-        error is SocketTimeoutException ->
-            "服务器响应较慢，请重试；当前内容会保留"
-        error is ApiException && error.message.isNotBlank() -> error.message
-        error is IOException -> "连接中断，请重试"
-        else -> "操作失败，请重试"
-    }
-
     companion object {
-        private const val RECOMMENDATION_COUNT = 5
+        private const val RECOMMENDATION_COUNT = 6
         private const val CRITICAL_THUMBNAIL_COUNT = 2
         private const val SHOWN_RETRY_COUNT = 3
         private const val PAIRING_POLL_INTERVAL_MS = 1_000L
@@ -469,11 +603,17 @@ class WatchViewModelFactory(
     private val repository: WatchRepository,
     private val thumbnailLoader: ThumbnailLoader,
     private val originalLoader: OriginalLoader,
+    private val originalSaver: OriginalSaver,
 ) : ViewModelProvider.Factory {
     @Suppress("UNCHECKED_CAST")
     override fun <T : ViewModel> create(modelClass: Class<T>): T {
         if (modelClass.isAssignableFrom(WatchViewModel::class.java)) {
-            return WatchViewModel(repository, thumbnailLoader, originalLoader) as T
+            return WatchViewModel(
+                repository,
+                thumbnailLoader,
+                originalLoader,
+                originalSaver,
+            ) as T
         }
         throw IllegalArgumentException("Unknown ViewModel class")
     }

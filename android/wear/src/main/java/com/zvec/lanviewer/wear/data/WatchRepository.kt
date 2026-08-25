@@ -29,6 +29,7 @@ interface WatchRepository {
     suspend fun recommendations(requestId: String): RecommendationsResponse
     suspend fun markShown(batchId: String, eventId: String)
     suspend fun recordOpen(batchId: String, itemId: String, eventId: String)
+    suspend fun recordSave(batchId: String, itemId: String, eventId: String)
 }
 
 class DefaultWatchRepository(
@@ -106,6 +107,18 @@ class DefaultWatchRepository(
                 itemId = itemId,
                 action = "open",
                 metadata = mapOf("surface" to "wear_original"),
+            ),
+        )
+    }
+
+    override suspend fun recordSave(batchId: String, itemId: String, eventId: String) {
+        api.recordSave(
+            batchId,
+            RecommendationActionRequest(
+                eventId = eventId,
+                itemId = itemId,
+                action = "export",
+                metadata = mapOf("channel" to "wear_save"),
             ),
         )
     }

@@ -164,14 +164,14 @@ class _FakeBackend:
         return {
             "request_id": request_id,
             "batch_id": "watch-batch-1",
-            "count": 5,
+            "count": 6,
             "items": [
                 {
                     "item_id": f"watch-item-{index}",
                     "media_id": f"watch-media-{index}",
                     "bucket": "random",
                 }
-                for index in range(5)
+                for index in range(6)
             ],
         }
 
@@ -1042,7 +1042,7 @@ class LanHttpApiTests(unittest.TestCase):
         )
         self.assertEqual(shown.status, 200)
         self.assertEqual(watch_created.status, 200)
-        self.assertEqual(watch_created.json()["count"], 5)
+        self.assertEqual(watch_created.json()["count"], 6)
         self.assertEqual(shown.json(), {"ok": True, "event_id": "event-shown-1"})
         self.assertEqual(action.status, 200)
         self.assertEqual(

@@ -3,8 +3,11 @@ package com.zvec.lanviewer.wear.ui
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.rememberTransformableState
-import androidx.compose.foundation.gestures.transformable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.calculatePan
+import androidx.compose.foundation.gestures.calculateZoom
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -37,6 +40,8 @@ import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.positionChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -55,11 +60,11 @@ import androidx.wear.compose.material.CompactChip
 import androidx.wear.compose.material.MaterialTheme
 import androidx.wear.compose.material.Text
 import coil.compose.AsyncImage
+import coil.compose.AsyncImagePainter
 import coil.compose.SubcomposeAsyncImage
 import coil.compose.SubcomposeAsyncImageContent
-import coil.request.CachePolicy
-import coil.request.ImageRequest
 import com.zvec.lanviewer.wear.data.RecommendationItem
+import kotlin.math.abs
 
 @Composable
 fun WatchApp(viewModel: WatchViewModel) {
@@ -103,7 +108,14 @@ fun WatchApp(viewModel: WatchViewModel) {
                     onOpen = viewModel::openOriginal,
                 )
                 WatchPage.ORIGINAL -> state.selectedItem?.let { item ->
-                    OriginalScreen(item = item)
+                    OriginalScreen(
+                        item = item,
+                        isSaving = state.isSavingOriginal,
+                        saveMessage = state.originalSaveMessage,
+                        onPrevious = viewModel::showPreviousOriginal,
+                        onNext = viewModel::showNextOriginal,
+                        onSave = viewModel::saveSelectedOriginal,
+                    )
                 }
             }
         }
@@ -325,7 +337,7 @@ private fun RecommendationGrid(
     items: List<RecommendationItem>,
     onOpen: (String) -> Unit,
 ) {
-    val slots = List(5) { index -> items.getOrNull(index) }
+    val slots = List(6) { index -> items.getOrNull(index) }
     slots.chunked(2).forEach { rowItems ->
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -378,19 +390,16 @@ private fun RecommendationTile(
 @Composable
 private fun OriginalScreen(
     item: RecommendationItem,
+    isSaving: Boolean,
+    saveMessage: String?,
+    onPrevious: () -> Unit,
+    onNext: () -> Unit,
+    onSave: () -> Unit,
 ) {
     val context = LocalContext.current
     var retry by remember(item.itemId) { mutableIntStateOf(0) }
     var viewport by remember(item.itemId) { mutableStateOf(IntSize.Zero) }
     var transform by remember(item.itemId) { mutableStateOf(ZoomTransform()) }
-    val transformableState = rememberTransformableState { zoomChange, panChange, _ ->
-        transform = updatedZoomTransform(
-            current = transform,
-            zoomChange = zoomChange,
-            panChange = panChange,
-            viewport = viewport,
-        )
-    }
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -400,7 +409,16 @@ private fun OriginalScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .onSizeChanged { viewport = it }
-                .transformable(transformableState),
+                .originalImageGestures(
+                    itemId = item.itemId,
+                    viewport = viewport,
+                    currentTransform = { transform },
+                    updateTransform = { transform = it },
+                    canSave = !isSaving,
+                    onPrevious = onPrevious,
+                    onNext = onNext,
+                    onSave = onSave,
+                ),
         ) {
             Box(
                 modifier = Modifier
@@ -420,12 +438,7 @@ private fun OriginalScreen(
                 )
                 key(retry) {
                     SubcomposeAsyncImage(
-                        model = ImageRequest.Builder(context)
-                            .data(item.previewUrl)
-                            .size(ORIGINAL_CACHE_SIZE, ORIGINAL_CACHE_SIZE)
-                            .memoryCachePolicy(CachePolicy.ENABLED)
-                            .diskCachePolicy(CachePolicy.ENABLED)
-                            .build(),
+                        model = originalImageRequest(context, item.previewUrl),
                         contentDescription = item.name.ifBlank { "原图" },
                         modifier = Modifier.fillMaxSize(),
                         contentScale = ContentScale.Fit,
@@ -449,6 +462,15 @@ private fun OriginalScreen(
                         },
                         success = { SubcomposeAsyncImageContent() },
                         error = {
+                            val cause = (painter.state as? AsyncImagePainter.State.Error)
+                                ?.result
+                                ?.throwable
+                            val message = cause?.let { error ->
+                                watchErrorMessage(error, WatchOperation.ORIGINAL)
+                            } ?: WatchFailure(
+                                WatchErrorType.ORIGINAL,
+                                "图片格式无法解码或原图响应为空",
+                            ).displayText
                             Box(
                                 modifier = Modifier.fillMaxSize(),
                                 contentAlignment = Alignment.Center,
@@ -457,9 +479,10 @@ private fun OriginalScreen(
                                     onClick = { retry += 1 },
                                     label = {
                                         Text(
-                                            text = "原图加载失败，重试",
+                                            text = "$message，点按重试",
                                             modifier = Modifier.fillMaxWidth(),
                                             textAlign = TextAlign.Center,
+                                            fontSize = 10.sp,
                                         )
                                     },
                                     modifier = Modifier
@@ -472,7 +495,102 @@ private fun OriginalScreen(
                 }
             }
         }
+        saveMessage?.let { message ->
+            Text(
+                text = message,
+                color = Color.White,
+                fontSize = 11.sp,
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(bottom = WearTokens.Space12)
+                    .clip(RoundedCornerShape(WearTokens.Radius12))
+                    .background(Color.Black.copy(alpha = 0.72f))
+                    .padding(horizontal = WearTokens.Space12, vertical = WearTokens.Space8),
+            )
+        }
     }
+}
+
+private fun Modifier.originalImageGestures(
+    itemId: String,
+    viewport: IntSize,
+    currentTransform: () -> ZoomTransform,
+    updateTransform: (ZoomTransform) -> Unit,
+    canSave: Boolean,
+    onPrevious: () -> Unit,
+    onNext: () -> Unit,
+    onSave: () -> Unit,
+): Modifier = this
+    .pointerInput(itemId, viewport) {
+        awaitEachGesture {
+            awaitFirstDown(requireUnconsumed = false)
+            var totalPan = Offset.Zero
+            var transformed = false
+            var pointersPressed: Boolean
+            do {
+                val event = awaitPointerEvent()
+                val zoomChange = event.calculateZoom()
+                val panChange = event.calculatePan()
+                if (event.changes.count { it.pressed } > 1 || zoomChange != 1f) {
+                    transformed = true
+                    totalPan = Offset.Zero
+                }
+                if (transformed || currentTransform().scale > MIN_ORIGINAL_SCALE) {
+                    updateTransform(
+                        updatedZoomTransform(
+                            current = currentTransform(),
+                            zoomChange = zoomChange,
+                            panChange = panChange,
+                            viewport = viewport,
+                        ),
+                    )
+                } else {
+                    totalPan += panChange
+                }
+                val shouldConsume = transformed ||
+                    currentTransform().scale > MIN_ORIGINAL_SCALE ||
+                    totalPan.getDistance() > viewConfiguration.touchSlop
+                if (shouldConsume) {
+                    event.changes.forEach { change ->
+                        if (change.positionChanged()) change.consume()
+                    }
+                }
+                pointersPressed = event.changes.any { it.pressed }
+            } while (pointersPressed)
+
+            if (!transformed && currentTransform().scale == MIN_ORIGINAL_SCALE) {
+                when (originalNavigationForSwipe(totalPan, viewport)) {
+                    OriginalNavigation.PREVIOUS -> onPrevious()
+                    OriginalNavigation.NEXT -> onNext()
+                    null -> Unit
+                }
+            }
+        }
+    }
+    .pointerInput(itemId, canSave) {
+        detectTapGestures(
+            onLongPress = {
+                if (canSave) onSave()
+            },
+        )
+    }
+
+internal enum class OriginalNavigation {
+    PREVIOUS,
+    NEXT,
+}
+
+internal fun originalNavigationForSwipe(
+    totalPan: Offset,
+    viewport: IntSize,
+): OriginalNavigation? {
+    if (viewport.width <= 0) return null
+    val horizontalDistance = abs(totalPan.x)
+    val threshold = viewport.width * ORIGINAL_SWIPE_THRESHOLD_FRACTION
+    if (horizontalDistance < threshold || horizontalDistance <= abs(totalPan.y) * 1.25f) {
+        return null
+    }
+    return if (totalPan.x > 0f) OriginalNavigation.PREVIOUS else OriginalNavigation.NEXT
 }
 
 internal data class ZoomTransform(
@@ -505,3 +623,4 @@ internal fun updatedZoomTransform(
 
 private const val MIN_ORIGINAL_SCALE = 1f
 private const val MAX_ORIGINAL_SCALE = 5f
+private const val ORIGINAL_SWIPE_THRESHOLD_FRACTION = 0.18f

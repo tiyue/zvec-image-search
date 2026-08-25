@@ -3,6 +3,7 @@ package com.zvec.lanviewer.wear.ui
 import android.content.Context
 import coil.ImageLoader
 import coil.request.CachePolicy
+import coil.request.ErrorResult
 import coil.request.ImageRequest
 import coil.request.SuccessResult
 import com.zvec.lanviewer.wear.data.RecommendationsResponse
@@ -35,7 +36,10 @@ class CoilThumbnailLoader(
             .memoryCachePolicy(CachePolicy.ENABLED)
             .diskCachePolicy(CachePolicy.ENABLED)
             .build()
-        return imageLoader.execute(request) is SuccessResult
+        return when (val result = imageLoader.execute(request)) {
+            is SuccessResult -> true
+            is ErrorResult -> throw result.throwable
+        }
     }
 }
 
@@ -44,19 +48,33 @@ class CoilOriginalLoader(
     private val imageLoader: ImageLoader,
 ) : OriginalLoader {
     override suspend fun preload(url: String): Boolean {
-        val request = ImageRequest.Builder(context)
-            .data(url)
-            .size(ORIGINAL_CACHE_SIZE, ORIGINAL_CACHE_SIZE)
-            .memoryCachePolicy(CachePolicy.ENABLED)
-            .diskCachePolicy(CachePolicy.ENABLED)
-            .build()
-        return imageLoader.execute(request) is SuccessResult
+        return when (val result = imageLoader.execute(originalImageRequest(context, url))) {
+            is SuccessResult -> true
+            is ErrorResult -> throw result.throwable
+        }
     }
 }
 
+internal fun originalImageRequest(context: Context, url: String): ImageRequest =
+    ImageRequest.Builder(context)
+        .data(url)
+        .size(ORIGINAL_CACHE_SIZE, ORIGINAL_CACHE_SIZE)
+        .memoryCachePolicy(CachePolicy.ENABLED)
+        .diskCachePolicy(CachePolicy.ENABLED)
+        .diskCacheKey(url)
+        .build()
+
 internal const val ORIGINAL_CACHE_SIZE = 2048
 
-internal data class PreloadOutcome(val failedCount: Int)
+internal data class PreloadOutcome(
+    val failedCount: Int,
+    val lastError: Throwable? = null,
+)
+
+private data class PreloadAttempt(
+    val loaded: Boolean,
+    val error: Throwable? = null,
+)
 
 internal class RecommendationPreloadTask(
     val requestId: String,
@@ -86,32 +104,46 @@ internal fun CoroutineScope.startRecommendationPreload(
             val urls = response.items.map { it.thumbnailUrl }
             if (urls.isEmpty()) throw IOException("服务器没有返回推荐图片")
             coroutineScope {
-                val results = Channel<Boolean>(urls.size)
+                val results = Channel<PreloadAttempt>(urls.size)
                 urls.forEach { url ->
                     launch {
-                        val loaded = try {
-                            preload(url)
+                        val result = try {
+                            if (preload(url)) {
+                                PreloadAttempt(loaded = true)
+                            } else {
+                                PreloadAttempt(
+                                    loaded = false,
+                                    error = IOException("服务器返回的缩略图无法显示"),
+                                )
+                            }
                         } catch (error: CancellationException) {
                             throw error
-                        } catch (_: Throwable) {
-                            false
+                        } catch (error: Throwable) {
+                            PreloadAttempt(loaded = false, error = error)
                         }
-                        results.send(loaded)
+                        results.send(result)
                     }
                 }
                 val criticalTarget = minOf(criticalCount, urls.size)
                 var succeeded = 0
                 var failed = 0
+                var lastError: Throwable? = null
                 repeat(urls.size) {
-                    if (results.receive()) succeeded += 1 else failed += 1
+                    val result = results.receive()
+                    if (result.loaded) {
+                        succeeded += 1
+                    } else {
+                        failed += 1
+                        lastError = result.error
+                    }
                     if (succeeded >= criticalTarget && !criticalResponse.isCompleted) {
                         criticalResponse.complete(response)
                     }
                 }
                 if (!criticalResponse.isCompleted) {
-                    throw IOException("推荐缩略图加载失败")
+                    throw lastError ?: IOException("推荐缩略图加载失败")
                 }
-                settled.complete(PreloadOutcome(failedCount = failed))
+                settled.complete(PreloadOutcome(failedCount = failed, lastError = lastError))
             }
         } catch (error: CancellationException) {
             criticalResponse.cancel(error)

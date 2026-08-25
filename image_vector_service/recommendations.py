@@ -22,7 +22,7 @@ SLOT_QUOTAS: Mapping[RecommendationSlot, int] = MappingProxyType(
     {"quality": 5, "low_exposure": 6, "random": 4}
 )
 WATCH_SLOT_QUOTAS: Mapping[RecommendationSlot, int] = MappingProxyType(
-    {"quality": 2, "low_exposure": 2, "random": 1}
+    {"quality": 2, "low_exposure": 2, "random": 2}
 )
 _HISTORY_WINDOWS = (240, 210, 180, 150, 120, 90, 60, 30, 0)
 _MAX_ALBUM_ITEMS = 3
@@ -273,7 +273,7 @@ def select_watch_recommendations(
     excluded_sha256: Iterable[str] = (),
     rng_seed: int = 0,
 ) -> RecommendationSelection:
-    """Select at most five unique images for the Wear OS surface."""
+    """Select at most six unique images for the Wear OS surface."""
 
     return _select_recommendations(
         candidates,

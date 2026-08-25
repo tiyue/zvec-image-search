@@ -1639,7 +1639,7 @@ class BackendJobManager:
         viewer_id: str,
         request_id: str,
     ) -> dict[str, Any]:
-        """Create or replay one five-item Wear OS recommendation batch."""
+        """Create or replay one six-item Wear OS recommendation batch."""
 
         viewer = _recommendation_identifier(viewer_id, "viewer_id")
         request = _recommendation_identifier(request_id, "request_id")

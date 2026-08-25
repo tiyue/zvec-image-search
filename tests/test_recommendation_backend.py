@@ -409,7 +409,7 @@ class RecommendationBackendTests(unittest.TestCase):
         for service in self.services.values():
             self.assertEqual(service.candidate_limits, [100])
 
-    def test_watch_create_returns_five_without_changing_standard_batch(self) -> None:
+    def test_watch_create_returns_six_without_changing_standard_batch(self) -> None:
         watch_status, watch = self.request(
             "/v1/watch/recommendations",
             {"viewer_id": "watch-viewer", "request_id": "watch-request"},
@@ -420,11 +420,11 @@ class RecommendationBackendTests(unittest.TestCase):
         )
 
         self.assertEqual(watch_status, 200)
-        self.assertEqual(watch["count"], 5)
+        self.assertEqual(watch["count"], 6)
         self.assertFalse(watch["partial"])
         self.assertEqual(
             watch["quota"],
-            {"quality": 2, "low_exposure": 2, "random": 1},
+            {"quality": 2, "low_exposure": 2, "random": 2},
         )
         self.assertEqual(standard_status, 200)
         self.assertEqual(standard["count"], 15)
@@ -943,7 +943,7 @@ class RecommendationBackendTests(unittest.TestCase):
 
         self.assertTrue(shown["recorded"])
         self.assertTrue(action["recorded"])
-        self.assertEqual(watch["count"], 5)
+        self.assertEqual(watch["count"], 6)
 
     def test_missing_selected_source_returns_partial_contiguous_idempotent_batch(
         self,
