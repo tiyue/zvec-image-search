@@ -79,6 +79,7 @@ from .image_clustering import (
     apply_manual_cluster_rules,
     cluster_detail,
     read_cluster_snapshot,
+    stored_perceptual_hash,
     write_cluster_snapshot,
 )
 from .image_scanner import (
@@ -3742,6 +3743,27 @@ class ImageVectorService:
                     if existing is not None and existing.get("sha256") == record.sha256
                     else ()
                 )
+                content_changed = (
+                    existing is None or existing.get("sha256") != record.sha256
+                )
+                perceptual_update: dict[str, str | None] = {}
+                if content_changed:
+                    try:
+                        perceptual_update["perceptual_hash"] = _average_image_hash(
+                            Path(record.absolute_path)
+                        )
+                    except (OSError, ValueError, UnidentifiedImageError) as exc:
+                        perceptual_update["perceptual_hash"] = None
+                        self._record_index_failure(
+                            report,
+                            failure_sink,
+                            path=record.absolute_path,
+                            error=str(exc) or "The image could not be decoded.",
+                            kind="item",
+                            stage="perceptual_hash",
+                            sha256_hex=record.sha256,
+                            quarantine=False,
+                        )
                 effective_tags = normalize_tags(
                     [
                         *manual_tags,
@@ -3765,6 +3787,7 @@ class ImageVectorService:
                         state_entry={
                             **record.state_dict(),
                             **state_values[record.doc_id],
+                            **perceptual_update,
                         },
                     )
                 )
@@ -5991,6 +6014,7 @@ class ImageVectorService:
             return payload
         items: list[ImageClusterInput] = []
         preparation_failures: list[dict[str, str]] = []
+        pending_perceptual_hashes: list[tuple[str, str]] = []
         entry_chunks = self.state.iter_entries(chunk_size=256)
         processed_entries = 0
         for entry_chunk in entry_chunks:
@@ -6026,32 +6050,41 @@ class ImageVectorService:
                     source_path = str(self.source_resolver.resolve_fields(entry))
                 perceptual_hash = None
                 if "perceptual" in normalized_types:
-                    try:
-                        source = (
-                            Path(source_path)
-                            if source_path
-                            else self.source_resolver.resolve_fields(entry)
-                        )
-                        perceptual_hash = _average_image_hash(source)
-                    except (
-                        OSError,
-                        ValueError,
-                        ConfigurationError,
-                        UnidentifiedImageError,
-                    ) as exc:
-                        # Exact SHA and semantic clustering remain usable.
-                        perceptual_hash = None
-                        preparation_failures.append(
-                            {
-                                "doc_id": doc_id,
-                                "code": "perceptual_hash_failed",
-                                "message": (
-                                    str(exc) or "The image could not be decoded."
-                                ),
-                                "relative_path": relative_path,
-                                **({"source_path": source_path} if source_path else {}),
-                            }
-                        )
+                    perceptual_hash = stored_perceptual_hash(
+                        entry.get("perceptual_hash")
+                    )
+                    if perceptual_hash is None:
+                        try:
+                            source = (
+                                Path(source_path)
+                                if source_path
+                                else self.source_resolver.resolve_fields(entry)
+                            )
+                            perceptual_hash = _average_image_hash(source)
+                            pending_perceptual_hashes.append((doc_id, perceptual_hash))
+                        except (
+                            OSError,
+                            ValueError,
+                            ConfigurationError,
+                            UnidentifiedImageError,
+                        ) as exc:
+                            # Exact SHA and semantic clustering remain usable.
+                            perceptual_hash = None
+                            preparation_failures.append(
+                                {
+                                    "doc_id": doc_id,
+                                    "code": "perceptual_hash_failed",
+                                    "message": (
+                                        str(exc) or "The image could not be decoded."
+                                    ),
+                                    "relative_path": relative_path,
+                                    **(
+                                        {"source_path": source_path}
+                                        if source_path
+                                        else {}
+                                    ),
+                                }
+                            )
                 try:
                     annotation = (
                         annotations.get(doc_id)
@@ -6085,6 +6118,8 @@ class ImageVectorService:
                     self.progress(
                         f"Preparing clustering inputs {processed_entries}/{total}"
                     )
+        if pending_perceptual_hashes:
+            self.state.update_perceptual_hashes(pending_perceptual_hashes)
 
         previous = (
             self._active_cluster_snapshot()

@@ -31,8 +31,6 @@ export const GRID_ROW_UNIT = 10;
 export const GRID_GAP = 8;
 /** Estimated non-image metadata height for gallery tiles (image-meta + image-tags). */
 export const GALLERY_META_OVERHEAD = 75;
-/** Estimated non-image metadata height for learning cards (learning-copy + single-decisions). */
-export const LEARNING_META_OVERHEAD = 100;
 
 /**
  * Calculate the grid row span for an image so its cell height matches the

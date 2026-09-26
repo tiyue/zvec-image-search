@@ -6,6 +6,8 @@ import {
   JobHistoryTable,
   useActivityCenter,
 } from "../activity";
+import type { JobHistoryItem } from "../activity";
+import { isActiveStatus, jobListHeadline, taskTypeLabel } from "../activity/presentation";
 
 import type {
   AutoTagEstimateSubmission,
@@ -41,27 +43,44 @@ const allScopeConfirmed = ref(false);
 const notice = ref("");
 const noticeKind = ref<"success" | "error">("success");
 const composerOpen = ref(false);
-const activityTab = ref<"history" | "logs">("history");
+const otherOpen = ref(false);
+const logJob = ref<JobHistoryItem | null>(null);
+
+const TASK_COPY: Record<LibraryTaskType, { title: string; detail: string }> = {
+  index_and_auto_tag: {
+    title: "索引并智能标注",
+    detail: "全量扫描并生成向量，同时给新图打模型标签。不删除磁盘上已经不在的文件记录。",
+  },
+  index: {
+    title: "建立索引",
+    detail: "只扫描并生成向量。不调用标注模型，也不删除已经不在磁盘上的文件记录。",
+  },
+  auto_tag: {
+    title: "智能标注",
+    detail: "只给已经进索引的图打标签。",
+  },
+  sync: {
+    title: "同步图库",
+    detail: "处理新增、修改和删除。",
+  },
+};
 
 const enabledLibraries = computed(() => props.libraries.filter((library) => library.enabled !== false));
-const isAiTask = computed(
+const currentLibrary = computed(
+  () => enabledLibraries.value.find((library) => library.id === libraryId.value) ?? null,
+);
+const usesModel = computed(
   () => taskType.value === "index_and_auto_tag" || taskType.value === "auto_tag",
 );
-const isAutoTagTask = computed(
-  () => taskType.value === "index_and_auto_tag" || taskType.value === "auto_tag",
-);
-const executionPolicy = computed(() => {
-  if (taskType.value === "auto_tag") {
-    return "智能标注使用 auto_tag_concurrency，并受 60 RPM 与 100,000 TPM 限流；单图失败会隔离并继续。";
-  }
-  if (taskType.value === "index_and_auto_tag") {
-    return "扫描、向量和标注分别使用 scan_concurrency、embedding_concurrency 与 auto_tag_concurrency；单图失败会隔离并继续。";
-  }
-  return "扫描与向量请求使用 scan_concurrency 和 embedding_concurrency；单图失败会隔离并继续。";
-});
-const requiresExternalConfirmation = isAiTask;
+const requiresExternalConfirmation = usesModel;
 const requiresAllScopeConfirmation = computed(
-  () => isAutoTagTask.value && autoTagScope.value === "all",
+  () => usesModel.value && autoTagScope.value === "all",
+);
+const activeJob = computed(
+  () => activityState.jobs.value.find((job) => isActiveStatus(job.status)) ?? null,
+);
+const latestFinishedJob = computed(
+  () => activityState.jobs.value.find((job) => !isActiveStatus(job.status)) ?? null,
 );
 
 const jobsState = useJobs(undefined, {
@@ -139,12 +158,12 @@ async function submit(): Promise<void> {
     task_type: taskType.value,
     library_id: libraryId.value,
   };
-  if (isAiTask.value) {
+  if (usesModel.value) {
     request.max_images = maxImages.value;
     const budget = Number(maxBudgetCny.value);
     if (maxBudgetCny.value.trim()) request.max_budget_cny = budget;
   }
-  if (isAutoTagTask.value) request.scope = autoTagScope.value;
+  if (usesModel.value) request.scope = autoTagScope.value;
   if (requiresExternalConfirmation.value && externalProcessingConfirmed.value) {
     request.external_processing_confirmed = true;
   }
@@ -161,6 +180,30 @@ async function submit(): Promise<void> {
       activityState.loadLogs({ quiet: true }),
     ]);
   }
+}
+
+function openComposer(type: LibraryTaskType): void {
+  if (composerOpen.value && taskType.value === type) {
+    composerOpen.value = false;
+    return;
+  }
+  taskType.value = type;
+  otherOpen.value = false;
+  composerOpen.value = true;
+}
+
+function latestResultText(job: JobHistoryItem): string {
+  return jobListHeadline(job);
+}
+
+function openJobLogs(job: JobHistoryItem): void {
+  logJob.value = job;
+  void activityState.selectJob(job.id);
+}
+
+function closeJobLogs(): void {
+  logJob.value = null;
+  void activityState.selectJob("");
 }
 
 async function estimate(): Promise<void> {
@@ -183,33 +226,73 @@ onBeforeUnmount(() => {
 
 <template>
   <section class="tasks-page" :class="{ 'has-composer': composerOpen }" aria-labelledby="tasks-title">
-    <header class="tasks-toolbar">
-      <button class="new-task-button" type="button" @click="composerOpen = !composerOpen">
-        {{ composerOpen ? "收起任务设置" : "＋ 新建任务" }}
-      </button>
+    <header class="tasks-status">
+      <div class="status-copy">
+        <h2 id="tasks-title">图库任务</h2>
+        <p v-if="!currentLibrary">暂无已启用图库。</p>
+        <p v-else-if="currentLibrary.auto_index_enabled">
+          「{{ currentLibrary.name }}」的自动增量已开启。日常新增、修改和删除会自动索引并标注。
+        </p>
+        <p v-else>
+          「{{ currentLibrary.name }}」的自动增量已关闭。到「设置 → 图库与路径」打开后，日常变化会自动处理。
+        </p>
+        <p v-if="activeJob" class="latest-result">
+          {{ latestResultText(activeJob) }}
+          <button
+            class="header-cancel"
+            type="button"
+            :disabled="activityState.cancellingJobId.value === activeJob.id"
+            @click="activityState.cancelJob(activeJob.id)"
+          >
+            {{ activityState.cancellingJobId.value === activeJob.id ? "取消中…" : "取消" }}
+          </button>
+        </p>
+        <p v-else-if="latestFinishedJob" class="latest-result">上次 · {{ latestResultText(latestFinishedJob) }}</p>
+        <p v-else-if="!activityState.jobsLoading.value">还没有任务记录。</p>
+      </div>
+      <div class="status-actions">
+        <label v-if="enabledLibraries.length > 1">
+          <span class="sr-only">当前图库</span>
+          <select v-model="libraryId" name="status_library">
+            <option v-for="library in enabledLibraries" :key="library.id" :value="library.id">
+              {{ library.name }}
+            </option>
+          </select>
+        </label>
+        <button class="new-task-button" type="button" @click="openComposer('index_and_auto_tag')">
+          {{ composerOpen && taskType === 'index_and_auto_tag' ? "收起任务设置" : "索引并智能标注" }}
+        </button>
+        <button class="other-task-button" type="button" @click="otherOpen = !otherOpen">
+          {{ otherOpen ? "收起其他任务" : "其他任务" }}
+        </button>
+      </div>
+      <div v-if="otherOpen" class="other-tasks">
+        <button type="button" @click="openComposer('index')">
+          <strong>建立索引</strong>
+          <small>{{ TASK_COPY.index.detail }}</small>
+        </button>
+        <button type="button" @click="openComposer('auto_tag')">
+          <strong>智能标注</strong>
+          <small>{{ TASK_COPY.auto_tag.detail }}</small>
+        </button>
+        <button type="button" @click="openComposer('sync')">
+          <strong>同步图库</strong>
+          <small>{{ TASK_COPY.sync.detail }}</small>
+        </button>
+      </div>
     </header>
 
     <section v-if="composerOpen" class="composer panel">
       <div class="section-heading">
         <div>
           <p class="eyebrow">任务配置</p>
-          <h2 id="tasks-title">新建图库任务</h2>
-          <p>索引、同步和智能标注可同时排队，由本地后端统一控制速度。</p>
+          <h2>{{ TASK_COPY[taskType].title }}</h2>
+          <p>{{ TASK_COPY[taskType].detail }}</p>
         </div>
-        <span class="limit-chip">60 RPM · 100,000 TPM</span>
         <button class="composer-close" type="button" aria-label="关闭新建任务" @click="composerOpen = false">×</button>
       </div>
 
       <form class="task-form" novalidate @submit.prevent="submit">
-        <label>
-          <span>任务类型</span>
-          <select v-model="taskType" name="task_type">
-            <option value="index_and_auto_tag">索引并智能标注</option>
-            <option value="index">建立索引</option>
-            <option value="auto_tag">智能标注</option>
-            <option value="sync">同步图库</option>
-          </select>
-        </label>
         <label>
           <span>目标图库</span>
           <select v-model="libraryId" name="library_id" :disabled="enabledLibraries.length === 0">
@@ -219,7 +302,7 @@ onBeforeUnmount(() => {
             </option>
           </select>
         </label>
-        <label v-if="isAutoTagTask">
+        <label v-if="usesModel">
           <span>标注范围</span>
           <select v-model="autoTagScope" name="auto_tag_scope">
             <option value="untagged">未标注或源图片已变化（推荐）</option>
@@ -229,12 +312,12 @@ onBeforeUnmount(() => {
             <option value="all">全部图片重新处理</option>
           </select>
         </label>
-        <label v-if="isAiTask">
+        <label v-if="usesModel">
           <span>本批图片上限</span>
           <input v-model.number="maxImages" name="max_images" type="number" min="1" max="10000" />
           <small>范围 1–10,000</small>
         </label>
-        <label v-if="isAiTask">
+        <label v-if="usesModel">
           <span>本批预算上限（元）</span>
           <input
             v-model="maxBudgetCny"
@@ -248,8 +331,7 @@ onBeforeUnmount(() => {
         </label>
 
         <div class="task-policy-note" data-testid="task-execution-policy">
-          <strong>并发与失败处理由后端运行配置统一控制</strong>
-          <small>{{ executionPolicy }}</small>
+          <small>单张失败会跳过，其余图片继续处理。</small>
         </div>
 
         <label v-if="requiresAllScopeConfirmation" class="risk-field">
@@ -270,7 +352,7 @@ onBeforeUnmount(() => {
 
         <div class="form-actions">
           <button
-            v-if="isAutoTagTask"
+            v-if="usesModel"
             class="estimate-button"
             type="button"
             :disabled="jobsState.estimating.value || jobsState.submitting.value || enabledLibraries.length === 0"
@@ -324,14 +406,14 @@ onBeforeUnmount(() => {
       </p>
     </section>
 
-    <nav class="task-view-tabs" aria-label="任务视图">
-      <button type="button" :class="{ active: activityTab === 'history' }" @click="activityTab = 'history'">任务历史</button>
-      <button type="button" :class="{ active: activityTab === 'logs' }" @click="activityTab = 'logs'">操作日志</button>
-    </nav>
-
     <div class="workspace-grid">
+      <div v-if="logJob" class="log-job-bar">
+        <button class="other-task-button" type="button" @click="closeJobLogs">返回任务历史</button>
+        <strong>{{ taskTypeLabel(logJob.taskType) }} 的操作日志</strong>
+        <small>{{ logJob.id }}</small>
+      </div>
       <JobHistoryTable
-        v-if="activityTab === 'history'"
+        v-if="!logJob"
         :items="activityState.jobs.value"
         :filters="activityState.jobFilters.value"
         :libraries="enabledLibraries"
@@ -357,6 +439,7 @@ onBeforeUnmount(() => {
         @retry-errors="activityState.retryJobErrors()"
         @load-more-errors="activityState.loadMoreJobErrors()"
         @close-errors="activityState.closeJobErrors()"
+        @view-logs="openJobLogs"
       />
 
       <ActivityLogTable
@@ -403,12 +486,24 @@ onBeforeUnmount(() => {
 }
 .tasks-page.has-composer { grid-template-rows:auto minmax(0,auto) auto minmax(240px,1fr); overflow:auto; }
 
-.tasks-toolbar { display:flex; min-height:52px; align-items:center; justify-content:center; }
-.new-task-button { min-height:38px; padding:0 17px; border:1px solid #dedede; border-radius:19px; color:#333; font:inherit; font-size:13px; font-weight:650; background:#ededed; }
-.new-task-button:hover { background:#e5e5e5; }
-.task-view-tabs { display:flex; min-height:39px; align-items:flex-end; gap:20px; border-bottom:1px solid #e7e7e7; }
-.task-view-tabs button { height:39px; padding:0 2px; border:0; border-bottom:2px solid transparent; color:#777; font:inherit; background:transparent; }
-.task-view-tabs button.active { border-bottom-color:#333; color:#171717; }
+.tasks-status { display:grid; gap:10px; padding:4px 2px 0; }
+.status-copy h2 { margin:0; font-size:18px; font-weight:650; }
+.status-copy p { margin:4px 0 0; color:#555; font-size:13px; line-height:1.5; }
+.latest-result { color:#3f3f3f; }
+.header-cancel { margin-left:8px; min-height:28px; padding:0 10px; border:1px solid #dedede; border-radius:8px; color:#333; font:inherit; font-size:12px; background:#fff; vertical-align:baseline; }
+.header-cancel:hover { background:#f3f3f3; }
+.status-actions { display:flex; flex-wrap:wrap; align-items:center; gap:8px; }
+.status-actions select { height:38px; padding:0 10px; border:1px solid #dedede; border-radius:10px; background:#fff; }
+.new-task-button,.other-task-button { min-height:38px; padding:0 17px; border:1px solid #dedede; border-radius:19px; color:#333; font:inherit; font-size:13px; background:#ededed; }
+.new-task-button { font-weight:650; }
+.new-task-button:hover,.other-task-button:hover { background:#e5e5e5; }
+.other-tasks { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:8px; }
+.other-tasks button { display:grid; gap:4px; min-height:72px; padding:10px 12px; border:1px solid #e5e5e5; border-radius:12px; text-align:left; background:#fff; }
+.other-tasks strong { font-size:13px; }
+.other-tasks small { color:#666; font-size:12px; }
+.log-job-bar { display:flex; align-items:center; gap:10px; min-height:36px; }
+.log-job-bar small { color:#777; }
+.sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0,0,0,0); border:0; }
 
 .summary-grid {
   display: grid;
@@ -728,18 +823,13 @@ button:disabled { opacity: 0.55; cursor: default; }
 }
 
 /* Approved full-screen task view. */
-.tasks-page{position:relative;display:grid;height:100%;grid-template-rows:66px 42px minmax(0,1fr);gap:0;overflow:hidden;color:#222}
-.tasks-toolbar{display:flex;min-height:66px;align-items:center;justify-content:center}
-.new-task-button{min-height:38px;padding:0 17px;border:1px solid #dedede;border-radius:19px;color:#333;font:inherit;font-size:13px;font-weight:400;background:#ededed}
-.new-task-button:hover{background:#e5e5e5}
-.task-view-tabs{display:flex;min-height:42px;align-items:flex-end;gap:20px;border-bottom:1px solid #e7e7e7}
-.task-view-tabs button{height:40px;padding:0 2px;border:0;border-bottom:2px solid transparent;color:#777;font:inherit;background:transparent}.task-view-tabs button.active{border-bottom-color:#333;color:#171717}
-.task-view-tabs button:focus-visible{outline:0;box-shadow:none}
-.workspace-grid{height:100%;min-height:0;overflow:hidden}
+.tasks-page{position:relative;display:grid;height:100%;grid-template-rows:auto minmax(0,1fr);gap:0;overflow:hidden;color:#222}
+.workspace-grid{display:grid;height:100%;min-height:0;overflow:hidden;grid-row:2;grid-template-rows:auto minmax(0,1fr)}
+.workspace-grid>.activity-panel{grid-row:2;min-height:0}
 .tasks-page.has-composer::before{content:"";position:fixed;z-index:1100;inset:0;background:rgb(0 0 0 / 15%)}
-.tasks-page.has-composer{grid-template-rows:66px 42px minmax(0,1fr);overflow:hidden}
+.tasks-page.has-composer{grid-template-rows:auto minmax(0,1fr);overflow:hidden}
 .composer{position:fixed;z-index:1200;left:50%;top:50%;width:min(430px,calc(100vw - 40px));max-height:calc(100vh - 56px);overflow:auto;transform:translate(-50%,-50%);padding:18px;border:1px solid #e2e2e2;border-radius:14px;background:#fff;box-shadow:0 20px 64px rgb(0 0 0 / 16%)}
-.composer .section-heading{display:flex;margin:0 0 14px;padding:0;border:0}.composer .section-heading .eyebrow,.composer .section-heading>div>p:last-child,.composer .limit-chip{display:none}.composer .section-heading h2{margin:0;font-size:16px;font-weight:500}
+.composer .section-heading{display:flex;margin:0 0 14px;padding:0;border:0}.composer .section-heading .eyebrow,.composer .limit-chip{display:none}.composer .section-heading h2{margin:0;font-size:16px;font-weight:500}.composer .section-heading>div>p:last-child{display:block;margin:6px 0 0;color:#666;font-size:12px}
 .composer-close{position:absolute;top:11px;right:11px;display:grid;width:30px;height:30px;place-items:center;padding:0;border:0;border-radius:8px;color:#777;font-size:20px;line-height:1;background:transparent}.composer-close:hover{color:#171717;background:#f1f1f1}
 .task-form{display:grid!important;grid-template-columns:1fr!important;gap:10px!important}.task-form>label{display:grid;gap:5px}.task-form>label>span:first-child{color:#333;font-size:12px}.task-form input,.task-form select{width:100%;height:40px;padding:0 10px;border:1px solid #dedede;border-radius:9px;background:#fff}.task-form small{color:#858585;font-size:11px}
 .task-policy-note{order:20;padding:10px;border:0;border-radius:9px;color:#777;background:#f2f2f2}.task-policy-note strong{display:none}.task-policy-note small{font-size:11px}

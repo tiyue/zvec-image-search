@@ -9,8 +9,6 @@ from PIL import Image
 from zvec_host.configuration_service import DesktopConfigurationService
 from zvec_host.credentials import SessionCredentialStore
 from zvec_host.library_tasks import (
-    ActiveLearningReviewRequest,
-    ActiveLearningReviewUndoRequest,
     ClusterApplyIdentityRequest,
     ClusterDetailRequest,
     ClusterImagesRequest,
@@ -19,7 +17,7 @@ from zvec_host.library_tasks import (
     ClusterSplitRequest,
     ClusterUndoRequest,
 )
-from zvec_webview.facade import PreviewFacade, _library_request
+from zvec_webview.facade import FacadeError, PreviewFacade, _library_request
 
 
 class _IdleHost:
@@ -170,34 +168,25 @@ class ClusterWebViewContractTests(unittest.TestCase):
                     }
                 )
 
-        task_type, request, _library_id = _library_request(
-            {
-                "task_type": "active_learning_review",
-                "library_id": self.library_id,
-                "queue_id": "queue-1",
-                "decisions": [
-                    {"doc_id": "doc-1", "decision": "accept"},
+        for task_type in (
+            "active_learning_queue",
+            "active_learning_review",
+            "active_learning_review_undo",
+        ):
+            with (
+                self.subTest(task_type=task_type),
+                self.assertRaises(FacadeError) as rejected,
+            ):
+                _library_request(
                     {
-                        "doc_id": "doc-2",
-                        "decision": "edit",
-                        "labels": ["雷电将军", "原神"],
-                    },
-                ],
-            }
-        )
-        self.assertEqual(task_type, "active_learning_review")
-        self.assertIsInstance(request, ActiveLearningReviewRequest)
-        self.assertEqual(len(request.decisions), 2)
-
-        task_type, request, _library_id = _library_request(
-            {
-                "task_type": "active_learning_review_undo",
-                "library_id": self.library_id,
-            }
-        )
-        self.assertEqual(task_type, "active_learning_review_undo")
-        self.assertIsInstance(request, ActiveLearningReviewUndoRequest)
-        self.assertEqual(request.to_params(), {"library_id": self.library_id})
+                        "task_type": task_type,
+                        "library_id": self.library_id,
+                        "queue_id": "queue-1",
+                        "review_budget": 25,
+                        "decisions": [{"doc_id": "doc-1", "decision": "accept"}],
+                    }
+                )
+            self.assertEqual(rejected.exception.code, "unsupported_task")
 
     def test_cluster_list_and_detail_register_safe_image_urls(self) -> None:
         representative = {

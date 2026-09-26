@@ -111,6 +111,7 @@ _STATE_FIELDS: Final = frozenset(
         "folder_tags",
         "accepted_auto_tags",
         "inherited_tags",
+        "perceptual_hash",
     }
 )
 _REQUIRED_STATE_FIELDS: Final = frozenset(

@@ -9,7 +9,6 @@ import {
 } from "vue";
 
 import PaginationBar from "../../components/PaginationBar.vue";
-import ActiveLearningPanel from "./ActiveLearningPanel.vue";
 import {
   calculateOrganizeGalleryCapacity,
   GALLERY_META_OVERHEAD,
@@ -32,7 +31,7 @@ import type {
 } from "./types";
 import { parseTagInput, useOrganize } from "./useOrganize";
 
-type WorkspaceTab = "batch" | "clusters" | "learning";
+type WorkspaceTab = "batch" | "clusters";
 
 const props = withDefaults(defineProps<{
   api?: OrganizeApi;
@@ -342,15 +341,6 @@ onBeforeUnmount(() => {
       >
         <strong>相似分组</strong>
         <small>重复图与语义近邻</small>
-      </button>
-      <button
-        type="button"
-        :class="{ active: activeWorkspaceTab === 'learning' }"
-        :aria-pressed="activeWorkspaceTab === 'learning'"
-        @click="selectWorkspaceTab('learning')"
-      >
-        <strong>待学习样本</strong>
-        <small>优先审核高价值图片</small>
       </button>
     </nav>
 
@@ -842,16 +832,6 @@ onBeforeUnmount(() => {
     <SimilarityGroupsPanel
       v-if="visitedWorkspaceTabs.has('clusters')"
       v-show="activeWorkspaceTab === 'clusters'"
-      class="organize-intelligence-workspace"
-      :api="props.api"
-      :library-id="organize.selectedLibraryId.value"
-      @toast="(title, message, kind) => emit('toast', title, message, kind)"
-      @open-image="(imageId) => emit('openImage', imageId)"
-    />
-
-    <ActiveLearningPanel
-      v-if="visitedWorkspaceTabs.has('learning')"
-      v-show="activeWorkspaceTab === 'learning'"
       class="organize-intelligence-workspace"
       :api="props.api"
       :library-id="organize.selectedLibraryId.value"
@@ -1377,7 +1357,7 @@ textarea { resize: vertical; line-height: 1.5; }
   .folder-tag-summary > div:nth-child(2) { border-right: 0; }
   .folder-tag-summary > div:nth-child(-n+2) { border-bottom: 1px solid #e8e8e8; }
   .folder-tag-preview-action { align-items: stretch; flex-direction: column; }
-  .workspace-tabs { display: grid; width: 100%; grid-template-columns: repeat(3,minmax(0,1fr)); }
+  .workspace-tabs { display: grid; width: 100%; grid-template-columns: repeat(2,minmax(0,1fr)); }
   .workspace-tabs button { min-width: 0; padding-inline: 8px; }
 }
 

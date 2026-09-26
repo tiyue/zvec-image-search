@@ -8,6 +8,7 @@ export interface LibrarySummary {
   name: string;
   enabled?: boolean;
   is_default?: boolean;
+  auto_index_enabled?: boolean;
 }
 
 export interface SearchResultItem {

@@ -214,13 +214,13 @@ describe("OrganizePage batch tags", () => {
     expect(wrapper.find('[data-folder-key="folder-photo"]').exists()).toBe(true);
   });
 
-  it("keeps batch tags and exposes the two new intelligence tabs", async () => {
+  it("keeps batch tags and the similarity groups tab", async () => {
     const api = fakeApi();
     const wrapper = await mountPage(api);
 
     expect(wrapper.get(".workspace-tabs").text()).toContain("批量标签");
     expect(wrapper.get(".workspace-tabs").text()).toContain("相似分组");
-    expect(wrapper.get(".workspace-tabs").text()).toContain("待学习样本");
+    expect(wrapper.get(".workspace-tabs").text()).not.toContain("待学习样本");
 
     await buttonWithText(wrapper, "相似分组").trigger("click");
     await flushPromises();
@@ -229,10 +229,6 @@ describe("OrganizePage batch tags", () => {
       expect.objectContaining({ task_type: "cluster_list", library_id: "lib-1" }),
       expect.any(AbortSignal),
     );
-
-    await buttonWithText(wrapper, "待学习样本").trigger("click");
-    await flushPromises();
-    expect(wrapper.get("#active-learning-title").text()).toBe("待学习样本");
   });
 
   it("keeps direct root images selectable when root images and child folders coexist", async () => {

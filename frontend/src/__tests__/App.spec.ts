@@ -273,7 +273,7 @@ describe("App page shell", () => {
     wrapper = mountApp();
     await flushPromises();
 
-    expect(wrapper.findAll(".nav-item")).toHaveLength(8);
+    expect(wrapper.findAll(".nav-item")).toHaveLength(7);
     expect(wrapper.get(".nav-item[data-page='search']").attributes("aria-current")).toBe("page");
     expect(wrapper.get("[data-page-section='search']").isVisible()).toBe(true);
     expect(wrapper.find("[data-page-section='search'] .page-heading").exists()).toBe(false);
@@ -297,7 +297,7 @@ describe("App page shell", () => {
 
     await wrapper.get(".sidebar-toggle").trigger("click");
     expect(wrapper.get(".app-shell").classes()).toContain("sidebar-collapsed");
-    expect(wrapper.findAll(".nav-item")).toHaveLength(8);
+    expect(wrapper.findAll(".nav-item")).toHaveLength(7);
   });
 
   it("keeps the requested result count uncapped without a redundant fixed-page summary", async () => {
@@ -418,27 +418,29 @@ describe("App page shell", () => {
     await flushPromises();
 
     const destinations = [
-      "search",
-      "tasks",
-      "batch",
-      "groups",
-      "learning",
-      "recommendations",
-      "raw-selection",
-      "image-edit",
-    ];
-    for (const [index, page] of destinations.entries()) {
-      const digit = String(index + 1);
+      ["1", "search", "search"],
+      ["2", "tasks", "tasks"],
+      ["3", "batch", "organize"],
+      ["4", "groups", "organize"],
+      ["6", "recommendations", "recommendations"],
+      ["7", "raw-selection", "raw-selection"],
+      ["8", "image-edit", "image-edit"],
+    ] as const;
+    for (const [digit, page, section] of destinations) {
       window.dispatchEvent(
         new KeyboardEvent("keydown", { key: digit, code: `Digit${digit}`, altKey: true }),
       );
       await wrapper.vm.$nextTick();
-      const section = page === "search" || page === "tasks" || page === "recommendations" || page === "raw-selection" || page === "image-edit"
-        ? page
-        : "organize";
       expect(wrapper.get(`[data-page-section='${section}']`).isVisible()).toBe(true);
       expect(wrapper.get(`.nav-item[data-page='${page}']`).attributes("aria-current")).toBe("page");
     }
+
+    expect(wrapper.find(".nav-item[data-page='learning']").exists()).toBe(false);
+    window.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "5", code: "Digit5", altKey: true }),
+    );
+    await wrapper.vm.$nextTick();
+    expect(wrapper.get(".nav-item[data-page='image-edit']").attributes("aria-current")).toBe("page");
 
     window.dispatchEvent(new KeyboardEvent("keydown", { key: "/" }));
     await wrapper.vm.$nextTick();

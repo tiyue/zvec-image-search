@@ -121,7 +121,7 @@ SemanticNeighborProvider: TypeAlias = Callable[
 
 @dataclass(frozen=True, slots=True)
 class ImageClusteringConfig:
-    algorithm_version: str = "image-cluster-v1"
+    algorithm_version: str = "image-cluster-v2"
     embedding_version: str = "unknown"
     semantic_similarity_threshold: float = 0.88
     semantic_top_k: int = 12
@@ -1336,6 +1336,12 @@ def _add_perceptual_edges(
     dsu: _DisjointSet,
     cancel_check: Callable[[], object] | None,
 ) -> None:
+    """Link each image only to the earliest representative within ``radius``.
+
+    Representatives are chosen in document-id order. A later image never
+    becomes a bridge between two pictures that are farther than ``radius``.
+    """
+
     tree = _HammingBKTree()
     for item in items:
         _check_cancel(cancel_check)
@@ -1343,14 +1349,17 @@ def _add_perceptual_edges(
             continue
         value = int(item.perceptual_hash, 16)
         bits = len(item.perceptual_hash) * 4
-        for other, distance in tree.query(value, bits, radius):
-            score = 1.0 - (distance / bits)
-            _store_edge(
-                edges,
-                dsu,
-                ClusterEdge(item.doc_id, other, "perceptual", score),
-            )
-        tree.add(value, bits, item.doc_id)
+        matches = tree.query(value, bits, radius)
+        if not matches:
+            tree.add(value, bits, item.doc_id)
+            continue
+        leader, distance = min(matches)
+        score = 1.0 - (distance / bits)
+        _store_edge(
+            edges,
+            dsu,
+            ClusterEdge(item.doc_id, leader, "perceptual", score),
+        )
 
 
 def _default_neighbor_provider(
@@ -1541,6 +1550,17 @@ def _coerce_neighbor(raw: SemanticNeighborValue) -> SemanticNeighbor:
     if not math.isfinite(neighbor.similarity) or not -1.0 <= neighbor.similarity <= 1.0:
         raise ValueError("Semantic neighbor similarity must be between -1 and 1.")
     return neighbor
+
+
+def stored_perceptual_hash(value: object) -> str | None:
+    """Return a persisted 8×8 average hash, or None when it is absent or invalid."""
+
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().casefold()
+    if len(normalized) != 16 or any(character not in _HEX for character in normalized):
+        return None
+    return normalized
 
 
 def _normalize_perceptual_hash(value: object) -> str | None:

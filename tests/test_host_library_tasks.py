@@ -165,16 +165,6 @@ class HostLibraryTaskRequestContractTest(unittest.TestCase):
                 "library-a", "semantic-001", "character", "雷电将军"
             ),
             ClusterUndoRequest("library-a"),
-            ActiveLearningQueueRequest("library-a", review_budget=25),
-            ActiveLearningReviewRequest(
-                "library-a",
-                "queue-001",
-                decisions=(
-                    ActiveLearningDecision("doc-1", "accept"),
-                    ActiveLearningDecision("doc-2", "edit", ("刻晴",)),
-                ),
-            ),
-            ActiveLearningReviewUndoRequest("library-a"),
         )
 
         for request in requests:
@@ -612,19 +602,6 @@ class HostLibraryTaskServiceTest(unittest.TestCase):
             lambda: self.service.undo_latest_cluster_operation(
                 ClusterUndoRequest("library-a")
             ),
-            lambda: self.service.active_learning_queue(
-                ActiveLearningQueueRequest("library-a")
-            ),
-            lambda: self.service.review_active_learning(
-                ActiveLearningReviewRequest(
-                    "library-a",
-                    "queue-001",
-                    decisions=(ActiveLearningDecision("doc-1", "accept"),),
-                )
-            ),
-            lambda: self.service.undo_latest_active_learning_review(
-                ActiveLearningReviewUndoRequest("library-a")
-            ),
         )
 
         submissions = [method() for method in methods]
@@ -656,15 +633,29 @@ class HostLibraryTaskServiceTest(unittest.TestCase):
                 "cluster_split",
                 "cluster_apply_identity",
                 "cluster_undo",
-                "active_learning_queue",
-                "active_learning_review",
-                "active_learning_review_undo",
             ],
         )
         self.assertEqual(
             [submission.job_id for submission in submissions],
             [f"job-{index}" for index in range(1, len(methods) + 1)],
         )
+
+    def test_active_learning_product_commands_are_rejected(self) -> None:
+        requests = (
+            ActiveLearningQueueRequest("library-a"),
+            ActiveLearningReviewRequest(
+                "library-a",
+                "queue-001",
+                decisions=(ActiveLearningDecision("doc-1", "accept"),),
+            ),
+            ActiveLearningReviewUndoRequest("library-a"),
+        )
+        for request in requests:
+            with self.subTest(command=request.command):
+                with self.assertRaises(LibraryTaskValidationError) as rejected:
+                    self.service.submit(request)
+                self.assertEqual(rejected.exception.code, "unsupported_command")
+        self.assertEqual(self.client.submissions, [])
 
     def test_wait_returns_structured_success_and_progress(self) -> None:
         submission = self.service.submit_stats(StatsRequest("library-a"))

@@ -832,8 +832,7 @@ Vue 3.5 + TypeScript 5.9 + Vite 8 SPA。
 
 | 文件 | 作用 |
 |------|------|
-| `OrganizePage.vue` | 整理页面 |
-| `ActiveLearningPanel.vue` | 主动学习面板（4列网格） |
+| `OrganizePage.vue` | 整理页面（批量标签、相似分组） |
 | `SimilarityGroupsPanel.vue` | 相似组面板 |
 | `useOrganize.ts` | 整理逻辑 |
 | `useOrganizeIntelligence.ts` | 整理智能逻辑 |

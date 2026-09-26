@@ -33,6 +33,7 @@ from .image_clustering import (
     ImageClusteringConfig,
     ImageClusterInput,
     SemanticNeighbor,
+    stored_perceptual_hash,
 )
 from .large_image_clustering import LargeClusterRunSummary, LargeImageClusterEngine
 from .models import RankSource, SearchHit
@@ -196,6 +197,7 @@ class LargeClusterPreparationSession:
         self._progress = progress
         self._expected_count = 0
         self._scanned_count = 0
+        self._hash_updates: list[tuple[str, str]] = []
         self._prepared_count = 0
         self._failure_count = 0
         self._failure_details: list[ClusterPreparationFailure] = []
@@ -215,6 +217,10 @@ class LargeClusterPreparationSession:
     @property
     def semantic_query_count(self) -> int:
         return self._semantic_query_count
+
+    @property
+    def hash_updates(self) -> tuple[tuple[str, str], ...]:
+        return tuple(self._hash_updates)
 
     @property
     def report(self) -> ClusterPreparationReport:
@@ -344,20 +350,25 @@ class LargeClusterPreparationSession:
 
         perceptual_hash: str | None = None
         if self._config.enable_perceptual_hash:
-            try:
-                source = self._source_resolver.resolve_fields(dict(entry))
-                perceptual_hash = self._perceptual_hash_builder(source)
-            except Exception as exc:
-                # Exact and semantic clustering remain useful when one source
-                # file is missing or cannot be decoded.
-                self._record_failure(
-                    doc_id,
-                    "perceptual_hash_failed",
-                    _generic_failure_message(
-                        "The image could not be decoded for perceptual hashing.", exc
-                    ),
-                    entry,
-                )
+            perceptual_hash = stored_perceptual_hash(entry.get("perceptual_hash"))
+            if perceptual_hash is None:
+                try:
+                    source = self._source_resolver.resolve_fields(dict(entry))
+                    perceptual_hash = self._perceptual_hash_builder(source)
+                    if perceptual_hash:
+                        self._hash_updates.append((doc_id, perceptual_hash))
+                except Exception as exc:
+                    # Exact and semantic clustering remain useful when one source
+                    # file is missing or cannot be decoded.
+                    self._record_failure(
+                        doc_id,
+                        "perceptual_hash_failed",
+                        _generic_failure_message(
+                            "The image could not be decoded for perceptual hashing.",
+                            exc,
+                        ),
+                        entry,
+                    )
 
         identity_evidence: tuple[IdentityEvidence, ...] = ()
         if self._identity_evidence_builder is not None:
@@ -525,6 +536,9 @@ class LargeClusterAdapter:
             cancel_check=cancel_check,
             progress=progress,
         )
+        writer = getattr(self.state, "update_perceptual_hashes", None)
+        if callable(writer) and session.hash_updates:
+            writer(session.hash_updates)
         return LargeClusterAdapterRunSummary(cluster, session.report)
 
 

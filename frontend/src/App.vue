@@ -30,13 +30,13 @@ import type {
   ToastMessage,
 } from "./types/contracts";
 
-type PageName = "search" | "tasks" | "batch" | "groups" | "learning" | "recommendations" | "raw-selection" | "image-edit" | "settings";
+type PageName = "search" | "tasks" | "batch" | "groups" | "recommendations" | "raw-selection" | "image-edit" | "settings";
 
 const pageDefinitions: Array<{
   id: PageName;
   label: string;
   description: string;
-  icon: "search" | "tasks" | "tags" | "groups" | "learning" | "image";
+  icon: "search" | "tasks" | "tags" | "groups" | "image";
   shortcut: `Alt+${1 | 2 | 3 | 4 | 5 | 6 | 7 | 8}`;
 }> = [
   {
@@ -66,13 +66,6 @@ const pageDefinitions: Array<{
     description: "重复图与近似图",
     icon: "groups",
     shortcut: "Alt+4",
-  },
-  {
-    id: "learning",
-    label: "待学习样本",
-    description: "审核搜索与分组反馈",
-    icon: "learning",
-    shortcut: "Alt+5",
   },
   {
     id: "recommendations",
@@ -166,13 +159,11 @@ const inferredSearchLabel = computed(() => {
   if (search.queryImageId.value) return "以图搜图";
   return "语义搜索";
 });
-const organizeTab = computed<"batch" | "clusters" | "learning">(() => {
-  if (activePage.value === "groups") return "clusters";
-  if (activePage.value === "learning") return "learning";
-  return "batch";
-});
+const organizeTab = computed<"batch" | "clusters">(() =>
+  activePage.value === "groups" ? "clusters" : "batch",
+);
 const organizeVisited = computed(() =>
-  visitedPages.value.some((page) => page === "batch" || page === "groups" || page === "learning"),
+  visitedPages.value.some((page) => page === "batch" || page === "groups"),
 );
 const activeActionIds = computed(() => {
   if (selectedImageIds.value.length > 0) return selectedImageIds.value;
@@ -654,6 +645,7 @@ function handleLibrariesUpdated(libraries: SettingsLibrary[]): void {
     name: library.name,
     enabled: library.enabled,
     is_default: library.isDefault,
+    auto_index_enabled: library.autoIndexEnabled,
   }));
   if (
     search.libraryId.value &&
@@ -676,7 +668,7 @@ function handleGlobalKeydown(event: KeyboardEvent): void {
     ["1", "2", "3", "4", "5", "6", "7", "8"].includes(shortcutKey)
   ) {
     event.preventDefault();
-    const page = pageDefinitions[Number(shortcutKey) - 1]?.id;
+    const page = pageDefinitions.find((item) => item.shortcut === `Alt+${shortcutKey}`)?.id;
     if (page) setPage(page);
     return;
   }
@@ -1024,7 +1016,7 @@ watch(
         />
       </div>
 
-      <div v-if="organizeVisited" v-show="activePage === 'batch' || activePage === 'groups' || activePage === 'learning'" class="feature-page" data-page-section="organize">
+      <div v-if="organizeVisited" v-show="activePage === 'batch' || activePage === 'groups'" class="feature-page" data-page-section="organize">
         <OrganizePage :active-tab="organizeTab" :show-tabs="false" @toast="handleFeatureToast" @open-image="nativeActions.open" />
       </div>
 

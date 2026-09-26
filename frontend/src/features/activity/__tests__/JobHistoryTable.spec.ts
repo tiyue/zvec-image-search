@@ -63,6 +63,12 @@ describe("JobHistoryTable", () => {
       totalCount: 1_000,
     });
 
+    const first = wrapper.get(".job-list-copy");
+    expect(first.text()).toContain("智能标注");
+    expect(first.text()).toContain("人物图库");
+    expect(first.text()).toContain("没有变化");
+    expect(first.text()).not.toContain("新增 0");
+    expect(wrapper.text()).not.toContain("job-0");
     expect(wrapper.findAll("tr.activity-row")).toHaveLength(50);
     expect(wrapper.text()).toContain("共 1000 条");
     await wrapper.findAll("tr.activity-row")[0]?.trigger("click");
@@ -131,9 +137,15 @@ describe("JobHistoryTable", () => {
     });
     expect(
       wrapper
-        .findAll(".job-history-table tbody tr.activity-row td:nth-child(2) strong")
+        .findAll(".job-list-title strong")
         .map((item) => item.text()),
-    ).toEqual(["文件夹清理", "文件夹清理", "文件夹名称标签"]);
+    ).toEqual([
+      "文件夹清理",
+      "文件夹清理",
+      "文件夹名称标签",
+    ]);
+    expect(wrapper.text()).toContain("没有变化");
+    expect(wrapper.text()).not.toContain("新增 0");
 
     expect(
       wrapper.get('option[value="folder_name_tag_apply"]').text(),

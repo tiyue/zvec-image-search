@@ -94,7 +94,9 @@ Vue 3 + TypeScript + Vite SPA：
 - 图片推荐模块（`src/features/recommendations/`）：推荐批次、缩略图预加载、shown/action 事件同步、单张右键菜单与独立推荐详情
 - API 层（`src/api/`）：`client.ts`、`gateway.ts`
 - 构建产物嵌入 `zvec_webview/frontend_dist/`
-- 缩略图显示策略：所有图片网格统一使用 `object-fit: contain` 确保全图可见不裁切；图库浏览 4 列 + dense 自动填充，待学习 2 列 + dense 自动填充，搜索结果 5×3 固定布局；横图（宽高比 > 1.5）自动跨 2 列；网格采用 masonry 瀑布流布局（`grid-auto-rows: 10px` + 动态 `grid-row: span N`），每张图的行跨度由宽高比和列宽自动计算，竖图高窄、横图矮宽，dense 模式自动填缝
+- 缩略图显示策略：所有图片网格统一使用 `object-fit: contain` 确保全图可见不裁切；图库浏览 4 列 + dense 自动填充，搜索结果 5×3 固定布局；横图（宽高比 > 1.5）自动跨 2 列；网格采用 masonry 瀑布流布局（`grid-auto-rows: 10px` + 动态 `grid-row: span N`），每张图的行跨度由宽高比和列宽自动计算，竖图高窄、横图矮宽，dense 模式自动填缝
+- 整理入口只保留批量标签和相似分组。待学习样本页面已撤下；宿主与后端不再接受 `active_learning_queue`、`active_learning_review`、`active_learning_review_undo`。既有审核记录仍留在本地库，启动时的未完成批次恢复保持不变。主动学习 Python 模块仍供冻结包自检导入，不作为产品入口。
+- 视觉近似使用图库记录上的 8×8 平均哈希。索引或同步在文件新增或内容变化时计算一次；解码失败只记录该图片，索引继续。旧图在下一次聚类时补写空哈希。聚类按文档 ID 顺序把图片连到汉明距离不超过 6 的最早组代表，中间成员不再充当桥梁。算法版本为 `image-cluster-v2`。完全重复仍按 SHA-256 传递合并。内容相似默认关闭。
 
 ### zvec_webview（WebView 宿主）
 
@@ -254,7 +256,7 @@ CLI 入口将配置创建、迁移/后端服务、需要 `ImageVectorService` �
 | `image_collection.state.sqlite3` | 索引状态数据库（含 `fs_change_queue` 表：文件变更队列） |
 | `recommendations.sqlite3` | 推荐批次、批次项、事件和 viewer 内容曝光计数；不存路径、向量或 token |
 | `search_results/` | 搜索结果导出目录 |
-| `search-learning/` | 搜索学习产物（聚类快照、主动学习队列） |
+| `search-learning/` | 搜索学习产物 |
 | `fixed-evaluation.json` | 搜索学习固定评测包（离线排序质量评估基准） |
 | `model-catalog.default.json` | 默认模型配置 |
 
@@ -325,6 +327,7 @@ CLI 入口将配置创建、迁移/后端服务、需要 `ImageVectorService` �
 
 ### 任务历史
 
+- 图库任务页首显示当前图库的自动增量开关状态、活动任务或最近一次完成结果。主操作是「索引并智能标注」；建立索引、智能标注和同步图库收在「其他任务」中，提交字段与原来的四个命令一致。操作日志从单条任务打开，并按该 `job_id` 筛选。
 - 仅持久化会改变数据或执行后台处理的任务；`cluster_list`、`cluster_detail` 等只读分页查询不进入任务历史。
 - watcher 的 `auto_index_and_auto_tag` 是正式可取消任务；任务筛选和详情使用“自动增量索引与标注”名称。完成后任务历史与聚合操作日志必须引用同一 `job_id`。
 - 旧版本已写入的聚类只读查询记录在读取任务历史时隐藏，不删除数据库行。

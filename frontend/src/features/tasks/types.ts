@@ -11,6 +11,7 @@ export interface TaskLibrary {
   id: string;
   name: string;
   enabled?: boolean;
+  auto_index_enabled?: boolean;
 }
 
 export interface JobSubmission {

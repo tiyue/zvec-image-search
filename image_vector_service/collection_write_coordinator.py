@@ -42,6 +42,7 @@ _STATE_ENTRY_FIELDS = (
     "folder_tags",
     "accepted_auto_tags",
     "inherited_tags",
+    "perceptual_hash",
 )
 
 

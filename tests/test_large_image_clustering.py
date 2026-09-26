@@ -257,9 +257,38 @@ class LargeImageClusteringTests(unittest.TestCase):
         )
 
         self.assertEqual(result.cluster_count, 1)
-        self.assertGreater(result.perceptual_truncated_queries, 0)
+        self.assertEqual(result.edge_count, 99)
+        self.assertEqual(result.perceptual_truncated_queries, 0)
         self.assertLessEqual(result.max_materialized_batch, 7)
-        self.assertLessEqual(result.edge_count, 99 * 4)
+
+    def test_perceptual_chain_does_not_bridge_through_members(self) -> None:
+        engine = LargeImageClusterEngine(
+            self.store,
+            ImageClusteringConfig(
+                embedding_version="existing-zvec-v1",
+                enable_exact_hash=True,
+                enable_perceptual_hash=True,
+                enable_semantic=False,
+                perceptual_hash_distance=6,
+            ),
+        )
+        result = engine.run(
+            "library-a",
+            (
+                ImageClusterInput("a", _sha(1), perceptual_hash="0000000000000000"),
+                ImageClusterInput("b", _sha(2), perceptual_hash="000000000000003f"),
+                ImageClusterInput("c", _sha(3), perceptual_hash="00000000000000fe"),
+                ImageClusterInput(
+                    "a-copy", _sha(1), perceptual_hash="0000000000000000"
+                ),
+            ),
+        )
+        snapshot = self.store.load_snapshot(result.snapshot_version)
+        groups = {frozenset(cluster.member_doc_ids) for cluster in snapshot.clusters}
+        self.assertEqual(
+            groups,
+            {frozenset({"a", "a-copy", "b"}), frozenset({"c"})},
+        )
 
     def _staging_count(self) -> int:
         with closing(sqlite3.connect(self.store.path)) as connection:

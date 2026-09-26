@@ -33,6 +33,7 @@ ENTRY_COLUMNS = (
     "folder_tags_json",
     "accepted_auto_tags_json",
     "inherited_tags_json",
+    "perceptual_hash",
 )
 
 DOCUMENT_ANNOTATION_COLUMNS = (
@@ -145,7 +146,8 @@ class IndexState:
                 tags_json TEXT NOT NULL DEFAULT '[]',
                 folder_tags_json TEXT NOT NULL DEFAULT '[]',
                 accepted_auto_tags_json TEXT NOT NULL DEFAULT '[]',
-                inherited_tags_json TEXT NOT NULL DEFAULT '[]'
+                inherited_tags_json TEXT NOT NULL DEFAULT '[]',
+                perceptual_hash TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_entries_sha256
                 ON entries(sha256, doc_id);
@@ -416,6 +418,10 @@ class IndexState:
             self.connection.execute(
                 "ALTER TABLE entries ADD COLUMN inherited_tags_json "
                 "TEXT NOT NULL DEFAULT '[]'"
+            )
+        if "perceptual_hash" not in entry_columns:
+            self.connection.execute(
+                "ALTER TABLE entries ADD COLUMN perceptual_hash TEXT"
             )
         if "parent_directory" not in entry_columns:
             self.connection.execute(
@@ -777,6 +783,9 @@ class IndexState:
         missing_inherited = [
             str(entry["doc_id"]) for entry in items if "inherited_tags" not in entry
         ]
+        missing_hash = [
+            str(entry["doc_id"]) for entry in items if "perceptual_hash" not in entry
+        ]
         inherited_by_id: dict[str, list[str]] = {}
         for offset in range(0, len(missing_inherited), _SQLITE_PARAMETER_CHUNK):
             chunk = missing_inherited[offset : offset + _SQLITE_PARAMETER_CHUNK]
@@ -796,9 +805,30 @@ class IndexState:
                     for row in rows
                 }
             )
+        hash_by_id: dict[str, str | None] = {}
+        for offset in range(0, len(missing_hash), _SQLITE_PARAMETER_CHUNK):
+            chunk = missing_hash[offset : offset + _SQLITE_PARAMETER_CHUNK]
+            if not chunk:
+                continue
+            placeholders = ", ".join("?" for _ in chunk)
+            rows = self.connection.execute(
+                "SELECT doc_id, perceptual_hash FROM entries "
+                f"WHERE doc_id IN ({placeholders})",
+                chunk,
+            )
+            hash_by_id.update(
+                {
+                    str(row["doc_id"]): _optional_perceptual_hash(
+                        row["perceptual_hash"]
+                    )
+                    for row in rows
+                }
+            )
         for entry in items:
             if "inherited_tags" not in entry:
                 entry["inherited_tags"] = inherited_by_id.get(str(entry["doc_id"]), [])
+            if "perceptual_hash" not in entry:
+                entry["perceptual_hash"] = hash_by_id.get(str(entry["doc_id"]))
         values = [self._entry_values(entry) for entry in items]
         if not values:
             return
@@ -2606,9 +2636,28 @@ class IndexState:
             if column in encoded_tags
             else _relative_parent_directory(str(entry["relative_path"]))
             if column == "parent_directory"
+            else _optional_perceptual_hash(entry.get(column))
+            if column == "perceptual_hash"
             else entry[column]
             for column in ENTRY_COLUMNS
         )
+
+    def update_perceptual_hashes(self, updates: Iterable[tuple[str, str]]) -> None:
+        """Fill missing average hashes without rewriting the rest of the row."""
+
+        rows = [
+            (normalized, str(doc_id))
+            for doc_id, value in updates
+            if (normalized := _optional_perceptual_hash(value)) is not None
+        ]
+        if not rows:
+            return
+        with self.connection:
+            self.connection.executemany(
+                "UPDATE entries SET perceptual_hash = ? WHERE doc_id = ? "
+                "AND (perceptual_hash IS NULL OR perceptual_hash = '')",
+                rows,
+            )
 
     @staticmethod
     def _effective_tags(entry: dict[str, Any]) -> tuple[str, ...]:
@@ -3198,6 +3247,17 @@ class IndexStateReader:
 
     def __exit__(self, *_args: object) -> None:
         self.close()
+
+
+def _optional_perceptual_hash(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().casefold()
+    if len(normalized) != 16 or any(
+        character not in "0123456789abcdef" for character in normalized
+    ):
+        return None
+    return normalized
 
 
 def _relative_parent_directory(relative_path: str) -> str:

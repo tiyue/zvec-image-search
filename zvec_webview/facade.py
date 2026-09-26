@@ -71,10 +71,6 @@ from zvec_host.configuration_service import (
 )
 from zvec_host.credentials import CredentialStore, default_credential_store
 from zvec_host.library_tasks import (
-    ActiveLearningDecision,
-    ActiveLearningQueueRequest,
-    ActiveLearningReviewRequest,
-    ActiveLearningReviewUndoRequest,
     AutoTagEstimateRequest,
     AutoTagPendingRequest,
     AutoTagPolicyMigrateRequest,
@@ -4446,58 +4442,6 @@ def _library_request(
         )
     elif task_type == "cluster_undo":
         request = ClusterUndoRequest(library_id=library_id)
-    elif task_type == "active_learning_queue":
-        request = ActiveLearningQueueRequest(
-            library_id=library_id,
-            review_budget=_bounded_int(
-                payload.get("review_budget", 25), "review_budget", 20, 30
-            ),
-        )
-    elif task_type == "active_learning_review":
-        raw_decisions = payload.get("decisions")
-        if not isinstance(raw_decisions, Sequence) or isinstance(
-            raw_decisions, (str, bytes)
-        ):
-            raise FacadeError("invalid_request", "decisions must be an array.")
-        if not raw_decisions:
-            raise FacadeError(
-                "invalid_request", "At least one learning decision is required."
-            )
-        if len(raw_decisions) > 1_000:
-            raise FacadeError(
-                "invalid_request", "decisions can contain at most 1000 items."
-            )
-        learning_decisions: list[ActiveLearningDecision] = []
-        for index, raw_decision in enumerate(raw_decisions):
-            if not isinstance(raw_decision, Mapping):
-                raise FacadeError(
-                    "invalid_request", f"decisions[{index}] must be an object."
-                )
-            learning_decisions.append(
-                ActiveLearningDecision(
-                    doc_id=_required_string(raw_decision, "doc_id", maximum=1_024),
-                    decision=cast(
-                        Any,
-                        _choice(
-                            raw_decision.get("decision"),
-                            f"decisions[{index}].decision",
-                            supported=("accept", "reject", "edit", "skip"),
-                            default="accept",
-                        ),
-                    ),
-                    labels=_string_tuple(
-                        raw_decision.get("labels"),
-                        f"decisions[{index}].labels",
-                    ),
-                )
-            )
-        request = ActiveLearningReviewRequest(
-            library_id=library_id,
-            queue_id=_required_string(payload, "queue_id", maximum=256),
-            decisions=tuple(learning_decisions),
-        )
-    elif task_type == "active_learning_review_undo":
-        request = ActiveLearningReviewUndoRequest(library_id=library_id)
     elif task_type == "organize_refresh":
         filters = AutoTagReviewFilters(
             latest_index_only=_boolean(

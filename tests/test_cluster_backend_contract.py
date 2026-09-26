@@ -33,9 +33,6 @@ class _ClusterContractService:
                 "cluster_split",
                 "cluster_apply_identity",
                 "cluster_undo",
-                "active_learning_queue",
-                "active_learning_review",
-                "active_learning_review_undo",
             )
         }
         self.blocked_operations: set[str] = set()
@@ -166,62 +163,6 @@ class _ClusterContractService:
             "received": received or {},
         }
 
-    def build_active_learning_review_queue(
-        self, *, review_budget: int
-    ) -> dict[str, Any]:
-        self._checkpoint("active_learning_queue")
-        return {
-            "schema_version": 1,
-            "queue_id": "queue-1",
-            "selection_version": "active-learning-v1",
-            "candidate_count": 2,
-            "selected_count": 1,
-            "items": [
-                {
-                    "rank": 1,
-                    "doc_id": "doc-1",
-                    "group_id": "cluster-1",
-                    "uncertainty_score": 0.8,
-                    "reasons": ["cluster_outlier"],
-                }
-            ],
-            "review_budget": review_budget,
-            "api_requests": 0,
-            "embedding_api_requests": 0,
-            "qwen_api_requests": 0,
-        }
-
-    def review_active_learning_queue(
-        self, *, queue_id: str, decisions: list[dict[str, Any]]
-    ) -> dict[str, Any]:
-        self._checkpoint("active_learning_review")
-        return {
-            "schema_version": 1,
-            "queue_id": queue_id,
-            "selection_version": "active-learning-v1",
-            "candidate_count": 2,
-            "selected_count": 1,
-            "items": [],
-            "decisions": decisions,
-            "api_requests": 0,
-            "embedding_api_requests": 0,
-            "qwen_api_requests": 0,
-        }
-
-    def undo_latest_active_learning_review(self) -> dict[str, Any]:
-        self._checkpoint("active_learning_review_undo")
-        return {
-            "undone": True,
-            "batch_id": "review-batch-1",
-            "restored": 1,
-            "failed": 0,
-            "conflicts": 0,
-            "undo_available": False,
-            "api_requests": 0,
-            "embedding_api_requests": 0,
-            "qwen_api_requests": 0,
-        }
-
     def close(self) -> None:
         return
 
@@ -349,24 +290,6 @@ class ClusterBackendContractTests(unittest.TestCase):
                 "command": "cluster_undo",
                 "params": {"library_id": "library-a"},
             },
-            {
-                "command": "active_learning_queue",
-                "params": {"library_id": "library-a", "review_budget": 25},
-            },
-            {
-                "command": "active_learning_review",
-                "params": {
-                    "library_id": "library-a",
-                    "queue_id": "queue-1",
-                    "decisions": [
-                        {"doc_id": "doc-1", "decision": "accept", "labels": []}
-                    ],
-                },
-            },
-            {
-                "command": "active_learning_review_undo",
-                "params": {"library_id": "library-a"},
-            },
         )
         completed: list[dict[str, Any]] = []
         for payload in requests:
@@ -401,11 +324,37 @@ class ClusterBackendContractTests(unittest.TestCase):
                 "cluster_split",
                 "cluster_apply_identity",
                 "cluster_undo",
-                "active_learning_queue",
-                "active_learning_review",
-                "active_learning_review_undo",
             },
         )
+
+    def test_active_learning_product_commands_are_rejected(self) -> None:
+        payloads = (
+            {
+                "command": "active_learning_queue",
+                "params": {"library_id": "library-a", "review_budget": 25},
+            },
+            {
+                "command": "active_learning_review",
+                "params": {
+                    "library_id": "library-a",
+                    "queue_id": "queue-1",
+                    "decisions": [
+                        {"doc_id": "doc-1", "decision": "accept", "labels": []}
+                    ],
+                },
+            },
+            {
+                "command": "active_learning_review_undo",
+                "params": {"library_id": "library-a"},
+            },
+        )
+        for payload in payloads:
+            with (
+                self.subTest(command=payload["command"]),
+                self.assertRaises(BackendRequestError) as rejected,
+            ):
+                self.manager.submit(payload)
+            self.assertEqual(rejected.exception.code, "unsupported_command")
 
     def test_each_intelligence_task_can_be_cancelled_without_stopping_worker(
         self,
@@ -463,24 +412,6 @@ class ClusterBackendContractTests(unittest.TestCase):
                 },
             ),
             ("cluster_undo", {"library_id": "library-a"}),
-            (
-                "active_learning_queue",
-                {"library_id": "library-a", "review_budget": 25},
-            ),
-            (
-                "active_learning_review",
-                {
-                    "library_id": "library-a",
-                    "queue_id": "queue-1",
-                    "decisions": [
-                        {"doc_id": "doc-1", "decision": "accept", "labels": []}
-                    ],
-                },
-            ),
-            (
-                "active_learning_review_undo",
-                {"library_id": "library-a"},
-            ),
         )
         for command, params in requests:
             with self.subTest(command=command):

@@ -2,8 +2,10 @@
 import { computed, reactive, ref, watch } from "vue";
 
 import {
+  activityActionLabel,
+  activityDetailRows,
   activityLevelLabel,
-  detailValue,
+  activitySummary,
   formatActivityTime,
 } from "./presentation";
 import type {
@@ -87,7 +89,12 @@ function toggleDetails(sequence: number): void {
 }
 
 function detailEntries(item: ActivityLogItem): Array<[string, string]> {
-  return Object.entries(item.details).map(([key, value]) => [key, detailValue(value)]);
+  const rows = activityDetailRows(item.details);
+  const action = activityActionLabel(item.event);
+  if (!action.known) rows.push(["内部名称", item.event]);
+  if (item.jobId) rows.push(["任务编号", item.jobId]);
+  if (item.operationId && item.operationId !== item.jobId) rows.push(["操作编号", item.operationId]);
+  return rows;
 }
 </script>
 
@@ -152,7 +159,7 @@ function detailEntries(item: ActivityLogItem): Array<[string, string]> {
       </label>
       <label class="filter-job">
         <span>任务编号</span>
-        <input v-model="draft.jobId" name="log_job_id" type="search" placeholder="job_id" />
+        <input v-model="draft.jobId" name="log_job_id" type="search" placeholder="任务编号" />
       </label>
       <label class="filter-query">
         <span>搜索</span>
@@ -200,11 +207,9 @@ function detailEntries(item: ActivityLogItem): Array<[string, string]> {
               />
             </th>
             <th>时间</th>
-            <th>级别</th>
-            <th>来源</th>
-            <th>操作</th>
-            <th>图库 / 任务</th>
-            <th>消息</th>
+            <th>结果</th>
+            <th>做了什么</th>
+            <th>说明</th>
             <th class="details-column">详情</th>
           </tr>
         </thead>
@@ -221,18 +226,8 @@ function detailEntries(item: ActivityLogItem): Array<[string, string]> {
               </td>
               <td><time>{{ formatActivityTime(item.timestamp) }}</time></td>
               <td><span class="level-chip" :data-level="item.level">{{ activityLevelLabel(item.level) }}</span></td>
-              <td>
-                <strong>{{ item.source }}</strong>
-                <small class="cell-subtitle">{{ item.category }}</small>
-              </td>
-              <td>{{ item.event }}</td>
-              <td>
-                <span>{{ item.libraryName || "—" }}</span>
-                <button v-if="item.jobId" class="job-link" type="button" @click="emit('selectJob', item.jobId)">
-                  {{ item.jobId }}
-                </button>
-              </td>
-              <td class="message-cell" :title="item.message">{{ item.message || "—" }}</td>
+              <td>{{ activityActionLabel(item.event).label }}</td>
+              <td class="message-cell" :title="activitySummary(item)">{{ activitySummary(item) }}</td>
               <td class="details-column">
                 <button
                   class="details-toggle"
@@ -246,14 +241,16 @@ function detailEntries(item: ActivityLogItem): Array<[string, string]> {
               </td>
             </tr>
             <tr v-if="expandedSequence === item.sequence" class="log-details-row">
-              <td colspan="8">
+              <td colspan="6">
                 <section class="log-details" :class="{ 'has-image': item.thumbnailUrl }">
                   <img v-if="item.thumbnailUrl" :src="item.thumbnailUrl" alt="错误图片缩略图" loading="lazy" />
                   <div class="log-details-copy">
                     <dl>
-                      <div v-if="item.operationId"><dt>操作编号</dt><dd>{{ item.operationId }}</dd></div>
-                      <div v-if="item.jobId"><dt>任务编号</dt><dd>{{ item.jobId }}</dd></div>
-                      <div v-for="([key, value]) in detailEntries(item)" :key="key"><dt>{{ key }}</dt><dd>{{ value }}</dd></div>
+                      <div v-for="([key, value], index) in detailEntries(item)" :key="`${key}-${index}`">
+                        <dt>{{ key }}</dt>
+                        <dd v-if="key === '任务编号'"><button class="job-link" type="button" @click="emit('selectJob', value)">{{ value }}</button></dd>
+                        <dd v-else>{{ value }}</dd>
+                      </div>
                     </dl>
                     <a
                       v-if="item.imageUrl"
@@ -268,7 +265,7 @@ function detailEntries(item: ActivityLogItem): Array<[string, string]> {
             </tr>
           </template>
           <tr v-if="!loading && !visibleItems.length">
-            <td class="empty-table-state" colspan="8">没有符合条件的操作日志。</td>
+            <td class="empty-table-state" colspan="6">没有符合条件的操作日志。</td>
           </tr>
         </tbody>
       </table>
@@ -290,10 +287,10 @@ function detailEntries(item: ActivityLogItem): Array<[string, string]> {
 @container(max-width:950px){.activity-filters{grid-template-columns:repeat(3,minmax(105px,1fr)) auto auto;grid-template-areas:"level category library . ." "job query query submit reset"}.activity-log-table{min-width:920px}}@container(max-width:650px){.activity-filters{grid-template-columns:repeat(3,minmax(90px,1fr)) auto auto;overflow-x:auto}.activity-filters .activity-button{min-height:34px;padding-inline:8px}.log-action-strip{flex-wrap:wrap}.export-actions{margin-left:0}.activity-log-table{min-width:880px}}
 .activity-panel{position:relative;display:grid;height:100%;grid-template-rows:auto minmax(0,1fr) auto;overflow:hidden;border:0;border-radius:0;background:#fff;box-shadow:none}
 .activity-panel-heading{position:absolute;z-index:4;top:7px;right:80px;padding:0}.log-heading-actions{gap:5px}.follow-button,.activity-button{border-radius:8px;font-weight:400}.follow-button{min-height:30px;border-color:#dedede;color:#666;background:#fff}.follow-button.is-following{border-color:#d9e8e2;color:#34745e;background:#f3faf7}.activity-panel-heading .activity-button{min-height:30px}
-.activity-filter-disclosure{position:absolute;z-index:6;right:2px;top:6px;color:#777}.activity-filter-disclosure>summary{padding:6px 9px;border-radius:8px;cursor:pointer;list-style:none}.activity-filter-disclosure>summary:hover{background:#f2f2f2;color:#222}.activity-filter-disclosure[open]{top:0;right:0;width:min(980px,100%);padding:10px;border:1px solid #e5e5e5;border-radius:12px;background:#fff;box-shadow:0 12px 36px rgb(0 0 0 / 10%)}.activity-filter-disclosure[open]>summary{position:absolute;right:8px;top:6px}
+.activity-filter-disclosure{position:absolute;z-index:6;right:8px;top:8px;color:#777}.activity-filter-disclosure>summary{padding:6px 9px;border-radius:8px;cursor:pointer;list-style:none}.activity-filter-disclosure>summary:hover{background:#f2f2f2;color:#222}.activity-filter-disclosure[open]{top:0;right:0;width:min(980px,100%);padding:10px;border:1px solid #e5e5e5;border-radius:12px;background:#fff;box-shadow:0 12px 36px rgb(0 0 0 / 10%)}.activity-filter-disclosure[open]>summary{position:absolute;right:8px;top:6px}
 .activity-filters{grid-template-columns:repeat(5,minmax(110px,1fr)) auto auto;grid-template-areas:"level category library job query submit reset";padding:34px 0 0;border:0}.activity-filters label>span,.cell-subtitle,.cursor-pagination{color:#777}.activity-filters input,.activity-filters select{border-color:#dedede;border-radius:8px;color:#242424;background:#fff}
 .activity-button-primary{color:#fff;background:#606060}.activity-button-quiet{border-color:#dedede;color:#333;background:#fff}
 .log-action-strip{min-height:48px;padding:6px 240px 6px 2px;border-top:0;border-bottom:1px solid #e7e7e7;background:#fff}.selected-copy>strong,.job-link{color:#4b4b4b}.active-filter-chip,.details-toggle{border-color:#dedede;color:#4b4b4b;background:#ededed}
-.activity-table-region{min-height:0;overflow:auto}.activity-table{font-size:12px}.activity-table th{position:static;padding:8px;color:#777;background:#f7f7f7}.activity-table td{padding:10px 8px;border-bottom-color:#e9e9e9}.activity-row:hover td,.activity-row.is-selected td{background:#f3f3f3}.selection-column input{accent-color:#777}.message-cell{max-width:none}.details-toggle{background:#f2f2f2}
+.activity-table-region{min-height:0;overflow:auto}.activity-table{font-size:12px}.activity-log-table{min-width:0!important}.activity-table th{position:static;padding:8px;color:#777;background:#f7f7f7}.activity-table td{padding:10px 8px;border-bottom-color:#e9e9e9;vertical-align:top}.activity-row:hover td,.activity-row.is-selected td{background:#f3f3f3}.selection-column input{accent-color:#777}.message-cell{max-width:none;overflow:visible;line-height:1.45;white-space:normal}.details-toggle{background:#f2f2f2}
 .cursor-pagination{justify-content:center;gap:12px;min-height:50px;padding:8px 2px;border-top:0}.cursor-pagination>span{order:2}.cursor-pagination>div{display:contents}.cursor-pagination button:first-child{order:1}.cursor-pagination button:last-child{order:3}
 </style>

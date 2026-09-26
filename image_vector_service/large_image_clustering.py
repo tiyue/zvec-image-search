@@ -8,10 +8,10 @@ streamed directly into :class:`ClusterOperationStore`.
 
 Semantic neighbours must come from an injected provider backed by vectors
 already stored in Zvec.  This module has no model client and reports zero API
-requests.  Perceptual matching uses a compact BK-tree with a configurable
-per-item result cap.  Its expected lookup cost is sub-linear for dispersed
-hashes but, like every metric tree, has an O(n^2) adversarial worst case; the
-bounded edge fan-out prevents dense hash groups from exhausting memory.
+requests.  Perceptual matching links each image to the earliest document-id
+representative within the Hamming radius. Members are not bridges, so a
+chain longer than the radius stays split. Each image emits at most one
+perceptual edge.
 """
 
 from __future__ import annotations
@@ -723,14 +723,15 @@ class LargeImageClusterEngine:
         progress: ProgressCallback | None,
     ) -> None:
         tree = _CompactHammingBKTree()
+        leader_doc_ids: dict[int, str] = {}
         edge_batch: list[tuple[int, int, str, float | None]] = []
         processed = 0
         with self._read_connection() as connection:
             cursor = connection.execute(
                 """
-                SELECT ordinal, perceptual_hash FROM cluster_stream_items
+                SELECT ordinal, doc_id, perceptual_hash FROM cluster_stream_items
                 WHERE run_id = ? AND valid = 1 AND perceptual_hash IS NOT NULL
-                ORDER BY ordinal
+                ORDER BY doc_id
                 """,
                 (run_id,),
             )
@@ -743,6 +744,7 @@ class LargeImageClusterEngine:
                     _check_cancel(cancel_check)
                     processed += 1
                     ordinal = int(row["ordinal"])
+                    doc_id = str(row["doc_id"])
                     perceptual_hash = str(row["perceptual_hash"])
                     bit_length = len(perceptual_hash) * 4
                     value = int(perceptual_hash, 16)
@@ -750,13 +752,20 @@ class LargeImageClusterEngine:
                         value,
                         bit_length,
                         self.config.perceptual_hash_distance,
-                        self.max_perceptual_neighbors,
+                        1_000_000,
                     )
                     metrics.observe_batch(len(matches))
                     if truncated:
                         metrics.perceptual_truncated_queries += 1
-                    for other, distance in matches:
-                        left, right = sorted((ordinal, other))
+                    if not matches:
+                        tree.add(value, bit_length, ordinal)
+                        leader_doc_ids[ordinal] = doc_id
+                    else:
+                        leader_ordinal, distance = min(
+                            matches,
+                            key=lambda match: leader_doc_ids[match[0]],
+                        )
+                        left, right = sorted((ordinal, leader_ordinal))
                         edge_batch.append(
                             (
                                 left,
@@ -765,7 +774,6 @@ class LargeImageClusterEngine:
                                 1.0 - (distance / bit_length),
                             )
                         )
-                    tree.add(value, bit_length, ordinal)
                     if len(edge_batch) >= self.batch_size:
                         self._insert_edges(run_id, edge_batch, metrics)
                 if processed % 10_000 == 0:

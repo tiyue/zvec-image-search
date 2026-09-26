@@ -258,7 +258,8 @@ describe("useActivityCenter", () => {
     state.toggleLogSelection(1);
 
     expect(await state.copySelectedLogs()).toBe(true);
-    expect(copyText).toHaveBeenCalledWith(expect.stringContaining("=FORMULA"));
+    expect(copyText).toHaveBeenCalledWith(expect.stringContaining("完成了一项操作"));
+    expect(copyText).not.toHaveBeenCalledWith(expect.stringContaining("=FORMULA"));
     expect(await state.exportLogs("csv")).toBe(true);
     expect(downloadText.mock.calls[0]?.[0]).toMatch(
       /^yaolens-activity-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z\.csv$/,
@@ -326,6 +327,8 @@ describe("useActivityCenter", () => {
 describe("serializeActivityLogs", () => {
   it("produces one valid object per JSONL line", () => {
     const content = serializeActivityLogs([logItem(1), logItem(2)], "jsonl");
-    expect(content.split("\n").map((line) => JSON.parse(line))).toHaveLength(2);
+    const parsed = content.split("\n").map((line) => JSON.parse(line));
+    expect(parsed).toHaveLength(2);
+    expect(parsed[0].说明).toBe("完成");
   });
 });

@@ -152,8 +152,8 @@ _CAPABILITIES = {
     "cluster_manual_merge_split": True,
     "cluster_identity_propagation": True,
     "cluster_operation_undo": True,
-    "active_learning": True,
-    "active_learning_review_undo": True,
+    "active_learning": False,
+    "active_learning_review_undo": False,
     "learning_external_api_requests": 0,
     "concurrent_jobs": True,
     "job_list": True,
@@ -246,7 +246,6 @@ _BATCH_PRIORITY_COMMANDS = frozenset(
         "folder_name_tag_apply",
         "metadata_backfill",
         "cluster_images",
-        "active_learning_queue",
     }
 )
 
@@ -3066,17 +3065,6 @@ class BackendJobManager:
             )
         if command == "cluster_undo":
             return service.undo_latest_cluster_operation()
-        if command == "active_learning_queue":
-            return service.build_active_learning_review_queue(
-                review_budget=params["review_budget"]
-            )
-        if command == "active_learning_review":
-            return service.review_active_learning_queue(
-                queue_id=params["queue_id"],
-                decisions=params["decisions"],
-            )
-        if command == "active_learning_review_undo":
-            return service.undo_latest_active_learning_review()
         if command == "sync":
             folder = self._library_folder(library, params["folder"])
             return service.sync_folder(
@@ -4047,9 +4035,6 @@ def _normalize_job(
         "cluster_split",
         "cluster_apply_identity",
         "cluster_undo",
-        "active_learning_queue",
-        "active_learning_review",
-        "active_learning_review_undo",
     }
     if command not in supported:
         raise BackendRequestError(
@@ -4782,80 +4767,6 @@ def _normalize_job(
             "identity_value": value,
         }
     if command == "cluster_undo":
-        _reject_unknown(params, {"library_id"})
-        return command, {
-            "library_id": _optional_string(params, "library_id"),
-        }
-    if command == "active_learning_queue":
-        _reject_unknown(params, {"library_id", "review_budget"})
-        review_budget = _bounded_positive_integer(params, "review_budget", 25, 30)
-        if review_budget < 20:
-            raise BackendRequestError(
-                "invalid_params", "review_budget must be between 20 and 30."
-            )
-        return command, {
-            "library_id": _optional_string(params, "library_id"),
-            "review_budget": review_budget,
-        }
-    if command == "active_learning_review":
-        _reject_unknown(params, {"library_id", "queue_id", "decisions"})
-        queue_id = _required_string(params, "queue_id")
-        if len(queue_id) > 256:
-            raise BackendRequestError(
-                "invalid_params", "queue_id must be at most 256 characters."
-            )
-        raw_decisions = params.get("decisions")
-        if not isinstance(raw_decisions, list) or not raw_decisions:
-            raise BackendRequestError(
-                "invalid_params", "decisions must be a non-empty array."
-            )
-        if len(raw_decisions) > 1_000 or not all(
-            isinstance(item, dict) for item in raw_decisions
-        ):
-            raise BackendRequestError(
-                "invalid_params", "decisions must contain at most 1000 objects."
-            )
-        learning_decisions: list[dict[str, Any]] = []
-        seen_doc_ids: set[str] = set()
-        for index, raw_decision in enumerate(raw_decisions):
-            assert isinstance(raw_decision, dict)
-            _reject_unknown(raw_decision, {"doc_id", "decision", "labels"})
-            doc_id = _required_string(raw_decision, "doc_id")
-            if len(doc_id) > 1_024:
-                raise BackendRequestError(
-                    "invalid_params",
-                    f"decisions[{index}].doc_id is too long.",
-                )
-            if doc_id in seen_doc_ids:
-                raise BackendRequestError(
-                    "invalid_params", "decisions contains duplicate doc_id values."
-                )
-            seen_doc_ids.add(doc_id)
-            raw_action = raw_decision.get("decision")
-            action = raw_action.strip().lower() if isinstance(raw_action, str) else ""
-            if action not in {"accept", "reject", "edit", "skip"}:
-                raise BackendRequestError(
-                    "invalid_params",
-                    f"decisions[{index}].decision is unsupported.",
-                )
-            labels = _tags(raw_decision.get("labels"))
-            if action == "edit" and not labels:
-                raise BackendRequestError(
-                    "invalid_params", "edit decisions require labels."
-                )
-            if action != "edit" and labels:
-                raise BackendRequestError(
-                    "invalid_params", "Only edit decisions may include labels."
-                )
-            learning_decisions.append(
-                {"doc_id": doc_id, "decision": action, "labels": labels}
-            )
-        return command, {
-            "library_id": _optional_string(params, "library_id"),
-            "queue_id": queue_id,
-            "decisions": learning_decisions,
-        }
-    if command == "active_learning_review_undo":
         _reject_unknown(params, {"library_id"})
         return command, {
             "library_id": _optional_string(params, "library_id"),

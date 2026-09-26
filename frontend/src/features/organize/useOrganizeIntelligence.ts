@@ -8,7 +8,6 @@ import {
 
 import { organizeApi } from "./api";
 import type {
-  ActiveLearningQueueView,
   ClusterIdentityCategory,
   ClusterOperationResult,
   ClusterRunType,
@@ -16,13 +15,6 @@ import type {
   ClusterType,
   IdentityAnchorView,
   IntelligenceImage,
-  LearningDecisionDraft,
-  LearningDecisionValue,
-  LearningCandidateKind,
-  LearningReason,
-  LearningReviewFailure,
-  LearningReviewResult,
-  LearningSample,
   SimilarityCluster,
   SimilarityClusterDetail,
   SimilarityClusterPage,
@@ -33,7 +25,6 @@ import type {
   OrganizeJobWire,
   ToastKind,
 } from "./types";
-import { parseTagInput } from "./useOrganize";
 
 const TERMINAL_STATUSES = new Set([
   "succeeded",
@@ -49,18 +40,6 @@ const SUCCESS_STATUSES = new Set([
   "completed",
   "partial",
   "needs_attention",
-]);
-const ACTIVE_LEARNING_REASONS = new Set<LearningReason>([
-  "identity_conflict",
-  "cluster_outlier",
-  "ranking_disagreement",
-  "combined_uncertainty",
-  "low_information",
-]);
-const ACTIVE_LEARNING_CANDIDATE_KINDS = new Set<LearningCandidateKind>([
-  "tag_review",
-  "search_result",
-  "cluster_membership",
 ]);
 const CLUSTER_RUN_TYPES = new Set<ClusterRunType>([
   "exact",
@@ -133,20 +112,6 @@ function boundedScore(value: unknown): number {
 function strings(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   return [...new Set(value.map((item) => text(item)).filter(Boolean))];
-}
-
-function normalizeCandidateKind(value: unknown): LearningCandidateKind {
-  const normalized = text(value).toLowerCase();
-  return ACTIVE_LEARNING_CANDIDATE_KINDS.has(
-    normalized as LearningCandidateKind,
-  )
-    ? (normalized as LearningCandidateKind)
-    : "tag_review";
-}
-
-function normalizeSourceSha256(value: unknown): string {
-  const normalized = text(value).toLowerCase();
-  return /^[0-9a-f]{64}$/u.test(normalized) ? normalized : "";
 }
 
 function safeLocalUrl(value: unknown): string {
@@ -314,82 +279,6 @@ export function normalizeClusterOperationResult(
       integer(source.conflicts, integer(source.conflict)),
     ),
     undoAvailable: source.undo_available === true,
-  };
-}
-
-function normalizeLearningSample(
-  raw: Record<string, unknown>,
-  index: number,
-): LearningSample | null {
-  const image = normalizeImage(raw);
-  if (!image.docId) return null;
-  const reasons = strings(raw.reasons).filter((value): value is LearningReason =>
-    ACTIVE_LEARNING_REASONS.has(value as LearningReason),
-  );
-  return {
-    ...image,
-    rank: Math.max(1, integer(raw.rank, index + 1)),
-    groupId: text(raw.group_id, raw.cluster_id, "ungrouped"),
-    queryId: text(raw.query_id),
-    candidateKind: normalizeCandidateKind(raw.candidate_kind),
-    sourceSha256: normalizeSourceSha256(raw.source_sha256),
-    uncertaintyScore: boundedScore(raw.uncertainty_score),
-    reasons,
-    suggestedTags: strings(raw.suggested_tags ?? raw.labels),
-  };
-}
-
-export function normalizeLearningQueue(
-  raw: Record<string, unknown>,
-): ActiveLearningQueueView | null {
-  const source = resultRecord(raw);
-  const queue = record(source.queue) ?? source;
-  const queueId = text(queue.queue_id, source.queue_id);
-  if (!queueId) return null;
-  const samples = records(queue.items ?? queue.samples)
-    .map(normalizeLearningSample)
-    .filter((value): value is LearningSample => value !== null);
-  return {
-    queueId,
-    candidateCount: Math.max(
-      samples.length,
-      integer(queue.candidate_count, samples.length),
-    ),
-    undoAvailable:
-      queue.undo_available === true || source.undo_available === true,
-    samples,
-  };
-}
-
-export function normalizeLearningReviewResult(
-  raw: Record<string, unknown>,
-): LearningReviewResult {
-  const source = resultRecord(raw);
-  const failures = records(source.failures).map(
-    (item): LearningReviewFailure => ({
-      docId: text(item.doc_id, item.proposal_id, item.image_id),
-      code: text(item.code, item.error_code),
-      message: text(
-        item.message,
-        item.error,
-        item.reason,
-        item.code,
-        "处理失败，等待重试。",
-      ),
-      retryable: item.retryable !== false,
-    }),
-  );
-  return {
-    batchId: text(source.batch_id, source.operation_id),
-    applied: Math.max(0, integer(source.applied, integer(source.updated))),
-    failed: Math.max(0, integer(source.failed)),
-    skipped: Math.max(0, integer(source.skipped)),
-    conflicts: Math.max(
-      0,
-      integer(source.conflicts, integer(source.conflict)),
-    ),
-    undoAvailable: source.undo_available === true,
-    failures,
   };
 }
 
@@ -926,247 +815,5 @@ export function useSimilarityGroups(
     nextPage,
     previousDetailPage,
     nextDetailPage,
-  };
-}
-
-export function useActiveLearning(
-  libraryId: Ref<string>,
-  suppliedApi?: OrganizeApi,
-  events: IntelligenceEvents = {},
-) {
-  const api = suppliedApi ?? organizeApi;
-  const runner = useTaskRunner(api, events);
-  const reviewBudget = ref(25);
-  const queue = ref<ActiveLearningQueueView | null>(null);
-  const selectedIds = ref<Set<string>>(new Set());
-  const decisions = ref<Record<string, LearningDecisionDraft>>({});
-  const editTagInput = ref("");
-  const lastReviewResult = ref<LearningReviewResult | null>(null);
-  const reviewFailures = ref<Record<string, LearningReviewFailure>>({});
-  const undoAvailable = ref(false);
-  const undoMessage = ref("");
-  let lastSubmittedDecisions: LearningDecisionDraft[] = [];
-
-  const pendingDecisionCount = computed(() => Object.keys(decisions.value).length);
-  const selectedCount = computed(() => selectedIds.value.size);
-
-  async function loadQueue(): Promise<boolean> {
-    if (!libraryId.value || runner.busy.value) return false;
-    if (!Number.isInteger(reviewBudget.value) || reviewBudget.value < 20 || reviewBudget.value > 30) {
-      events.onToast?.("审核预算无效", "请输入 20～30 之间的整数。", "error");
-      return false;
-    }
-    const result = await runner.run({
-      task_type: "active_learning_queue",
-      library_id: libraryId.value,
-      review_budget: reviewBudget.value,
-    });
-    if (!result) return false;
-    const normalized = normalizeLearningQueue(result);
-    if (!normalized) {
-      events.onToast?.("无法读取待学习样本", "后端没有返回有效队列。", "error");
-      return false;
-    }
-    queue.value = normalized;
-    selectedIds.value = new Set();
-    decisions.value = {};
-    reviewFailures.value = {};
-    if (normalized.undoAvailable) undoAvailable.value = true;
-    return true;
-  }
-
-  function toggleSelection(docId: string, selected?: boolean): void {
-    const next = new Set(selectedIds.value);
-    const shouldSelect = selected ?? !next.has(docId);
-    if (shouldSelect) next.add(docId);
-    else next.delete(docId);
-    selectedIds.value = next;
-  }
-
-  function selectAll(): void {
-    selectedIds.value = new Set(queue.value?.samples.map((sample) => sample.docId) ?? []);
-  }
-
-  function clearSelection(): void {
-    selectedIds.value = new Set();
-  }
-
-  function setDecision(
-    docId: string,
-    decision: LearningDecisionValue,
-    labels: string[] = [],
-  ): boolean {
-    if (!queue.value?.samples.some((sample) => sample.docId === docId)) return false;
-    if (decision === "edit" && !labels.length) {
-      events.onToast?.("请输入修正标签", "编辑决定需要至少一个标签。", "error");
-      return false;
-    }
-    const draft: LearningDecisionDraft = { doc_id: docId, decision };
-    if (labels.length) draft.labels = labels;
-    decisions.value = { ...decisions.value, [docId]: draft };
-    return true;
-  }
-
-  function applyDecisionToSelection(decision: LearningDecisionValue): boolean {
-    if (!selectedIds.value.size) {
-      events.onToast?.("尚未选择样本", "请先选择一张或多张图片。", "error");
-      return false;
-    }
-    const labels = decision === "edit" ? parseTagInput(editTagInput.value) : [];
-    if (decision === "edit" && !labels.length) {
-      events.onToast?.("请输入修正标签", "编辑决定需要至少一个标签。", "error");
-      return false;
-    }
-    for (const docId of [...selectedIds.value].sort()) {
-      setDecision(docId, decision, labels);
-    }
-    return true;
-  }
-
-  function decisionFor(docId: string): LearningDecisionDraft | null {
-    return decisions.value[docId] ?? null;
-  }
-
-  function failureFor(docId: string): LearningReviewFailure | null {
-    return reviewFailures.value[docId] ?? null;
-  }
-
-  function reviewSummary(result: LearningReviewResult): string {
-    return `已应用 ${result.applied} 项，失败 ${result.failed} 项，跳过 ${result.skipped} 项，冲突 ${result.conflicts} 项。`;
-  }
-
-  async function submitReview(): Promise<boolean> {
-    if (!libraryId.value || !queue.value || runner.busy.value) return false;
-    const decisionValues = Object.values(decisions.value).sort((left, right) =>
-      left.doc_id.localeCompare(right.doc_id, "zh-CN"),
-    );
-    if (!decisionValues.length) {
-      events.onToast?.("尚无审核决定", "请先接受、拒绝、编辑或跳过样本。", "error");
-      return false;
-    }
-    const result = await runner.run({
-      task_type: "active_learning_review",
-      library_id: libraryId.value,
-      queue_id: queue.value.queueId,
-      decisions: decisionValues,
-    });
-    if (!result) return false;
-    const normalized = normalizeLearningReviewResult(result);
-    lastReviewResult.value = normalized;
-    undoAvailable.value = normalized.undoAvailable;
-    undoMessage.value = "";
-    lastSubmittedDecisions = decisionValues.map((decision) => ({
-      ...decision,
-      labels: decision.labels ? [...decision.labels] : undefined,
-    }));
-
-    const submittedById = new Map(
-      decisionValues.map((decision) => [decision.doc_id, decision]),
-    );
-    const failuresById = new Map(
-      normalized.failures
-        .filter((failure) => failure.docId && submittedById.has(failure.docId))
-        .map((failure) => [failure.docId, failure]),
-    );
-    const unresolvedCount = Math.max(
-      normalized.failed + normalized.conflicts,
-      failuresById.size,
-    );
-    const keepAll = unresolvedCount > 0 && failuresById.size < unresolvedCount;
-    const remaining: Record<string, LearningDecisionDraft> = {};
-    const retainedFailures: Record<string, LearningReviewFailure> = {};
-    for (const decision of decisionValues) {
-      const failure = failuresById.get(decision.doc_id);
-      if (!failure && !keepAll) continue;
-      remaining[decision.doc_id] = decision;
-      retainedFailures[decision.doc_id] = failure ?? {
-        docId: decision.doc_id,
-        code: "incomplete_failure_details",
-        message: "后端未返回完整失败明细，已保留此项以便安全重试。",
-        retryable: true,
-      };
-    }
-    decisions.value = remaining;
-    reviewFailures.value = retainedFailures;
-    selectedIds.value = new Set(Object.keys(remaining));
-
-    const hasUnresolved = unresolvedCount > 0;
-    events.onToast?.(
-      hasUnresolved ? "审核部分完成" : "审核已应用",
-      hasUnresolved
-        ? `${reviewSummary(normalized)}失败或冲突项已保留，可直接重试。`
-        : `${reviewSummary(normalized)}对应标签、反馈或分组关系已写入。`,
-      hasUnresolved ? (normalized.applied > 0 ? "info" : "error") : "success",
-    );
-    return true;
-  }
-
-  async function undoLastReview(): Promise<boolean> {
-    if (!libraryId.value || runner.busy.value || !undoAvailable.value) {
-      return false;
-    }
-    const result = await runner.run({
-      task_type: "active_learning_review_undo",
-      library_id: libraryId.value,
-    });
-    if (!result) return false;
-    const normalized = normalizeLearningReviewResult(result);
-    undoAvailable.value = normalized.undoAvailable;
-    undoMessage.value = normalized.batchId
-      ? `批次 ${normalized.batchId} 已撤销。`
-      : "最近一次主动学习审核已撤销。";
-    if (
-      lastSubmittedDecisions.length &&
-      (!normalized.batchId || normalized.batchId === lastReviewResult.value?.batchId)
-    ) {
-      decisions.value = Object.fromEntries(
-        lastSubmittedDecisions.map((decision) => [decision.doc_id, decision]),
-      );
-      selectedIds.value = new Set(lastSubmittedDecisions.map((item) => item.doc_id));
-    }
-    reviewFailures.value = {};
-    events.onToast?.(
-      "审核已撤销",
-      `${undoMessage.value} 如需修改，可以调整已恢复的决定后重新提交。`,
-      "success",
-    );
-    return true;
-  }
-
-  watch(libraryId, () => {
-    queue.value = null;
-    selectedIds.value = new Set();
-    decisions.value = {};
-    reviewFailures.value = {};
-    lastReviewResult.value = null;
-    undoAvailable.value = false;
-    undoMessage.value = "";
-    lastSubmittedDecisions = [];
-    if (libraryId.value) void loadQueue();
-  });
-
-  return {
-    ...runner,
-    reviewBudget,
-    queue,
-    selectedIds,
-    decisions,
-    editTagInput,
-    lastReviewResult,
-    reviewFailures,
-    undoAvailable,
-    undoMessage,
-    pendingDecisionCount,
-    selectedCount,
-    loadQueue,
-    toggleSelection,
-    selectAll,
-    clearSelection,
-    setDecision,
-    applyDecisionToSelection,
-    decisionFor,
-    failureFor,
-    submitReview,
-    undoLastReview,
   };
 }

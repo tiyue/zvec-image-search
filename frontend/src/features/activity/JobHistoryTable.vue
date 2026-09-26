@@ -6,6 +6,7 @@ import {
   formatActivityTime,
   formatDuration,
   isActiveStatus,
+  jobListParts,
   jobStatusLabel,
   taskTypeLabel,
 } from "./presentation";
@@ -59,12 +60,14 @@ const emit = defineEmits<{
   retryErrors: [];
   loadMoreErrors: [];
   closeErrors: [];
+  viewLogs: [job: JobHistoryItem];
 }>();
 
 const draft = reactive<JobHistoryFilters>({ ...props.filters });
 const pendingCancelJobId = ref("");
 const detailJobId = ref("");
 const visibleItems = computed(() => props.items.slice(0, 50));
+const visibleRows = computed(() => visibleItems.value.map((job) => ({ job, parts: jobListParts(job) })));
 const detailJob = computed(() => visibleItems.value.find((job) => job.id === (detailJobId.value || props.expandedErrorJobId)) ?? null);
 
 watch(
@@ -100,6 +103,11 @@ function openDetails(job: JobHistoryItem): void {
 function closeDetails(): void {
   detailJobId.value = "";
   emit("closeErrors");
+}
+
+function openLogs(job: JobHistoryItem): void {
+  closeDetails();
+  emit("viewLogs", job);
 }
 
 function errorPath(item: ActivityLogItem): string {
@@ -166,7 +174,7 @@ function errorReason(item: ActivityLogItem): string {
     <div class="activity-list-region" :aria-busy="loading">
       <table class="job-history-table"><tbody>
       <tr
-        v-for="job in visibleItems"
+        v-for="{ job, parts } in visibleRows"
         :key="job.id"
         class="activity-row job-list-row"
         :class="{ 'is-selected': selectedJobId === job.id, 'is-active': isActiveStatus(job.status) }"
@@ -175,10 +183,18 @@ function errorReason(item: ActivityLogItem): string {
         @dblclick="openDetails(job)"
         @keydown.enter.prevent="openDetails(job)"
       >
-        <td><span class="job-status-icon" :data-status="job.status" aria-hidden="true">{{ isActiveStatus(job.status) ? '◷' : job.status === 'succeeded' ? '✓' : '○' }}</span></td>
-        <td class="job-list-copy"><strong>{{ taskTypeLabel(job.taskType) }}</strong><small>{{ job.id }}</small></td>
-        <td class="job-list-summary"><small>{{ jobStatusLabel(job.status) }} · {{ job.libraryName }} · {{ job.processed.toLocaleString('zh-CN') }} / {{ job.total ? job.total.toLocaleString('zh-CN') : '—' }} · 失败 {{ job.failed }}</small><progress v-if="isActiveStatus(job.status)" max="100" :value="job.progressPercent" /></td>
-        <td class="job-actions" @click.stop>
+        <td class="job-list-copy">
+          <div class="job-list-title">
+            <strong>{{ parts.title }}</strong>
+            <span v-if="parts.showStatus" class="job-status-word" :data-status="job.status">{{ parts.status }}</span>
+          </div>
+          <p class="job-list-detail">
+            <span v-if="parts.library">{{ parts.library }}</span>
+            <span v-for="(piece, index) in parts.pieces" :key="`${job.id}-${index}`" :class="{ 'is-alert': piece.alert }">{{ piece.text }}</span>
+            <time>{{ formatActivityTime(job.finishedAt || job.updatedAt || job.submittedAt) }}</time>
+            <button :class="job.failed ? 'error-count-button' : 'job-detail-button'" type="button" @click.stop="openDetails(job)">详情</button>
+          </p>
+          <div v-if="isActiveStatus(job.status) || pendingCancelJobId === job.id" class="job-actions" @click.stop>
                 <template v-if="pendingCancelJobId === job.id">
                   <span class="cancel-confirm-copy">确认取消？</span>
                   <button class="activity-button activity-button-danger activity-button-small" type="button" @click="confirmCancel(job.id)">
@@ -197,8 +213,9 @@ function errorReason(item: ActivityLogItem): string {
                 >
                   {{ cancellingJobId === job.id ? "取消中…" : "取消" }}
                 </button>
+          </div>
+          <progress v-if="isActiveStatus(job.status)" max="100" :value="job.progressPercent" />
         </td>
-        <td class="job-detail-action" @click.stop><button :class="job.failed ? 'error-count-button' : 'activity-button activity-button-quiet activity-button-small'" type="button" @click="openDetails(job)">详情</button></td>
       </tr>
       </tbody></table>
       <p v-if="!loading && !visibleItems.length" class="empty-table-state">没有符合条件的任务记录。</p>
@@ -216,6 +233,7 @@ function errorReason(item: ActivityLogItem): string {
     <div v-if="detailJob" class="activity-modal-backdrop" role="presentation" @click.self="closeDetails">
       <section class="job-detail-modal" role="dialog" aria-modal="true" aria-labelledby="job-detail-title">
         <header><h3 id="job-detail-title">任务详情 {{ taskTypeLabel(detailJob.taskType) }} · {{ detailJob.id }}</h3><button type="button" aria-label="关闭详情" @click="closeDetails">×</button></header>
+        <button class="activity-button activity-button-quiet" type="button" @click="openLogs(detailJob)">查看操作日志</button>
         <dl class="job-detail-list">
           <div><dt>状态</dt><dd>{{ jobStatusLabel(detailJob.status) }}</dd></div>
           <div><dt>图库</dt><dd>{{ detailJob.libraryName }}</dd></div>
@@ -238,9 +256,9 @@ function errorReason(item: ActivityLogItem): string {
 
 <style scoped>
 .activity-panel{container-type:inline-size;display:grid;min-width:0;min-height:0;height:100%;grid-template-rows:auto auto minmax(0,1fr) auto;overflow:hidden;border:1px solid var(--border,#e1e6ef);border-radius:16px;background:var(--surface,#fff);box-shadow:var(--shadow-card,0 8px 24px rgb(28 39 59 / 7%))}.activity-panel-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:15px 16px 11px}.activity-panel-heading h2{margin:0;font-size:17px}.activity-eyebrow{margin:0 0 2px;color:var(--brand,#6258e7);font-size:11px;font-weight:800;letter-spacing:.08em}.activity-filters{display:grid;grid-template-columns:130px 170px 160px minmax(180px,1fr) auto auto;align-items:end;gap:8px;padding:0 16px 12px;border-bottom:1px solid var(--border,#e1e6ef)}.activity-filters label{display:grid;gap:4px;min-width:0}.activity-filters label>span{color:var(--muted,#596478);font-size:11px;font-weight:700}.activity-filters input,.activity-filters select{width:100%;height:36px;padding:0 9px;border:1px solid var(--border-strong,#cbd3df);border-radius:9px;color:var(--text,#171e2e);background:var(--surface,#fff)}.activity-filters input:focus,.activity-filters select:focus{outline:0;border-color:var(--brand,#6258e7);box-shadow:0 0 0 3px rgb(98 88 231 / 12%)}.activity-button{display:inline-flex;min-height:36px;align-items:center;justify-content:center;padding:0 12px;border:1px solid transparent;border-radius:9px;font:inherit;font-size:12px;font-weight:750;white-space:nowrap}.activity-button-primary{color:#fff;background:var(--brand,#6258e7)}.activity-button-quiet{border-color:var(--border,#e1e6ef);color:var(--text,#171e2e);background:var(--surface,#fff)}.activity-button-danger{color:#fff;background:var(--danger,#a93643)}.activity-button-small{min-height:30px;padding-inline:9px}.activity-table-region{position:relative;min-height:0;overflow:auto;scrollbar-gutter:stable}.activity-table{width:100%;border-collapse:separate;border-spacing:0;font-size:12px}.activity-table th{position:sticky;z-index:2;top:0;padding:9px 10px;border-bottom:1px solid var(--border,#e1e6ef);color:var(--muted,#596478);font-size:11px;text-align:left;background:var(--surface-soft,#f8f9fc);white-space:nowrap}.activity-table td{padding:9px 10px;border-bottom:1px solid #edf0f5;vertical-align:middle}.activity-row{cursor:pointer}.activity-row:hover td{background:#fafaff}.activity-row.is-selected td{background:var(--brand-soft,#f0efff)}.activity-row.is-active td:first-child{box-shadow:inset 3px 0 var(--brand,#6258e7)}.cell-subtitle{display:block;max-width:180px;margin-top:2px;overflow:hidden;color:var(--muted,#596478);font-size:10px;text-overflow:ellipsis;white-space:nowrap}.status-chip{display:inline-flex;min-height:25px;align-items:center;padding:3px 8px;border-radius:999px;color:#475569;font-size:11px;font-weight:750;background:#eef1f6}.status-chip[data-status="running"],.status-chip[data-status="queued"],.status-chip[data-status="pending"]{color:#4938b6;background:#eeecff}.status-chip[data-status="succeeded"],.status-chip[data-status="completed"]{color:#08705d;background:#e7f7f2}.status-chip[data-status="failed"],.status-chip[data-status="interrupted"]{color:#a93643;background:#fff0f2}.status-chip[data-status="partial"],.status-chip[data-status="needs_attention"]{color:#92500b;background:#fff5e7}.compact-progress{display:flex;min-width:94px;align-items:center;gap:6px;font-variant-numeric:tabular-nums}.compact-progress progress{width:62px;height:6px;border:0;border-radius:999px;overflow:hidden;appearance:none;background:#e7e9ef}.compact-progress progress::-webkit-progress-bar{background:#e7e9ef}.compact-progress progress::-webkit-progress-value{background:var(--brand,#6258e7)}.numeric-cell{font-variant-numeric:tabular-nums;white-space:nowrap}.error-count-button{padding:3px 7px;border:0;border-radius:7px;color:var(--danger,#a93643);font:inherit;font-weight:750;background:#fff0f2}.job-actions{min-width:112px}.job-actions>*+*{margin-left:5px}.cancel-confirm-copy{color:var(--danger,#a93643);font-size:11px;font-weight:750}.finished-mark{color:var(--faint,#68758b)}.job-errors-row td{padding:0;background:#fafbfe}.job-errors{display:grid;gap:10px;padding:12px 16px 14px;border-bottom:1px solid #e5e7ef}.job-errors>header{display:flex;align-items:center;justify-content:space-between;gap:12px}.job-errors>header small{display:block;margin-top:2px;color:var(--muted,#596478);font-size:11px}.error-image-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:8px}.error-image-item{display:grid;grid-template-columns:44px minmax(0,1fr);align-items:center;gap:9px;min-width:0;padding:7px;border:1px solid var(--border,#e1e6ef);border-radius:10px;background:#fff}.error-image-item img,.error-image-placeholder{width:44px;height:44px;border-radius:7px;object-fit:contain;background:#eef1f6}.error-image-placeholder{display:grid;place-items:center;color:var(--danger,#a93643);font-weight:800}.error-image-item strong,.error-image-item small{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.error-image-item strong{font-size:11px}.error-image-item small{margin-top:2px;color:var(--muted,#596478);font-size:10px}.error-image-action{display:inline-flex;margin-top:4px;color:var(--brand,#6258e7);font-size:10px;font-weight:750;text-decoration:none}.inline-error{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 10px;border-radius:9px;color:var(--danger,#a93643);background:#fff0f2}.inline-state,.empty-table-state{color:var(--muted,#596478);text-align:center}.empty-table-state{height:110px}.loading-overlay{position:absolute;inset:36px 0 0;display:grid;place-items:center;margin:0;color:var(--muted,#596478);background:rgb(255 255 255 / 82%)}.cursor-pagination{display:flex;min-height:48px;align-items:center;justify-content:space-between;gap:10px;padding:8px 16px;border-top:1px solid var(--border,#e1e6ef);color:var(--muted,#596478);font-size:11px}.cursor-pagination>div{display:flex;gap:6px}
-@container(max-width:1100px){.activity-filters{grid-template-columns:repeat(3,minmax(120px,1fr)) auto auto}.filter-query{grid-column:1/4}.job-history-table{min-width:1050px}}@container(max-width:700px){.activity-filters{grid-template-columns:repeat(3,minmax(105px,1fr)) auto auto;overflow-x:auto}.activity-filters .activity-button{min-height:34px;padding-inline:8px}.job-history-table{min-width:1000px}}
+@container(max-width:1100px){.activity-filters{grid-template-columns:repeat(3,minmax(120px,1fr)) auto auto}.filter-query{grid-column:1/4}}@container(max-width:700px){.activity-filters{grid-template-columns:repeat(3,minmax(105px,1fr)) auto auto;overflow-x:auto}.activity-filters .activity-button{min-height:34px;padding-inline:8px}}
 .activity-panel{position:relative;display:grid;height:100%;grid-template-rows:auto minmax(0,1fr) auto;overflow:hidden;border:0;border-radius:0;background:#fff;box-shadow:none}
-.activity-filter-disclosure{position:absolute;z-index:5;right:2px;top:-42px;color:#777}
+.activity-filter-disclosure{position:absolute;z-index:5;right:8px;top:8px;color:#777}
 .activity-filter-disclosure>summary{padding:6px 9px;border-radius:8px;cursor:pointer;list-style:none}
 .activity-filter-disclosure>summary:hover{background:#f2f2f2;color:#222}
 .activity-filter-disclosure[open]{top:0;right:0;width:min(850px,100%);padding:10px;border:1px solid #e5e5e5;border-radius:12px;background:#fff;box-shadow:0 12px 36px rgb(0 0 0 / 10%)}
@@ -249,14 +267,30 @@ function errorReason(item: ActivityLogItem): string {
 .activity-filters label>span,.cursor-pagination{color:#777}
 .activity-filters input,.activity-filters select{border-color:#dedede;border-radius:8px;color:#242424;background:#fff}
 .activity-button{border-radius:8px;font-weight:400}.activity-button-primary{color:#fff;background:#606060}.activity-button-quiet{border-color:#dedede;color:#333;background:#fff}
-.activity-list-region{min-height:0;overflow:auto;border-top:1px solid #e7e7e7}
-.job-history-table{width:100%;min-width:0!important;border-collapse:collapse}.job-list-row{display:grid;grid-template-columns:22px 170px minmax(0,1fr) auto auto;align-items:center;gap:8px;min-height:64px;padding:9px 2px;border-bottom:1px solid #e7e7e7;background:#fff}.job-list-row td{padding:0;border:0}
-.job-list-row:hover,.job-list-row.is-selected{background:#f7f7f7}
-.job-status-icon{color:#555;font-size:16px;text-align:center}
-.job-list-copy,.job-list-summary{display:grid;gap:2px;min-width:0}
-.job-list-copy strong{font-size:14px;font-weight:500}.job-list-copy small{overflow:hidden;color:#777;text-overflow:ellipsis;white-space:nowrap}
-.job-list-summary progress{width:min(780px,100%);height:5px;margin-top:4px;border:0;border-radius:999px;overflow:hidden;appearance:none;background:#ededed}
-.job-list-summary progress::-webkit-progress-bar{background:#ededed}.job-list-summary progress::-webkit-progress-value{background:#4d4d4d}
+.activity-list-region{min-height:0;overflow:auto;border-top:1px solid #e7e7e7;padding-top:36px}
+.job-history-table,.job-history-table tbody{display:block;width:100%;min-width:0!important}
+.job-list-row{display:grid;width:100%;box-sizing:border-box;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:18px;min-height:68px;padding:12px 8px 12px 2px;border-bottom:1px solid #ececec;background:#fff}
+.job-list-row>td{display:block;min-width:0;padding:0;border:0;background:transparent}
+.job-list-row:hover{background:#fafafa}
+.job-list-row.is-selected{background:#f4f4f4}
+.job-list-row:hover td,.job-list-row.is-selected td,.job-list-row.is-active td{background:transparent}
+.job-list-row.is-active td:first-child{box-shadow:none}
+.job-list-row.is-active{box-shadow:inset 2px 0 #3a3a3a}
+.job-list-copy{display:grid;gap:2px;width:100%;min-width:0}
+.job-list-title{display:flex;align-items:baseline;gap:8px;min-width:0}
+.job-list-title strong{overflow:hidden;color:#1a1a1a;font-size:15px;font-weight:600;line-height:1.35;text-overflow:ellipsis;white-space:nowrap}
+.job-status-word{flex:none;color:#555;font-size:12px;line-height:1.3}
+.job-status-word[data-status="failed"],.job-status-word[data-status="interrupted"]{color:#a93643}
+.job-status-word[data-status="partial"],.job-status-word[data-status="needs_attention"]{color:#8a4e09}
+.job-list-detail{display:flex;flex-wrap:wrap;align-items:baseline;margin:1px 0 0;color:#6d6d6d;font-size:13px;line-height:1.45}
+.job-list-detail span+span::before,.job-list-detail span+time::before,.job-list-detail time+button::before{content:"·";margin:0 7px;color:#c6c6c6}
+.job-list-detail .is-alert{color:#a93643}
+.job-list-detail time{color:#8a8a8a}
+.job-list-copy progress{width:min(220px,100%);height:4px;margin-top:8px;border:0;border-radius:999px;overflow:hidden;appearance:none;background:#ececec}
+.job-list-copy progress::-webkit-progress-bar{background:#ececec}
+.job-list-copy progress::-webkit-progress-value{background:#3f3f3f}
+.job-detail-button{min-height:0;padding:0;border:0;color:#555;font:inherit;font-size:13px;line-height:1.45;background:transparent}
+.job-detail-button:hover{color:#171717;background:#f0f0f0}
 .job-actions{display:flex;align-items:center;gap:6px;min-width:0}.job-actions>*+*{margin-left:0}
 .empty-table-state{display:grid;min-height:180px;place-items:center;color:#777;text-align:center}
 .cursor-pagination{justify-content:center;gap:12px;min-height:50px;padding:8px 2px;border-top:0}.cursor-pagination>div{display:flex;gap:6px}.cursor-pagination>span{order:2}.cursor-pagination>div{display:contents}.cursor-pagination button:first-child{order:1}.cursor-pagination button:last-child{order:3}

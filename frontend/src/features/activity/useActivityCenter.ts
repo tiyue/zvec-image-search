@@ -21,6 +21,7 @@ import type {
   JobHistoryWire,
 } from "./types";
 import { EMPTY_JOB_FILTERS, EMPTY_LOG_FILTERS } from "./types";
+import { activityCopyLine, activitySummary } from "./presentation";
 
 export const ACTIVITY_PAGE_SIZE = 50;
 const ACTIVITY_EXPORT_PAGE_SIZE = 200;
@@ -235,6 +236,7 @@ function exportRecord(item: ActivityLogItem): Record<string, unknown> {
     operation_id: item.operationId,
     message: item.message,
     details: item.details,
+    说明: activitySummary(item),
   };
 }
 
@@ -256,6 +258,7 @@ export function serializeActivityLogs(
     "operation_id",
     "message",
     "details",
+    "说明",
   ] as const;
   const rows = items.map((item) => {
     const row = exportRecord(item);
@@ -265,8 +268,7 @@ export function serializeActivityLogs(
 }
 
 function copyLine(item: ActivityLogItem): string {
-  const context = [item.libraryName, item.jobId].filter(Boolean).join(" / ");
-  return `${item.timestamp} [${item.level.toUpperCase()}] ${item.category}/${item.event}${context ? ` (${context})` : ""} ${item.message}`.trim();
+  return activityCopyLine(item);
 }
 
 async function copyToClipboard(value: string): Promise<void> {

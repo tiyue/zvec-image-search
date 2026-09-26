@@ -30,9 +30,9 @@ describe("TasksPage", () => {
       props: { libraries: [{ id: "people", name: "人物图库", enabled: true }] },
     });
     await flushPromises();
+    expect(wrapper.find(".task-form").exists()).toBe(false);
     await wrapper.get(".new-task-button").trigger("click");
 
-    await wrapper.get('select[name="task_type"]').setValue("index_and_auto_tag");
     await wrapper.get("form").trigger("submit");
     await flushPromises();
     expect(fetchMock.mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(0);
@@ -57,14 +57,9 @@ describe("TasksPage", () => {
     wrapper.unmount();
   });
 
-  it.each([
-    ["index", "scan_concurrency", "embedding_concurrency"],
-    ["sync", "scan_concurrency", "embedding_concurrency"],
-    ["index_and_auto_tag", "embedding_concurrency", "auto_tag_concurrency"],
-    ["auto_tag", "auto_tag_concurrency", "60 RPM"],
-  ] as const)(
-    "shows the real backend execution policy for %s without fake per-job controls",
-    async (taskType, firstPolicy, secondPolicy) => {
+  it.each(["index", "sync"] as const)(
+    "submits %s from other tasks without model fields",
+    async (taskType) => {
       const fetchMock = vi.fn(async (_path: RequestInfo | URL, init?: RequestInit) => {
         if (init?.method === "POST") {
           const body = JSON.parse(String(init.body)) as Record<string, unknown>;
@@ -77,25 +72,24 @@ describe("TasksPage", () => {
         props: { libraries: [{ id: "people", name: "人物图库", enabled: true }] },
       });
       await flushPromises();
-      await wrapper.get(".new-task-button").trigger("click");
-
-      await wrapper.get('select[name="task_type"]').setValue(taskType);
+      await wrapper.get(".other-task-button").trigger("click");
+      const label = taskType === "index" ? "建立索引" : "同步图库";
+      await wrapper.get(".other-tasks").get("button");
+      const choice = wrapper.findAll(".other-tasks button").find((button) => button.text().includes(label));
+      expect(choice).toBeDefined();
+      await choice?.trigger("click");
       const policy = wrapper.get('[data-testid="task-execution-policy"]');
-      expect(policy.text()).toContain("并发与失败处理由后端运行配置统一控制");
-      expect(policy.text()).toContain(firstPolicy);
-      expect(policy.text()).toContain(secondPolicy);
+      expect(policy.text()).toContain("单张失败会跳过");
+      expect(policy.text()).not.toContain("scan_concurrency");
       expect(wrapper.find('input[name="concurrency"]').exists()).toBe(false);
-      expect(wrapper.find('input[name="skip_errors"]').exists()).toBe(false);
 
-      if (taskType === "index" || taskType === "sync") {
-        await wrapper.get("form").trigger("submit");
-        await flushPromises();
-        const post = fetchMock.mock.calls.find(([, init]) => init?.method === "POST");
-        expect(JSON.parse(String(post?.[1]?.body))).toEqual({
-          task_type: taskType,
-          library_id: "people",
-        });
-      }
+      await wrapper.get("form").trigger("submit");
+      await flushPromises();
+      const post = fetchMock.mock.calls.find(([, init]) => init?.method === "POST");
+      expect(JSON.parse(String(post?.[1]?.body))).toEqual({
+        task_type: taskType,
+        library_id: "people",
+      });
       wrapper.unmount();
     },
   );
@@ -132,13 +126,13 @@ describe("TasksPage", () => {
       props: { libraries: [{ id: "people", name: "人物图库", enabled: true }] },
     });
     await flushPromises();
-    await wrapper.get(".new-task-button").trigger("click");
-
-    await wrapper.get('select[name="task_type"]').setValue("auto_tag");
+    await wrapper.get(".other-task-button").trigger("click");
+    const annotation = wrapper.findAll(".other-tasks button").find((button) => button.text().includes("智能标注"));
+    await annotation?.trigger("click");
     expect(wrapper.get('select[name="auto_tag_scope"]').text()).toContain(
       "未标注或源图片已变化（推荐）",
     );
-    expect(wrapper.text()).toContain("并发与失败处理由后端运行配置统一控制");
+    expect(wrapper.text()).toContain("单张失败会跳过，其余图片继续处理。");
     expect(wrapper.find('input[name="concurrency"]').exists()).toBe(false);
 
     await wrapper.get('button.estimate-button').trigger("click");
@@ -235,8 +229,10 @@ describe("TasksPage", () => {
     });
     await flushPromises();
 
+    expect(wrapper.find(".task-form").exists()).toBe(false);
+    expect(wrapper.find(".task-view-tabs").exists()).toBe(false);
+    expect(wrapper.text()).toContain("自动增量已关闭");
     expect(wrapper.findAll(".job-history-table tr.activity-row")).toHaveLength(2);
-    expect(wrapper.text()).toContain("同步图库");
     expect(wrapper.text()).toContain("同步图库");
 
     await wrapper.get(".error-count-button").trigger("click");
@@ -247,6 +243,12 @@ describe("TasksPage", () => {
     expect(fetchMock.mock.calls.some(([path]) =>
       String(path).includes("category=image_failure") && String(path).includes("job_id=job-partial"),
     )).toBe(true);
+
+    const logsButton = wrapper.findAll("button").find((button) => button.text().includes("查看操作日志"));
+    await logsButton?.trigger("click");
+    await flushPromises();
+    expect(wrapper.text()).toContain("建立索引 的操作日志");
+    expect(wrapper.find(".job-history-table").exists()).toBe(false);
     wrapper.unmount();
   });
 

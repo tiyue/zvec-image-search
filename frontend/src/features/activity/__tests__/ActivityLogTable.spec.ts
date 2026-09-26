@@ -80,6 +80,41 @@ describe("ActivityLogTable", () => {
     });
   });
 
+  it("shows a Chinese action and hides the raw event name until details open", async () => {
+    const wrapper = mountTable({
+      items: [
+        log(1, {
+          category: "auto_index",
+          event: "auto_index_cycle_succeeded",
+          source: "backend",
+          message: "自动索引完成：新增 2 张。",
+          details: { task_type: "auto_index_and_auto_tag", inserted: 2, updated: 1, deleted: 0, failed: 0 },
+        }),
+        log(2, {
+          event: "watchdog_poll",
+          message: "watchdog_poll",
+          details: {},
+        }),
+      ],
+    });
+
+    expect(wrapper.text()).toContain("自动处理了图库变化");
+    expect(wrapper.text()).toContain("自动索引完成：新增 2 张。");
+    expect(wrapper.text()).not.toContain("auto_index_cycle_succeeded");
+    expect(wrapper.text()).not.toContain("task_type");
+    expect(wrapper.text()).toContain("完成了一项操作");
+
+    await wrapper.findAll(".details-toggle")[0]?.trigger("click");
+    expect(wrapper.text()).toContain("新增");
+    expect(wrapper.text()).toContain("更新");
+    expect(wrapper.text()).toContain("删除");
+    expect(wrapper.text()).toContain("失败");
+    expect(wrapper.text()).not.toContain("task_type");
+
+    await wrapper.findAll(".details-toggle")[1]?.trigger("click");
+    expect(wrapper.text()).toContain("watchdog_poll");
+  });
+
   it("pauses following, selects rows, copies and exports", async () => {
     const wrapper = mountTable({ selectedSequences: new Set([1]) });
     await wrapper.get(".follow-button").trigger("click");
@@ -108,8 +143,9 @@ describe("ActivityLogTable", () => {
       items: [log(1, { imageUrl: "http://127.0.0.1:8000/api/image/doc-1" })],
     });
     await wrapper.get(".details-toggle").trigger("click");
-    expect(wrapper.text()).toContain("result_count");
+    expect(wrapper.text()).toContain("结果数量");
     expect(wrapper.text()).toContain("15");
+    expect(wrapper.text()).not.toContain("result_count");
     expect(wrapper.text()).toContain("操作编号");
     expect(wrapper.get(".image-action").attributes("href")).toContain("api/image/doc-1");
 

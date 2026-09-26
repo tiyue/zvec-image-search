@@ -79,6 +79,13 @@ _CLUSTER_LIST_TYPES = frozenset(
 _CLUSTER_IDENTITY_CATEGORIES = frozenset(
     {"real_person", "cosplayer", "character", "work"}
 )
+_RETIRED_COMMANDS = frozenset(
+    {
+        "active_learning_queue",
+        "active_learning_review",
+        "active_learning_review_undo",
+    }
+)
 _LEARNING_DECISIONS = frozenset({"accept", "reject", "edit", "skip"})
 _TERMINAL_STATUSES = frozenset(
     {"succeeded", "partial", "needs_attention", "failed", "cancelled"}
@@ -1718,6 +1725,12 @@ class LibraryTaskService:
         ):
             raise TypeError("request must be a supported library task request")
         command = request.command
+        if command in _RETIRED_COMMANDS:
+            raise LibraryTaskValidationError(
+                "Active learning review is no longer a product command.",
+                field_name="command",
+                code="unsupported_command",
+            )
         params = request.to_params()
         job = self._client.submit_job(command, params)
         job_id = _job_id(job, command=command)
@@ -1869,21 +1882,6 @@ class LibraryTaskService:
 
     def undo_latest_cluster_operation(
         self, request: ClusterUndoRequest
-    ) -> SubmittedLibraryTask:
-        return self.submit(request)
-
-    def active_learning_queue(
-        self, request: ActiveLearningQueueRequest
-    ) -> SubmittedLibraryTask:
-        return self.submit(request)
-
-    def review_active_learning(
-        self, request: ActiveLearningReviewRequest
-    ) -> SubmittedLibraryTask:
-        return self.submit(request)
-
-    def undo_latest_active_learning_review(
-        self, request: ActiveLearningReviewUndoRequest
     ) -> SubmittedLibraryTask:
         return self.submit(request)
 

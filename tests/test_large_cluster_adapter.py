@@ -205,6 +205,56 @@ class LargeClusterAdapterTests(unittest.TestCase):
         self.assertLessEqual(session.report.max_read_batch, 2)
         self.assertEqual(session.external_api_calls, 0)
 
+    def test_stored_perceptual_hash_skips_decode_and_missing_hash_is_recorded(
+        self,
+    ) -> None:
+        calls: list[str] = []
+
+        def builder(path: Path) -> str:
+            calls.append(str(path))
+            return "0123456789abcdef"
+
+        rows = [
+            (
+                {
+                    "doc_id": "stored",
+                    "sha256": _sha(1),
+                    "relative_path": "images/stored.png",
+                    "perceptual_hash": "aaaaaaaaaaaaaaaa",
+                },
+                None,
+            ),
+            (
+                {
+                    "doc_id": "fresh",
+                    "sha256": _sha(2),
+                    "relative_path": "images/fresh.png",
+                },
+                None,
+            ),
+        ]
+        state = _PagedState(rows)
+        fresh = self.root / "images" / "fresh.png"
+        fresh.parent.mkdir(parents=True)
+        Image.new("RGB", (8, 8), "white").save(fresh)
+        adapter = LargeClusterAdapter(
+            state,
+            _Resolver(self.root),
+            _Repository(),
+            ImageClusteringConfig(
+                enable_exact_hash=True,
+                enable_perceptual_hash=True,
+                enable_semantic=False,
+            ),
+            perceptual_hash_builder=builder,
+        )
+        session = adapter.create_session()
+        items = {item.doc_id: item for item in session.iter_inputs()}
+        self.assertEqual(items["stored"].perceptual_hash, "aaaaaaaaaaaaaaaa")
+        self.assertEqual(items["fresh"].perceptual_hash, "0123456789abcdef")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(session.hash_updates, (("fresh", "0123456789abcdef"),))
+
     def test_failure_preview_is_capped_and_never_contains_absolute_paths(self) -> None:
         rows = [
             (

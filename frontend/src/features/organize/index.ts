@@ -4,9 +4,6 @@ export {
   normalizeClusterDetail,
   normalizeClusterOperationResult,
   normalizeClusterPage,
-  normalizeLearningQueue,
-  normalizeLearningReviewResult,
-  useActiveLearning,
   useSimilarityGroups,
 } from "./useOrganizeIntelligence";
 export {
@@ -30,18 +27,11 @@ export type {
   TagPresence,
 } from "./types";
 export type {
-  ActiveLearningQueueView,
   ClusterRunType,
   ClusterIdentityCategory,
   ClusterOperationResult,
   ClusterScope,
   ClusterType,
-  LearningDecisionDraft,
-  LearningDecisionValue,
-  LearningCandidateKind,
-  LearningReviewFailure,
-  LearningReviewResult,
-  LearningSample,
   SimilarityCluster,
   SimilarityClusterDetail,
   SimilarityClusterPage,

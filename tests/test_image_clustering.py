@@ -92,6 +92,35 @@ class ImageClusteringTest(unittest.TestCase):
         self.assertEqual(near.member_doc_ids, ("near-a", "near-b"))
         self.assertIn("perceptual", near.edge_kinds)
 
+    def test_perceptual_chain_does_not_bridge_through_members(self) -> None:
+        items = [
+            _item("a", perceptual_hash="0000000000000000"),
+            _item("b", perceptual_hash="000000000000003f"),
+            _item("c", perceptual_hash="00000000000000fe"),
+        ]
+
+        result = ImageClusterService(
+            self.config(perceptual_hash_distance=6, enable_semantic=False)
+        ).run(items)
+
+        groups = {
+            frozenset(cluster.member_doc_ids) for cluster in result.snapshot.clusters
+        }
+        self.assertEqual(groups, {frozenset({"a", "b"}), frozenset({"c"})})
+
+    def test_exact_duplicates_stay_grouped_without_perceptual_hash(self) -> None:
+        shared = _sha("same")
+        items = [
+            _item("copy-a", sha256=shared, perceptual_hash="0000000000000000"),
+            _item("copy-b", sha256=shared, perceptual_hash=None),
+        ]
+        result = ImageClusterService(
+            self.config(enable_semantic=False, enable_perceptual_hash=True)
+        ).run(items)
+        self.assertEqual(
+            result.snapshot.clusters[0].member_doc_ids, ("copy-a", "copy-b")
+        )
+
     def test_incremental_run_reuses_old_edges_and_queries_only_new_or_changed(
         self,
     ) -> None:
