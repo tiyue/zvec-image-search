@@ -61,4 +61,30 @@ describe("GalleryGrid", () => {
     expect(wrapper.get(".state-panel").attributes("role")).toBe("status");
     expect(wrapper.text()).toContain("暂无可显示的图片");
   });
+
+  it("applies the responsive column count and tile height", () => {
+    const wrapper = mount(GalleryGrid, {
+      props: { items: items.slice(0, 4), columns: 3, cardHeight: 186 },
+    });
+    const style = wrapper.get('[role="list"]').attributes("style") ?? "";
+
+    expect(style).toContain("--gallery-columns: 3");
+    expect(style).toContain("--gallery-row-height: 186px");
+  });
+
+  it("omits the row height until a container has been measured", () => {
+    const wrapper = mount(GalleryGrid, { props: { items: items.slice(0, 1) } });
+    const style = wrapper.get('[role="list"]').attributes("style") ?? "";
+
+    expect(style).toContain("--gallery-columns: 5");
+    expect(style).not.toContain("--gallery-row-height");
+  });
+
+  it("never collapses the column count below one", () => {
+    const wrapper = mount(GalleryGrid, {
+      props: { items: items.slice(0, 1), columns: 0, cardHeight: 0 },
+    });
+
+    expect(wrapper.get('[role="list"]').attributes("style")).toContain("--gallery-columns: 1");
+  });
 });

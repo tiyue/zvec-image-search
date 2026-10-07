@@ -29,6 +29,28 @@ def _entry(doc_id: str, root_id: str, relative_path: str) -> dict[str, object]:
     }
 
 
+def _tagged_entry(
+    doc_id: str,
+    root_id: str,
+    relative_path: str,
+    *,
+    tags: list[str] | None = None,
+    folder_tags: list[str] | None = None,
+    accepted_auto_tags: list[str] | None = None,
+    inherited_tags: list[str] | None = None,
+) -> dict[str, object]:
+    entry = _entry(doc_id, root_id, relative_path)
+    entry.update(
+        {
+            "tags": tags or [],
+            "folder_tags": folder_tags or [],
+            "accepted_auto_tags": accepted_auto_tags or [],
+            "inherited_tags": inherited_tags or [],
+        }
+    )
+    return entry
+
+
 class LibraryBrowserTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -595,6 +617,237 @@ class FolderCatalogLifecycleTest(unittest.TestCase):
             ).fetchone()[0],
             1,
         )
+
+
+class FolderListQueryTest(unittest.TestCase):
+    """Folder-list statistics, filters and paging over the read path."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        root = Path(self.temporary.name)
+        self.state_path = root / "state.sqlite3"
+        self.state = IndexState(self.state_path)
+        self.addCleanup(self.state.close)
+        self.state.ensure_collection_uuid("collection-queries")
+        images_a = root / "gallery-a"
+        images_b = root / "gallery-b"
+        images_a.mkdir()
+        images_b.mkdir()
+        self.state.record_root("root-a", str(images_a), True)
+        self.state.record_root("root-b", str(images_b), True)
+        self.state.set_many(
+            [
+                _tagged_entry(
+                    "doc-a1",
+                    "root-a",
+                    "shows/raiden/a1.jpg",
+                    tags=["manual"],
+                    accepted_auto_tags=["model"],
+                ),
+                _tagged_entry(
+                    "doc-a2",
+                    "root-a",
+                    "shows/raiden/a2.jpg",
+                    folder_tags=["folder"],
+                ),
+                _tagged_entry(
+                    "doc-a3",
+                    "root-a",
+                    "shows/raiden/sub/a3.jpg",
+                    inherited_tags=["inherited"],
+                ),
+                _entry("doc-a4", "root-a", "top.jpg"),
+                _entry("doc-a5", "root-a", "order/B.jpg"),
+                _entry("doc-a6", "root-a", "order/a.jpg"),
+                _entry("doc-a7", "root-a", "order/A.jpg"),
+                _entry("doc-p1", "root-a", "a%b/p1.jpg"),
+                _entry("doc-p2", "root-a", "axxb/p2.jpg"),
+                _entry("doc-b1", "root-b", "shows/raiden/b1.jpg"),
+                _entry("doc-b2", "root-b", "other/b2.jpg"),
+            ]
+        )
+        self.state.set_document_annotation(
+            doc_id="doc-a2",
+            source_sha256="2" * 64,
+            cache_key=None,
+            status="failed",
+            error="synthetic failure",
+        )
+
+    def _folder(
+        self, browser: LibraryBrowser, root_id: str, relative_folder: str
+    ) -> dict[str, object]:
+        folders = browser.list_folders(root_id=root_id)["folders"]
+        return next(
+            folder for folder in folders if folder["relative_folder"] == relative_folder
+        )
+
+    def test_direct_folder_statistics_count_every_tag_source(self) -> None:
+        with LibraryBrowser(
+            library_id="library-a", state_path=self.state_path
+        ) as browser:
+            folder = self._folder(browser, "root-a", "shows/raiden")
+
+        self.assertEqual(folder["image_count"], 2)
+        self.assertEqual(folder["direct_image_count"], 2)
+        self.assertEqual(folder["descendant_image_count"], 3)
+        self.assertEqual(folder["manual_tagged_count"], 1)
+        self.assertEqual(folder["model_tagged_count"], 1)
+        self.assertEqual(folder["inherited_tagged_count"], 0)
+        self.assertEqual(folder["failed_count"], 1)
+        self.assertEqual(folder["timestamp_source"], "observed")
+
+        with LibraryBrowser(
+            library_id="library-a", state_path=self.state_path
+        ) as browser:
+            subfolder = self._folder(browser, "root-a", "shows/raiden/sub")
+
+        self.assertEqual(subfolder["image_count"], 1)
+        self.assertEqual(subfolder["descendant_image_count"], 1)
+        self.assertEqual(subfolder["manual_tagged_count"], 0)
+        self.assertEqual(subfolder["model_tagged_count"], 0)
+        self.assertEqual(subfolder["inherited_tagged_count"], 1)
+        self.assertEqual(subfolder["failed_count"], 0)
+
+    def test_root_level_images_form_the_root_folder(self) -> None:
+        with LibraryBrowser(
+            library_id="library-a", state_path=self.state_path
+        ) as browser:
+            root_folder = self._folder(browser, "root-a", "")
+            page = browser.folder_images(root_folder["folder_key"])
+            root_b_folders = browser.list_folders(root_id="root-b")["folders"]
+
+        self.assertEqual(root_folder["root_name"], "gallery-a")
+        self.assertEqual(root_folder["name"], "gallery-a")
+        self.assertEqual(root_folder["depth"], 0)
+        self.assertEqual(root_folder["parent_relative_folder"], "")
+        self.assertEqual(root_folder["direct_image_count"], 1)
+        self.assertEqual([item["doc_id"] for item in page["items"]], ["doc-a4"])
+        self.assertNotIn("", [folder["relative_folder"] for folder in root_b_folders])
+
+    def test_pages_are_stable_and_offsets_beyond_the_end_keep_the_total(self) -> None:
+        with LibraryBrowser(
+            library_id="library-a", state_path=self.state_path
+        ) as browser:
+            listing = browser.list_folders(limit=200)
+            singles = [
+                browser.list_folders(offset=offset, limit=1)["folders"][0]
+                for offset in range(listing["total"])
+            ]
+            beyond = browser.list_folders(offset=listing["total"], limit=10)
+
+        expected = [
+            ("root-a", ""),
+            ("root-a", "a%b"),
+            ("root-a", "axxb"),
+            ("root-a", "order"),
+            ("root-a", "shows/raiden"),
+            ("root-a", "shows/raiden/sub"),
+            ("root-b", "other"),
+            ("root-b", "shows/raiden"),
+        ]
+        self.assertEqual(listing["total"], len(expected))
+        self.assertEqual(
+            [(folder["root_id"], folder["relative_folder"]) for folder in singles],
+            expected,
+        )
+        self.assertEqual(
+            [
+                (folder["root_id"], folder["relative_folder"])
+                for folder in listing["folders"]
+            ],
+            expected,
+        )
+        self.assertEqual(beyond["folders"], [])
+        self.assertEqual(beyond["total"], len(expected))
+        self.assertFalse(beyond["has_more"])
+
+    def test_search_matches_folder_names_root_paths_and_literal_wildcards(
+        self,
+    ) -> None:
+        with LibraryBrowser(
+            library_id="library-a", state_path=self.state_path
+        ) as browser:
+            by_name = browser.list_folders(query="raiden")
+            by_root = browser.list_folders(query="gallery-b")
+            literal_percent = browser.list_folders(query="a%b")
+            literal_underscore = browser.list_folders(query="_")
+            no_match = browser.list_folders(query="zzz")
+
+        self.assertEqual(
+            sorted(
+                (folder["root_id"], folder["relative_folder"])
+                for folder in by_name["folders"]
+            ),
+            [
+                ("root-a", "shows/raiden"),
+                ("root-a", "shows/raiden/sub"),
+                ("root-b", "shows/raiden"),
+            ],
+        )
+        self.assertEqual(by_name["total"], 3)
+        self.assertEqual(
+            sorted(folder["relative_folder"] for folder in by_root["folders"]),
+            ["other", "shows/raiden"],
+        )
+        self.assertEqual(by_root["total"], 2)
+        self.assertEqual(
+            [folder["relative_folder"] for folder in literal_percent["folders"]],
+            ["a%b"],
+        )
+        self.assertEqual(literal_percent["total"], 1)
+        self.assertEqual(literal_underscore["total"], 0)
+        self.assertEqual(literal_underscore["folders"], [])
+        self.assertEqual(no_match["total"], 0)
+        self.assertEqual(no_match["folders"], [])
+
+    def test_folder_page_order_is_identical_with_and_without_the_index(self) -> None:
+        with LibraryBrowser(
+            library_id="library-a", state_path=self.state_path
+        ) as browser:
+            folder = self._folder(browser, "root-a", "order")
+            page = browser.folder_images(folder["folder_key"])
+
+        with self.state.connection:
+            self.state.connection.execute("DROP INDEX idx_entries_folder_page_nocase")
+        with LibraryBrowser(
+            library_id="library-a", state_path=self.state_path
+        ) as browser:
+            folder = self._folder(browser, "root-a", "order")
+            page_without_index = browser.folder_images(folder["folder_key"])
+
+        self.assertEqual(page, page_without_index)
+        self.assertEqual(
+            [item["file_name"] for item in page["items"]],
+            ["a.jpg", "A.jpg", "B.jpg"],
+        )
+        self.assertEqual(
+            [item["doc_id"] for item in page["items"]],
+            ["doc-a6", "doc-a7", "doc-a5"],
+        )
+
+    def test_emptied_folder_disappears_but_same_named_folder_survives(self) -> None:
+        self.state.remove_many(["doc-a1", "doc-a2"])
+        with LibraryBrowser(
+            library_id="library-a", state_path=self.state_path
+        ) as browser:
+            root_a = browser.list_folders(root_id="root-a")
+            root_b = browser.list_folders(root_id="root-b")
+
+        self.assertNotIn(
+            "shows/raiden",
+            [folder["relative_folder"] for folder in root_a["folders"]],
+        )
+        self.assertEqual(root_a["total"], 5)
+        other = next(
+            folder
+            for folder in root_b["folders"]
+            if folder["relative_folder"] == "shows/raiden"
+        )
+        self.assertEqual(other["image_count"], 1)
+        self.assertEqual(other["descendant_image_count"], 1)
+        self.assertEqual(root_b["total"], 2)
 
 
 if __name__ == "__main__":

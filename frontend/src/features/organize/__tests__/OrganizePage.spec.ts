@@ -2,6 +2,7 @@ import { flushPromises, mount, type DOMWrapper } from "@vue/test-utils";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import OrganizePage from "../OrganizePage.vue";
+import { useGalleryDensity } from "../../../composables/useGalleryDensity";
 import type {
   OrganizeApi,
   OrganizeBootstrapResponse,
@@ -150,8 +151,13 @@ async function selectOneAndEnterTags(
 }
 
 describe("OrganizePage batch tags", () => {
-  beforeEach(() => vi.clearAllMocks());
+  beforeEach(() => {
+    vi.clearAllMocks();
+    // The density tier is a module singleton shared with the search grid.
+    useGalleryDensity().setDensity("standard");
+  });
   afterEach(() => {
+    useGalleryDensity().setDensity("standard");
     vi.useRealTimers();
     vi.unstubAllGlobals();
   });
@@ -481,20 +487,22 @@ describe("OrganizePage batch tags", () => {
 
     const wrapper = await mountPage(api);
 
+    // 7 columns × 3 rows at the standard density, bounded by the organize cap.
     expect(api.listFolderImages).toHaveBeenCalledWith(
       "lib-1",
       "folder-raiden",
       1,
-      6,
+      21,
       false,
       expect.any(AbortSignal),
     );
+    expect(wrapper.get(".image-grid").attributes("style")).toContain("--organize-columns: 7");
     wrapper.unmount();
     width.mockRestore();
     height.mockRestore();
   });
 
-  it("does not refetch after resize since the page size is fixed", async () => {
+  it("reloads the folder page with the new capacity after a resize", async () => {
     vi.useFakeTimers();
     let viewportWidth = 1_547;
     let viewportHeight = 1_030;
@@ -524,12 +532,10 @@ describe("OrganizePage batch tags", () => {
       "lib-1",
       "folder-raiden",
       1,
-      6,
+      21,
       false,
       expect.any(AbortSignal),
     );
-
-    const callCountBeforeResize = vi.mocked(api.listFolderImages).mock.calls.length;
 
     viewportWidth = 300;
     viewportHeight = 520;
@@ -537,8 +543,209 @@ describe("OrganizePage batch tags", () => {
     await vi.advanceTimersByTimeAsync(160);
     await flushPromises();
 
-    // Fixed page size means resize does not trigger a refetch.
-    expect(vi.mocked(api.listFolderImages).mock.calls.length).toBe(callCountBeforeResize);
+    // A single narrow column of one tile row: offset/limit are recomputed.
+    expect(api.listFolderImages).toHaveBeenLastCalledWith(
+      "lib-1",
+      "folder-raiden",
+      1,
+      1,
+      false,
+      expect.any(AbortSignal),
+    );
+    expect(wrapper.get(".image-grid").attributes("style")).toContain("--organize-columns: 1");
+
+    wrapper.unmount();
+    width.mockRestore();
+    height.mockRestore();
+  });
+
+  it("ignores zero-sized viewports and keeps the last measured capacity", async () => {
+    vi.useFakeTimers();
+    let viewportWidth = 1_547;
+    let viewportHeight = 1_030;
+    let resizeCallback: ResizeObserverCallback | undefined;
+    const width = vi
+      .spyOn(HTMLElement.prototype, "clientWidth", "get")
+      .mockImplementation(() => viewportWidth);
+    const height = vi
+      .spyOn(HTMLElement.prototype, "clientHeight", "get")
+      .mockImplementation(() => viewportHeight);
+
+    class ResizeObserverMock {
+      constructor(callback: ResizeObserverCallback) {
+        resizeCallback = callback;
+      }
+
+      observe(): void {}
+      unobserve(): void {}
+      disconnect(): void {}
+    }
+
+    vi.stubGlobal("ResizeObserver", ResizeObserverMock);
+    const api = fakeApi();
+    const wrapper = await mountPage(api);
+    const callsBefore = vi.mocked(api.listFolderImages).mock.calls.length;
+
+    // Hidden workspaces report 0×0; they must not collapse the page capacity.
+    viewportWidth = 0;
+    viewportHeight = 0;
+    resizeCallback?.([], {} as ResizeObserver);
+    await vi.advanceTimersByTimeAsync(160);
+    await flushPromises();
+
+    expect(vi.mocked(api.listFolderImages).mock.calls.length).toBe(callsBefore);
+    expect(wrapper.get(".image-grid").attributes("style")).toContain("--organize-columns: 7");
+
+    wrapper.unmount();
+    width.mockRestore();
+    height.mockRestore();
+  });
+
+  it("recomputes the folder capacity when the shared density changes", async () => {
+    const width = vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockReturnValue(1_547);
+    const height = vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(1_030);
+    const api = fakeApi();
+    const wrapper = await mountPage(api);
+
+    const select = wrapper.get('select[aria-label="缩略图密度"]');
+    expect(select.findAll("option").map((option) => option.text())).toEqual([
+      "紧凑",
+      "标准",
+      "大图",
+    ]);
+    await select.setValue("large");
+    await flushPromises();
+
+    expect(useGalleryDensity().density.value).toBe("large");
+    expect(api.listFolderImages).toHaveBeenLastCalledWith(
+      "lib-1",
+      "folder-raiden",
+      1,
+      10,
+      false,
+      expect.any(AbortSignal),
+    );
+    expect(wrapper.get(".image-grid").attributes("style")).toContain("--organize-columns: 5");
+
+    wrapper.unmount();
+    width.mockRestore();
+    height.mockRestore();
+  });
+
+  it("anchors the new page on the selected image when the capacity shrinks", async () => {
+    const width = vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockReturnValue(1_547);
+    const height = vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(1_030);
+    const api = fakeApi();
+    const wrapper = await mountPage(api);
+
+    // Page 2 starts at absolute index 21 with the standard density.
+    await buttonWithText(wrapper, "下一页").trigger("click");
+    await flushPromises();
+    await imageButton(wrapper, "doc-4").trigger("click");
+    await wrapper.get('select[aria-label="缩略图密度"]').setValue("large");
+    await flushPromises();
+
+    // 10 images per page puts absolute index 21 on page 3, not back on page 1.
+    expect(api.listFolderImages).toHaveBeenLastCalledWith(
+      "lib-1",
+      "folder-raiden",
+      3,
+      10,
+      false,
+      expect.any(AbortSignal),
+    );
+    const pageInput = wrapper.get("#organize-gallery-page-input").element as HTMLInputElement;
+    expect(pageInput.value).toBe("3");
+
+    wrapper.unmount();
+    width.mockRestore();
+    height.mockRestore();
+  });
+
+  it("anchors on the rendered page across rapid consecutive capacity changes", async () => {
+    const width = vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockReturnValue(1_547);
+    const height = vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(1_030);
+    const galleryPage = (page: number, size: number): OrganizeFolderImagesResponse => {
+      const total = 65;
+      const start = (page - 1) * size;
+      const count = Math.max(0, Math.min(size, total - start));
+      return {
+        page,
+        page_size: size,
+        total_items: total,
+        items: Array.from({ length: count }, (_, index) => {
+          const absolute = start + index;
+          return {
+            doc_id: `doc-${absolute + 1}`,
+            file_name: `${String(absolute + 1).padStart(2, "0")}.jpg`,
+            relative_path: `原神/雷电将军/${absolute + 1}.jpg`,
+            image_available: true,
+            manual_tags: ["写真"],
+          };
+        }),
+      };
+    };
+    let resolveStale: ((payload: OrganizeFolderImagesResponse) => void) | undefined;
+    const listFolderImages = vi.fn(
+      (_libraryId: string, _folderKey: string, page: number, size: number) => {
+        if (size === 10) {
+          // The large-density request stays in flight and ignores AbortSignal.
+          return new Promise<OrganizeFolderImagesResponse>((resolve) => {
+            resolveStale = resolve;
+          });
+        }
+        return Promise.resolve(galleryPage(page, size));
+      },
+    );
+    const wrapper = await mountPage(fakeApi({ listFolderImages }));
+
+    // Page 2 at the standard capacity starts at absolute index 21.
+    await buttonWithText(wrapper, "下一页").trigger("click");
+    await flushPromises();
+    expect(listFolderImages).toHaveBeenLastCalledWith(
+      "lib-1",
+      "folder-raiden",
+      2,
+      21,
+      false,
+      expect.any(AbortSignal),
+    );
+    await imageButton(wrapper, "doc-22").trigger("click");
+
+    const density = wrapper.get('select[aria-label="缩略图密度"]');
+    await density.setValue("large");
+    expect(listFolderImages).toHaveBeenLastCalledWith(
+      "lib-1",
+      "folder-raiden",
+      3,
+      10,
+      false,
+      expect.any(AbortSignal),
+    );
+
+    // The second change lands before the first finishes: the anchor is still
+    // absolute index 21, so the reload must stay on page 2 instead of being
+    // recomputed from the in-flight page 3 at ten per page.
+    await density.setValue("standard");
+    await flushPromises();
+
+    expect(listFolderImages).toHaveBeenLastCalledWith(
+      "lib-1",
+      "folder-raiden",
+      2,
+      21,
+      false,
+      expect.any(AbortSignal),
+    );
+    const pageInput = wrapper.get("#organize-gallery-page-input").element as HTMLInputElement;
+    expect(pageInput.value).toBe("2");
+    expect(imageButton(wrapper, "doc-22").attributes("aria-pressed")).toBe("true");
+
+    // The abandoned page-3 response must not replace what is on screen.
+    resolveStale?.(galleryPage(3, 10));
+    await flushPromises();
+    expect(imageButton(wrapper, "doc-22").attributes("aria-pressed")).toBe("true");
+    expect(wrapper.find('[data-image-id="doc-1"]').exists()).toBe(false);
 
     wrapper.unmount();
     width.mockRestore();

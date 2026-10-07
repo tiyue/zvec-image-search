@@ -10,12 +10,12 @@ export { GatewayError as ApiError } from "./gateway";
 
 export interface SearchApi {
   bootstrap(signal?: AbortSignal): Promise<BootstrapResponse>;
-  latest(page: number, pageSize: 15, signal?: AbortSignal): Promise<SearchPageResponse>;
+  latest(page: number, pageSize: number, signal?: AbortSignal): Promise<SearchPageResponse>;
   submit(body: SearchSubmission, signal?: AbortSignal): Promise<SearchPageResponse>;
   page(
     operationId: string,
     page: number,
-    pageSize: 15,
+    pageSize: number,
     signal?: AbortSignal,
   ): Promise<SearchPageResponse>;
   cancel(operationId: string): Promise<SearchPageResponse>;
@@ -23,7 +23,7 @@ export interface SearchApi {
   historyPage?(
     historyId: string,
     page: number,
-    pageSize: 15,
+    pageSize: number,
     signal?: AbortSignal,
   ): Promise<SearchPageResponse>;
 }

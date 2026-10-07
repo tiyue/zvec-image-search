@@ -94,7 +94,13 @@ Vue 3 + TypeScript + Vite SPA：
 - 图片推荐模块（`src/features/recommendations/`）：推荐批次、缩略图预加载、shown/action 事件同步、单张右键菜单与独立推荐详情
 - API 层（`src/api/`）：`client.ts`、`gateway.ts`
 - 构建产物嵌入 `zvec_webview/frontend_dist/`
-- 缩略图显示策略：所有图片网格统一使用 `object-fit: contain` 确保全图可见不裁切；图库浏览 4 列 + dense 自动填充，搜索结果 5×3 固定布局；横图（宽高比 > 1.5）自动跨 2 列；网格采用 masonry 瀑布流布局（`grid-auto-rows: 10px` + 动态 `grid-row: span N`），每张图的行跨度由宽高比和列宽自动计算，竖图高窄、横图矮宽，dense 模式自动填缝
+- 缩略图显示策略：所有图片网格统一使用 `object-fit: contain` 确保全图可见不裁切；横图（宽高比 > 1.5）在整理图库自动跨 2 列；整理图库采用 masonry 瀑布流布局（`grid-auto-rows: 10px` + 动态 `grid-row: span N`），每张图的行跨度由宽高比和列宽自动计算，竖图高窄、横图矮宽，dense 模式自动填缝
+- 自适应缩略图密度与分页（`composables/useGalleryDensity.ts`）：搜索网格与整理图库共享三档密度——紧凑/标准/大图，目标卡片宽度 144/192/272 px、间距 8 px，默认标准，选择写入本机 `localStorage`（`yaolens.gallery-density`）并在异常旧值/不可用存储时回退 `standard`。列数由实测容器宽高计算（上限 12 列），搜索页容量 = 列 × 行、上限 60，整理页容量上限 32（整理卡高度额外计入 `GALLERY_META_OVERHEAD` 文本区）；未测量时回退搜索 15 / 整理 6。搜索网格固定行高、`align-content: start` 并允许纵向滚动，隐藏页面（`v-show`）的 0 尺寸测量被忽略，仅在容量真正变化时重新读取数据
+- 密度控件入口：首页「搜索设置」与搜索结果标题栏都提供原生三档 `<select>`，搜索结果/历史页无需回到首页即可切换；整理图库在自身标题栏切换并监听共享档位，从搜索结果页改档后返回已访问的整理页会按新档重新计算布局（隐藏页面的 0 尺寸测量忽略，仅容量变化才重新请求）
+- 分页契约：前端把当前展示容量作为 `page_size` 传给 `api/results/latest`、`api/results/history/{id}` 与 `api/search/{id}`（网关允许 1–100，默认 15），`SearchSubmission.page_size` 不再是字面量 15；`top_k` 语义、默认检索数量（15）与排序结果不变，本地后端分页未改动。切换密度/窗口只重新读取已有结果页，不重新提交语义搜索、不调用嵌入；缓存与预取按页容量区分，迟到的旧容量/旧来源/旧查询响应不能覆盖当前页；换页优先保留选中图片，否则以原页首图片的绝对位置换算新页码，锚点不随连续 resize 漂移
+- 容量切换与请求所有权：前台页请求使用单调序号判定归属，A→B→A 连续改容量后迟到的旧请求既不覆盖新页、也不提前结束 loading；预取在取消后不再写入缓存。初始化期间发生的容量变化会在最新结果返回后按最新容量重读，初始化不会覆盖更新的来源。密度重读保留主选中项（仍在新页时），普通翻页/新搜索仍以页首图片为主选中项
+- 历史结果恢复：打开历史记录时标题立即切换为该记录名称、锚点回到第一页；若首屏读取被新的容量重读取代，历史视图交由取代它的请求渲染，不会退回搜索首页
+- 整理瀑布流与窄窗/主题：整理行跨度按实际列数与实际跨列计算（单列不跨列），测量宽度扣除网格水平内边距；搜索结果与整理图库支持 390px 窄窗口（标题/控件换行、图片与分页可达、无横向溢出），并随 `prefers-color-scheme` 提供深浅配色（沿用既有 CSS token 与对比度）
 - 整理入口只保留批量标签和相似分组。待学习样本页面已撤下；宿主与后端不再接受 `active_learning_queue`、`active_learning_review`、`active_learning_review_undo`。既有审核记录仍留在本地库，启动时的未完成批次恢复保持不变。主动学习 Python 模块仍供冻结包自检导入，不作为产品入口。
 - 视觉近似使用图库记录上的 8×8 平均哈希。索引或同步在文件新增或内容变化时计算一次；解码失败只记录该图片，索引继续。旧图在下一次聚类时补写空哈希。聚类按文档 ID 顺序把图片连到汉明距离不超过 6 的最早组代表，中间成员不再充当桥梁。算法版本为 `image-cluster-v2`。完全重复仍按 SHA-256 传递合并。内容相似默认关闭。
 
@@ -199,6 +205,7 @@ CLI 入口将配置创建、迁移/后端服务、需要 `ImageVectorService` �
 | 工具 | 说明 |
 |------|------|
 | `tools/search_learning/generate_eval_pack.py` | 从 `search_results/` 历史结果生成固定评测包（`fixed-evaluation.json`），用于搜索学习排序模型的离线评估；参数：`--search-results-dir`、`--output`、`--max-cases`、`--max-candidates` |
+| `tools/benchmark_gallery_queries.py` | 用合成元数据基准并逐项校验文件夹列表/同目录分页的结果等价性（含索引有无对比、索引构建与写入成本）；参数：`--scenario small|large|multi`、`--work-dir`、`--output`、`--keep` |
 
 ## 技术栈
 
@@ -261,6 +268,15 @@ CLI 入口将配置创建、迁移/后端服务、需要 `ImageVectorService` �
 | `model-catalog.default.json` | 默认模型配置 |
 
 集合写入前会对字段做安全校验（`collection_write_outbox`）：拒绝凭据、绝对路径（Windows 盘符 / UNC / Unix `/` 开头）和 NUL 字符。`relative_path` 必须是 POSIX 风格的相对路径，支持 CJK 字符及多级子目录（如 `作品/子目录/1.jpg`）。
+
+### 图库文件夹浏览查询
+
+- 文件夹列表只展示“直接包含至少一张图片”的文件夹，空目录及仅含子目录的中间目录不进入此列表；Root 导航仍保留空 Root 的浏览入口。图片数量、直接图片数、后代图片数、手工/模型/继承标签张数、标注失败张数与首次/末次索引时间语义不变，排序仍为首次索引时间倒序 → Root 路径（`COLLATE NOCASE`，同值时按原文）→ 文件夹相对路径（`COLLATE NOCASE`，同值时按原文）→ `root_id`。
+- 搜索词继续同时匹配文件夹相对路径与 Root 当前路径，`%`、`_`、`\` 按字面转义；分页参数 `offset`/`limit` 校验与 `has_more` 语义不变。
+- 列表查询先在 `folder_catalog` 中选出当前页文件夹（用 `entry_folder_index` 的直接图片存在性过滤），再只为这一页的文件夹经 `entry_folder_index` 聚合统计，不再对整个图库重复分组关联。总数查询同样只遍历 `folder_catalog`，不关联 `entries`、`document_annotations` 的整库分组。
+- 同目录图片分页按 `relative_path COLLATE NOCASE, doc_id` 排序，新增匹配该排序规则的复合覆盖索引 `idx_entries_folder_page_nocase (root_id, parent_directory, relative_path COLLATE NOCASE, doc_id)`；该索引不含 `WHERE` 条件，是普通复合索引，不是 SQLite partial index。已有库在下次打开时自动补建该索引，不重建向量、不改动既有数据。原有 `idx_entries_folder_page` 保留，供默认排序规则（BINARY）的查找继续使用。
+- 未引入统计缓存、持久化计数表或全局缓存；每个请求的总数仍是对该目录索引项的 O(n) 计数扫描（仅索引页），`document_annotations` 仍逐文档左连接。
+- 上述结论由 `tools/benchmark_gallery_queries.py` 的合成元数据基准与结果等价校验支撑：带/不带该索引的读写对比在两份独立但内容等价的合成数据库上进行；写对比在已打开的同一状态库实例上于计时前真正删除索引，并校验计时前后索引是否存在；每次计时样本各自新建连接，`first_sample_ms` 是等价性校验读取之后的第一个样本，页面缓存已预热，并非冷缓存测量。该基准只覆盖本机合成元数据与所列页面/列表/多 Root 场景，不代表真实照片库端到端指标。
 
 ### 图片推荐
 

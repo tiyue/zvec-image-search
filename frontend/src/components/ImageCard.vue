@@ -232,4 +232,27 @@ function openContextMenu(event: MouseEvent): void {
   box-shadow: 0 3px 10px rgb(0 0 0 / 18%);
 }
 
+@media (prefers-color-scheme: dark) {
+  .image-card {
+    color: #ededed;
+    background: #262626;
+  }
+
+  .image-card:hover {
+    filter: brightness(1.12);
+  }
+
+  .image-card.is-selected {
+    outline-color: #e6e6e6;
+  }
+
+  .thumbnail-stage {
+    background: linear-gradient(145deg, #232323, #1b1b1b);
+  }
+
+  .thumbnail-fallback {
+    color: #a9b0be;
+  }
+}
+
 </style>

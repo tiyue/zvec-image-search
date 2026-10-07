@@ -6,19 +6,41 @@ import {
   GRID_GAP,
   gridRowSpan,
   gridSpan,
-  ORGANIZE_GALLERY_DEFAULT_PAGE_SIZE,
 } from "../galleryCapacity";
 
 describe("calculateOrganizeGalleryCapacity", () => {
-  it("returns a fixed page size regardless of viewport", () => {
+  it("derives columns and page size from the measured viewport", () => {
+    // 1547px / 192px target width => 7 columns; 1030px / (192 + 75 meta) => 3 rows.
     expect(calculateOrganizeGalleryCapacity(1547, 1030)).toEqual({
-      pageSize: ORGANIZE_GALLERY_DEFAULT_PAGE_SIZE,
-    });
-    expect(calculateOrganizeGalleryCapacity(0, 0)).toEqual({
-      pageSize: ORGANIZE_GALLERY_DEFAULT_PAGE_SIZE,
+      pageSize: 21,
+      columns: 7,
     });
     expect(calculateOrganizeGalleryCapacity(470, 300)).toEqual({
-      pageSize: ORGANIZE_GALLERY_DEFAULT_PAGE_SIZE,
+      pageSize: 2,
+      columns: 2,
+    });
+  });
+
+  it("keeps the previous bounded default when nothing was measured", () => {
+    expect(calculateOrganizeGalleryCapacity(0, 0)).toEqual({
+      pageSize: 6,
+      columns: 3,
+    });
+    expect(calculateOrganizeGalleryCapacity(0, 1030)).toEqual({
+      pageSize: 6,
+      columns: 3,
+    });
+  });
+
+  it("follows the shared density tier", () => {
+    // compact (144px) and large (272px) targets on the same viewport.
+    expect(calculateOrganizeGalleryCapacity(1547, 1030, "compact")).toEqual({
+      pageSize: 32,
+      columns: 10,
+    });
+    expect(calculateOrganizeGalleryCapacity(1547, 1030, "large")).toEqual({
+      pageSize: 10,
+      columns: 5,
     });
   });
 });

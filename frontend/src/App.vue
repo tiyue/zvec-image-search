@@ -9,6 +9,11 @@ import PaginationBar from "./components/PaginationBar.vue";
 import StatusToast from "./components/StatusToast.vue";
 import AppIcon from "./components/AppIcon.vue";
 import { useNativeImageActions } from "./composables/useNativeImageActions";
+import {
+  computeGalleryLayout,
+  useGalleryDensity,
+  type GalleryLayout,
+} from "./composables/useGalleryDensity";
 import { useSearch } from "./composables/useSearch";
 import { installGlobalDiagnostics, reportFrontendDiagnostic } from "./diagnostics";
 import { OrganizePage } from "./features/organize";
@@ -119,7 +124,18 @@ const nativeActions = useNativeImageActions({
 });
 const searchFeedback = useSearchFeedback();
 
+const galleryDensity = useGalleryDensity();
+const galleryDensityOptions = galleryDensity.options;
 const searchWorkspace = ref<HTMLElement | null>(null);
+const searchGalleryViewport = ref<HTMLElement | null>(null);
+const searchGalleryLayout = ref<GalleryLayout>(
+  computeGalleryLayout({
+    width: 0,
+    height: 0,
+    density: galleryDensity.density.value,
+    mode: "search",
+  }),
+);
 const searchInput = ref<HTMLInputElement | null>(null);
 const paginationBar = ref<{ focusInput: () => void } | null>(null);
 const previewVisible = ref(false);
@@ -133,6 +149,8 @@ const knownSearchItems = new Map<string, SearchResultItem>();
 let knownFeedbackSessions = "";
 let removeGlobalDiagnostics: (() => void) | null = null;
 let imageEditImportSequence = 0;
+let searchGalleryObserver: ResizeObserver | null = null;
+let searchGalleryResizeTimer: number | null = null;
 
 const selectedCount = computed(() => selectedImageIds.value.length);
 const hasSearchActivity = computed(
@@ -504,6 +522,53 @@ function handleWindowResize(): void {
   closeContextMenu();
 }
 
+/**
+ * Measure the real search gallery box and hand the resulting capacity to the
+ * search composable. Zero-sized (hidden) boxes are ignored so switching pages
+ * through `v-show` cannot collapse the grid, and a change only reloads when
+ * the capacity actually differs.
+ */
+function applySearchGalleryLayout(reload: boolean): void {
+  const element = searchGalleryViewport.value;
+  if (!element) return;
+  const width = element.clientWidth;
+  const height = element.clientHeight;
+  if (width <= 0 || height <= 0) return;
+  const next = computeGalleryLayout({
+    width,
+    height,
+    density: galleryDensity.density.value,
+    mode: "search",
+  });
+  const previous = searchGalleryLayout.value;
+  if (
+    next.pageSize === previous.pageSize &&
+    next.columns === previous.columns &&
+    next.cardHeight === previous.cardHeight
+  ) return;
+  searchGalleryLayout.value = next;
+  // Only a real capacity change re-reads the page; a pure visual change (tile
+  // height) just re-renders the grid.
+  if (next.pageSize !== previous.pageSize) void search.setPageSize(next.pageSize, reload);
+}
+
+function scheduleSearchGalleryLayout(): void {
+  if (searchGalleryResizeTimer !== null) window.clearTimeout(searchGalleryResizeTimer);
+  searchGalleryResizeTimer = window.setTimeout(() => {
+    searchGalleryResizeTimer = null;
+    applySearchGalleryLayout(true);
+  }, 140);
+}
+
+function stopSearchGalleryObserver(): void {
+  searchGalleryObserver?.disconnect();
+  searchGalleryObserver = null;
+  if (searchGalleryResizeTimer !== null) {
+    window.clearTimeout(searchGalleryResizeTimer);
+    searchGalleryResizeTimer = null;
+  }
+}
+
 function handleCloseBlocked(): void {
   addToast("暂时无法退出", "仍有任务在运行，请完成或取消任务后重试。", "error");
 }
@@ -577,6 +642,10 @@ function handleFeatureToast(
   kind: ToastMessage["kind"],
 ): void {
   addToast(title, message, kind);
+}
+
+function changeGalleryDensity(event: Event): void {
+  galleryDensity.setDensity((event.target as HTMLSelectElement).value);
 }
 
 function handleRawSelectionSelectFolder(callback: (path: string) => void): void {
@@ -707,6 +776,27 @@ function handleGlobalKeydown(event: KeyboardEvent): void {
   }
 }
 
+watch(hasSearchActivity, async (active) => {
+  if (!active) {
+    stopSearchGalleryObserver();
+    return;
+  }
+  await nextTick();
+  applySearchGalleryLayout(true);
+  const element = searchGalleryViewport.value;
+  if (typeof ResizeObserver === "undefined" || !element) return;
+  searchGalleryObserver ??= new ResizeObserver(scheduleSearchGalleryLayout);
+  searchGalleryObserver.disconnect();
+  searchGalleryObserver.observe(element);
+});
+
+watch(
+  () => galleryDensity.density.value,
+  () => {
+    void nextTick(() => applySearchGalleryLayout(true));
+  },
+);
+
 onMounted(() => {
   removeGlobalDiagnostics = installGlobalDiagnostics();
   search.setPreviewEnabled(false);
@@ -722,6 +812,7 @@ onMounted(() => {
 onBeforeUnmount(() => {
   removeGlobalDiagnostics?.();
   removeGlobalDiagnostics = null;
+  stopSearchGalleryObserver();
   window.removeEventListener("keydown", handleGlobalKeydown);
   window.removeEventListener("pointerdown", handleWindowPointerDown);
   window.removeEventListener("resize", handleWindowResize);
@@ -916,6 +1007,16 @@ watch(
                     <span>结果数量</span>
                     <input v-model="search.resultLimit.value" aria-label="本次搜索图片数量" type="number" min="1" step="1" inputmode="numeric" />
                   </label>
+                  <label>
+                    <span>缩略图</span>
+                    <select
+                      :value="galleryDensity.density.value"
+                      aria-label="缩略图密度"
+                      @change="changeGalleryDensity"
+                    >
+                      <option v-for="option in galleryDensityOptions" :key="option.value" :value="option.value">{{ option.label }}</option>
+                    </select>
+                  </label>
                   <label v-if="search.mode.value === 'tags'" class="tag-match-setting">
                     <span>标签匹配</span>
                     <select v-model="search.tagMode.value" aria-label="标签匹配方式">
@@ -937,6 +1038,17 @@ watch(
                 <p>{{ search.title.value || "当前搜索" }}</p>
               </div>
               <div class="result-status-actions">
+                <label class="result-density-control">
+                  <span>缩略图</span>
+                  <select
+                    data-testid="result-density"
+                    aria-label="缩略图密度"
+                    :value="galleryDensity.density.value"
+                    @change="changeGalleryDensity"
+                  >
+                    <option v-for="option in galleryDensityOptions" :key="option.value" :value="option.value">{{ option.label }}</option>
+                  </select>
+                </label>
                 <button class="result-action-button" type="button" @click="searchInput?.focus()">筛选</button>
                 <button class="result-action-button" type="button" :disabled="!search.items.value.length || nativeActions.exporting.value" @click="exportSelectedImages(search.items.value.map((item) => item.id), 'result_header_export')">导出</button>
                 <output class="status-pill" :class="{ 'is-passive': !search.searching.value && search.status.value !== 'failed' }" role="status" aria-live="polite" :title="search.message.value">{{ statusLabel }}</output>
@@ -955,16 +1067,20 @@ watch(
               </div>
               <div v-if="nativeActions.exporting.value" class="export-progress" role="status">{{ nativeActions.exportJob.value?.message }}</div>
             </div>
-            <GalleryGrid
-              :items="search.items.value"
-              :selected-id="search.selectedId.value"
-              :selected-ids="selectedImageIds"
-              :loading="search.pageLoading.value"
-              :loading-text="`正在读取第 ${search.page.value} 页`"
-              @select="handleGallerySelection"
-              @open="openSearchImage"
-              @context="openContextMenu"
-            />
+            <div ref="searchGalleryViewport" class="search-gallery-viewport">
+              <GalleryGrid
+                :items="search.items.value"
+                :selected-id="search.selectedId.value"
+                :selected-ids="selectedImageIds"
+                :loading="search.pageLoading.value"
+                :loading-text="`正在读取第 ${search.page.value} 页`"
+                :columns="searchGalleryLayout.columns"
+                :card-height="searchGalleryLayout.cardHeight"
+                @select="handleGallerySelection"
+                @open="openSearchImage"
+                @context="openContextMenu"
+              />
+            </div>
             <PaginationBar
               ref="paginationBar"
               :page="search.page.value"

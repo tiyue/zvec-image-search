@@ -1,19 +1,34 @@
+import {
+  computeGalleryLayout,
+  type GalleryDensity,
+} from "../../composables/useGalleryDensity";
+
 export const ORGANIZE_GALLERY_MAX_PAGE_SIZE = 32;
 export const ORGANIZE_GALLERY_DEFAULT_PAGE_SIZE = 6;
 
 export interface OrganizeGalleryCapacity {
   pageSize: number;
+  columns: number;
 }
 
 /**
  * Dense grid layout: images span 1 or 2 columns based on aspect ratio.
- * The grid scrolls vertically with enough items per page to fill several rows.
+ * Columns and page capacity follow the real container size and the shared
+ * thumbnail density; unmeasured containers keep the previous 6-image default.
  */
 export function calculateOrganizeGalleryCapacity(
-  _width: number,
-  _height: number,
+  width: number,
+  height: number,
+  density: GalleryDensity = "standard",
 ): OrganizeGalleryCapacity {
-  return { pageSize: ORGANIZE_GALLERY_DEFAULT_PAGE_SIZE };
+  const layout = computeGalleryLayout({
+    width,
+    height,
+    density,
+    mode: "organize",
+    metaOverhead: GALLERY_META_OVERHEAD,
+  });
+  return { pageSize: layout.pageSize, columns: layout.columns };
 }
 
 /**
@@ -29,6 +44,8 @@ export function gridSpan(width: number, height: number): 1 | 2 {
 export const GRID_ROW_UNIT = 10;
 /** Gap between grid tracks in pixels (must match CSS `gap`). */
 export const GRID_GAP = 8;
+/** Horizontal padding of `.image-grid` (1px left + 3px right) inside the viewport. */
+export const GRID_HORIZONTAL_PADDING = 4;
 /** Estimated non-image metadata height for gallery tiles (image-meta + image-tags). */
 export const GALLERY_META_OVERHEAD = 75;
 

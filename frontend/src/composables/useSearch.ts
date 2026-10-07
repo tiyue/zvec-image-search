@@ -1,6 +1,7 @@
 import { computed, ref, shallowRef } from "vue";
 
 import { ApiError, searchApi, type SearchApi } from "../api/client";
+import { clampGalleryPageSize } from "./useGalleryDensity";
 import type {
   LibrarySummary,
   SearchHistoryEntry,
@@ -13,7 +14,7 @@ import type {
   TagMatchMode,
 } from "../types/contracts";
 
-const PAGE_SIZE = 15 as const;
+const DEFAULT_PAGE_SIZE = 15;
 const CACHE_LIMIT = 5;
 const LATEST_CACHE_TTL_MS = 30_000;
 const DEFAULT_SEARCH_TIMEOUT_MS = 120_000;
@@ -35,6 +36,7 @@ interface CacheEntry {
   cachedAt: number;
   scope: string;
   snapshot: string;
+  pageSize: number;
 }
 
 interface SearchEvents {
@@ -169,13 +171,16 @@ function normalizeItem(raw: SearchResultWire, index: number): SearchResultItem {
   };
 }
 
-function payloadItems(payload: SearchPageResponse): SearchResultItem[] {
+function payloadItems(
+  payload: SearchPageResponse,
+  size: number = DEFAULT_PAGE_SIZE,
+): SearchResultItem[] {
   const source = payload.items?.length
     ? payload.items
     : payload.results?.length
       ? payload.results
       : payload.result?.items ?? [];
-  return source.slice(0, PAGE_SIZE).map(normalizeItem);
+  return source.slice(0, Math.max(1, size)).map(normalizeItem);
 }
 
 function operationId(payload: SearchPageResponse | null | undefined): string {
@@ -271,13 +276,24 @@ export function useSearch(
   const status = ref("idle");
   const searching = ref(false);
   const pageLoading = ref(false);
+  const pageSize = ref(DEFAULT_PAGE_SIZE);
 
   let source: SearchSource = "latest";
   let activeOperationId = "";
   let activeHistoryId = "";
   let generation = 0;
+  // Monotonic id of the foreground page request that currently owns the
+  // gallery: an older response must never replace or unload a newer one, even
+  // when the API ignores the abort signal and the capacity round-trips (A→B→A).
+  let pageRequestSequence = 0;
   let scope = "";
   let snapshot = "";
+  // Size of the page currently rendered in `items`; the desired `pageSize`
+  // only diverges from it while a running search still returns its first page.
+  let appliedPageSize = 0;
+  // Absolute index of the image that must stay visible across capacity
+  // changes: the last explicit selection, or the start of the last page.
+  let anchorAbsolute = 0;
   let searchController: AbortController | null = null;
   let searchWatchdogHandle: number | null = null;
   let foregroundController: AbortController | null = null;
@@ -410,7 +426,7 @@ export function useSearch(
     snapshot = nextSnapshot;
   }
 
-  function store(payload: SearchPageResponse): void {
+  function store(payload: SearchPageResponse, size: number): void {
     const targetPage = Math.max(1, integer(payload.page, 1));
     cache.delete(targetPage);
     cache.set(targetPage, {
@@ -418,6 +434,7 @@ export function useSearch(
       cachedAt: Date.now(),
       scope,
       snapshot,
+      pageSize: size,
     });
     while (cache.size > CACHE_LIMIT) {
       const oldest = cache.keys().next().value as number | undefined;
@@ -426,9 +443,14 @@ export function useSearch(
     }
   }
 
-  function cached(targetPage: number): SearchPageResponse | null {
+  function cached(targetPage: number, size: number): SearchPageResponse | null {
     const entry = cache.get(targetPage);
-    if (!entry || entry.scope !== scope || entry.snapshot !== snapshot) return null;
+    if (
+      !entry ||
+      entry.pageSize !== size ||
+      entry.scope !== scope ||
+      entry.snapshot !== snapshot
+    ) return null;
     if (source === "latest" && Date.now() - entry.cachedAt > LATEST_CACHE_TTL_MS) {
       cache.delete(targetPage);
       return null;
@@ -438,10 +460,16 @@ export function useSearch(
     return entry.payload;
   }
 
-  function apply(payload: SearchPageResponse, nextSource: SearchSource, fallbackTitle: string): void {
-    const nextItems = payloadItems(payload);
+  function apply(
+    payload: SearchPageResponse,
+    nextSource: SearchSource,
+    fallbackTitle: string,
+    size: number = pageSize.value,
+    preserveSelection = false,
+  ): void {
+    const nextItems = payloadItems(payload, size);
     const nextPage = Math.max(1, integer(payload.page, 1));
-    const minimumKnown = (nextPage - 1) * PAGE_SIZE + nextItems.length;
+    const minimumKnown = (nextPage - 1) * size + nextItems.length;
     const explicitTotal = finite(
       payload.total_items,
       payload.total_count,
@@ -453,17 +481,24 @@ export function useSearch(
     const nextTotal = Math.max(minimumKnown, Math.trunc(explicitTotal ?? minimumKnown));
     const nextPages = Math.max(
       0,
-      integer(payload.total_pages, nextTotal ? Math.ceil(nextTotal / PAGE_SIZE) : 0),
+      integer(payload.total_pages, nextTotal ? Math.ceil(nextTotal / size) : 0),
     );
     const nextStatus = statusOf(payload);
 
     source = nextSource;
     updateContext(payload, nextSource);
-    if (nextStatus !== "failed") store(payload);
+    if (nextStatus !== "failed") store(payload, size);
     items.value = nextItems;
-    selectedId.value = nextItems[0]?.id ?? "";
+    // A capacity reload keeps the primary selection when it is still on the
+    // re-read page; a new search or an ordinary page turn starts at the top.
+    const previousSelectedId = selectedId.value;
+    selectedId.value =
+      preserveSelection && nextItems.some((item) => item.id === previousSelectedId)
+        ? previousSelectedId
+        : nextItems[0]?.id ?? "";
     clearHighResolutionPreview();
     page.value = nextPage;
+    appliedPageSize = size;
     totalItems.value = nextTotal;
     totalPages.value = nextPages;
     hasPrevious.value = payload.has_previous ?? nextPage > 1;
@@ -481,15 +516,25 @@ export function useSearch(
     scheduleAdjacent();
   }
 
-  function endpointPage(targetPage: number, signal: AbortSignal): Promise<SearchPageResponse> {
-    if (source === "latest") return api.latest(targetPage, PAGE_SIZE, signal);
+  function canLoadPages(): boolean {
+    if (source === "latest") return true;
+    if (source === "history") return Boolean(api.historyPage && activeHistoryId);
+    return Boolean(activeOperationId);
+  }
+
+  function endpointPage(
+    targetPage: number,
+    signal: AbortSignal,
+    size: number,
+  ): Promise<SearchPageResponse> {
+    if (source === "latest") return api.latest(targetPage, size, signal);
     if (source === "history") {
       if (!api.historyPage || !activeHistoryId) {
         return Promise.reject(new ApiError("搜索历史暂不可用。", 503));
       }
-      return api.historyPage(activeHistoryId, targetPage, PAGE_SIZE, signal);
+      return api.historyPage(activeHistoryId, targetPage, size, signal);
     }
-    return api.page(activeOperationId, targetPage, PAGE_SIZE, signal);
+    return api.page(activeOperationId, targetPage, size, signal);
   }
 
   async function prefetch(targetPage: number, context: {
@@ -497,44 +542,48 @@ export function useSearch(
     scope: string;
     snapshot: string;
     totalPages: number;
+    pageSize: number;
     source: SearchSource;
     operationId: string;
     historyId: string;
   }): Promise<void> {
-    if (targetPage < 1 || targetPage > context.totalPages || cached(targetPage)) return;
+    if (targetPage < 1 || targetPage > context.totalPages) return;
+    if (context.pageSize !== pageSize.value || cached(targetPage, context.pageSize)) return;
     const controller = new AbortController();
     prefetchControllers.add(controller);
     try {
       let payload: SearchPageResponse;
       if (context.source === "latest") {
-        payload = await api.latest(targetPage, PAGE_SIZE, controller.signal);
+        payload = await api.latest(targetPage, context.pageSize, controller.signal);
       } else if (context.source === "history") {
         if (!api.historyPage) return;
         payload = await api.historyPage(
           context.historyId,
           targetPage,
-          PAGE_SIZE,
+          context.pageSize,
           controller.signal,
         );
       } else {
         payload = await api.page(
           context.operationId,
           targetPage,
-          PAGE_SIZE,
+          context.pageSize,
           controller.signal,
         );
       }
       if (
+        controller.signal.aborted ||
         generation !== context.generation ||
         scope !== context.scope ||
-        snapshot !== context.snapshot
+        snapshot !== context.snapshot ||
+        pageSize.value !== context.pageSize
       ) return;
       if (context.source === "search" && operationId(payload) !== context.operationId) return;
       if (snapshotOf(payload) !== context.snapshot) {
         cache.clear();
         return;
       }
-      store(payload);
+      store(payload, context.pageSize);
     } catch (error) {
       if (!(error instanceof DOMException && error.name === "AbortError")) {
         // Prefetch is opportunistic; foreground navigation reports failures.
@@ -552,6 +601,7 @@ export function useSearch(
       scope,
       snapshot,
       totalPages: totalPages.value,
+      pageSize: pageSize.value,
       source,
       operationId: activeOperationId,
       historyId: activeHistoryId,
@@ -571,9 +621,10 @@ export function useSearch(
 
   async function initialize(): Promise<void> {
     const localGeneration = generation;
+    const initialSize = pageSize.value;
     const [bootstrapResult, latestResult, historyResult] = await Promise.allSettled([
       api.bootstrap(),
-      api.latest(1, PAGE_SIZE),
+      api.latest(1, initialSize),
       api.history ? api.history() : Promise.resolve({ items: [] }),
     ]);
     if (localGeneration !== generation) return;
@@ -587,7 +638,10 @@ export function useSearch(
       emitError("无法连接本地服务", bootstrapResult.reason);
     }
     if (latestResult.status === "fulfilled") {
-      apply(latestResult.value, "latest", "最近结果");
+      apply(latestResult.value, "latest", "最近结果", initialSize);
+      // The capacity may have changed while the first read was in flight; the
+      // latest results must still be shown at the newest capacity.
+      await reconcileCapacity();
     } else {
       message.value = "暂无最近结果，可以开始新的搜索。";
     }
@@ -618,26 +672,39 @@ export function useSearch(
     activeOperationId = "";
     activeHistoryId = historyId;
     source = "history";
+    // A history view always opens on its first page, and the superseding
+    // capacity reload must be able to render it with the right title.
+    anchorAbsolute = 0;
+    title.value = fallbackTitle;
     pageLoading.value = true;
     status.value = "running";
     message.value = "正在恢复历史搜索结果";
+    const size = pageSize.value;
     const controller = new AbortController();
     foregroundController = controller;
+    const requestId = ++pageRequestSequence;
     try {
-      const payload = await api.historyPage(historyId, 1, PAGE_SIZE, controller.signal);
+      const payload = await api.historyPage(historyId, 1, size, controller.signal);
       if (localGeneration !== generation || activeHistoryId !== historyId) return false;
-      apply(payload, "history", fallbackTitle);
+      // A newer foreground request owns the gallery now; it renders this same
+      // history view at the newest capacity.
+      if (requestId !== pageRequestSequence) return true;
+      apply(payload, "history", fallbackTitle, size);
+      await reconcileCapacity();
       return true;
     } catch (error) {
-      if (!isAbortError(error)) {
-        status.value = "failed";
-        message.value = error instanceof Error ? error.message : String(error);
-        emitError("无法打开搜索记录", error);
+      if (isAbortError(error)) {
+        // A capacity reload superseded this first read and renders the same
+        // history results itself, so the history view stays available.
+        return localGeneration === generation && requestId !== pageRequestSequence;
       }
+      status.value = "failed";
+      message.value = error instanceof Error ? error.message : String(error);
+      emitError("无法打开搜索记录", error);
       return false;
     } finally {
       if (foregroundController === controller) foregroundController = null;
-      if (localGeneration === generation) pageLoading.value = false;
+      if (requestId === pageRequestSequence) pageLoading.value = false;
     }
   }
 
@@ -650,14 +717,22 @@ export function useSearch(
     for (let attempt = 0; attempt < 600; attempt += 1) {
       await waitWithAbort(interval, signal);
       if (localGeneration !== generation || operation !== activeOperationId) return;
+      const size = pageSize.value;
       const payload = await awaitWithAbort(
-        api.page(operation, 1, PAGE_SIZE, signal),
+        api.page(operation, 1, size, signal),
         signal,
       );
       if (localGeneration !== generation || operation !== activeOperationId) return;
       const nextStatus = statusOf(payload);
+      // Discard a page fetched at a capacity the user has already left behind.
+      if (size !== pageSize.value) continue;
       if (TERMINAL.has(nextStatus)) {
-        apply(payload, "search", query.value.trim() || queryImageName.value || "搜索结果");
+        apply(
+          payload,
+          "search",
+          query.value.trim() || queryImageName.value || "搜索结果",
+          size,
+        );
         return;
       }
       status.value = nextStatus || "running";
@@ -700,6 +775,7 @@ export function useSearch(
     generation += 1;
     const localGeneration = generation;
     abortActivity(true);
+    const size = pageSize.value;
     const controller = new AbortController();
     searchController = controller;
     searching.value = true;
@@ -724,7 +800,7 @@ export function useSearch(
         library_ids: libraryId.value ? [libraryId.value] : [],
         top_k: topK,
         page: 1 as const,
-        page_size: PAGE_SIZE,
+        page_size: size,
       };
       if (requestMode === "tag") {
         body.tag_mode = tagMode.value;
@@ -767,13 +843,17 @@ export function useSearch(
       });
       const nextStatus = statusOf(payload);
       if (TERMINAL.has(nextStatus) || payloadItems(payload).length) {
-        apply(payload, "search", searchText || queryImageName.value || "以图搜图");
+        apply(payload, "search", searchText || queryImageName.value || "以图搜图", size);
+        anchorAbsolute = 0;
       } else if (activeOperationId) {
         emitDiagnostic("search_poll_started", { initial_status: nextStatus || "running" });
         await poll(activeOperationId, localGeneration, controller.signal);
       } else {
         throw new ApiError("搜索请求没有返回可跟踪的任务编号。", 502, payload);
       }
+      // The capacity may have changed while the request was in flight; the
+      // final page must still be rendered at the newest capacity.
+      await reconcileCapacity();
       emitDiagnostic("search_completed", {
         status: status.value,
         total_items: totalItems.value,
@@ -807,27 +887,49 @@ export function useSearch(
     }
   }
 
-  async function goToPage(targetPage: number): Promise<boolean> {
-    if (
-      pageLoading.value ||
-      targetPage === page.value ||
-      targetPage < 1 ||
-      targetPage > totalPages.value
-    ) return false;
+  /** Page that keeps the anchored image visible at `size`. */
+  function pageForAnchor(size: number): number {
+    const targetPage = Math.floor(anchorAbsolute / size) + 1;
+    const totalForSize = totalItems.value > 0 ? Math.ceil(totalItems.value / size) : 0;
+    return totalForSize > 0 ? Math.min(Math.max(1, targetPage), totalForSize) : Math.max(1, targetPage);
+  }
+
+  async function fetchPage(
+    targetPage: number,
+    options: { force?: boolean; preserveSelection?: boolean } = {},
+  ): Promise<boolean> {
+    if (targetPage < 1 || !canLoadPages()) return false;
+    if (!options.force) {
+      if (pageLoading.value || targetPage === page.value) return false;
+      if (totalPages.value > 0 && targetPage > totalPages.value) return false;
+    }
     const localGeneration = generation;
     const expectedScope = scope;
+    const size = pageSize.value;
+    const requestId = ++pageRequestSequence;
+    let controller: AbortController | null = null;
     pageLoading.value = true;
     try {
-      let payload = cached(targetPage);
+      let payload = options.force ? null : cached(targetPage, size);
       if (!payload) {
-        foregroundController = new AbortController();
-        payload = await endpointPage(targetPage, foregroundController.signal);
+        foregroundController?.abort();
+        controller = new AbortController();
+        foregroundController = controller;
+        payload = await endpointPage(targetPage, controller.signal, size);
       }
-      if (localGeneration !== generation || expectedScope !== scope) return false;
+      // A response for a superseded request, source, snapshot or capacity must
+      // never replace the page the user is looking at now.
+      if (
+        requestId !== pageRequestSequence ||
+        localGeneration !== generation ||
+        expectedScope !== scope ||
+        size !== pageSize.value
+      ) return false;
       if (source === "search" && operationId(payload) !== activeOperationId) {
         throw new ApiError("搜索结果已经更新，请重新提交搜索。", 409, payload);
       }
-      apply(payload, source, title.value);
+      apply(payload, source, title.value, size, options.preserveSelection === true);
+      if (!options.force) anchorAbsolute = Math.max(0, (targetPage - 1) * size);
       return true;
     } catch (error) {
       if (!(error instanceof DOMException && error.name === "AbortError")) {
@@ -835,9 +937,37 @@ export function useSearch(
       }
       return false;
     } finally {
-      foregroundController = null;
-      if (localGeneration === generation) pageLoading.value = false;
+      if (foregroundController === controller) foregroundController = null;
+      // Only the newest request may end the busy state; a stale response must
+      // not clear the loading flag of the request that replaced it.
+      if (requestId === pageRequestSequence) pageLoading.value = false;
     }
+  }
+
+  function goToPage(targetPage: number): Promise<boolean> {
+    return fetchPage(targetPage);
+  }
+
+  /**
+   * Change the display capacity, re-reading only the existing result page.
+   * A semantic search is never resubmitted and no embedding runs.
+   */
+  async function setPageSize(size: number, reload = true): Promise<boolean> {
+    const next = clampGalleryPageSize(size);
+    if (next === pageSize.value) return false;
+    cancelPrefetch();
+    const targetPage = pageForAnchor(next);
+    pageSize.value = next;
+    if (!reload || !appliedPageSize || !canLoadPages() || searching.value) return true;
+    return fetchPage(targetPage, { force: true, preserveSelection: true });
+  }
+
+  /** Re-read the visible page when its capacity changed while it was loading. */
+  async function reconcileCapacity(): Promise<void> {
+    if (appliedPageSize === pageSize.value || !appliedPageSize || !canLoadPages()) return;
+    const targetPage = pageForAnchor(pageSize.value);
+    cancelPrefetch();
+    await fetchPage(targetPage, { force: true, preserveSelection: true });
   }
 
   async function cancel(): Promise<void> {
@@ -858,8 +988,10 @@ export function useSearch(
   }
 
   function select(id: string, loadHighResolution = true): void {
-    if (!items.value.some((item) => item.id === id)) return;
+    const index = items.value.findIndex((item) => item.id === id);
+    if (index < 0) return;
     selectedId.value = id;
+    anchorAbsolute = Math.max(0, (page.value - 1) * (appliedPageSize || pageSize.value) + index);
     if (loadHighResolution) scheduleHighResolutionPreview(id);
     else clearHighResolutionPreview();
   }
@@ -912,12 +1044,14 @@ export function useSearch(
     status,
     searching,
     pageLoading,
+    pageSize,
     initialize,
     refreshHistory,
     openHistory,
     submit,
     cancel,
     goToPage,
+    setPageSize,
     select,
     setQueryImage,
     dispose,

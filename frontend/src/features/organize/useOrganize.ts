@@ -563,6 +563,11 @@ export function useOrganize(api: OrganizeApi = organizeApi, events: OrganizeEven
   const imagePage = ref(1);
   const imagePageSize = ref(ORGANIZE_GALLERY_DEFAULT_PAGE_SIZE);
   const imageTotal = ref(0);
+  // Page and capacity actually rendered in `images`. They trail
+  // `imagePage`/`imagePageSize` while a request is in flight so consecutive
+  // capacity changes keep anchoring on what the user currently sees.
+  let renderedPage = 1;
+  let renderedPageSize = ORGANIZE_GALLERY_DEFAULT_PAGE_SIZE;
   const folderLoading = ref(false);
   const folderLoadingMore = ref(false);
   const imageLoading = ref(false);
@@ -940,11 +945,23 @@ export function useOrganize(api: OrganizeApi = organizeApi, events: OrganizeEven
       ORGANIZE_GALLERY_MAX_PAGE_SIZE,
       Math.max(1, integer(pageSize, ORGANIZE_GALLERY_DEFAULT_PAGE_SIZE)),
     );
-    const previousSize = imagePageSize.value;
-    if (nextSize === previousSize) return false;
-    const firstVisibleIndex = Math.max(0, (imagePage.value - 1) * previousSize);
+    if (nextSize === imagePageSize.value) return false;
+    // Anchor on the page that is actually rendered: `imagePage`/`imagePageSize`
+    // may already point at a capacity change that is still loading. Keep the
+    // selected image visible; fall back to the rendered page's first image.
+    const anchorOffset = Math.max(
+      0,
+      images.value.findIndex((image) => image.id === selectionAnchorId.value),
+    );
+    const anchorIndex = Math.max(
+      0,
+      (renderedPage - 1) * renderedPageSize + anchorOffset,
+    );
     imagePageSize.value = nextSize;
-    const nextPage = Math.floor(firstVisibleIndex / nextSize) + 1;
+    const totalForSize = imageTotal.value > 0 ? Math.ceil(imageTotal.value / nextSize) : 0;
+    const nextPage = totalForSize > 0
+      ? Math.min(Math.floor(anchorIndex / nextSize) + 1, totalForSize)
+      : 1;
     imagePage.value = nextPage;
     if (!reload || !selectedLibraryId.value || !selectedFolderKey.value) return true;
     return loadFolderImages(nextPage);
@@ -958,20 +975,21 @@ export function useOrganize(api: OrganizeApi = organizeApi, events: OrganizeEven
     const controller = new AbortController();
     imageController = controller;
     const requestSequence = ++imageRequestSequence;
+    const size = imagePageSize.value;
     imageLoading.value = true;
     try {
       if (folderKey.startsWith("legacy:")) {
         const folder = decodeURIComponent(folderKey.slice("legacy:".length));
         const rows = legacy.value.filter((image) => parentFolder(image.relativePath) === folder);
-        const start = (page - 1) * imagePageSize.value;
-        images.value = rows.slice(start, start + imagePageSize.value);
+        const start = (page - 1) * size;
+        images.value = rows.slice(start, start + size);
         imageTotal.value = rows.length;
       } else {
         const payload = await api.listFolderImages(
           libraryId,
           folderKey,
           page,
-          imagePageSize.value,
+          size,
           false,
           controller.signal,
         );
@@ -981,6 +999,8 @@ export function useOrganize(api: OrganizeApi = organizeApi, events: OrganizeEven
         imageTotal.value = responseTotal(payload, rows.length);
       }
       imagePage.value = page;
+      renderedPage = page;
+      renderedPageSize = size;
       mergeKnown(images.value);
       lastError.value = "";
       return true;

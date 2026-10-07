@@ -3,6 +3,7 @@ import { defineComponent, h } from "vue";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import App from "../App.vue";
+import { useGalleryDensity } from "../composables/useGalleryDensity";
 
 const nativeActionMocks = vi.hoisted(() => ({
   selectQueryImage: vi.fn().mockResolvedValue(null),
@@ -218,6 +219,7 @@ describe("App page shell", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    useGalleryDensity().setDensity("standard");
     Reflect.deleteProperty(window, "pywebview");
     nativeActionMocks.selectQueryImage.mockResolvedValue(null);
     nativeActionMocks.registerQueryImage.mockResolvedValue(null);
@@ -320,6 +322,24 @@ describe("App page shell", () => {
     expect(wrapper.get(".status-pill").text()).toContain("无可靠结果");
   });
 
+  it("exposes the shared thumbnail density control and persists the choice", async () => {
+    wrapper = mountApp();
+    await flushPromises();
+
+    await wrapper.get(".search-settings summary").trigger("click");
+    const select = wrapper.get("select[aria-label='缩略图密度']");
+    expect(select.findAll("option").map((option) => option.text())).toEqual([
+      "紧凑",
+      "标准",
+      "大图",
+    ]);
+    expect((select.element as HTMLSelectElement).value).toBe("standard");
+
+    await select.setValue("compact");
+    expect(useGalleryDensity().density.value).toBe("compact");
+    expect(localStorage.getItem("yaolens.gallery-density")).toBe("compact");
+  });
+
   it("keeps running, cancelled, and failed search states visible in the compact live region", async () => {
     const fetchMock = vi.mocked(fetch);
     let searchAttempt = 0;
@@ -406,6 +426,125 @@ describe("App page shell", () => {
     await wrapper.get("[data-testid='submit-search']").trigger("click");
     await flushPromises();
     expect(wrapper.find(".gallery-panel").exists()).toBe(true);
+  });
+
+  it("re-reads the search page with the measured container capacity", async () => {
+    vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockReturnValue(1_366);
+    vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(768);
+
+    wrapper = mountApp();
+    await flushPromises();
+    await wrapper.get("input[type='search']").setValue("人物写真");
+    await wrapper.get("[data-testid='submit-search']").trigger("click");
+    await flushPromises();
+
+    // 6 columns × 3 rows at the standard density.
+    expect(
+      vi.mocked(fetch).mock.calls.some(([input]) =>
+        String(input).includes("page_size=18"),
+      ),
+    ).toBe(true);
+  });
+
+  it("keeps a working density control on the result header after a search", async () => {
+    vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockReturnValue(1_366);
+    vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(768);
+
+    wrapper = mountApp();
+    await flushPromises();
+    await wrapper.get("input[type='search']").setValue("人物写真");
+    await wrapper.get("[data-testid='submit-search']").trigger("click");
+    await flushPromises();
+
+    const density = wrapper.get("[data-testid='result-density']");
+    expect(density.findAll("option").map((option) => option.text())).toEqual([
+      "紧凑",
+      "标准",
+      "大图",
+    ]);
+    expect((density.element as HTMLSelectElement).value).toBe("standard");
+
+    // 4 columns × 2 rows at the large density re-reads the page at capacity 8.
+    await density.setValue("large");
+    await flushPromises();
+
+    expect((wrapper.get("[data-testid='result-density']").element as HTMLSelectElement).value)
+      .toBe("large");
+    expect(
+      vi.mocked(fetch).mock.calls.some(([input]) =>
+        String(input).includes("page_size=8"),
+      ),
+    ).toBe(true);
+  });
+
+  it("keeps a working density control after opening a history entry", async () => {
+    vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockReturnValue(1_366);
+    vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(768);
+    const historyPage = {
+      id: "history:history-1",
+      history_id: "history-1",
+      status: "succeeded",
+      page: 1,
+      page_size: 15,
+      total_items: 30,
+      total_pages: 2,
+      source_label: "history",
+      summary: { version: "history" },
+      items: [
+        {
+          id: "history-image-1",
+          name: "和服-01.jpg",
+          relative_path: "和服/和服-01.jpg",
+          library_name: "图片数据库",
+          rank: 1,
+        },
+      ],
+    };
+    vi.mocked(fetch).mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("api/bootstrap")) {
+        return Promise.resolve(
+          jsonResponse({
+            service: { status: "ready", ready: true },
+            libraries: [{ id: "library-1", name: "图片数据库", enabled: true }],
+          }),
+        );
+      }
+      if (url.includes("api/results/history/history-1")) {
+        return Promise.resolve(jsonResponse(historyPage));
+      }
+      if (url.includes("api/results/history")) {
+        return Promise.resolve(
+          jsonResponse({
+            items: [{
+              id: "history-1",
+              label: "红色和服 室内",
+              query_type: "text",
+              created_at: "2026-07-22T17:00:00+08:00",
+              total_items: 30,
+              status: "succeeded",
+            }],
+          }),
+        );
+      }
+      return Promise.resolve(jsonResponse(latestPayload));
+    });
+
+    wrapper = mountApp();
+    await flushPromises();
+    await wrapper.get(".sidebar-recents button").trigger("click");
+    await flushPromises();
+
+    const density = wrapper.get("[data-testid='result-density']");
+    await density.setValue("large");
+    await flushPromises();
+
+    const historyRequests = vi.mocked(fetch).mock.calls
+      .map(([input]) => String(input))
+      .filter((url) => url.includes("api/results/history/history-1"));
+    expect(
+      historyRequests.some((url) => url.includes("page_size=8")),
+    ).toBe(true);
   });
 
   it("supports Alt+1 through Alt+8 plus slash, Ctrl+K and Ctrl+G", async () => {

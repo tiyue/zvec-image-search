@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { computed } from "vue";
+
 import ImageCard from "./ImageCard.vue";
 
 import type {
@@ -14,14 +16,30 @@ const props = withDefaults(
     selectedIds?: string[];
     loading?: boolean;
     loadingText?: string;
+    columns?: number;
+    cardHeight?: number;
   }>(),
   {
     selectedId: null,
     selectedIds: () => [],
     loading: false,
     loadingText: "正在读取结果",
+    columns: 5,
+    cardHeight: 0,
   },
 );
+
+// The parent owns the measurement; this only maps the shared layout onto the
+// CSS grid so tiles keep the requested column count and pixel height.
+const gridStyle = computed<Record<string, string>>(() => {
+  const style: Record<string, string> = {
+    "--gallery-columns": String(Math.max(1, Math.trunc(props.columns) || 1)),
+  };
+  if (props.cardHeight > 0) {
+    style["--gallery-row-height"] = `${Math.round(props.cardHeight)}px`;
+  }
+  return style;
+});
 
 const emit = defineEmits<{
   select: [intent: GallerySelectionIntent];
@@ -36,7 +54,7 @@ function isSelected(id: string): boolean {
 
 <template>
   <div class="gallery-frame">
-    <div class="gallery-grid" role="list" :aria-busy="loading">
+    <div class="gallery-grid" role="list" :aria-busy="loading" :style="gridStyle">
       <ImageCard
         v-for="(item, index) in items"
         :key="item.id"
@@ -73,22 +91,19 @@ function isSelected(id: string): boolean {
 .gallery-frame {
   position: relative;
   min-width: 0;
-  min-height: 0;
-  height: 100%;
-  padding: 10px 14px 2px;
-  overflow: hidden;
+  min-height: 100%;
+  padding: 0;
 }
 
 .gallery-grid {
   display: grid;
   min-width: 0;
   min-height: 0;
-  height: 100%;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
-  grid-template-rows: repeat(3, minmax(0, 1fr));
-  grid-auto-flow: row;
+  grid-template-columns: repeat(var(--gallery-columns, 5), minmax(0, 1fr));
+  grid-auto-rows: var(--gallery-row-height, 180px);
+  align-content: start;
   gap: 8px;
-  overflow: hidden;
+  padding: 0 14px;
   transition: opacity 100ms ease;
 }
 
@@ -167,9 +182,35 @@ function isSelected(id: string): boolean {
   stroke-width: 1.8;
 }
 
-@media (max-width: 680px) {
+@media (max-width: 620px) {
   .gallery-grid {
-    grid-template-columns: repeat(5, minmax(0, 1fr));
+    padding: 0 10px;
   }
 }
+
+@media (prefers-color-scheme: dark) {
+  .gallery-loading-overlay {
+    color: #f0f0f0;
+    background: rgb(28 28 28 / 55%);
+  }
+
+  .loading-spinner {
+    border-color: rgb(255 255 255 / 18%);
+    border-top-color: #d8d8d8;
+  }
+
+  .state-panel {
+    color: #b9b9b9;
+  }
+
+  .state-panel strong {
+    color: #f2f2f2;
+  }
+
+  .state-orb {
+    color: #d0d0d0;
+    background: #2c2c2c;
+  }
+}
+
 </style>

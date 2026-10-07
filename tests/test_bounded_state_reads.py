@@ -228,6 +228,69 @@ class BoundedStateReadScaleTest(unittest.TestCase):
 
 
 class StateIndexUpgradeTest(unittest.TestCase):
+    def test_legacy_database_gains_nocase_folder_page_index_on_reopen(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "state.sqlite3"
+            state = IndexState(path)
+            try:
+                state.ensure_collection_uuid("collection-index")
+                state.record_root("root-a", str(Path(temporary) / "images"), True)
+                state.set_many(
+                    [
+                        {
+                            "doc_id": "doc-a",
+                            "root_id": "root-a",
+                            "relative_path": "album/set/a.jpg",
+                            "file_name": "a.jpg",
+                            "extension": "jpg",
+                            "mime_type": "image/jpeg",
+                            "sha256": "a" * 64,
+                            "size_bytes": 1,
+                            "mtime_ns": 2,
+                            "width": 3,
+                            "height": 4,
+                        }
+                    ]
+                )
+            finally:
+                state.close()
+            connection = sqlite3.connect(path)
+            try:
+                connection.execute("DROP INDEX idx_entries_folder_page_nocase")
+                connection.commit()
+            finally:
+                connection.close()
+
+            reopened = IndexState(path)
+            try:
+                columns = tuple(
+                    str(row["name"])
+                    for row in reopened.connection.execute(
+                        "PRAGMA index_info('idx_entries_folder_page_nocase')"
+                    )
+                )
+                self.assertEqual(
+                    columns,
+                    ("root_id", "parent_directory", "relative_path", "doc_id"),
+                )
+                plan = " ".join(
+                    str(row["detail"])
+                    for row in reopened.connection.execute(
+                        "EXPLAIN QUERY PLAN SELECT entries.doc_id FROM entries "
+                        "LEFT JOIN document_annotations "
+                        "ON document_annotations.doc_id = entries.doc_id "
+                        "WHERE entries.root_id = ? "
+                        "AND entries.parent_directory = ? "
+                        "ORDER BY entries.relative_path COLLATE NOCASE, "
+                        "entries.doc_id LIMIT ? OFFSET ?",
+                        ("root-a", "album/set", 10, 0),
+                    )
+                )
+                self.assertIn("idx_entries_folder_page_nocase", plan)
+                self.assertNotIn("TEMP B-TREE", plan)
+            finally:
+                reopened.close()
+
     def test_legacy_hash_index_is_upgraded_to_cover_doc_id(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "state.sqlite3"

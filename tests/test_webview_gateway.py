@@ -660,6 +660,48 @@ class GatewayTests(unittest.TestCase):
         with urlopen(self.server.url + "assets/app-H4sH.js", timeout=5) as response:
             self.assertIn(b"window.ready", response.read())
 
+    def test_result_pages_honor_variable_page_size(self) -> None:
+        # The WebView grid asks for a container-driven page capacity; the
+        # gateway must pass it through instead of forcing the legacy 15.
+        status, _headers, latest = _json(
+            self.server.url + "api/results/latest?page=3&page_size=40"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(latest["page"], 3)
+        self.assertEqual(latest["page_size"], 40)
+
+        status, _headers, defaulted = _json(self.server.url + "api/results/latest")
+        self.assertEqual(status, 200)
+        self.assertEqual(defaulted["page"], 1)
+        self.assertEqual(defaulted["page_size"], 15)
+
+        status, _headers, page = _json(
+            self.server.url + "api/search/search-folder-1?page=2&page_size=60"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(page["page"], 2)
+        self.assertEqual(page["page_size"], 60)
+
+        status, _headers, history = _json(
+            self.server.url + "api/results/history/search-folder-1?page=1&page_size=60"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(history["page_size"], 60)
+
+        for page_size in ("0", "101", "many"):
+            with self.subTest(page_size=page_size), self.assertRaises(
+                HTTPError
+            ) as caught:
+                urlopen(
+                    self.server.url
+                    + f"api/results/latest?page=1&page_size={page_size}",
+                    timeout=5,
+                )
+            self.assertEqual(caught.exception.code, 400)
+            payload = json.loads(caught.exception.read().decode("utf-8"))
+            caught.exception.close()
+            self.assertEqual(payload["error"]["code"], "invalid_query")
+
     def test_default_gateway_serves_the_manifest_built_vue_application(self) -> None:
         server = GatewayServer(
             self.facade,  # type: ignore[arg-type]

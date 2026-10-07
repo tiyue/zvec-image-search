@@ -220,4 +220,118 @@ describe("useSearch resilience", () => {
     expect(search.items.value[0]?.id).toBe("image-2");
     expect(search.status.value).toBe("succeeded");
   });
+
+  it("drops a page response that arrives after the capacity changed", async () => {
+    const paged = (page: number): SearchPageResponse => ({
+      id: "latest",
+      status: "succeeded",
+      page,
+      page_size: 15,
+      total_items: 30,
+      total_pages: 2,
+      has_previous: page > 1,
+      has_next: page < 2,
+      items: [{ id: `image-${page}`, name: `图片 ${page}`, rank: page }],
+    });
+    const api = fakeApi();
+    let resolveSlowPage: ((payload: SearchPageResponse) => void) | undefined;
+    const slowPage = new Promise<SearchPageResponse>((resolve) => {
+      resolveSlowPage = resolve;
+    });
+    vi.mocked(api.latest)
+      .mockImplementationOnce(async () => paged(1))
+      .mockImplementationOnce(async () => await slowPage);
+    const search = useSearch(api);
+    await search.initialize();
+
+    const navigation = search.goToPage(2);
+    await search.setPageSize(30);
+    resolveSlowPage?.(paged(2));
+
+    await expect(navigation).resolves.toBe(false);
+    expect(search.pageSize.value).toBe(30);
+    expect(search.page.value).toBe(1);
+  });
+
+  it("renders the final page at the newest capacity when it changes mid-search", async () => {
+    const api = fakeApi();
+    let resolveSubmit: ((payload: SearchPageResponse) => void) | undefined;
+    vi.mocked(api.submit).mockImplementation(
+      async () =>
+        await new Promise<SearchPageResponse>((resolve) => {
+          resolveSubmit = resolve;
+        }),
+    );
+    const search = useSearch(api);
+    search.query.value = "人物";
+
+    const submission = search.submit();
+    await Promise.resolve();
+    await search.setPageSize(30);
+    resolveSubmit?.(resultPayload("人物", 1));
+
+    await expect(submission).resolves.toBe(true);
+    expect(api.submit).toHaveBeenCalledTimes(1);
+    expect(api.page).toHaveBeenLastCalledWith(
+      "search-1",
+      1,
+      30,
+      expect.any(AbortSignal),
+    );
+    expect(search.pageSize.value).toBe(30);
+  });
+
+  it("rejects a late page response when the capacity round-trips (A→B→A)", async () => {
+    const sized = (page: number, size: number, name: string): SearchPageResponse => ({
+      id: "latest",
+      status: "succeeded",
+      page,
+      page_size: size,
+      total_items: 60,
+      total_pages: Math.ceil(60 / size),
+      source_label: "snapshot-a",
+      summary: { version: "snapshot-a" },
+      items: Array.from({ length: size }, (_, index) => ({
+        id: `image-${(page - 1) * size + index + 1}`,
+        name,
+        rank: (page - 1) * size + index + 1,
+      })),
+    });
+    const api = fakeApi();
+    let finishOld: ((payload: SearchPageResponse) => void) | undefined;
+    let finishNewest: ((payload: SearchPageResponse) => void) | undefined;
+    let calls = 0;
+    // The mock ignores AbortSignal on purpose: only request ownership may
+    // reject the abandoned response.
+    vi.mocked(api.latest).mockImplementation(async (page: number, size: number) => {
+      calls += 1;
+      if (calls === 2) {
+        return await new Promise<SearchPageResponse>((resolve) => {
+          finishOld = resolve;
+        });
+      }
+      if (calls === 4) {
+        return await new Promise<SearchPageResponse>((resolve) => {
+          finishNewest = resolve;
+        });
+      }
+      return sized(page, size, "当前结果");
+    });
+    const search = useSearch(api);
+    await search.initialize();
+
+    const old = search.goToPage(2);
+    await search.setPageSize(30);
+    const newest = search.setPageSize(15);
+    finishOld?.(sized(2, 15, "过期结果"));
+    await old;
+
+    expect(search.items.value[0]?.name).not.toBe("过期结果");
+    expect(search.pageLoading.value).toBe(true);
+
+    finishNewest?.(sized(1, 15, "最新结果"));
+    await expect(newest).resolves.toBe(true);
+    expect(search.items.value[0]?.name).toBe("最新结果");
+    expect(search.pageLoading.value).toBe(false);
+  });
 });

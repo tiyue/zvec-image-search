@@ -479,6 +479,14 @@ class IndexState:
             "CREATE INDEX IF NOT EXISTS idx_entries_folder_page "
             "ON entries(root_id, parent_directory, relative_path, doc_id)"
         )
+        # ``_page_folder_entries`` orders a folder by ``relative_path COLLATE
+        # NOCASE``.  The column needs the same collation inside the index or
+        # SQLite has to sort every page in a temporary B-tree.
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_entries_folder_page_nocase "
+            "ON entries("
+            "root_id, parent_directory, relative_path COLLATE NOCASE, doc_id)"
+        )
         self.connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_entries_auto_tag_page "
             "ON entries(root_id, relative_path, doc_id)"
@@ -3299,6 +3307,39 @@ def _escape_like(value: str) -> str:
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
+def _folder_list_clauses(
+    root_id: str | None, normalized_query: str
+) -> tuple[list[str], list[Any]]:
+    clauses: list[str] = []
+    values: list[Any] = []
+    if root_id is not None:
+        normalized_root = str(root_id).strip()
+        if not normalized_root:
+            raise ValueError("root_id must not be empty when supplied.")
+        clauses.append("catalog.root_id = ?")
+        values.append(normalized_root)
+    if normalized_query:
+        pattern = f"%{_escape_like(normalized_query)}%"
+        clauses.append(
+            "(catalog.relative_folder LIKE ? ESCAPE '\\' "
+            "OR roots.current_path LIKE ? ESCAPE '\\')"
+        )
+        values.extend((pattern, pattern))
+    return clauses, values
+
+
+# An actionable folder must directly own an existing image.  The catalog also
+# contains ancestor folders, so listing pages explicitly require a direct
+# image instead of treating every catalog row as actionable.
+_FOLDER_HAS_DIRECT_IMAGE = (
+    "EXISTS (SELECT 1 FROM entry_folder_index AS direct_folder "
+    "JOIN entries AS direct_entry ON direct_entry.doc_id = direct_folder.doc_id "
+    "WHERE direct_folder.root_id = catalog.root_id "
+    "AND direct_folder.relative_folder = catalog.relative_folder "
+    "AND direct_folder.is_direct = 1)"
+)
+
+
 def _list_folders(
     connection: sqlite3.Connection,
     *,
@@ -3309,45 +3350,39 @@ def _list_folders(
 ) -> tuple[int, list[dict[str, Any]]]:
     _validate_page(offset, limit, maximum=1_000)
     normalized_query = str(query).strip()
-    where: list[str] = []
-    values: list[Any] = []
-    if root_id is not None:
-        normalized_root = str(root_id).strip()
-        if not normalized_root:
-            raise ValueError("root_id must not be empty when supplied.")
-        where.append("folder_index.root_id = ?")
-        values.append(normalized_root)
-    if normalized_query:
-        pattern = f"%{_escape_like(normalized_query)}%"
-        where.append(
-            "(folder_index.relative_folder LIKE ? ESCAPE '\\' "
-            "OR roots.current_path LIKE ? ESCAPE '\\')"
-        )
-        values.extend((pattern, pattern))
-    where_sql = f"WHERE {' AND '.join(where)}" if where else ""
-    grouped_from = (
-        "FROM entry_folder_index AS folder_index "
-        "JOIN entries ON entries.doc_id = folder_index.doc_id "
-        "JOIN roots ON roots.root_id = folder_index.root_id "
-        "JOIN folder_catalog ON "
-        "folder_catalog.root_id = folder_index.root_id AND "
-        "folder_catalog.relative_folder = folder_index.relative_folder "
-        "LEFT JOIN document_annotations "
-        "ON document_annotations.doc_id = entries.doc_id "
-        f"{where_sql} GROUP BY folder_index.root_id, "
-        "folder_index.relative_folder HAVING SUM(folder_index.is_direct) > 0"
+    clauses, values = _folder_list_clauses(root_id, normalized_query)
+    clauses.append(_FOLDER_HAS_DIRECT_IMAGE)
+    folder_source = (
+        "FROM folder_catalog AS catalog "
+        "JOIN roots ON roots.root_id = catalog.root_id "
+        f"WHERE {' AND '.join(clauses)}"
     )
     count_row = connection.execute(
-        f"SELECT COUNT(*) FROM (SELECT 1 {grouped_from})", values
+        f"SELECT COUNT(*) {folder_source}", values
     ).fetchone()
     total = int(count_row[0]) if count_row else 0
+    # Select the requested page of folders from the small catalog first, then
+    # aggregate only those folders through the entry-folder index instead of
+    # grouping the whole library twice.
     rows = connection.execute(
-        "SELECT folder_index.root_id, folder_index.relative_folder, "
-        "roots.current_path, SUM(folder_index.is_direct) AS image_count, "
+        "WITH page AS ("
+        "SELECT catalog.root_id AS root_id, "
+        "catalog.relative_folder AS relative_folder, "
+        "roots.current_path AS current_path, "
+        "catalog.first_indexed_at AS first_indexed_at, "
+        "catalog.last_indexed_at AS last_indexed_at, "
+        "catalog.timestamp_source AS timestamp_source "
+        f"{folder_source} "
+        "ORDER BY catalog.first_indexed_at DESC, "
+        "roots.current_path COLLATE NOCASE, roots.current_path, "
+        "catalog.relative_folder COLLATE NOCASE, "
+        "catalog.relative_folder, catalog.root_id "
+        "LIMIT ? OFFSET ?) "
+        "SELECT page.root_id, page.relative_folder, page.current_path, "
+        "SUM(folder_index.is_direct) AS image_count, "
         "SUM(folder_index.is_direct) AS direct_image_count, "
         "COUNT(*) AS descendant_image_count, "
-        "folder_catalog.first_indexed_at, folder_catalog.last_indexed_at, "
-        "folder_catalog.timestamp_source, "
+        "page.first_indexed_at, page.last_indexed_at, page.timestamp_source, "
         "SUM(CASE WHEN folder_index.is_direct = 1 AND "
         "LENGTH(TRIM(entries.tags_json)) > 2 THEN 1 ELSE 0 END) "
         "AS manual_tagged_count, "
@@ -3359,12 +3394,18 @@ def _list_folders(
         "THEN 1 ELSE 0 END) AS inherited_tagged_count, "
         "SUM(CASE WHEN folder_index.is_direct = 1 AND "
         "document_annotations.status = 'failed' THEN 1 ELSE 0 END) "
-        f"AS failed_count {grouped_from} "
-        "ORDER BY folder_catalog.first_indexed_at DESC, "
-        "roots.current_path COLLATE NOCASE, roots.current_path, "
-        "folder_index.relative_folder COLLATE NOCASE, "
-        "folder_index.relative_folder, folder_index.root_id "
-        "LIMIT ? OFFSET ?",
+        "AS failed_count "
+        "FROM page "
+        "JOIN entry_folder_index AS folder_index "
+        "ON folder_index.root_id = page.root_id "
+        "AND folder_index.relative_folder = page.relative_folder "
+        "JOIN entries ON entries.doc_id = folder_index.doc_id "
+        "LEFT JOIN document_annotations "
+        "ON document_annotations.doc_id = entries.doc_id "
+        "GROUP BY page.root_id, page.relative_folder "
+        "ORDER BY page.first_indexed_at DESC, page.current_path COLLATE NOCASE, "
+        "page.current_path, page.relative_folder COLLATE NOCASE, "
+        "page.relative_folder, page.root_id",
         (*values, limit, offset),
     )
     folders: list[dict[str, Any]] = []

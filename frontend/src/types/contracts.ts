@@ -134,7 +134,7 @@ export interface SearchSubmission {
   library_ids: string[];
   top_k: number;
   page: 1;
-  page_size: 15;
+  page_size: number;
   query_image_id?: string;
   tag_mode?: TagMatchMode;
 }

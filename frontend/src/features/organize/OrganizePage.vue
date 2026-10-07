@@ -9,10 +9,12 @@ import {
 } from "vue";
 
 import PaginationBar from "../../components/PaginationBar.vue";
+import { useGalleryDensity } from "../../composables/useGalleryDensity";
 import {
   calculateOrganizeGalleryCapacity,
   GALLERY_META_OVERHEAD,
   GRID_GAP,
+  GRID_HORIZONTAL_PADDING,
   gridRowSpan,
   gridSpan,
   type OrganizeGalleryCapacity,
@@ -53,13 +55,15 @@ const organize = useOrganize(props.api, {
   autoLoad: false,
   onToast: (title, message, kind) => emit("toast", title, message, kind),
 });
+const galleryDensity = useGalleryDensity();
+const galleryDensityOptions = galleryDensity.options;
 const aliasCanonical = ref("");
 const aliasInput = ref("");
 const failedThumbnails = ref<Set<string>>(new Set());
 const galleryViewport = ref<HTMLElement | null>(null);
 const containerWidth = ref(0);
 const galleryCapacity = ref<OrganizeGalleryCapacity>(
-  calculateOrganizeGalleryCapacity(0, 0),
+  calculateOrganizeGalleryCapacity(0, 0, galleryDensity.density.value),
 );
 const editorOpen = ref(false);
 const deleteConfirmation = ref("");
@@ -97,6 +101,14 @@ function selectWorkspaceTab(tab: WorkspaceTab): void {
 watch(
   () => props.activeTab,
   (tab) => selectWorkspaceTab(tab),
+);
+
+// The density tier is shared with the search grid: recompute the folder
+// capacity whenever it changes elsewhere. Hidden (0×0) workspaces are
+// skipped by updateGalleryCapacity and pick the change up when shown again.
+watch(
+  () => galleryDensity.density.value,
+  () => updateGalleryCapacity(true),
 );
 
 function handleImageClick(image: OrganizeImage, event: MouseEvent): void {
@@ -162,24 +174,47 @@ function formatBytes(value: number): string {
   return `${amount >= 10 || index === 0 ? amount.toFixed(0) : amount.toFixed(1)} ${units[index]}`;
 }
 
+function applyGalleryCapacity(next: OrganizeGalleryCapacity, reload: boolean): void {
+  const sizeChanged = next.pageSize !== galleryCapacity.value.pageSize;
+  if (!sizeChanged && next.columns === galleryCapacity.value.columns) return;
+  galleryCapacity.value = next;
+  if (sizeChanged) void organize.setImagePageSize(next.pageSize, reload);
+}
+
 function updateGalleryCapacity(reload: boolean): void {
   const element = galleryViewport.value;
   if (!element) return;
-  containerWidth.value = element.clientWidth;
-  const next = calculateOrganizeGalleryCapacity(element.clientWidth, element.clientHeight);
-  if (next.pageSize === galleryCapacity.value.pageSize) return;
-  galleryCapacity.value = next;
-  void organize.setImagePageSize(next.pageSize, reload);
+  const width = element.clientWidth;
+  const height = element.clientHeight;
+  // Hidden workspaces (v-show) report 0×0; keep the last measured capacity.
+  if (width <= 0 || height <= 0) return;
+  // The grid's content box excludes its own horizontal padding, so tiles and
+  // column counts are derived from the inner width the images really fill.
+  const contentWidth = Math.max(0, width - GRID_HORIZONTAL_PADDING);
+  containerWidth.value = contentWidth;
+  applyGalleryCapacity(
+    calculateOrganizeGalleryCapacity(contentWidth, height, galleryDensity.density.value),
+    reload,
+  );
+}
+
+function changeGalleryDensity(event: Event): void {
+  galleryDensity.setDensity((event.target as HTMLSelectElement).value);
+}
+
+/** CSS grid column span the tile actually gets at the current column count. */
+function columnSpanFor(image: OrganizeImage): 1 | 2 {
+  // A single-column grid never renders the `span-2` class.
+  return galleryCapacity.value.columns > 1 ? gridSpan(image.width, image.height) : 1;
 }
 
 function tileRowSpan(image: OrganizeImage): number {
-  const colSpan = gridSpan(image.width, image.height);
   return gridRowSpan(
     image.width,
     image.height,
-    colSpan,
+    columnSpanFor(image),
     containerWidth.value,
-    3,
+    galleryCapacity.value.columns,
     GRID_GAP,
     GALLERY_META_OVERHEAD,
   );
@@ -519,6 +554,18 @@ onBeforeUnmount(() => {
             <strong>{{ organize.imageTotal.value }}</strong>
             <span>张图片</span>
           </div>
+          <label class="gallery-density-control">
+            <span>缩略图</span>
+            <select
+              :value="galleryDensity.density.value"
+              aria-label="缩略图密度"
+              @change="changeGalleryDensity"
+            >
+              <option v-for="option in galleryDensityOptions" :key="option.value" :value="option.value">
+                {{ option.label }}
+              </option>
+            </select>
+          </label>
         </header>
 
         <section class="selection-toolbar" aria-label="图片选择操作">
@@ -558,6 +605,7 @@ onBeforeUnmount(() => {
             v-else
             class="image-grid"
             aria-label="文件夹图片"
+            :style="{ '--organize-columns': galleryCapacity.columns }"
           >
             <article
               v-for="image in organize.images.value"
@@ -565,7 +613,7 @@ onBeforeUnmount(() => {
               class="image-tile"
               :class="{
                 selected: organize.isImageSelected(image.id),
-                'span-2': gridSpan(image.width, image.height) === 2,
+                'span-2': columnSpanFor(image) === 2,
               }"
               :style="{ gridRow: `span ${tileRowSpan(image)}` }"
               :data-image-id="image.id"
@@ -1153,6 +1201,8 @@ textarea { resize: vertical; line-height: 1.5; }
 .gallery-metrics { display: grid; justify-items: end; }
 .gallery-metrics strong { color: #5545d1; font-size: 23px; }
 .gallery-metrics span { color: #7b8396; font-size: 11px; }
+.gallery-density-control { display: inline-flex; align-items: center; gap: 6px; color: #6f6f6f; font-size: 11px; }
+.gallery-density-control select { height: 30px; padding: 0 8px; border: 1px solid #dedede; border-radius: 8px; color: #242424; background: #fff; }
 .selection-toolbar { padding:10px 14px; }
 .selection-summary { display: grid; gap: 2px; }
 .selection-summary strong { font-size: 13px; }
@@ -1161,7 +1211,7 @@ textarea { resize: vertical; line-height: 1.5; }
 .toolbar-button { border: 1px solid #dde1ec; border-radius: 8px; padding: 6px 9px; color: #515b73; background: #f8f9fc; font: inherit; font-size: 11px; font-weight: 750; cursor: pointer; transition: .12s ease; }
 .toolbar-button.quiet { color: #8a5260; background: #fff6f7; }
 .gallery-viewport { min-height: 0; overflow: auto; }
-.image-grid { display: grid; min-height: 0; grid-template-columns: repeat(3, 1fr); grid-auto-flow: row dense; grid-auto-rows: 10px; gap: 9px; padding: 2px 3px 8px 1px; }
+.image-grid { display: grid; min-height: 0; grid-template-columns: repeat(var(--organize-columns, 3), minmax(0, 1fr)); grid-auto-flow: row dense; grid-auto-rows: 10px; gap: 9px; padding: 2px 3px 8px 1px; }
 .image-tile.span-2 { grid-column: span 2; }
 .image-tile { position: relative; display: grid; grid-template-rows: minmax(0,1fr) auto; min-width: 0; min-height: 0; overflow: hidden; border: 1px solid #e1e5ee; border-radius: 12px; background: #fff; content-visibility: auto; contain-intrinsic-size: 210px 168px; }
 .image-tile.selected { border-color: #6d5ee3; box-shadow: 0 0 0 2px rgba(109,94,227,.16); }
@@ -1315,7 +1365,7 @@ textarea { resize: vertical; line-height: 1.5; }
 .folder-library-refresh,.folder-search .icon-button { border-color:#dedede; color:#555; background:#f5f5f5; }
 .selection-toolbar { margin-bottom:10px; padding:8px 10px; border:0; border-radius:10px; background:#f7f7f7; }
 .toolbar-button,.toolbar-button.quiet,.editor-toggle,.folder-load-more { border-color:#dedede; color:#333; background:#f5f5f5; font-weight:500; }
-.image-grid { grid-template-columns: repeat(3, 1fr); grid-auto-flow: row dense; gap: 8px; }
+.image-grid { grid-template-columns: repeat(var(--organize-columns, 3), minmax(0, 1fr)); grid-auto-flow: row dense; gap: 8px; }
 .image-tile.span-2 { grid-column: span 2; }
 .image-tile { border:0; border-radius:10px; background:#f2f2f2; box-shadow:none; }
 .image-tile:hover { transform:translateY(-2px); box-shadow:0 4px 12px -2px rgb(0 0 0 / 10%); }
@@ -1366,11 +1416,45 @@ textarea { resize: vertical; line-height: 1.5; }
   .folder-tag-scope small { white-space: normal; }
 }
 
+@media (max-width: 620px) {
+  /* Keep the folder title readable: the collapse toggle stays beside it and the
+     count/density controls move to their own row instead of squeezing it. */
+  .gallery-heading {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    align-items: center;
+    gap: 8px 12px;
+  }
+  .gallery-heading > div:first-of-type { min-width: 0; }
+  .gallery-metrics { justify-items: start; }
+  .image-grid { padding: 2px 2px 8px 2px; }
+}
+
 @media (prefers-color-scheme: dark) {
   .folder-tag-modal { border-color: #444; color: #f2f2f2; background: #202020; }
   .folder-tag-modal > header button,.folder-tag-sample-table th { color: #ddd; background: #333; }
   .folder-tag-modal > p,.folder-tag-scope legend,.folder-tag-scope small,.folder-tag-preview-action > span,.folder-tag-preview-status,.folder-tag-no-changes,.folder-tag-summary dt { color: #bbb; }
   .folder-tag-scope label,.folder-tag-force,.folder-tag-summary,.folder-tag-summary > div,.folder-tag-sample-table,.folder-tag-sample-table th,.folder-tag-sample-table td { border-color: #3d3d3d; }
   .folder-tag-force,.folder-tag-force small { color: #bbb; }
+  .gallery-heading { border-bottom-color: rgb(255 255 255 / 12%); }
+  .gallery-heading h2 { color: #f2f2f2; }
+  .gallery-heading small { color: #b5b5b5; }
+  .gallery-metrics strong { color: #f2f2f2; }
+  .gallery-metrics span { color: #b5b5b5; }
+  .gallery-density-control { color: #b5b5b5; }
+  .gallery-density-control select { color: #f0f0f0; border-color: rgb(255 255 255 / 18%); background: #262626; }
+  .selection-toolbar { color: #d5d5d5; background: #242424; }
+  .selection-summary span { color: #b5b5b5; }
+  .image-tile { border-color: rgb(255 255 255 / 12%); background: #262626; }
+  .image-tile.selected { border-color: #e6e6e6; outline-color: #e6e6e6; }
+  .thumbnail-stage { background: linear-gradient(140deg, #232323, #1b1b1b); }
+  .thumbnail-placeholder { color: #a9b0be; }
+  .image-meta strong { color: #ededed; }
+  .image-meta small { color: #b0b0b0; }
+  .mini-tag { color: #dedede; background: #333333; }
+  .mini-tag.more { color: #c4c4c4; background: #2e2e2e; }
+  .no-tag { color: #a5a5a5; }
+  .empty-state { color: #c0c0c0; }
+  .empty-state strong { color: #ededed; }
 }
 </style>

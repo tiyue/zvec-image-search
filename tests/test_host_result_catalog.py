@@ -62,6 +62,28 @@ class HostResultCatalogTests(unittest.TestCase):
         self.assertEqual(second.items[0].library_name, "图库（原神）")
         self.assertIn("雷电将军", second.items[0].relative_path)
 
+    def test_folder_pagination_accepts_a_container_driven_page_size(self) -> None:
+        for index in range(45):
+            (self.images / f"image-{index:02}.jpg").write_bytes(b"image")
+        catalog = ResultCatalog.from_config(self.config_path)
+
+        page = catalog.from_folder(self.images, page=2, page_size=40)
+
+        self.assertEqual(page.page_size, 40)
+        self.assertEqual(page.total_items, 45)
+        self.assertEqual(page.total_pages, 2)
+        self.assertEqual([item.rank for item in page.items], list(range(41, 46)))
+
+    def test_manifest_pagination_accepts_a_container_driven_page_size(self) -> None:
+        manifest, _copied = self._bulk_manifest("variable-page-size", 90)
+        catalog = ResultCatalog.from_config(self.config_path)
+
+        page = catalog.load_manifest(manifest, page=2, page_size=40)
+
+        self.assertEqual(page.page_size, 40)
+        self.assertEqual(page.total_pages, 3)
+        self.assertEqual([item.rank for item in page.items], list(range(41, 81)))
+
     def test_folder_pages_reuse_one_recursive_scan_until_cache_is_cleared(self) -> None:
         for index in range(3):
             (self.images / f"image-{index}.jpg").write_bytes(b"image")

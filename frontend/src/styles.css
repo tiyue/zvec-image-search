@@ -181,6 +181,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .search-workspace, .gallery-panel { width: 100%; height: 100%; min-width: 0; min-height: 0; }
 .search-workspace { overflow: hidden; }
 .gallery-panel { display: grid; grid-template-rows: auto auto minmax(0, 1fr) auto; overflow: hidden; border: 0 !important; border-radius: 0 !important; background: #fff; box-shadow: none !important; }
+.search-gallery-viewport { min-width: 0; min-height: 0; overflow: auto; }
 .panel-heading { display: flex; min-height: 58px; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 14px; border-bottom: 1px solid var(--border); }
 .panel-heading h2 { margin: 0; font-size: 14px; font-weight: 500; }
 .panel-heading p { margin: 2px 0 0; color: #777; font-size: 12px; }
@@ -188,7 +189,9 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .result-action-button, .result-cancel-button, .select-page-button { min-height: 30px; padding: 0 10px; border: 1px solid var(--border); border-radius: 9px; color: #333; background: #fff; }
 .status-pill { display: inline-flex; min-height: 28px; align-items: center; padding: 4px 9px; border: 1px solid var(--border); border-radius: 999px; color: #666; background: #f7f7f7; }
 .status-pill.is-passive { display: none; }
-.gallery-operations { position: relative; min-height: 0; }
+.result-density-control { display: inline-flex; align-items: center; gap: 5px; color: var(--muted); font-size: 11px; }
+.result-density-control select { height: 30px; padding: 0 6px; border: 1px solid var(--border-strong); border-radius: 9px; color: #333; background: #fff; }
+.gallery-operations { position: relative; min-height: 0; padding-top: 8px; }
 .select-page-button { position: absolute; z-index: 4; top: 8px; left: 14px; }
 .selection-toolbar { display: flex; min-height: 44px; align-items: center; gap: 7px; padding: 6px 14px; border-bottom: 1px solid var(--border); background: #f7f7f7; }
 .selection-toolbar > span { min-width: 0; margin-right: auto; color: #666; font-size: 12px; }
@@ -249,6 +252,66 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   .app-shell.image-edit-active :is(.icon-button, .new-search-button, .settings-button, .nav-item, .sidebar-recents button):hover,
   .app-shell.image-edit-active :is(.nav-item, .settings-button).is-active { color: #fff; background: #30312c; }
   .app-shell.image-edit-active .sidebar-recents button { color: #e7e7e0; }
+}
+
+/* Narrow windows: the result header, density control and selection tools wrap
+   instead of pushing images and pagination out of the gallery area. Scoped to
+   the search workspace so no other feature page is affected. */
+@media (max-width: 620px) {
+  .search-workspace .panel-heading { flex-wrap: wrap; row-gap: 6px; }
+  .search-workspace .panel-heading > div { min-width: 0; }
+  .search-workspace .panel-heading h2 { overflow-wrap: anywhere; }
+  .search-workspace .result-status-actions { flex-wrap: wrap; row-gap: 6px; justify-content: flex-start; }
+  .search-workspace .selection-toolbar { flex-wrap: wrap; row-gap: 6px; }
+  .search-workspace .selection-toolbar > span { margin-right: 0; }
+}
+
+/* Light/dark palette for the search results and the organize gallery. Only the
+   tokens and surfaces these two areas own are redefined. */
+@media (prefers-color-scheme: dark) {
+  .search-workspace, .feature-page[data-page-section="organize"] {
+    --surface: #262626;
+    --surface-soft: #232323;
+    --surface-strong: #303030;
+    --text: #ededed;
+    --muted: #b5b5b5;
+    --faint: #9c9c9c;
+    --border: rgb(255 255 255 / 13%);
+    --border-strong: rgb(255 255 255 / 22%);
+  }
+  .search-page:not(.is-landing), .search-workspace .gallery-panel { color: #ededed; background: #1c1c1c; }
+  .search-workspace .panel-heading { border-bottom-color: rgb(255 255 255 / 12%); }
+  .search-workspace .panel-heading h2 { color: #f2f2f2; }
+  .search-workspace .panel-heading p { color: #b5b5b5; }
+  .search-workspace .result-density-control { color: #b5b5b5; }
+  .search-workspace :is(.result-density-control select, .result-action-button, .result-cancel-button, .select-page-button, .button, .status-pill) {
+    color: #ededed;
+    border-color: rgb(255 255 255 / 18%);
+    background: #262626;
+  }
+  .search-workspace :is(.button-secondary, .button.secondary) { background: #303030; }
+  .search-workspace .selection-toolbar { border-bottom-color: rgb(255 255 255 / 12%); background: #242424; }
+  .search-workspace .selection-toolbar > span { color: #c3c3c3; }
+  .search-workspace .export-progress { color: #d0d0d0; background: #262626; }
+  .feature-page[data-page-section="organize"] { color: #ededed; background: #1c1c1c; }
+  .feature-page[data-page-section="organize"] :is(.folder-panel, .gallery-panel, .tag-editor) {
+    color: #ededed !important;
+    border-color: rgb(255 255 255 / 12%) !important;
+    background: #202020 !important;
+  }
+  .feature-page[data-page-section="organize"] :is(.root-row, .folder-item) { color: #d7d7d7; background: transparent; }
+  .feature-page[data-page-section="organize"] :is(.root-row, .folder-item):hover,
+  .feature-page[data-page-section="organize"] :is(.root-row, .folder-item).active { color: #fff; background: #2e2e2e; }
+  .feature-page[data-page-section="organize"] :is(.toolbar-button, .folder-load-more, .editor-toggle, .editor-close) {
+    color: #e2e2e2 !important;
+    border-color: rgb(255 255 255 / 18%) !important;
+    background: #2b2b2b !important;
+  }
+  .feature-page[data-page-section="organize"] :is(.folder-library-control select, .folder-search input) {
+    color: #f0f0f0 !important;
+    border-color: rgb(255 255 255 / 18%) !important;
+    background: #262626 !important;
+  }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
