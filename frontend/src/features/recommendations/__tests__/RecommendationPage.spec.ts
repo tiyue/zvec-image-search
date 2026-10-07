@@ -135,7 +135,7 @@ describe("RecommendationPage", () => {
     expect(wrapper.get(".refresh-button").text()).toBe("换一批");
   });
 
-  it("renders image-only cards and records a successful image click", async () => {
+  it("selects a card on click and opens the shared viewer only on double click", async () => {
     state.currentBatch.value = batch();
     const openImage = vi.fn().mockResolvedValue(true);
     const wrapper = mount(RecommendationPage, {
@@ -152,15 +152,75 @@ describe("RecommendationPage", () => {
     expect(wrapper.find(".recommendation-copy").exists()).toBe(false);
     expect(wrapper.find(".recommendation-actions").exists()).toBe(false);
 
-    await wrapper.get(".recommendation-media").trigger("click");
+    const card = wrapper.get(".recommendation-media");
+    expect(card.attributes("aria-pressed")).toBe("false");
+    expect(card.attributes("aria-label")).toBe("选择 雷电将军.jpg");
+    await card.trigger("click");
+    await flushPromises();
+    expect(card.attributes("aria-pressed")).toBe("true");
+    expect(document.body.querySelector("[data-testid='image-viewer']")).toBeNull();
+    expect(openImage).not.toHaveBeenCalled();
+    expect(state.recordAction).not.toHaveBeenCalled();
+
+    await card.trigger("dblclick");
+    await flushPromises();
+    expect(document.body.querySelector("[data-testid='image-viewer']")).not.toBeNull();
+    expect(document.body.textContent).toContain("雷电将军.jpg");
+    expect(openImage).not.toHaveBeenCalled();
+    expect(state.recordAction).not.toHaveBeenCalled();
+
+    const viewerOpen = Array.from(document.body.querySelectorAll("button")).find(
+      (button) => button.textContent?.trim() === "用系统程序打开",
+    );
+    viewerOpen?.click();
     await flushPromises();
     expect(openImage).toHaveBeenCalledWith("media-1");
     expect(state.recordAction).toHaveBeenCalledWith("item-1", "open");
   });
 
+  it("keeps the source selection on the image the viewer steps to", async () => {
+    const twoItems = batch();
+    twoItems.count = 2;
+    twoItems.items = [
+      twoItems.items[0],
+      {
+        ...twoItems.items[0],
+        itemId: "item-2",
+        mediaId: "media-2",
+        name: "八重神子.jpg",
+        thumbnailUrl: "http://localhost/api/image/media-2?variant=thumbnail",
+        previewUrl: "http://localhost/api/image/media-2?variant=preview",
+      },
+    ];
+    state.currentBatch.value = twoItems;
+    const wrapper = mount(RecommendationPage, {
+      attachTo: document.body,
+      props: { visible: true },
+    });
+    mountedWrappers.push(wrapper);
+
+    await wrapper.findAll(".recommendation-media")[0].trigger("dblclick");
+    await flushPromises();
+    expect(document.body.querySelector("[data-testid='image-viewer']")).not.toBeNull();
+
+    document.body.querySelector<HTMLButtonElement>("[data-testid='viewer-next']")?.click();
+    await flushPromises();
+    expect(document.body.textContent).toContain("八重神子.jpg");
+
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+    await flushPromises();
+    await wrapper.vm.$nextTick();
+
+    const cards = wrapper.findAll(".recommendation-media");
+    expect(cards[0].attributes("aria-pressed")).toBe("false");
+    expect(cards[1].attributes("aria-pressed")).toBe("true");
+    expect(state.recordAction).not.toHaveBeenCalled();
+  });
+
   it("does not record open or export when the native operation fails", async () => {
     state.currentBatch.value = batch();
     const wrapper = mount(RecommendationPage, {
+      attachTo: document.body,
       props: {
         visible: true,
         openImage: vi.fn().mockResolvedValue(false),
@@ -169,7 +229,14 @@ describe("RecommendationPage", () => {
     });
     mountedWrappers.push(wrapper);
 
-    await wrapper.get(".recommendation-media").trigger("click");
+    await wrapper.get(".recommendation-media").trigger("dblclick");
+    await flushPromises();
+    const viewerOpen = Array.from(document.body.querySelectorAll("button")).find(
+      (button) => button.textContent?.trim() === "用系统程序打开",
+    );
+    viewerOpen?.click();
+    await flushPromises();
+
     openMenu(wrapper.element, 80, 80);
     await wrapper.vm.$nextTick();
     menuButton("导出到文件夹…").click();
@@ -233,7 +300,7 @@ describe("RecommendationPage", () => {
     mountedWrappers.push(wrapper);
 
     for (const label of [
-      "系统打开",
+      "用系统程序打开",
       "所在文件夹",
       "复制图片",
       "复制文件",
@@ -313,12 +380,12 @@ describe("RecommendationPage", () => {
 
     openMenu(wrapper.element, 80, 80);
     await wrapper.vm.$nextTick();
-    menuButton("系统打开").click();
+    menuButton("用系统程序打开").click();
     await wrapper.vm.$nextTick();
     openMenu(wrapper.element, 80, 80);
     await wrapper.vm.$nextTick();
-    expect(menuButton("系统打开").disabled).toBe(true);
-    menuButton("系统打开").click();
+    expect(menuButton("用系统程序打开").disabled).toBe(true);
+    menuButton("用系统程序打开").click();
     expect(openImage).toHaveBeenCalledOnce();
 
     finish(true);

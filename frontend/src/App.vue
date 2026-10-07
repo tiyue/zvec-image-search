@@ -1,30 +1,43 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import {
+  computed,
+  defineAsyncComponent,
+  defineComponent,
+  h,
+  nextTick,
+  onBeforeUnmount,
+  onMounted,
+  ref,
+  watch,
+} from "vue";
+import type { AsyncComponentLoader, Component } from "vue";
 
 import yaolensLogoUrl from "./assets/yaolens-logo.png";
+import AsyncPageState from "./components/AsyncPageState.vue";
 import GalleryContextMenu from "./components/GalleryContextMenu.vue";
 import GalleryGrid from "./components/GalleryGrid.vue";
 import ImagePreview from "./components/ImagePreview.vue";
+import ImageViewer from "./components/ImageViewer.vue";
 import PaginationBar from "./components/PaginationBar.vue";
 import StatusToast from "./components/StatusToast.vue";
 import AppIcon from "./components/AppIcon.vue";
+import {
+  isViewerOverlayOpen,
+  useImageViewerSession,
+  type ViewerImage,
+} from "./composables/useImageViewer";
 import { useNativeImageActions } from "./composables/useNativeImageActions";
 import {
   computeGalleryLayout,
   useGalleryDensity,
   type GalleryLayout,
 } from "./composables/useGalleryDensity";
+import { createLazyPageLoader } from "./composables/useLazyPage";
 import { useSearch } from "./composables/useSearch";
 import { installGlobalDiagnostics, reportFrontendDiagnostic } from "./diagnostics";
-import { OrganizePage } from "./features/organize";
-import { ImageEditPage } from "./features/image-edit";
 import type { ImageEditIncomingSource } from "./features/image-edit";
-import { RawSelectionPage } from "./features/raw-selection";
-import { RecommendationPage } from "./features/recommendations";
 import { canRecordFeedback, useSearchFeedback } from "./features/search-learning";
-import { SettingsPage } from "./features/settings";
 import type { SettingsLibrary } from "./features/settings";
-import { TasksPage } from "./features/tasks";
 import type {
   GalleryContextIntent,
   GallerySelectionIntent,
@@ -95,6 +108,87 @@ const pageDefinitions: Array<{
   },
 ];
 
+/**
+ * Off-screen feature pages load on first visit through a direct `.vue` import
+ * so no aggregation module pulls them all back into the entry chunk. The
+ * search landing page stays a synchronous import.
+ */
+const pageKeys = ref<Partial<Record<PageName, number>>>({});
+
+function pageKey(page: PageName): number {
+  return pageKeys.value[page] ?? 0;
+}
+
+function reloadPage(page: PageName): void {
+  pageKeys.value = { ...pageKeys.value, [page]: pageKey(page) + 1 };
+}
+
+function lazyPageState(label: string, page?: PageName): Component {
+  return defineComponent({
+    name: "AsyncPageStateSurface",
+    inheritAttrs: false,
+    props: { error: { type: [Object, String], default: null } },
+    setup(stateProps) {
+      return () =>
+        h(AsyncPageState, {
+          label,
+          error: stateProps.error,
+          // Vue 3.5 does not forward the async error component's `retry`
+          // emit, so the manual retry remounts the page through a new key.
+          onRetry: page ? () => reloadPage(page) : undefined,
+        });
+    },
+  });
+}
+
+function lazyPage<P extends Component>(
+  page: PageName,
+  label: string,
+  loader: () => Promise<{ default: P }>,
+): P {
+  // Resolve `default` explicitly. Vue only unwraps real ES module namespaces,
+  // so a plain module object (for example a test mock) would otherwise be
+  // treated as the component itself.
+  const direct = () => loader().then((module) => module.default);
+  // The first attempt is the plain `.vue` dynamic import; after a failure the
+  // manual retry re-requests the emitted chunk, because the browser keeps the
+  // failed module in its module map for the rest of the document.
+  const load: AsyncComponentLoader<P> = createLazyPageLoader(page, direct);
+  return defineAsyncComponent({
+    loader: load,
+    delay: 0,
+    loadingComponent: lazyPageState(label),
+    errorComponent: lazyPageState(label, page),
+  });
+}
+
+const TasksPage = lazyPage("tasks", "图库任务", () => import("./features/tasks/TasksPage.vue"));
+const OrganizePage = lazyPage(
+  "batch",
+  "批量标签",
+  () => import("./features/organize/OrganizePage.vue"),
+);
+const RecommendationPage = lazyPage(
+  "recommendations",
+  "图片推荐",
+  () => import("./features/recommendations/RecommendationPage.vue"),
+);
+const RawSelectionPage = lazyPage(
+  "raw-selection",
+  "ARW 选片",
+  () => import("./features/raw-selection/RawSelectionPage.vue"),
+);
+const ImageEditPage = lazyPage(
+  "image-edit",
+  "图片编辑",
+  () => import("./features/image-edit/ImageEditPage.vue"),
+);
+const SettingsPage = lazyPage(
+  "settings",
+  "设置",
+  () => import("./features/settings/SettingsPage.vue"),
+);
+
 const activePage = ref<PageName>("search");
 const visitedPages = ref<PageName[]>(["search"]);
 const sidebarCollapsed = ref(false);
@@ -151,6 +245,131 @@ let removeGlobalDiagnostics: (() => void) | null = null;
 let imageEditImportSequence = 0;
 let searchGalleryObserver: ResizeObserver | null = null;
 let searchGalleryResizeTimer: number | null = null;
+
+const searchViewer = useImageViewerSession({
+  items: () => search.items.value.map(toViewerImage),
+  startId: () => search.selectedId.value || search.items.value[0]?.id || "",
+  hasMore: (direction) => (direction > 0 ? search.hasNext.value : search.hasPrevious.value),
+  loadAdjacent: async (direction) => {
+    const anchorId = search.selectedId.value;
+    const targetPage = search.page.value + direction;
+    if (!(await search.goToPage(targetPage))) return null;
+    const items = search.items.value;
+    if (items.length === 0) return null;
+    // A capacity change can carry the anchor into the freshly read window; keep
+    // its absolute neighbour instead of assuming the page starts at the anchor.
+    const index = items.findIndex((item) => item.id === anchorId);
+    if (index >= 0) {
+      const neighbor = items[index + direction]?.id;
+      if (neighbor) return neighbor;
+    }
+    return direction > 0 ? items[0].id : items[items.length - 1].id;
+  },
+});
+
+const searchViewerPosition = computed(() => {
+  const index = search.items.value.findIndex((item) => item.id === searchViewer.currentId.value);
+  if (index < 0) return "";
+  const absolute = (search.page.value - 1) * search.pageSize.value + index + 1;
+  const total = search.totalItems.value;
+  return total > 0 ? `${absolute} / ${total}` : "";
+});
+
+const searchViewerPreloads = computed(() => {
+  const items = search.items.value;
+  const index = items.findIndex((item) => item.id === searchViewer.currentId.value);
+  if (index < 0) return [];
+  const urls: string[] = [];
+  const previous = items[index - 1];
+  const next = items[index + 1];
+  if (previous) urls.push(previous.imageUrl || previous.thumbnailUrl);
+  if (next) urls.push(next.imageUrl || next.thumbnailUrl);
+  return urls.filter(Boolean);
+});
+
+watch(
+  () => searchViewer.currentId.value,
+  (id) => {
+    if (searchViewer.visible.value && id) search.select(id);
+  },
+);
+
+// Whatever closed the overlay, the capacity deferred while it was open is
+// re-applied once the viewer has unmounted and released the shortcut hold.
+watch(
+  () => searchViewer.visible.value,
+  (visible) => {
+    if (!visible) void nextTick(() => applySearchGalleryLayout(true));
+  },
+);
+
+function toViewerImage(item: SearchResultItem): ViewerImage {
+  return {
+    id: item.id,
+    name: item.name,
+    relativePath: item.relativePath,
+    libraryName: item.libraryName,
+    width: item.width,
+    height: item.height,
+    tags: item.tags,
+    thumbnailUrl: item.thumbnailUrl,
+    imageUrl: item.imageUrl,
+    nativeId: item.id,
+  };
+}
+
+function escapeSelector(value: string): string {
+  return typeof CSS !== "undefined" && typeof CSS.escape === "function"
+    ? CSS.escape(value)
+    : value.replace(/["\\]/gu, "\\$&");
+}
+
+function focusSearchImage(imageId: string): void {
+  const target = imageId
+    ? searchGalleryViewport.value?.querySelector<HTMLElement>(
+        `[data-image-id="${escapeSelector(imageId)}"]`,
+      )
+    : null;
+  if (target) target.focus({ preventScroll: true });
+  else searchInput.value?.focus({ preventScroll: true });
+}
+
+function openSearchViewer(imageId: string): void {
+  if (!imageId) return;
+  search.select(imageId);
+  // Drop a queued capacity change so it cannot reload the page under the overlay.
+  if (searchGalleryResizeTimer !== null) {
+    window.clearTimeout(searchGalleryResizeTimer);
+    searchGalleryResizeTimer = null;
+  }
+  // A capacity re-read may already be in flight; cancel it so it cannot unload
+  // the window under the overlay. The capacity the gallery actually shows is
+  // reported back so closing re-reads at the measured one.
+  const applied = search.cancelPendingPageLoad(true);
+  if (applied > 0 && applied !== searchGalleryLayout.value.pageSize) {
+    searchGalleryLayout.value = { ...searchGalleryLayout.value, pageSize: applied };
+  }
+  searchViewer.open(imageId);
+}
+
+function closeSearchViewer(): void {
+  const imageId = searchViewer.currentId.value;
+  searchViewer.close();
+  // A cross-page step may still be loading; stop it so a late page cannot
+  // replace the window or the selection the user returns to.
+  search.cancelPendingPageLoad();
+  void nextTick(() => focusSearchImage(imageId));
+}
+
+async function openViewerImageNative(): Promise<void> {
+  const imageId = searchViewer.currentId.value;
+  if (imageId) await openSearchImage(imageId);
+}
+
+function revealViewerImage(): void {
+  const imageId = searchViewer.currentId.value;
+  if (imageId) void nativeActions.reveal(imageId);
+}
 
 const selectedCount = computed(() => selectedImageIds.value.length);
 const hasSearchActivity = computed(
@@ -223,6 +442,7 @@ const activeLibraryLabel = computed(() => {
 
 async function submitSearch(): Promise<void> {
   if (search.searching.value) return;
+  if (searchViewer.visible.value) searchViewer.close();
   searchHasRun.value = true;
   clearSelection();
   await search.submit();
@@ -546,6 +766,9 @@ function applySearchGalleryLayout(reload: boolean): void {
     next.columns === previous.columns &&
     next.cardHeight === previous.cardHeight
   ) return;
+  // While a viewer overlay is open, defer the capacity change (and the page
+  // reload it triggers) so the viewer window stays put; closing re-applies it.
+  if (reload && isViewerOverlayOpen()) return;
   searchGalleryLayout.value = next;
   // Only a real capacity change re-reads the page; a pure visual change (tile
   // height) just re-renders the grid.
@@ -607,6 +830,7 @@ function selectSearchMode(mode: "semantic" | "tags"): void {
 }
 
 function newSearch(): void {
+  if (searchViewer.visible.value) searchViewer.close();
   search.query.value = "";
   search.setQueryImage();
   clearSelection();
@@ -616,6 +840,7 @@ function newSearch(): void {
 }
 
 async function openSearchHistory(entry: SearchHistoryEntry): Promise<void> {
+  if (searchViewer.visible.value) searchViewer.close();
   setPage("search");
   clearSelection();
   searchHasRun.value = true;
@@ -727,6 +952,9 @@ function handleLibrariesUpdated(libraries: SettingsLibrary[]): void {
 }
 
 function handleGlobalKeydown(event: KeyboardEvent): void {
+  // The viewer owns its own keys; background shortcuts and selection must not
+  // react while the overlay is open.
+  if (isViewerOverlayOpen()) return;
   // Use the physical digit code as a fallback so Alt shortcuts work under
   // keyboard layouts that transform event.key. Ignore AltGr (Ctrl+Alt).
   const shortcutKey = /^Digit([1-8])$/u.exec(event.code)?.[1] ?? event.key;
@@ -754,7 +982,15 @@ function handleGlobalKeydown(event: KeyboardEvent): void {
     (event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === "g";
   const commandSelectPage =
     (event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === "a";
-  if (commandSelectPage && activePage.value === "search" && !editing) {
+  if (
+    event.key === " " &&
+    !editing &&
+    activePage.value === "search" &&
+    searchGalleryViewport.value?.contains(document.activeElement) === true
+  ) {
+    event.preventDefault();
+    if (search.selectedId.value) openSearchViewer(search.selectedId.value);
+  } else if (commandSelectPage && activePage.value === "search" && !editing) {
     event.preventDefault();
     selectCurrentPage();
   } else if (commandPageJump) {
@@ -1077,7 +1313,7 @@ watch(
                 :columns="searchGalleryLayout.columns"
                 :card-height="searchGalleryLayout.cardHeight"
                 @select="handleGallerySelection"
-                @open="openSearchImage"
+                @open="openSearchViewer"
                 @context="openContextMenu"
               />
             </div>
@@ -1098,11 +1334,12 @@ watch(
       </section>
 
       <div v-if="visitedPages.includes('tasks')" v-show="activePage === 'tasks'" class="feature-page" data-page-section="tasks">
-        <TasksPage :libraries="search.libraries.value" :visible="activePage === 'tasks'" @toast="handleFeatureToast" />
+        <TasksPage :key="pageKey('tasks')" :libraries="search.libraries.value" :visible="activePage === 'tasks'" @toast="handleFeatureToast" />
       </div>
 
       <div v-if="visitedPages.includes('recommendations')" v-show="activePage === 'recommendations'" class="feature-page" data-page-section="recommendations">
         <RecommendationPage
+          :key="pageKey('recommendations')"
           :visible="activePage === 'recommendations'"
           :export-busy="nativeActions.exporting.value"
           :open-image="nativeActions.open"
@@ -1117,6 +1354,7 @@ watch(
 
       <div v-if="visitedPages.includes('raw-selection')" v-show="activePage === 'raw-selection'" class="feature-page" data-page-section="raw-selection">
         <RawSelectionPage
+          :key="pageKey('raw-selection')"
           @toast="handleFeatureToast"
           @select-folder="handleRawSelectionSelectFolder"
           @select-files="handleRawSelectionSelectFiles"
@@ -1125,6 +1363,7 @@ watch(
 
       <div v-if="visitedPages.includes('image-edit')" v-show="activePage === 'image-edit'" class="feature-page" data-page-section="image-edit">
         <ImageEditPage
+          :key="pageKey('image-edit')"
           :visible="activePage === 'image-edit'"
           :incoming-source="incomingImageEditSource"
           @toast="handleFeatureToast"
@@ -1133,11 +1372,11 @@ watch(
       </div>
 
       <div v-if="organizeVisited" v-show="activePage === 'batch' || activePage === 'groups'" class="feature-page" data-page-section="organize">
-        <OrganizePage :active-tab="organizeTab" :show-tabs="false" @toast="handleFeatureToast" @open-image="nativeActions.open" />
+        <OrganizePage :key="pageKey('batch')" :active-tab="organizeTab" :show-tabs="false" @toast="handleFeatureToast" @open-image="nativeActions.open" />
       </div>
 
       <div v-if="visitedPages.includes('settings')" v-show="activePage === 'settings'" class="settings-feature-page" data-page-section="settings">
-        <SettingsPage @toast="handleFeatureToast" @libraries-updated="handleLibrariesUpdated" />
+        <SettingsPage :key="pageKey('settings')" @toast="handleFeatureToast" @libraries-updated="handleLibrariesUpdated" />
       </div>
     </main>
 
@@ -1167,6 +1406,24 @@ watch(
       @undo-feedback="undoContextFeedback"
       @clear="clearSelection"
       @close="closeContextMenu"
+    />
+
+    <ImageViewer
+      v-if="searchViewer.visible.value"
+      :image="searchViewer.current.value"
+      :can-previous="searchViewer.hasPrevious.value"
+      :can-next="searchViewer.hasNext.value"
+      :loading="searchViewer.loading.value"
+      :error="searchViewer.error.value"
+      :position-text="searchViewerPosition"
+      :preload-urls="searchViewerPreloads"
+      can-reveal
+      @close="closeSearchViewer"
+      @previous="searchViewer.step(-1)"
+      @next="searchViewer.step(1)"
+      @retry="searchViewer.retry()"
+      @open-native="openViewerImageNative"
+      @reveal="revealViewerImage"
     />
 
     <div

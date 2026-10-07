@@ -485,4 +485,62 @@ describe("useSearch", () => {
     expect(await navigation).toBe(false);
     expect(search.page.value).toBe(1);
   });
+
+  it("cancels an in-flight page read and ignores its late response", async () => {
+    const api = fakeApi();
+    let resolvePage: ((payload: SearchPageResponse) => void) | undefined;
+    api.latest = vi.fn(
+      async (page, pageSize) =>
+        page === 1
+          ? sizedPagePayload(1, pageSize)
+          : new Promise<SearchPageResponse>((resolve) => {
+              resolvePage = resolve;
+            }),
+    );
+    const search = useSearch(api);
+    await search.initialize();
+
+    const navigation = search.goToPage(2);
+    expect(search.pageLoading.value).toBe(true);
+    search.cancelPendingPageLoad();
+    expect(search.pageLoading.value).toBe(false);
+
+    resolvePage?.(sizedPagePayload(2, 15));
+    expect(await navigation).toBe(false);
+    expect(search.page.value).toBe(1);
+    expect(search.items.value[0]?.id).toBe("image-1");
+  });
+
+  it("falls back to the applied capacity when a capacity reload is cancelled", async () => {
+    const api = fakeApi();
+    let resolveCapacity: ((payload: SearchPageResponse) => void) | undefined;
+    api.latest = vi.fn(async (page, pageSize) =>
+      pageSize === 30
+        ? new Promise<SearchPageResponse>((resolve) => {
+            resolveCapacity = resolve;
+          })
+        : sizedPagePayload(page, pageSize),
+    );
+    const search = useSearch(api);
+    await search.initialize();
+    search.select("image-10", false);
+
+    const reload = search.setPageSize(30);
+    expect(search.pageSize.value).toBe(30);
+    expect(search.pageLoading.value).toBe(true);
+
+    // The gallery never showed the new capacity, so it reports the one it shows.
+    search.cancelPendingPageLoad();
+    expect(search.pageSize.value).toBe(15);
+    expect(search.pageLoading.value).toBe(false);
+
+    resolveCapacity?.(sizedPagePayload(1, 30));
+    expect(await reload).toBe(false);
+    expect(search.pageSize.value).toBe(15);
+    expect(search.selectedId.value).toBe("image-10");
+
+    // The next read uses the capacity that is actually displayed.
+    expect(await search.goToPage(2)).toBe(true);
+    expect(api.latest).toHaveBeenLastCalledWith(2, 15, expect.any(AbortSignal));
+  });
 });

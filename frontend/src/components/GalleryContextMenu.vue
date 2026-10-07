@@ -62,7 +62,7 @@ const emit = defineEmits<{
         role="menuitem"
         :disabled="recommendationMode && actionPending"
         @click="emit('open'); emit('close')"
-      >系统打开</button>
+      >用系统程序打开</button>
       <button
         type="button"
         role="menuitem"

@@ -9,7 +9,13 @@ import {
 } from "vue";
 
 import PaginationBar from "../../components/PaginationBar.vue";
+import ImageViewer from "../../components/ImageViewer.vue";
 import { useGalleryDensity } from "../../composables/useGalleryDensity";
+import {
+  isViewerOverlayOpen,
+  useImageViewerSession,
+  type ViewerImage,
+} from "../../composables/useImageViewer";
 import {
   calculateOrganizeGalleryCapacity,
   GALLERY_META_OVERHEAD,
@@ -146,12 +152,123 @@ function markThumbnailUnavailable(imageId: string): void {
   failedThumbnails.value = new Set([...failedThumbnails.value, imageId]);
 }
 
-function openImage(image: OrganizeImage): void {
-  if (!image.nativeImageId) {
+// The shared overlay keeps display/geometry; this page only supplies the
+// folder page data and the existing native open action.
+function toViewerImage(image: OrganizeImage): ViewerImage {
+  return {
+    id: image.id,
+    name: image.fileName,
+    relativePath: image.relativePath,
+    libraryName: "",
+    width: image.width,
+    height: image.height,
+    tags: image.effectiveTags,
+    thumbnailUrl: image.thumbnailUrl,
+    imageUrl: image.imageUrl,
+    nativeId: image.nativeImageId,
+  };
+}
+
+const imageViewer = useImageViewerSession({
+  items: () => organize.images.value.map(toViewerImage),
+  startId: () => organize.images.value[0]?.id ?? "",
+  hasMore: (direction) =>
+    direction > 0
+      ? organize.imagePage.value < organize.imageTotalPages.value
+      : organize.imagePage.value > 1,
+  loadAdjacent: async (direction) => {
+    if (!(await organize.loadFolderImages(organize.imagePage.value + direction))) return null;
+    const images = organize.images.value;
+    if (images.length === 0) return null;
+    return direction > 0 ? images[0].id : images[images.length - 1].id;
+  },
+});
+
+const imageViewerPosition = computed(() => {
+  const images = organize.images.value;
+  const index = images.findIndex((image) => image.id === imageViewer.currentId.value);
+  if (index < 0) return "";
+  const absolute = (organize.imagePage.value - 1) * organize.imagePageSize.value + index + 1;
+  const total = organize.imageTotal.value;
+  return total > 0 ? `${absolute} / ${total}` : "";
+});
+
+const imageViewerPreloads = computed(() => {
+  const images = organize.images.value;
+  const index = images.findIndex((image) => image.id === imageViewer.currentId.value);
+  if (index < 0) return [];
+  const urls: string[] = [];
+  const previous = images[index - 1];
+  const next = images[index + 1];
+  if (previous) urls.push(previous.imageUrl || previous.thumbnailUrl);
+  if (next) urls.push(next.imageUrl || next.thumbnailUrl);
+  return urls.filter(Boolean);
+});
+
+function escapeSelector(value: string): string {
+  return typeof CSS !== "undefined" && typeof CSS.escape === "function"
+    ? CSS.escape(value)
+    : value.replace(/["\\]/gu, "\\$&");
+}
+
+function focusTile(imageId: string): void {
+  const target = imageId
+    ? galleryViewport.value?.querySelector<HTMLElement>(
+        `[data-image-id="${escapeSelector(imageId)}"] .image-select`,
+      )
+    : null;
+  target?.focus({ preventScroll: true });
+}
+
+function openViewer(image: OrganizeImage): void {
+  if (!image.thumbnailUrl && !image.imageUrl) {
+    emit("toast", "无法查看大图", "当前图片文件不可用。", "error");
+    return;
+  }
+  // A capacity re-read may already be in flight; cancel it so it cannot unload
+  // the window under the overlay. The capacity the gallery actually shows is
+  // reported back so closing re-reads at the measured one.
+  const applied = organize.cancelPendingImageLoad(true);
+  if (applied !== galleryCapacity.value.pageSize) {
+    galleryCapacity.value = { ...galleryCapacity.value, pageSize: applied };
+  }
+  imageViewer.open(image.id);
+}
+
+// Space opens the viewer for the primary selection of the focused grid.
+function openViewerFromSelection(): void {
+  const target =
+    organize.images.value.find((image) => organize.isImageSelected(image.id)) ??
+    organize.images.value[0];
+  if (target) openViewer(target);
+}
+
+function closeViewer(): void {
+  const imageId = imageViewer.currentId.value;
+  imageViewer.close();
+  // A cross-page step may still be loading; stop it so a late page cannot
+  // replace the window or the selection the user returns to.
+  organize.cancelPendingImageLoad();
+  void nextTick(() => focusTile(imageId));
+}
+
+// Whatever closed the overlay, the capacity deferred while it was open is
+// re-applied once the viewer has unmounted and released the shortcut hold.
+watch(
+  () => imageViewer.visible.value,
+  (visible) => {
+    if (!visible) void nextTick(() => updateGalleryCapacity(true));
+  },
+);
+
+function openViewerNative(): void {
+  const image = imageViewer.current.value;
+  if (!image) return;
+  if (!image.nativeId) {
     emit("toast", "无法打开原图", "当前图片文件不可用或尚未注册。", "error");
     return;
   }
-  emit("openImage", image.nativeImageId);
+  emit("openImage", image.nativeId);
 }
 
 function formatIndexedAt(value: string): string {
@@ -177,6 +294,9 @@ function formatBytes(value: number): string {
 function applyGalleryCapacity(next: OrganizeGalleryCapacity, reload: boolean): void {
   const sizeChanged = next.pageSize !== galleryCapacity.value.pageSize;
   if (!sizeChanged && next.columns === galleryCapacity.value.columns) return;
+  // While a viewer overlay is open, defer the capacity change (and the page
+  // reload it triggers) so the viewer window stays put; closing re-applies it.
+  if (reload && isViewerOverlayOpen()) return;
   galleryCapacity.value = next;
   if (sizeChanged) void organize.setImagePageSize(next.pageSize, reload);
 }
@@ -606,6 +726,7 @@ onBeforeUnmount(() => {
             class="image-grid"
             aria-label="文件夹图片"
             :style="{ '--organize-columns': galleryCapacity.columns }"
+            @keydown.space.prevent="openViewerFromSelection"
           >
             <article
               v-for="image in organize.images.value"
@@ -627,7 +748,7 @@ onBeforeUnmount(() => {
                 <span class="selection-marker" aria-hidden="true">
                   {{ organize.isImageSelected(image.id) ? "✓" : "" }}
                 </span>
-                <span class="thumbnail-stage" @dblclick.stop.prevent="openImage(image)">
+                <span class="thumbnail-stage" @dblclick.stop.prevent="openViewer(image)">
                   <img
                     v-if="canDisplayThumbnail(image)"
                     class="media-contain"
@@ -1120,6 +1241,22 @@ onBeforeUnmount(() => {
         </footer>
       </section>
     </div>
+
+    <ImageViewer
+      v-if="imageViewer.visible.value"
+      :image="imageViewer.current.value"
+      :can-previous="imageViewer.hasPrevious.value"
+      :can-next="imageViewer.hasNext.value"
+      :loading="imageViewer.loading.value"
+      :error="imageViewer.error.value"
+      :position-text="imageViewerPosition"
+      :preload-urls="imageViewerPreloads"
+      @close="closeViewer"
+      @previous="imageViewer.step(-1)"
+      @next="imageViewer.step(1)"
+      @retry="imageViewer.retry()"
+      @open-native="openViewerNative"
+    />
   </section>
 </template>
 

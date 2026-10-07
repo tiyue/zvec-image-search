@@ -1014,6 +1014,28 @@ export function useOrganize(api: OrganizeApi = organizeApi, events: OrganizeEven
     }
   }
 
+  /**
+   * Invalidate the foreground folder-image read before an overlay takes
+   * ownership. A transport that ignores AbortSignal still cannot apply a late
+   * response because the request id moves on, and the loading flag stays owned
+   * by this cancel. `capacityOnly` keeps a page the user asked for: opening an
+   * overlay cancels only a capacity read whose page never landed, and the
+   * gallery then falls back to the rendered capacity it actually shows.
+   */
+  function cancelPendingImageLoad(capacityOnly = false): number {
+    const capacityPending = imagePageSize.value !== renderedPageSize;
+    if (!imageLoading.value || (capacityOnly && !capacityPending)) return renderedPageSize;
+    imageRequestSequence += 1;
+    imageController?.abort();
+    imageController = null;
+    imageLoading.value = false;
+    if (capacityPending) {
+      imagePageSize.value = renderedPageSize;
+      imagePage.value = renderedPage;
+    }
+    return renderedPageSize;
+  }
+
   function isImageSelected(imageId: string): boolean {
     return wholeFolderSelected.value
       ? !excludedIds.value.has(imageId)
@@ -1565,6 +1587,7 @@ export function useOrganize(api: OrganizeApi = organizeApi, events: OrganizeEven
     selectRoot,
     selectFolder,
     loadFolderImages,
+    cancelPendingImageLoad,
     setImagePageSize,
     isImageSelected,
     selectImage,

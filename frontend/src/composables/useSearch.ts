@@ -949,6 +949,26 @@ export function useSearch(
   }
 
   /**
+   * Invalidate the foreground page read that an incoming overlay (or a new
+   * selection) is about to take ownership of. A transport that ignores
+   * AbortSignal still cannot apply the response because the request id moves
+   * on. `capacityOnly` keeps a page the user asked for: opening an overlay
+   * cancels only a capacity read whose page never landed. When such a change
+   * is dropped the gallery falls back to the capacity it actually shows and
+   * reports it, so the visible window is never mistaken for the new capacity.
+   */
+  function cancelPendingPageLoad(capacityOnly = false): number {
+    const capacityPending = appliedPageSize > 0 && pageSize.value !== appliedPageSize;
+    if (!pageLoading.value || (capacityOnly && !capacityPending)) return appliedPageSize;
+    pageRequestSequence += 1;
+    foregroundController?.abort();
+    foregroundController = null;
+    pageLoading.value = false;
+    if (capacityPending) pageSize.value = appliedPageSize;
+    return appliedPageSize;
+  }
+
+  /**
    * Change the display capacity, re-reading only the existing result page.
    * A semantic search is never resubmitted and no embedding runs.
    */
@@ -1051,6 +1071,7 @@ export function useSearch(
     submit,
     cancel,
     goToPage,
+    cancelPendingPageLoad,
     setPageSize,
     select,
     setQueryImage,

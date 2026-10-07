@@ -81,7 +81,7 @@ describe("GalleryContextMenu", () => {
     });
     const buttons = Array.from(document.body.querySelectorAll("button"));
     const actionLabels = new Set([
-      "系统打开",
+      "用系统程序打开",
       "所在文件夹",
       "喜欢",
       "不喜欢",

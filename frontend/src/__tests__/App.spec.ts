@@ -679,7 +679,7 @@ describe("App page shell", () => {
     expect(wrapper.text()).toContain("退出失败");
   });
 
-  it("connects gallery double click and context-menu detail actions to the native bridge", async () => {
+  it("opens the in-app viewer on double click and only system-opens from the viewer action", async () => {
     latestPayload = {
       id: "latest-with-image",
       status: "succeeded",
@@ -708,7 +708,54 @@ describe("App page shell", () => {
     await flushPromises();
 
     await wrapper.get(".thumbnail-stage").trigger("dblclick");
+    await flushPromises();
+
+    expect(document.body.querySelector("[data-testid='image-viewer']")).not.toBeNull();
+    expect(document.body.textContent).toContain("示例人物写真.jpg");
+    expect(nativeActionMocks.open).not.toHaveBeenCalled();
+
+    const viewerOpen = Array.from(document.body.querySelectorAll("button")).find(
+      (button) => button.textContent?.trim() === "用系统程序打开",
+    );
+    viewerOpen?.click();
+    await flushPromises();
     expect(nativeActionMocks.open).toHaveBeenCalledWith("image-1");
+
+    const viewerClose = document.body.querySelector<HTMLButtonElement>(
+      "[data-testid='viewer-close']",
+    );
+    viewerClose?.click();
+    await flushPromises();
+    expect(document.body.querySelector("[data-testid='image-viewer']")).toBeNull();
+  });
+
+  it("opens label details from the context menu and reveals the file", async () => {
+    latestPayload = {
+      id: "latest-with-image",
+      status: "succeeded",
+      page: 1,
+      page_size: 15,
+      total_items: 1,
+      total_pages: 1,
+      items: [
+        {
+          id: "image-1",
+          name: "示例人物写真.jpg",
+          relative_path: "人物写真/示例人物写真.jpg",
+          library_name: "图片数据库",
+          rank: 1,
+          match_state: "high",
+          rank_source: "fused",
+          thumbnail_url: "http://127.0.0.1:8765/api/images/image-1/thumbnail",
+          image_url: "http://127.0.0.1:8765/api/images/image-1/preview",
+        },
+      ],
+    };
+    wrapper = mountApp();
+    await flushPromises();
+    await wrapper.get("input[type='search']").setValue("人物写真");
+    await wrapper.get("[data-testid='submit-search']").trigger("click");
+    await flushPromises();
 
     await wrapper.get(".image-card").trigger("contextmenu", { clientX: 400, clientY: 300 });
     const detailButton = Array.from(

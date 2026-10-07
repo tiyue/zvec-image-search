@@ -1,7 +1,9 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 
 import GalleryContextMenu from "../../components/GalleryContextMenu.vue";
+import ImageViewer from "../../components/ImageViewer.vue";
+import { useImageViewerSession, type ViewerImage } from "../../composables/useImageViewer";
 import RecommendationDetail from "./RecommendationDetail.vue";
 import type { RecommendationAction, RecommendationItem } from "./types";
 import { useRecommendations } from "./useRecommendations";
@@ -52,6 +54,7 @@ const contextMenu = ref<{
   y: number;
 }>({ item: null, x: MENU_MARGIN, y: MENU_MARGIN });
 const detailItem = ref<RecommendationItem | null>(null);
+const selectedItemId = ref("");
 
 const batch = computed(() => recommendations.currentBatch.value);
 const diversityLabel = computed(() => {
@@ -95,6 +98,98 @@ const bucketLabels: Record<RecommendationItem["bucket"], string> = {
   random: "随机发现",
 };
 
+// Recommendations stay inside the already-shown batch: no page loading and no
+// extra shown exposure while stepping through the shared viewer.
+function toViewerImage(item: RecommendationItem): ViewerImage {
+  return {
+    id: item.itemId,
+    name: item.name,
+    relativePath: "",
+    libraryName: item.libraryName,
+    width: item.width,
+    height: item.height,
+    tags: item.tags,
+    thumbnailUrl: item.thumbnailUrl,
+    imageUrl: item.previewUrl || item.thumbnailUrl,
+    nativeId: item.mediaId,
+  };
+}
+
+const imageViewer = useImageViewerSession({
+  items: () => batch.value?.items.map(toViewerImage) ?? [],
+  startId: () => "",
+  hasMore: () => false,
+  loadAdjacent: async () => null,
+});
+
+const imageViewerPosition = computed(() => {
+  const items = batch.value?.items ?? [];
+  const index = items.findIndex((item) => item.itemId === imageViewer.currentId.value);
+  return index < 0 ? "" : `${index + 1} / ${items.length}`;
+});
+
+const imageViewerPreloads = computed(() => {
+  const items = batch.value?.items ?? [];
+  const index = items.findIndex((item) => item.itemId === imageViewer.currentId.value);
+  if (index < 0) return [];
+  const urls: string[] = [];
+  const previous = items[index - 1];
+  const next = items[index + 1];
+  if (previous) urls.push(previous.previewUrl || previous.thumbnailUrl);
+  if (next) urls.push(next.previewUrl || next.thumbnailUrl);
+  return urls.filter(Boolean);
+});
+
+// A single click only selects/focuses the card; the shared viewer opens on a
+// double click or the space key so the whole batch stays one shown exposure.
+function selectItem(item: RecommendationItem): void {
+  selectedItemId.value = item.itemId;
+}
+
+function openViewer(item: RecommendationItem): void {
+  selectedItemId.value = item.itemId;
+  imageViewer.open(item.itemId);
+}
+
+function closeViewer(): void {
+  const itemId = imageViewer.currentId.value;
+  imageViewer.close();
+  void nextTick(() => {
+    const target = itemId
+      ? Array.from(document.querySelectorAll<HTMLElement>(".recommendation-media")).find(
+          (element) => element.dataset.itemId === itemId,
+        )
+      : null;
+    target?.focus({ preventScroll: true });
+  });
+}
+
+// Stepping inside the viewer moves the batch selection with the shown image,
+// so closing returns focus to a card that is also the reported selection. It
+// stays inside the already-shown batch and records no extra exposure.
+watch(
+  () => imageViewer.currentId.value,
+  (id) => {
+    if (imageViewer.visible.value && id) selectedItemId.value = id;
+  },
+);
+
+function viewerItem(): RecommendationItem | null {
+  return (
+    batch.value?.items.find((item) => item.itemId === imageViewer.currentId.value) ?? null
+  );
+}
+
+function openViewerNative(): void {
+  const item = viewerItem();
+  if (item) void runNativeAction(item, "open");
+}
+
+function revealViewerImage(): void {
+  const item = viewerItem();
+  if (item) void runNativeAction(item, "reveal");
+}
+
 watch(
   () => props.visible,
   (visible) => {
@@ -102,6 +197,7 @@ watch(
     if (!visible) {
       closeContextMenu();
       detailItem.value = null;
+      imageViewer.close();
     }
   },
   { immediate: true },
@@ -273,9 +369,13 @@ onBeforeUnmount(() => {
           <button
             class="recommendation-media"
             type="button"
-            :aria-label="`打开 ${item.name}`"
+            :aria-label="`选择 ${item.name}`"
+            :data-item-id="item.itemId"
+            :aria-pressed="selectedItemId === item.itemId"
             :disabled="actionBusy(item.itemId)"
-            @click="runNativeAction(item, 'open')"
+            @click="selectItem(item)"
+            @dblclick="openViewer(item)"
+            @keydown.space.prevent="openViewer(item)"
             @contextmenu="openContextMenu(item, $event)"
           >
             <img :src="item.thumbnailUrl" :alt="item.name" draggable="false" />
@@ -331,6 +431,24 @@ onBeforeUnmount(() => {
         @reveal="runDetailNative('reveal')"
       />
     </div>
+
+    <ImageViewer
+      v-if="imageViewer.visible.value"
+      :image="imageViewer.current.value"
+      :can-previous="imageViewer.hasPrevious.value"
+      :can-next="imageViewer.hasNext.value"
+      :loading="imageViewer.loading.value"
+      :error="imageViewer.error.value"
+      :position-text="imageViewerPosition"
+      :preload-urls="imageViewerPreloads"
+      can-reveal
+      @close="closeViewer"
+      @previous="imageViewer.step(-1)"
+      @next="imageViewer.step(1)"
+      @retry="imageViewer.retry()"
+      @open-native="openViewerNative"
+      @reveal="revealViewerImage"
+    />
   </section>
 </template>
 

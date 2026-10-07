@@ -6,6 +6,7 @@
 - Sony A7M4 ARW 选片模块需求规格：`docs/raw-image-support-requirements.md`
 - 软件开发全流程、需求约束、原型、测试与发布实践：`docs/development-workflow-guide.md`
 - 第一轮缩略图密度与数据库查询优化实施、分工与验收：`docs/optimization-round1-deepseek.md`
+- 第二轮应用内大图与页面按需加载实施、分工与验收：`docs/optimization-round2-deepseek.md`
 
 ## 发布矩阵
 

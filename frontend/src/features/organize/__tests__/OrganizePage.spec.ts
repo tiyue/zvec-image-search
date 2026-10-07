@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import OrganizePage from "../OrganizePage.vue";
 import { useGalleryDensity } from "../../../composables/useGalleryDensity";
+import { isViewerOverlayOpen } from "../../../composables/useImageViewer";
 import type {
   OrganizeApi,
   OrganizeBootstrapResponse,
@@ -897,12 +898,88 @@ describe("OrganizePage batch tags", () => {
     expect(submitJob).toHaveBeenCalledTimes(2);
   });
 
-  it("opens the original image on thumbnail double click", async () => {
-    const wrapper = await mountPage(fakeApi());
+  it("opens the folder image in the shared viewer and system-opens from there", async () => {
+    const wrapper = mount(OrganizePage, { attachTo: document.body, props: { api: fakeApi() } });
+    await flushPromises();
 
+    expect(isViewerOverlayOpen()).toBe(false);
     await wrapper.get('[data-image-id="doc-1"] .thumbnail-stage').trigger("dblclick");
+    await flushPromises();
 
+    expect(document.body.querySelector("[data-testid='image-viewer']")).not.toBeNull();
+    expect(document.body.textContent).toContain("01.jpg");
+    expect(wrapper.emitted("openImage")).toBeUndefined();
+    // The shared overlay holds background shortcuts for the folder source too.
+    expect(isViewerOverlayOpen()).toBe(true);
+
+    const viewerOpen = Array.from(document.body.querySelectorAll("button")).find(
+      (button) => button.textContent?.trim() === "用系统程序打开",
+    );
+    viewerOpen?.click();
+    await flushPromises();
     expect(wrapper.emitted("openImage")).toEqual([["native-doc-1"]]);
+
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+    await flushPromises();
+    await wrapper.vm.$nextTick();
+    expect(document.body.querySelector("[data-testid='image-viewer']")).toBeNull();
+    expect(isViewerOverlayOpen()).toBe(false);
+    expect(document.activeElement).toBe(
+      wrapper.get('[data-image-id="doc-1"] .image-select').element,
+    );
+
+    wrapper.unmount();
+    document.body.innerHTML = "";
+  });
+
+  it("cancels the folder page read when the viewer closes mid-step", async () => {
+    const width = vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockReturnValue(1_547);
+    const height = vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(1_030);
+    let releasePageTwo: (() => void) | undefined;
+    const listFolderImages = vi.fn(
+      (_libraryId: string, _folderKey: string, page: number) =>
+        page === 2
+          ? new Promise<OrganizeFolderImagesResponse>((resolve) => {
+              releasePageTwo = () => resolve(folderImages(2));
+            })
+          : Promise.resolve(folderImages(page)),
+    );
+    const wrapper = mount(OrganizePage, {
+      attachTo: document.body,
+      props: { api: fakeApi({ listFolderImages }) },
+    });
+    await flushPromises();
+    expect(wrapper.find('[data-image-id="doc-3"]').exists()).toBe(true);
+
+    // Open the viewer on the last image of the first page and step past the edge.
+    await wrapper.get('[data-image-id="doc-3"] .thumbnail-stage').trigger("dblclick");
+    await flushPromises();
+    expect(
+      document.body.querySelector("[data-testid='image-viewer']")?.textContent,
+    ).toContain("03.jpg");
+
+    document.body.querySelector<HTMLButtonElement>("[data-testid='viewer-next']")?.click();
+    await flushPromises();
+    expect(document.body.textContent).toContain("正在读取图片");
+
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+    await flushPromises();
+    await wrapper.vm.$nextTick();
+    expect(document.body.querySelector("[data-testid='image-viewer']")).toBeNull();
+
+    await imageButton(wrapper, "doc-1").trigger("click");
+
+    // The abandoned page must not replace the window or the selection.
+    releasePageTwo?.();
+    await flushPromises();
+    expect(wrapper.find('[data-image-id="doc-3"]').exists()).toBe(true);
+    expect(wrapper.find('[data-image-id="doc-4"]').exists()).toBe(false);
+    expect(imageButton(wrapper, "doc-1").attributes("aria-pressed")).toBe("true");
+
+    wrapper.unmount();
+    document.body.innerHTML = "";
+    width.mockRestore();
+    height.mockRestore();
   });
 
   it("previews and confirms a two-stage folder deletion", async () => {

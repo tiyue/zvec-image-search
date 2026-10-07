@@ -87,6 +87,8 @@ describe("App search feedback wiring", () => {
               library_name: "人物图库",
               rank: 1,
               confidence: 0.91,
+              thumbnail_url: "api/thumbnails/image-1",
+              image_url: "api/images/image-1",
             }],
           }));
         }
@@ -108,6 +110,8 @@ describe("App search feedback wiring", () => {
               library_name: "人物图库",
               rank: 1,
               confidence: 0.91,
+              thumbnail_url: "api/thumbnails/image-1",
+              image_url: "api/images/image-1",
             }],
           }));
         }
@@ -226,6 +230,11 @@ describe("App search feedback wiring", () => {
     await flushPromises();
     await wrapper.get(".thumbnail-stage").trigger("dblclick");
     await flushPromises();
+    const viewerOpen = Array.from(document.body.querySelectorAll("button")).find(
+      (button) => button.textContent?.trim() === "用系统程序打开",
+    );
+    viewerOpen?.click();
+    await flushPromises();
     expect(nativeActions.open).toHaveBeenCalledWith("image-1");
 
     await openMenu();
@@ -254,8 +263,15 @@ describe("App search feedback wiring", () => {
     await wrapper.get(".thumbnail-stage").trigger("dblclick");
     await flushPromises();
 
-    expect(nativeActions.open).toHaveBeenCalledWith("image-1");
+    expect(document.body.querySelector("[data-testid='image-viewer']")).not.toBeNull();
     expect(wrapper.find(".gallery-panel").exists()).toBe(true);
+
+    const viewerOpen = Array.from(document.body.querySelectorAll("button")).find(
+      (button) => button.textContent?.trim() === "用系统程序打开",
+    );
+    viewerOpen?.click();
+    await flushPromises();
+    expect(nativeActions.open).toHaveBeenCalledWith("image-1");
     expect(wrapper.get(".image-card").attributes("data-image-id")).toBe("image-1");
   });
 });
