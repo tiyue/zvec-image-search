@@ -27,6 +27,8 @@ data class QueryImageUiState(
     val uploading: Boolean = false,
     val bytesUploaded: Long = 0L,
     val totalBytes: Long? = null,
+    val uploadError: String? = null,
+    val uploadAttempt: Long = 0L,
 )
 
 enum class ViewerSource {
@@ -72,11 +74,18 @@ data class AppUiState(
     val totalResults: Int = 0,
     val activeSearchId: String? = null,
     val nextPage: Int = 1,
+    val searchPhase: SearchPhase = SearchPhase.IDLE,
+    val searchAttempt: Long = 0L,
+    val searchError: String? = null,
+    val nextPageError: String? = null,
+    val searchCompletionSignal: Long = 0L,
+    val searchRestoreNotice: String? = null,
     val recommendations: RecommendationUiState = RecommendationUiState(),
     val viewerSource: ViewerSource? = null,
     val viewerIndex: Int? = null,
     val transferMessage: String? = null,
     val transferFraction: Float? = null,
+    val transferAttempt: Long? = null,
     val savedFiles: List<SavedFileRecord> = emptyList(),
 )
 
@@ -104,7 +113,7 @@ internal fun resolveSearchMode(visibleMode: SearchMode, hasText: Boolean, hasIma
 internal fun AppUiState.resolvedSearchMode(): SearchMode = resolveSearchMode(
     visibleMode = searchMode,
     hasText = searchText.isNotBlank(),
-    hasImage = queryImage?.queryImageId != null,
+    hasImage = queryImage != null,
 )
 
 sealed interface AppEvent {

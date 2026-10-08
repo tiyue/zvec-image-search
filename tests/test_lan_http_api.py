@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import http.client
+import io
 import json
 import socket
 import tempfile
@@ -15,6 +16,9 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
+from PIL import Image
+
+from tests.test_webview_lan_access import _Facade
 from zvec_lan import (
     DISCOVERY_REQUEST_PREFIX,
     LanApiServer,
@@ -32,6 +36,8 @@ from zvec_lan import (
     ThumbnailPayload,
 )
 from zvec_lan.http_server import _validated_host_header
+from zvec_webview.image_registry import ImageRegistry
+from zvec_webview.lan_access import PreviewLanAdapter
 
 
 def _secret(byte: int) -> str:
@@ -1694,6 +1700,157 @@ class LanHttpApiTests(unittest.TestCase):
             ).status,
             200,
         )
+
+
+class SearchSourceThumbnailHttpTests(unittest.TestCase):
+    """Drive the real adapter through the LAN media routes for search items."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        root = Path(self.temporary.name)
+        self.source_path = root / "raiden.jpg"
+        Image.new("RGB", (80, 120), (60, 80, 140)).save(self.source_path)
+        self.source_bytes = self.source_path.read_bytes()
+        self.digest = hashlib.sha256(self.source_bytes).hexdigest()
+        self.registry = ImageRegistry(cache_directory=root / "cache")
+        self.addCleanup(self.registry.close)
+        self.facade = _Facade(
+            self.registry,
+            self.registry.register(self.source_path).image_id,
+        )
+        self.adapter = PreviewLanAdapter(self.facade)
+        self.pairing = PairingManager()
+        pairing = self.pairing.create_request(
+            device_id="android-install-search-thumb",
+            device_name="Pixel Tablet",
+            client_secret=_secret(1),
+        )
+        self.pairing.approve(pairing.pairing_id)
+        token = self.pairing.poll(
+            pairing.pairing_id,
+            client_secret=_secret(1),
+        ).token
+        assert token is not None
+        self.token = token
+        self.uploads = QueryImageStore(root / "uploads")
+        self.server = LanApiServer(
+            instance_id="stable-instance-id-1234567890",
+            name="Zvec on TEST-PC",
+            search_backend=self.adapter,
+            recommendation_backend=self.adapter,
+            media_resolver=self.adapter,
+            pairing_manager=self.pairing,
+            query_images=self.uploads,
+            host="127.0.0.1",
+            port=0,
+            allowed_hosts=("127.0.0.1",),
+        )
+        self.address = self.server.start()
+        self.addCleanup(self.uploads.close)
+        self.addCleanup(self.server.stop)
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        *,
+        headers: dict[str, str] | None = None,
+    ) -> _Response:
+        request_headers = {"Authorization": f"Bearer {self.token}"}
+        request_headers.update(headers or {})
+        connection = http.client.HTTPConnection(
+            "127.0.0.1",
+            self.address.port,
+            timeout=5,
+        )
+        try:
+            connection.request(method, path, headers=request_headers)
+            response = connection.getresponse()
+            return _Response(
+                response.status,
+                {name.lower(): value for name, value in response.getheaders()},
+                response.read(),
+            )
+        finally:
+            connection.close()
+
+    def json_request(self, path: str, payload: object) -> _Response:
+        body = json.dumps(payload, separators=(",", ":")).encode()
+        connection = http.client.HTTPConnection(
+            "127.0.0.1",
+            self.address.port,
+            timeout=5,
+        )
+        try:
+            connection.request(
+                "POST",
+                path,
+                body=body,
+                headers={
+                    "Authorization": f"Bearer {self.token}",
+                    "Content-Type": "application/json",
+                },
+            )
+            response = connection.getresponse()
+            return _Response(
+                response.status,
+                {name.lower(): value for name, value in response.getheaders()},
+                response.read(),
+            )
+        finally:
+            connection.close()
+
+    def test_search_source_thumbnail_and_original_media_routes(self) -> None:
+        created = self.json_request(
+            "/api/v1/searches",
+            {
+                "mode": "text",
+                "text": "原神",
+                "library_ids": ["lib-a"],
+                "top_k": 100,
+            },
+        )
+        self.assertEqual(created.status, 202)
+        search_id = created.json()["search_id"]
+        self.facade.complete(search_id, self.digest)
+
+        page = self.request(
+            "GET",
+            f"/api/v1/searches/{search_id}?page=1&page_size=100",
+        )
+        self.assertEqual(page.status, 200)
+        items = page.json()["items"]
+        self.assertEqual([item["score"] for item in items], [0.91])
+        media_id = items[0]["media_id"]
+        self.assertNotEqual(media_id, self.facade.image_id)
+
+        thumbnail = self.request("GET", f"/api/v1/media/{media_id}/thumbnail")
+        head = self.request("HEAD", f"/api/v1/media/{media_id}/thumbnail")
+        not_modified = self.request(
+            "GET",
+            f"/api/v1/media/{media_id}/thumbnail",
+            headers={"If-None-Match": thumbnail.headers["etag"]},
+        )
+
+        self.assertEqual(thumbnail.status, 200)
+        self.assertEqual(thumbnail.headers["content-type"], "image/jpeg")
+        self.assertEqual(
+            thumbnail.headers["content-length"], str(len(thumbnail.body))
+        )
+        self.assertTrue(thumbnail.body)
+        self.assertEqual(head.status, 200)
+        self.assertEqual(head.body, b"")
+        self.assertEqual(head.headers["content-length"], str(len(thumbnail.body)))
+        self.assertEqual(not_modified.status, 304)
+        self.assertEqual(not_modified.body, b"")
+        with Image.open(io.BytesIO(thumbnail.body)) as rendered:
+            self.assertEqual(rendered.size, (80, 120))
+            self.assertLessEqual(max(rendered.size), 640)
+
+        original = self.request("GET", f"/api/v1/media/{media_id}/original")
+        self.assertEqual(original.status, 200)
+        self.assertEqual(original.body, self.source_bytes)
 
 
 class LanGatewayLifecycleTests(unittest.TestCase):

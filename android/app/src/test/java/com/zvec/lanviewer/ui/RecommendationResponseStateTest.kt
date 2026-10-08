@@ -80,26 +80,6 @@ class RecommendationResponseStateTest {
     }
 
     @Test
-    fun completedSearchOnlyPreservesRecommendationTab() {
-        assertEquals(
-            MobileTab.RECOMMENDATIONS,
-            mobileTabAfterSearchUpdate(MobileTab.RECOMMENDATIONS, hasActiveSearch = true, hasResults = true),
-        )
-        assertEquals(
-            MobileTab.RESULTS,
-            mobileTabAfterSearchUpdate(MobileTab.RESULTS, hasActiveSearch = true, hasResults = true),
-        )
-        assertEquals(
-            MobileTab.RESULTS,
-            mobileTabAfterSearchUpdate(MobileTab.SEARCH, hasActiveSearch = true, hasResults = true),
-        )
-        assertEquals(
-            MobileTab.RESULTS,
-            mobileTabAfterSearchUpdate(MobileTab.DEVICE, hasActiveSearch = true, hasResults = true),
-        )
-    }
-
-    @Test
     fun leavingReadyResetsLiftedTabWithoutChangingReadyTab() {
         assertEquals(
             MobileTab.RECOMMENDATIONS,

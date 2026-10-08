@@ -135,6 +135,8 @@ class ZvecRepository(
 
     fun mediaUrl(mediaId: String): String = api.mediaUrl(mediaId)
 
+    fun thumbnailUrl(mediaId: String): String = api.thumbnailUrl(mediaId)
+
     suspend fun cacheOriginal(
         item: OriginalMediaItem,
         onProgress: (DownloadProgress) -> Unit = {},
@@ -155,9 +157,7 @@ class ZvecRepository(
         onProgress: (DownloadProgress) -> Unit = {},
     ) {
         val cached = cacheOriginal(item, onProgress)
-        val output = context.contentResolver.openOutputStream(destination, "w")
-            ?: throw IOException("无法打开保存位置")
-        output.use { sink -> cached.inputStream().use { source -> source.copyTo(sink, 256 * 1024) } }
+        copyOriginalFile(cached, { context.contentResolver.openOutputStream(destination, "w") })
     }
 
     suspend fun shareUri(item: OriginalMediaItem, onProgress: (DownloadProgress) -> Unit = {}): Uri {

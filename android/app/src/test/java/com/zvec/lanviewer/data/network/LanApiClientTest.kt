@@ -16,6 +16,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
 import okhttp3.Call
 import okhttp3.Callback
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
 import okhttp3.Request
 import okhttp3.Response
@@ -500,6 +501,50 @@ class LanApiClientTest {
         assertNull(legacy.preference)
         assertTrue(cleared.preferenceProvided)
         assertNull(cleared.preference)
+    }
+
+    @Test
+    fun thumbnailUrlTargetsThumbnailRouteWhileMediaUrlStaysOriginal() {
+        assertEquals("$baseUrl/api/v1/media/m1/original", client.mediaUrl("m1"))
+        assertEquals("$baseUrl/api/v1/media/m1/thumbnail", client.thumbnailUrl("m1"))
+    }
+
+    @Test
+    fun thumbnailAndOriginalUrlsKeepTheMediaIdAsOnePathSegment() {
+        val mediaId = "a b/c"
+
+        assertEquals(
+            listOf("api", "v1", "media", mediaId, "original"),
+            client.mediaUrl(mediaId).toHttpUrl().pathSegments,
+        )
+        assertEquals(
+            listOf("api", "v1", "media", mediaId, "thumbnail"),
+            client.thumbnailUrl(mediaId).toHttpUrl().pathSegments,
+        )
+    }
+
+    @Test
+    fun thumbnailAndOriginalUrlsFollowTheCurrentConnectionWithoutInterfering() {
+        var connection = SavedConnection(baseUrl, "instance", "test")
+        val switchingClient = LanApiClient(
+            connectionReader = ConnectionReader { connection },
+            tokenStore = InMemoryTokenStore("top-secret-token"),
+            maxConcurrentRequests = 10,
+        )
+        // Computing the thumbnail route must not mutate the original route for the same media.
+        assertEquals("$baseUrl/api/v1/media/m1/thumbnail", switchingClient.thumbnailUrl("m1"))
+        assertEquals("$baseUrl/api/v1/media/m1/original", switchingClient.mediaUrl("m1"))
+
+        val otherServer = MockWebServer().apply { start() }
+        try {
+            val otherBaseUrl = otherServer.url("/").toString().trimEnd('/')
+            connection = SavedConnection(otherBaseUrl, "instance", "test")
+
+            assertEquals("$otherBaseUrl/api/v1/media/m1/thumbnail", switchingClient.thumbnailUrl("m1"))
+            assertEquals("$otherBaseUrl/api/v1/media/m1/original", switchingClient.mediaUrl("m1"))
+        } finally {
+            otherServer.shutdown()
+        }
     }
 
     private fun clientWithConcurrency(limit: Int): LanApiClient = LanApiClient(

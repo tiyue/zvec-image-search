@@ -456,6 +456,57 @@ class PreviewLanAdapterTests(unittest.TestCase):
             self.adapter.resolve_original(second_media, client_id="tablet-b")
         )
 
+    def test_search_source_thumbnail_reuses_registry_image_and_keeps_original(
+        self,
+    ) -> None:
+        search_id = self.adapter.create_search(self._request(), client_id="tablet-a")
+        self.facade.complete(search_id, self.digest)
+        page = self.adapter.get_search_page(
+            search_id, page=1, page_size=15, client_id="tablet-a"
+        )
+        assert not isinstance(page, SearchPending)
+        items = list(page.items)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].score, 0.91)
+        media_id = items[0].media_id
+        self.assertNotEqual(media_id, self.facade.image_id)
+
+        thumbnail = self.adapter.resolve_thumbnail(media_id, client_id="tablet-a")
+        self.assertIsNotNone(thumbnail)
+        assert thumbnail is not None
+        self.assertNotEqual(thumbnail.content, self.source.read_bytes())
+        with Image.open(io.BytesIO(thumbnail.content)) as rendered:
+            self.assertEqual(rendered.size, (80, 120))
+            self.assertLessEqual(max(rendered.size), 640)
+
+        original = self.adapter.resolve_original(media_id, client_id="tablet-a")
+        self.assertIsNotNone(original)
+        assert original is not None
+        self.assertEqual(original.path, self.source.resolve())
+        self.assertEqual(original.sha256, self.digest)
+        self.assertEqual(original.path.read_bytes(), self.source.read_bytes())
+
+    def test_search_source_thumbnail_expires_after_delete_search(self) -> None:
+        search_id = self.adapter.create_search(self._request(), client_id="tablet-a")
+        self.facade.complete(search_id, self.digest)
+        page = self.adapter.get_search_page(
+            search_id, page=1, page_size=15, client_id="tablet-a"
+        )
+        assert not isinstance(page, SearchPending)
+        media_id = page.items[0].media_id
+        self.assertIsNotNone(
+            self.adapter.resolve_thumbnail(media_id, client_id="tablet-a")
+        )
+
+        self.adapter.delete_search(search_id, client_id="tablet-a")
+
+        self.assertIsNone(
+            self.adapter.resolve_thumbnail(media_id, client_id="tablet-a")
+        )
+        self.assertIsNone(
+            self.adapter.resolve_original(media_id, client_id="tablet-a")
+        )
+
     def test_source_change_mints_new_capability_and_invalidates_old_etag(self) -> None:
         search_id = self.adapter.create_search(self._request(), client_id="tablet-a")
         self.facade.complete(search_id, self.digest)

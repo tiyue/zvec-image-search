@@ -5,9 +5,12 @@ import android.content.Context
 import android.net.Uri
 import android.os.SystemClock
 import android.provider.OpenableColumns
+import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.createSavedStateHandle
 import androidx.lifecycle.viewModelScope
+import androidx.lifecycle.viewmodel.CreationExtras
 import coil.imageLoader
 import coil.request.ImageRequest
 import coil.request.SuccessResult
@@ -42,6 +45,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -51,10 +55,10 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeout
-import kotlinx.collections.immutable.persistentListOf
 import kotlinx.collections.immutable.toPersistentList
 import java.io.IOException
 import java.util.UUID
+import kotlin.coroutines.coroutineContext
 
 private const val RECOMMENDATION_SHOWN_RETRY_INITIAL_DELAY_MILLIS = 1_000L
 private const val RECOMMENDATION_SHOWN_RETRY_MAX_DELAY_MILLIS = 30_000L
@@ -179,6 +183,7 @@ class AppViewModel(
     private val appContext: Context,
     private val repository: ZvecRepository,
     private val savedFilesStore: SavedFilesStore,
+    private val savedStateHandle: SavedStateHandle = SavedStateHandle(),
 ) : ViewModel() {
     private val _state = MutableStateFlow(AppUiState())
     val state: StateFlow<AppUiState> = _state.asStateFlow()
@@ -190,9 +195,12 @@ class AppViewModel(
     private var discoveryJob: Job? = null
     private val discoveryGeneration = OperationGeneration()
     private var uploadJob: Job? = null
+    private var uploadAttemptCounter = 0L
     private var pageJob: Job? = null
     private var searchJob: Job? = null
+    private var searchAttemptCounter = 0L
     private var actionJob: Job? = null
+    private var transferAttemptCounter = 0L
     private var recommendationJob: Job? = null
     private val recommendationShownJobs = mutableMapOf<String, Job>()
     private var recommendationActionJob: Job? = null
@@ -206,7 +214,17 @@ class AppViewModel(
     private var settledRecommendationBatchId: String? = null
 
     init {
-        _state.update { it.copy(savedFiles = savedFilesStore.list()) }
+        val draft = restoreDraft()
+        _state.update {
+            it.copy(
+                savedFiles = savedFilesStore.list(),
+                searchText = draft.searchText,
+                searchMode = draft.searchMode,
+                topKText = draft.topKText,
+                selectedLibraryIds = draft.selectedLibraryIds,
+                searchRestoreNotice = draft.notice,
+            )
+        }
         restoreOrDiscover()
     }
 
@@ -294,14 +312,19 @@ class AppViewModel(
         val visibleMode = if (mode == SearchMode.TAG) SearchMode.TAG else SearchMode.TEXT
         if (visibleMode == SearchMode.TAG) clearQueryImage()
         _state.update { it.copy(searchMode = visibleMode, errorMessage = null) }
+        persistDraft()
     }
 
     fun setSearchText(text: String) {
         _state.update { it.copy(searchText = text) }
+        persistDraft()
     }
 
     fun setTopK(text: String) {
-        if (text.all(Char::isDigit) && text.length <= 9) _state.update { it.copy(topKText = text) }
+        if (text.all(Char::isDigit) && text.length <= 9) {
+            _state.update { it.copy(topKText = text) }
+            persistDraft()
+        }
     }
 
     fun toggleLibrary(libraryId: String) {
@@ -311,55 +334,102 @@ class AppViewModel(
             }
             current.copy(selectedLibraryIds = updated)
         }
+        persistDraft()
     }
 
     fun selectQueryImage(uri: Uri) {
+        val attempt = nextUploadAttempt()
         uploadJob?.cancel()
-        uploadJob = viewModelScope.launch {
-            val resolver = appContext.contentResolver
-            val name = resolver.displayName(uri) ?: "query-image"
+        uploadJob = viewModelScope.launch { runQueryUpload(attempt, uri) }
+    }
+
+    fun retryQueryUpload() {
+        val query = _state.value.queryImage ?: return
+        if (query.uploading) return
+        val attempt = nextUploadAttempt()
+        uploadJob?.cancel()
+        uploadJob = viewModelScope.launch { runQueryUpload(attempt, query.uri) }
+    }
+
+    /**
+     * Upload progress, success and failure all arrive from OkHttp's IO thread, so every commit
+     * re-checks [QueryImageUiState.uploadAttempt] inside the state update. A replaced, removed or
+     * cancelled upload can therefore never overwrite or delete the newer query image.
+     */
+    private suspend fun runQueryUpload(attempt: Long, uri: Uri) {
+        val resolver = appContext.contentResolver
+        val name = resolver.displayName(uri) ?: "query-image"
+        val previousId = _state.value.queryImage?.queryImageId
+        _state.update {
+            it.copy(
+                queryImage = QueryImageUiState(
+                    uri = uri,
+                    displayName = name,
+                    mimeType = null,
+                    uploading = true,
+                    uploadAttempt = attempt,
+                ),
+                errorMessage = null,
+            )
+        }
+        persistDraft()
+        try {
             val mime = resolver.getType(uri) ?: "application/octet-stream"
-            val previousId = _state.value.queryImage?.queryImageId
-            _state.update {
-                it.copy(
-                    queryImage = QueryImageUiState(
-                        uri = uri,
-                        displayName = name,
-                        mimeType = mime,
-                        uploading = true,
-                    ),
-                    errorMessage = null,
-                )
+            _state.update { current ->
+                val query = current.queryImage
+                if (query?.uploadAttempt != attempt) current
+                else current.copy(queryImage = query.copy(mimeType = mime))
             }
-            try {
-                previousId?.let { runCatching { repository.deleteQueryImage(it) } }
-                val uploaded = repository.uploadQueryImage(resolver, uri, name, mime) { progress ->
-                    _state.update { current ->
+            previousId?.let { runCatching { repository.deleteQueryImage(it) } }
+            val uploaded = repository.uploadQueryImage(resolver, uri, name, mime) { progress ->
+                _state.update { current ->
+                    val query = current.queryImage
+                    if (query == null || query.uploadAttempt != attempt) {
+                        current
+                    } else {
                         current.copy(
-                            queryImage = current.queryImage?.copy(
+                            queryImage = query.copy(
                                 bytesUploaded = progress.bytesWritten,
                                 totalBytes = progress.contentLength,
                             ),
                         )
                     }
                 }
-                _state.update {
-                    it.copy(
-                        queryImage = it.queryImage?.copy(
+            }
+            _state.update { current ->
+                val query = current.queryImage
+                if (query == null || query.uploadAttempt != attempt) {
+                    current
+                } else {
+                    current.copy(
+                        queryImage = query.copy(
                             queryImageId = uploaded.queryImageId,
                             uploading = false,
+                            uploadError = null,
                         ),
                     )
                 }
-            } catch (error: Throwable) {
-                if (error is CancellationException) {
-                    _state.update { it.copy(queryImage = null) }
-                    return@launch
+            }
+        } catch (error: Throwable) {
+            if (error is CancellationException) {
+                _state.update { current ->
+                    val query = current.queryImage
+                    if (query == null || query.uploadAttempt != attempt) current
+                    else current.copy(queryImage = null)
                 }
-                _state.update {
-                    it.copy(
-                        queryImage = it.queryImage?.copy(uploading = false),
-                        errorMessage = userMessage(error),
+                return
+            }
+            _state.update { current ->
+                val query = current.queryImage
+                if (query == null || query.uploadAttempt != attempt) {
+                    current
+                } else {
+                    current.copy(
+                        queryImage = query.copy(
+                            uploading = false,
+                            queryImageId = null,
+                            uploadError = userMessage(error),
+                        ),
                     )
                 }
             }
@@ -370,72 +440,62 @@ class AppViewModel(
         uploadJob?.cancel()
         uploadJob = null
         _state.update { it.copy(queryImage = null) }
+        persistDraft()
     }
 
     fun clearQueryImage() {
         val queryId = _state.value.queryImage?.queryImageId
         uploadJob?.cancel()
+        uploadJob = null
         _state.update { it.copy(queryImage = null) }
+        persistDraft()
         if (queryId != null) viewModelScope.launch { runCatching { repository.deleteQueryImage(queryId) } }
     }
 
     fun search() {
-        if (_state.value.isSearching) return
+        val snapshot = _state.value
+        val valid = when (val validation = snapshot.validateSearchRequest()) {
+            is SearchRequestValidation.Invalid -> {
+                showMessage(validation.message)
+                return
+            }
+            is SearchRequestValidation.Valid -> validation
+        }
+        persistDraft(hadSearch = true)
+        searchJob?.cancel()
         pageJob?.cancel()
+        pageJob = null
+        val attempt = nextSearchAttempt()
+        _state.update { it.beginSearchSession(attempt) }
         searchJob = viewModelScope.launch {
-            val snapshot = _state.value
-            val requestMode = snapshot.resolvedSearchMode()
-            val topK = snapshot.topKText.toIntOrNull()?.takeIf { it > 0 }
-            val validationError = when {
-                topK == null -> "结果数量必须是正整数"
-                requestMode in setOf(SearchMode.TEXT, SearchMode.TAG) && snapshot.searchText.isBlank() ->
-                    "请输入搜索文字"
-                requestMode in setOf(SearchMode.IMAGE, SearchMode.COMBINED) &&
-                    snapshot.queryImage?.queryImageId == null -> "请先选择并上传查询图片"
-                requestMode == SearchMode.COMBINED && snapshot.searchText.isBlank() ->
-                    "图文联合搜索还需要输入文字"
-                else -> null
-            }
-            if (validationError != null) {
-                showMessage(validationError)
-                return@launch
-            }
-
-            _state.update {
-                it.copy(
-                    isSearching = true,
-                    searchStatus = "正在创建搜索…",
-                    errorMessage = null,
-                    results = persistentListOf(),
-                    totalResults = 0,
-                    viewerIndex = null,
-                )
-            }
             try {
                 snapshot.activeSearchId?.let { runCatching { repository.deleteSearch(it) } }
                 val created = repository.createSearch(
                     SearchRequest(
-                        mode = requestMode,
+                        mode = valid.mode,
                         text = snapshot.searchText.trim().takeIf(String::isNotBlank),
-                        queryImageId = snapshot.queryImage?.queryImageId.takeIf { requestMode != SearchMode.TAG },
+                        queryImageId = snapshot.queryImage?.queryImageId.takeIf { valid.mode != SearchMode.TAG },
                         libraryIds = snapshot.selectedLibraryIds.toList(),
-                        topK = requireNotNull(topK),
+                        topK = valid.topK,
                     ),
                 )
-                _state.update {
-                    it.copy(
-                        activeSearchId = created.searchId,
-                        nextPage = 1,
-                        isSearching = true,
-                        searchStatus = "等待电脑完成搜索…",
-                    )
+                _state.update { current -> current.applySearchCreated(attempt, created.searchId) }
+                if (_state.value.activeSearchId != created.searchId) {
+                    runCatching { repository.deleteSearch(created.searchId) }
+                    return@launch
                 }
                 loadNextPage()
             } catch (error: Throwable) {
                 if (error is CancellationException) throw error
-                _state.update { it.copy(isSearching = false, searchStatus = null, errorMessage = userMessage(error)) }
+                _state.update { current ->
+                    current.applyPageFailed(attempt, requestedPage = 1, message = userMessage(error))
+                }
             }
         }
+    }
+
+    fun retrySearch() {
+        search()
     }
 
     fun cancelSearch() {
@@ -444,64 +504,57 @@ class AppViewModel(
         searchJob = null
         pageJob?.cancel()
         pageJob = null
-        _state.update {
-            it.copy(
-                isSearching = false,
-                isLoadingNextPage = false,
-                searchStatus = null,
-                activeSearchId = null,
-            )
-        }
+        val attempt = nextSearchAttempt()
+        _state.update { it.cancelSearchSession(attempt) }
         if (searchId != null) viewModelScope.launch { runCatching { repository.deleteSearch(searchId) } }
     }
 
     fun loadNextPage() {
         val snapshot = _state.value
-        if (snapshot.isLoadingNextPage || snapshot.activeSearchId == null) return
-        if (snapshot.totalResults > 0 && snapshot.results.size >= snapshot.totalResults) return
+        if (!snapshot.canStartNextPage()) return
+        val attempt = snapshot.searchAttempt
+        val searchId = requireNotNull(snapshot.activeSearchId)
+        val page = snapshot.nextPage
+        _state.update { it.copy(isLoadingNextPage = true, nextPageError = null) }
+        pageJob?.cancel()
         pageJob = viewModelScope.launch {
-            _state.update { it.copy(isLoadingNextPage = true) }
             try {
-                val current = _state.value
-                val page = awaitReadyPage(
-                    searchId = requireNotNull(current.activeSearchId),
-                    page = current.nextPage,
-                    pageSize = SEARCH_PAGE_SIZE,
-                )
-                _state.update {
-                    it.copy(
-                        isLoadingNextPage = false,
-                        isSearching = false,
-                        searchStatus = null,
-                        results = it.results.addAll(page.items),
-                        totalResults = page.total,
-                        nextPage = page.page + 1,
-                    )
-                }
+                val response = awaitReadyPage(attempt, searchId, page)
+                _state.update { current -> current.applyPageLoaded(attempt, response, page) }
             } catch (error: Throwable) {
                 if (error is CancellationException) throw error
-                _state.update {
-                    it.copy(
-                        isLoadingNextPage = false,
-                        isSearching = false,
-                        searchStatus = null,
-                        errorMessage = userMessage(error),
-                    )
+                _state.update { current ->
+                    current.applyPageFailed(attempt, requestedPage = page, message = userMessage(error))
                 }
             }
         }
     }
 
-    private suspend fun awaitReadyPage(searchId: String, page: Int, pageSize: Int): SearchPageResponse {
+    fun retryNextPage() {
+        val snapshot = _state.value
+        if (snapshot.nextPageError == null) return
+        _state.update { current -> current.clearNextPageError(snapshot.searchAttempt) }
+        loadNextPage()
+    }
+
+    private suspend fun awaitReadyPage(attempt: Long, searchId: String, page: Int): SearchPageResponse {
         val deadline = System.currentTimeMillis() + SEARCH_TIMEOUT_MS
         var localBackoffMs = 500L
         while (System.currentTimeMillis() < deadline) {
-            when (val result = repository.searchPage(searchId, page, pageSize)) {
+            if (_state.value.searchAttempt != attempt) throw CancellationException("搜索已过期")
+            when (val result = repository.searchPage(searchId, page, SEARCH_PAGE_SIZE)) {
                 is SearchPageResult.Ready -> return result.page
                 is SearchPageResult.Pending -> {
-                    _state.update {
-                        it.copy(searchStatus = if (result.status == "queued") "搜索正在排队…" else "电脑正在搜索…")
+                    _state.update { current ->
+                        if (current.searchAttempt != attempt) {
+                            current
+                        } else {
+                            current.copy(
+                                searchStatus = if (result.status == "queued") "搜索正在排队…" else "电脑正在搜索…",
+                            )
+                        }
                     }
+                    if (_state.value.searchAttempt != attempt) throw CancellationException("搜索已过期")
                     val serverDelayMs = result.retryAfterSeconds * 1_000L
                     delay(maxOf(serverDelayMs, localBackoffMs).coerceAtMost(5_000L))
                     localBackoffMs = (localBackoffMs * 3L / 2L).coerceAtMost(5_000L)
@@ -513,6 +566,8 @@ class AppViewModel(
     }
 
     fun mediaUrl(item: OriginalMediaItem): String = repository.mediaUrl(item.mediaId)
+
+    fun thumbnailUrl(item: OriginalMediaItem): String = repository.thumbnailUrl(item.mediaId)
 
     fun openViewer(index: Int) {
         if (index in _state.value.results.indices) {
@@ -530,14 +585,7 @@ class AppViewModel(
     }
 
     fun closeViewer() {
-        _state.update {
-            it.copy(
-                viewerSource = null,
-                viewerIndex = null,
-                transferMessage = null,
-                transferFraction = null,
-            )
-        }
+        _state.update { it.copy(viewerSource = null, viewerIndex = null) }
     }
 
     fun loadRecommendations() {
@@ -943,23 +991,40 @@ class AppViewModel(
     private fun isRecommendationGenerationCurrent(generation: Long): Boolean =
         recommendationsVisible && recommendationGeneration == generation
 
+    /** Compatibility entry point: delegates to [saveItem] for whichever item the viewer shows now. */
     fun saveCurrent(destination: Uri) {
         val item = currentViewerItem() ?: return
-        actionJob?.cancel()
+        saveItem(item, destination)
+    }
+
+    /**
+     * Binds the transfer to the item captured by the caller. The busy flag is set synchronously
+     * before the coroutine starts, so a same-frame repeat tap cannot start a second transfer, and a
+     * running transfer is never cancelled implicitly. Cancellation or failure keeps the user's
+     * destination file untouched and never reports a success record.
+     */
+    fun saveItem(item: OriginalMediaItem, destination: Uri) {
+        if (_state.value.transferAttempt != null) return
+        val attempt = nextTransferAttempt()
+        val targetName = item.name.ifBlank { "yaolens-original" }
+        beginTransfer(attempt, "正在保存 $targetName")
         actionJob = viewModelScope.launch {
-            beginTransfer("正在保存原图…")
             try {
-                repository.copyOriginalTo(item, destination) { updateTransfer(it.fraction) }
-                endTransfer()
+                repository.copyOriginalTo(item, destination) { updateTransfer(attempt, it.fraction) }
+                coroutineContext.ensureActive()
+                if (!isTransferActive(attempt)) return@launch
                 savedFilesStore.add(
                     SavedFileRecord(
-                        name = item.name.ifBlank { "yaolens-original" },
+                        name = targetName,
                         uri = destination.toString(),
                         savedAtMillis = System.currentTimeMillis(),
                         sizeBytes = item.sizeBytes,
                     ),
                 )
-                _state.update { it.copy(savedFiles = savedFilesStore.list()) }
+                _state.update { current ->
+                    if (current.transferAttempt != attempt) current
+                    else current.copy(savedFiles = savedFilesStore.list())
+                }
                 (item as? RecommendationItem)?.let { recommendation ->
                     recordRecommendationAction(
                         recommendation,
@@ -967,41 +1032,83 @@ class AppViewModel(
                         metadata = mapOf("channel" to "save"),
                     )
                 }
+                endTransfer(attempt)
                 _events.emit(AppEvent.Message("原图已保存"))
             } catch (error: Throwable) {
-                if (error is CancellationException) throw error
-                endTransfer()
-                _events.emit(AppEvent.Message(userMessage(error)))
+                if (error is CancellationException) {
+                    endTransfer(attempt)
+                    return@launch
+                }
+                if (!isTransferActive(attempt)) return@launch
+                endTransfer(attempt)
+                _events.emit(AppEvent.Message("${userMessage(error)}；目标位置可能留下不完整的文件"))
             }
         }
     }
 
     fun shareCurrent() {
         val item = currentViewerItem() ?: return
-        actionJob?.cancel()
+        if (_state.value.transferAttempt != null) return
+        val attempt = nextTransferAttempt()
+        val targetName = item.name.ifBlank { "yaolens-original" }
+        beginTransfer(attempt, "正在准备 $targetName")
         actionJob = viewModelScope.launch {
-            beginTransfer("正在准备原图…")
             try {
-                val uri = repository.shareUri(item) { updateTransfer(it.fraction) }
-                endTransfer()
+                val uri = repository.shareUri(item) { updateTransfer(attempt, it.fraction) }
+                coroutineContext.ensureActive()
+                if (!isTransferActive(attempt)) return@launch
+                endTransfer(attempt)
                 _events.emit(AppEvent.Share(uri, item.contentType ?: "image/*"))
             } catch (error: Throwable) {
-                if (error is CancellationException) throw error
-                endTransfer()
+                if (error is CancellationException) {
+                    endTransfer(attempt)
+                    return@launch
+                }
+                if (!isTransferActive(attempt)) return@launch
+                endTransfer(attempt)
                 _events.emit(AppEvent.Message(userMessage(error)))
             }
         }
     }
 
+    fun cancelTransfer() {
+        val attempt = _state.value.transferAttempt ?: return
+        actionJob?.cancel()
+        actionJob = null
+        _state.update { current ->
+            if (current.transferAttempt != attempt) {
+                current
+            } else {
+                current.copy(transferAttempt = null, transferMessage = null, transferFraction = null)
+            }
+        }
+        _events.tryEmit(AppEvent.Message("已取消；目标位置可能留下不完整的文件"))
+    }
+
     fun disconnect() {
         val activeSearchId = _state.value.activeSearchId
         val queryImageId = _state.value.queryImage?.queryImageId
+        val attempt = nextSearchAttempt()
+        _state.update {
+            it.copy(
+                searchAttempt = attempt,
+                searchPhase = SearchPhase.CANCELLED,
+                queryImage = null,
+                transferAttempt = null,
+                transferMessage = null,
+                transferFraction = null,
+            )
+        }
         cancelDiscovery()
         connectionFlight.cancel()
         uploadJob?.cancel()
+        uploadJob = null
         pageJob?.cancel()
+        pageJob = null
         searchJob?.cancel()
+        searchJob = null
         actionJob?.cancel()
+        actionJob = null
         recommendationsVisible = false
         cancelRecommendationDelivery()
         recommendationActionJob?.cancel()
@@ -1215,17 +1322,78 @@ class AppViewModel(
 
     private fun currentViewerItem(): OriginalMediaItem? = _state.value.currentViewerItem()
 
-    private fun beginTransfer(message: String) {
-        _state.update { it.copy(transferMessage = message, transferFraction = null) }
+    private fun nextUploadAttempt(): Long = ++uploadAttemptCounter
+
+    private fun nextSearchAttempt(): Long = ++searchAttemptCounter
+
+    private fun nextTransferAttempt(): Long = ++transferAttemptCounter
+
+    private fun beginTransfer(attempt: Long, message: String) {
+        _state.update {
+            it.copy(transferAttempt = attempt, transferMessage = message, transferFraction = null)
+        }
     }
 
-    private fun updateTransfer(fraction: Float?) {
-        _state.update { it.copy(transferFraction = fraction) }
+    private fun updateTransfer(attempt: Long, fraction: Float?) {
+        _state.update { current ->
+            if (current.transferAttempt != attempt) current else current.copy(transferFraction = fraction)
+        }
     }
 
-    private fun endTransfer() {
-        _state.update { it.copy(transferMessage = null, transferFraction = null) }
+    private fun endTransfer(attempt: Long) {
+        _state.update { current ->
+            if (current.transferAttempt != attempt) {
+                current
+            } else {
+                current.copy(transferAttempt = null, transferMessage = null, transferFraction = null)
+            }
+        }
     }
+
+    private fun isTransferActive(attempt: Long): Boolean = _state.value.transferAttempt == attempt
+
+    /**
+     * Saves only the small search draft described by the plan. Result sets, bitmaps and server
+     * sessions never enter the bundle; a restored draft never re-uploads or auto-submits a search.
+     */
+    private fun persistDraft(hadSearch: Boolean = false) {
+        val state = _state.value
+        savedStateHandle[KEY_SEARCH_TEXT] = state.searchText
+        savedStateHandle[KEY_SEARCH_MODE] = state.searchMode.name
+        savedStateHandle[KEY_TOP_K] = state.topKText
+        savedStateHandle[KEY_SELECTED_LIBRARIES] = ArrayList(state.selectedLibraryIds)
+        savedStateHandle[KEY_HAD_QUERY_IMAGE] = state.queryImage != null
+        if (hadSearch) savedStateHandle[KEY_HAD_SEARCH] = true
+    }
+
+    private fun restoreDraft(): SavedDraft {
+        val hadSearch = savedStateHandle.get<Boolean>(KEY_HAD_SEARCH) == true
+        val hadQueryImage = savedStateHandle.get<Boolean>(KEY_HAD_QUERY_IMAGE) == true
+        savedStateHandle[KEY_HAD_SEARCH] = false
+        savedStateHandle[KEY_HAD_QUERY_IMAGE] = false
+        val mode = savedStateHandle.get<String>(KEY_SEARCH_MODE)
+        return SavedDraft(
+            searchText = savedStateHandle.get<String>(KEY_SEARCH_TEXT).orEmpty(),
+            searchMode = if (mode == SearchMode.TAG.name) SearchMode.TAG else SearchMode.TEXT,
+            topKText = savedStateHandle.get<String>(KEY_TOP_K) ?: DEFAULT_TOP_K_TEXT,
+            selectedLibraryIds = savedStateHandle.get<ArrayList<String>>(KEY_SELECTED_LIBRARIES)
+                .orEmpty()
+                .toSet(),
+            notice = when {
+                hadQueryImage -> SEARCH_RESTORE_IMAGE_NOTICE
+                !hadSearch -> null
+                else -> SEARCH_RESTORE_NOTICE
+            },
+        )
+    }
+
+    private data class SavedDraft(
+        val searchText: String,
+        val searchMode: SearchMode,
+        val topKText: String,
+        val selectedLibraryIds: Set<String>,
+        val notice: String?,
+    )
 
     private fun showMessage(message: String) {
         _state.update { it.copy(errorMessage = message) }
@@ -1258,7 +1426,23 @@ class AppViewModel(
         @Suppress("UNCHECKED_CAST")
         override fun <T : ViewModel> create(modelClass: Class<T>): T {
             require(modelClass.isAssignableFrom(AppViewModel::class.java))
-            return AppViewModel(context.applicationContext, repository, savedFilesStore) as T
+            return AppViewModel(
+                context.applicationContext,
+                repository,
+                savedFilesStore,
+                SavedStateHandle(),
+            ) as T
+        }
+
+        @Suppress("UNCHECKED_CAST")
+        override fun <T : ViewModel> create(modelClass: Class<T>, extras: CreationExtras): T {
+            require(modelClass.isAssignableFrom(AppViewModel::class.java))
+            return AppViewModel(
+                context.applicationContext,
+                repository,
+                savedFilesStore,
+                extras.createSavedStateHandle(),
+            ) as T
         }
     }
 
@@ -1267,6 +1451,15 @@ class AppViewModel(
         private const val CONNECTION_RETRY_DELAY_MS = 350L
         private const val SEARCH_TIMEOUT_MS = 5 * 60 * 1000L
         private const val RECOMMENDATION_CRITICAL_THUMBNAIL_COUNT = 4
+        private const val DEFAULT_TOP_K_TEXT = "36"
+        private const val SEARCH_RESTORE_NOTICE = "上次搜索已结束，请重新搜索"
+        private const val SEARCH_RESTORE_IMAGE_NOTICE = "上次搜索已结束，请重新选择查询图片并重新搜索"
+        private const val KEY_SEARCH_TEXT = "searchText"
+        private const val KEY_SEARCH_MODE = "searchMode"
+        private const val KEY_TOP_K = "topK"
+        private const val KEY_SELECTED_LIBRARIES = "selectedLibraryIds"
+        private const val KEY_HAD_SEARCH = "hadSearch"
+        private const val KEY_HAD_QUERY_IMAGE = "hadQueryImage"
     }
 }
 

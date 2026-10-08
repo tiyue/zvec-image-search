@@ -143,10 +143,10 @@ class RecommendationUiTest {
                     state = searchViewerState(),
                     mediaUrl = { TEST_IMAGE_URL },
                     onIndexChanged = {},
-                    onLoadMore = {},
                     onClose = {},
                     onSave = {},
                     onShare = { shareCount += 1 },
+                    onCancelTransfer = {},
                     onReaction = { _, _ -> error("搜索查看器不得提交推荐反馈") },
                 )
             }
@@ -223,10 +223,10 @@ class RecommendationUiTest {
                         state = recommendationViewerState(reaction),
                         mediaUrl = { TEST_IMAGE_URL },
                         onIndexChanged = {},
-                        onLoadMore = {},
                         onClose = {},
                         onSave = {},
                         onShare = {},
+                        onCancelTransfer = {},
                         onReaction = onReaction,
                     )
                 }
@@ -293,19 +293,23 @@ private fun NavigationHarness(initialViewerSource: ViewerSource? = null) {
             state = state,
             mediaUrl = { TEST_IMAGE_URL },
             onIndexChanged = {},
-            onLoadMore = {},
             onClose = { viewerSource = null },
             onSave = {},
             onShare = {},
+            onCancelTransfer = {},
             onReaction = { _, _ -> },
         )
     } else {
         SearchScreen(
             state = state,
             selectedTab = selectedTab,
+            searchGridState = rememberLazyGridState(),
             recommendationGridState = recommendationGridState,
             modifier = Modifier.fillMaxSize(),
-            mediaUrl = { TEST_IMAGE_URL },
+            thumbnailUrl = { TEST_IMAGE_URL },
+            transferMessage = null,
+            transferFraction = null,
+            onCancelTransfer = {},
             onSelectedTab = { selectedTab = it },
             onMode = {},
             onText = {},
@@ -313,10 +317,13 @@ private fun NavigationHarness(initialViewerSource: ViewerSource? = null) {
             onLibrary = {},
             onPickImage = {},
             onCancelUpload = {},
+            onRetryUpload = {},
             onClearImage = {},
             onSearch = {},
             onCancelSearch = {},
+            onRetrySearch = {},
             onLoadMore = {},
+            onRetryPage = {},
             onOpen = { index ->
                 viewerIndex = index
                 viewerSource = ViewerSource.SEARCH

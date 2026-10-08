@@ -242,6 +242,9 @@ class LanApiClient(
     fun mediaUrl(mediaId: String): String =
         currentEndpoint("api", "v1", "media", mediaId, "original").toString()
 
+    fun thumbnailUrl(mediaId: String): String =
+        currentEndpoint("api", "v1", "media", mediaId, "thumbnail").toString()
+
     private fun currentEndpoint(vararg segments: String): HttpUrl {
         val baseUrl = connectionReader.read()?.baseUrl
             ?: throw IllegalStateException("尚未选择 YaoLens 电脑")

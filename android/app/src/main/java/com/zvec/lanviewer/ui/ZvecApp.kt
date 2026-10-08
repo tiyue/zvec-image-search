@@ -67,14 +67,15 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.saveable.Saver
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -102,6 +103,7 @@ import coil.compose.SubcomposeAsyncImageContent
 import coil.request.ImageRequest
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.zvec.lanviewer.data.local.SavedFileRecord
 import com.zvec.lanviewer.data.local.ServerAddress
 import com.zvec.lanviewer.data.model.DiscoveredServer
@@ -111,26 +113,44 @@ import com.zvec.lanviewer.data.model.RecommendationAction
 import com.zvec.lanviewer.data.model.RecommendationItem
 import com.zvec.lanviewer.data.model.SearchItem
 import com.zvec.lanviewer.data.model.SearchMode
+import com.zvec.lanviewer.ui.search.QueryImageControl
+import com.zvec.lanviewer.ui.search.SearchResultsPane
 import kotlinx.coroutines.flow.distinctUntilChanged
-import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.launch
 import java.text.DecimalFormat
 import java.text.SimpleDateFormat
 
 @Composable
 fun ZvecApp(viewModel: AppViewModel) {
-    val state by viewModel.state.collectAsState()
+    val state by viewModel.state.collectAsStateWithLifecycle()
     val context = LocalContext.current
     val snackbarHostState = remember { SnackbarHostState() }
-    val currentItem = state.currentViewerItem()
+    val scope = rememberCoroutineScope()
     var selectedTab by rememberSaveable { mutableStateOf(MobileTab.SEARCH) }
+    var awaitingFirstResult by rememberSaveable { mutableStateOf(false) }
+    var handledSearchCompletion by rememberSaveable { mutableStateOf(state.searchCompletionSignal) }
+    val searchGridState = rememberLazyGridState()
     val recommendationGridState = rememberLazyGridState()
 
-    LaunchedEffect(state.activeSearchId, state.results.size) {
-        selectedTab = mobileTabAfterSearchUpdate(
-            selectedTab = selectedTab,
-            hasActiveSearch = state.activeSearchId != null,
-            hasResults = state.results.isNotEmpty(),
+    // Search and recommendation each keep their own lifted, saveable grid state, so opening the
+    // viewer or switching tabs never loses the browse position.
+    SearchGridAnchorEffect(gridState = searchGridState, searchAttempt = state.searchAttempt)
+
+    LaunchedEffect(state.searchCompletionSignal) {
+        val decision = searchNavigationAfterCompletion(
+            awaitingFirstResult = awaitingFirstResult,
+            currentTab = selectedTab,
+            completionSignal = state.searchCompletionSignal,
+            handledCompletionSignal = handledSearchCompletion,
         )
+        handledSearchCompletion = state.searchCompletionSignal
+        selectedTab = decision.targetTab
+        awaitingFirstResult = decision.awaitingFirstResult
+    }
+    LaunchedEffect(state.searchPhase) {
+        if (state.searchPhase == SearchPhase.ERROR || state.searchPhase == SearchPhase.CANCELLED) {
+            awaitingFirstResult = false
+        }
     }
     LaunchedEffect(state.phase) {
         selectedTab = mobileTabAfterPhaseChange(selectedTab, state.phase)
@@ -147,10 +167,28 @@ fun ZvecApp(viewModel: AppViewModel) {
             viewModel.selectQueryImage(it)
         }
     }
+
+    // The save destination picker captures the item at launch and stores only a small snapshot, so
+    // the callback never rebinds to a different image after the viewer or search moved on.
+    var pendingSaveTarget by rememberSaveable(stateSaver = PendingSaveTargetSaver) {
+        mutableStateOf<PendingSaveTarget?>(null)
+    }
+    val viewerItem = state.currentViewerItem()
     val saveLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.CreateDocument(currentItem?.contentType ?: "image/*"),
+        ActivityResultContracts.CreateDocument(viewerItem?.contentType ?: "image/*"),
     ) { destination: Uri? ->
-        destination?.let(viewModel::saveCurrent)
+        val target = pendingSaveTarget
+        pendingSaveTarget = null
+        if (destination != null) {
+            val pinnedItem = target?.resolve(viewModel.state.value)
+            if (pinnedItem != null) {
+                viewModel.saveItem(pinnedItem, destination)
+            } else {
+                scope.launch {
+                    snackbarHostState.showSnackbar("保存目标已失效，请重新打开图片后再保存")
+                }
+            }
+        }
     }
 
     LaunchedEffect(viewModel) {
@@ -158,78 +196,118 @@ fun ZvecApp(viewModel: AppViewModel) {
             when (event) {
                 is AppEvent.Message -> snackbarHostState.showSnackbar(event.text)
                 is AppEvent.Share -> {
-                    val intent = Intent(Intent.ACTION_SEND).apply {
-                        type = event.mimeType
-                        putExtra(Intent.EXTRA_STREAM, event.uri)
-                        clipData = ClipData.newUri(context.contentResolver, "YaoLens original", event.uri)
-                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    val launched = runCatching {
+                        val intent = Intent(Intent.ACTION_SEND).apply {
+                            type = event.mimeType
+                            putExtra(Intent.EXTRA_STREAM, event.uri)
+                            clipData = ClipData.newUri(context.contentResolver, "YaoLens original", event.uri)
+                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                        }
+                        context.startActivity(Intent.createChooser(intent, "分享原图"))
                     }
-                    context.startActivity(Intent.createChooser(intent, "分享原图"))
+                    if (launched.isFailure) {
+                        val reason = launched.exceptionOrNull()?.message ?: "未知原因"
+                        snackbarHostState.showSnackbar("无法启动分享：$reason")
+                    }
                 }
             }
         }
     }
 
-    if (state.viewerIndex != null && state.viewerItems().isNotEmpty()) {
-        OriginalViewer(
-            state = state,
-            mediaUrl = viewModel::mediaUrl,
-            onIndexChanged = viewModel::setViewerIndex,
-            onLoadMore = viewModel::loadNextPage,
-            onClose = viewModel::closeViewer,
-            onSave = { saveLauncher.launch(currentItem?.name?.ifBlank { "yaolens-original" } ?: "yaolens-original") },
-            onShare = viewModel::shareCurrent,
-            onReaction = viewModel::reactToRecommendation,
-        )
-        return
-    }
+    val viewerOpen = state.viewerIndex != null && state.viewerItems().isNotEmpty()
 
-    Scaffold(
-        snackbarHost = { SnackbarHost(snackbarHostState) },
-        containerColor = MaterialTheme.colorScheme.background,
-    ) { padding ->
-        when (state.phase) {
-            ConnectionPhase.DISCOVERY -> DiscoveryScreen(
+    // The viewer and the normal pages share one visible SnackbarHost, so save and share messages
+    // are shown on the current screen instead of being sent to a host that the early return skipped.
+    Box(Modifier.fillMaxSize()) {
+        if (viewerOpen) {
+            OriginalViewer(
                 state = state,
-                modifier = Modifier.padding(padding),
-                onDiscover = viewModel::discover,
-                onServer = viewModel::connect,
-                onManual = viewModel::connectManual,
-            )
-            ConnectionPhase.CONNECTING -> CenterStatus(
-                title = "正在连接",
-                detail = state.connectionDetail ?: state.serverName ?: "YaoLens 电脑",
-                modifier = Modifier.padding(padding),
-            )
-            ConnectionPhase.PAIRING -> PairingScreen(
-                state = state,
-                modifier = Modifier.padding(padding),
-                onCancel = viewModel::cancelPairing,
-            )
-            ConnectionPhase.READY -> SearchScreen(
-                state = state,
-                selectedTab = selectedTab,
-                recommendationGridState = recommendationGridState,
-                modifier = Modifier.padding(padding),
                 mediaUrl = viewModel::mediaUrl,
-                onSelectedTab = { selectedTab = it },
-                onMode = viewModel::setSearchMode,
-                onText = viewModel::setSearchText,
-                onTopK = viewModel::setTopK,
-                onLibrary = viewModel::toggleLibrary,
-                onPickImage = { imagePicker.launch("image/*") },
-                onCancelUpload = viewModel::cancelQueryUpload,
-                onClearImage = viewModel::clearQueryImage,
-                onSearch = viewModel::search,
-                onCancelSearch = viewModel::cancelSearch,
-                onLoadMore = viewModel::loadNextPage,
-                onOpen = viewModel::openViewer,
-                onLoadRecommendations = viewModel::loadRecommendations,
-                onRecommendationsVisible = viewModel::onRecommendationsVisibilityChanged,
-                onOpenRecommendation = viewModel::openRecommendation,
-                onDisconnect = viewModel::disconnect,
+                onIndexChanged = viewModel::setViewerIndex,
+                onClose = viewModel::closeViewer,
+                onSave = {
+                    viewerItem?.let { item ->
+                        pendingSaveTarget = PendingSaveTarget.of(item, state.viewerSource)
+                        saveLauncher.launch(item.name.ifBlank { "yaolens-original" })
+                    }
+                },
+                onShare = viewModel::shareCurrent,
+                onCancelTransfer = viewModel::cancelTransfer,
+                onReaction = viewModel::reactToRecommendation,
             )
+        } else {
+            Scaffold(
+                modifier = Modifier.fillMaxSize(),
+                containerColor = MaterialTheme.colorScheme.background,
+            ) { padding ->
+                when (state.phase) {
+                    ConnectionPhase.DISCOVERY -> DiscoveryScreen(
+                        state = state,
+                        modifier = Modifier.padding(padding),
+                        onDiscover = viewModel::discover,
+                        onServer = viewModel::connect,
+                        onManual = viewModel::connectManual,
+                    )
+                    ConnectionPhase.CONNECTING -> CenterStatus(
+                        title = "正在连接",
+                        detail = state.connectionDetail ?: state.serverName ?: "YaoLens 电脑",
+                        modifier = Modifier.padding(padding),
+                    )
+                    ConnectionPhase.PAIRING -> PairingScreen(
+                        state = state,
+                        modifier = Modifier.padding(padding),
+                        onCancel = viewModel::cancelPairing,
+                    )
+                    ConnectionPhase.READY -> SearchScreen(
+                        state = state,
+                        selectedTab = selectedTab,
+                        searchGridState = searchGridState,
+                        recommendationGridState = recommendationGridState,
+                        modifier = Modifier.padding(padding),
+                        thumbnailUrl = { item -> viewModel.thumbnailUrl(item) },
+                        transferMessage = state.transferMessage,
+                        transferFraction = state.transferFraction,
+                        onCancelTransfer = viewModel::cancelTransfer,
+                        onSelectedTab = { tab ->
+                            awaitingFirstResult = searchNavigationAfterTabSelected(awaitingFirstResult, tab)
+                            selectedTab = tab
+                        },
+                        onMode = viewModel::setSearchMode,
+                        onText = viewModel::setSearchText,
+                        onTopK = viewModel::setTopK,
+                        onLibrary = viewModel::toggleLibrary,
+                        onPickImage = { imagePicker.launch("image/*") },
+                        onCancelUpload = viewModel::cancelQueryUpload,
+                        onRetryUpload = viewModel::retryQueryUpload,
+                        onClearImage = viewModel::clearQueryImage,
+                        onSearch = {
+                            val previousAttempt = viewModel.state.value.searchAttempt
+                            viewModel.search()
+                            awaitingFirstResult = viewModel.state.value.searchAttempt != previousAttempt
+                        },
+                        onCancelSearch = {
+                            awaitingFirstResult = false
+                            viewModel.cancelSearch()
+                        },
+                        onRetrySearch = viewModel::retrySearch,
+                        onLoadMore = viewModel::loadNextPage,
+                        onRetryPage = viewModel::retryNextPage,
+                        onOpen = viewModel::openViewer,
+                        onLoadRecommendations = viewModel::loadRecommendations,
+                        onRecommendationsVisible = viewModel::onRecommendationsVisibilityChanged,
+                        onOpenRecommendation = viewModel::openRecommendation,
+                        onDisconnect = viewModel::disconnect,
+                    )
+                }
+            }
         }
+        SnackbarHost(
+            hostState = snackbarHostState,
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .navigationBarsPadding()
+                .testTag(APP_SNACKBAR_HOST_TAG),
+        )
     }
 }
 
@@ -369,9 +447,13 @@ private fun CenterStatus(title: String, detail: String, modifier: Modifier) {
 internal fun SearchScreen(
     state: AppUiState,
     selectedTab: MobileTab,
+    searchGridState: LazyGridState,
     recommendationGridState: LazyGridState,
     modifier: Modifier,
-    mediaUrl: (OriginalMediaItem) -> String,
+    thumbnailUrl: (SearchItem) -> String,
+    transferMessage: String?,
+    transferFraction: Float?,
+    onCancelTransfer: () -> Unit,
     onSelectedTab: (MobileTab) -> Unit,
     onMode: (SearchMode) -> Unit,
     onText: (String) -> Unit,
@@ -379,10 +461,13 @@ internal fun SearchScreen(
     onLibrary: (String) -> Unit,
     onPickImage: () -> Unit,
     onCancelUpload: () -> Unit,
+    onRetryUpload: () -> Unit,
     onClearImage: () -> Unit,
     onSearch: () -> Unit,
     onCancelSearch: () -> Unit,
+    onRetrySearch: () -> Unit,
     onLoadMore: () -> Unit,
+    onRetryPage: () -> Unit,
     onOpen: (Int) -> Unit,
     onLoadRecommendations: () -> Unit,
     onRecommendationsVisible: (Boolean) -> Unit,
@@ -400,26 +485,22 @@ internal fun SearchScreen(
                     onLibrary = onLibrary,
                     onPickImage = onPickImage,
                     onCancelUpload = onCancelUpload,
+                    onRetryUpload = onRetryUpload,
                     onClearImage = onClearImage,
                     onSearch = onSearch,
                     onCancelSearch = onCancelSearch,
                 )
-                MobileTab.RESULTS -> if (state.results.isEmpty()) {
-                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                        when {
-                            state.isSearching || state.isLoadingNextPage -> CircularProgressIndicator()
-                            else -> Text("搜索后在这里查看结果", color = MaterialTheme.colorScheme.secondary)
-                        }
-                    }
-                } else {
-                    ResultsGrid(
-                        state = state,
-                        mediaUrl = mediaUrl,
-                        onOpen = onOpen,
-                        onLoadMore = onLoadMore,
-                        modifier = Modifier.fillMaxSize(),
-                    )
-                }
+                MobileTab.RESULTS -> SearchResultsPane(
+                    state = state,
+                    gridState = searchGridState,
+                    thumbnailUrl = thumbnailUrl,
+                    onOpen = onOpen,
+                    onLoadMore = onLoadMore,
+                    onRetryPage = onRetryPage,
+                    onRetrySearch = onRetrySearch,
+                    onModifySearch = { onSelectedTab(MobileTab.SEARCH) },
+                    modifier = Modifier.fillMaxSize(),
+                )
                 MobileTab.RECOMMENDATIONS -> RecommendationPanel(
                     state = state,
                     onLoad = onLoadRecommendations,
@@ -431,28 +512,16 @@ internal fun SearchScreen(
             }
         }
 
+        if (transferMessage != null) {
+            TransferStatusBar(
+                message = transferMessage,
+                fraction = transferFraction,
+                onCancel = onCancelTransfer,
+            )
+        }
         MobileBottomBar(selected = selectedTab, onSelected = onSelectedTab)
     }
 }
-
-internal enum class MobileTab { SEARCH, RESULTS, RECOMMENDATIONS, DEVICE }
-
-internal fun mobileTabAfterSearchUpdate(
-    selectedTab: MobileTab,
-    hasActiveSearch: Boolean,
-    hasResults: Boolean,
-): MobileTab = if (
-    selectedTab != MobileTab.RECOMMENDATIONS && hasActiveSearch && hasResults
-) {
-    MobileTab.RESULTS
-} else {
-    selectedTab
-}
-
-internal fun mobileTabAfterPhaseChange(
-    selectedTab: MobileTab,
-    phase: ConnectionPhase,
-): MobileTab = if (phase == ConnectionPhase.READY) selectedTab else MobileTab.SEARCH
 
 @Composable
 private fun MobileBottomBar(selected: MobileTab, onSelected: (MobileTab) -> Unit) {
@@ -639,14 +708,16 @@ private fun SearchControls(
     onLibrary: (String) -> Unit,
     onPickImage: () -> Unit,
     onCancelUpload: () -> Unit,
+    onRetryUpload: () -> Unit,
     onClearImage: () -> Unit,
     onSearch: () -> Unit,
     onCancelSearch: () -> Unit,
 ) {
     var optionsOpen by remember { mutableStateOf(false) }
-    val canSearch = state.queryImage?.uploading != true && when (state.searchMode) {
+    val canSearch = when (state.searchMode) {
         SearchMode.TAG -> state.searchText.isNotBlank()
-        else -> state.searchText.isNotBlank() || state.queryImage?.queryImageId != null
+        else -> if (state.queryImage == null) state.searchText.isNotBlank()
+            else !state.queryImage.uploading && state.queryImage.queryImageId != null
     }
 
     if (optionsOpen) {
@@ -740,7 +811,13 @@ private fun SearchControls(
 
         if (state.queryImage != null && state.searchMode != SearchMode.TAG) {
             Spacer(Modifier.height(10.dp))
-            QueryImageControl(state.queryImage, onPickImage, onCancelUpload, onClearImage)
+            QueryImageControl(
+                query = state.queryImage,
+                onPickImage = onPickImage,
+                onCancelUpload = onCancelUpload,
+                onRetryUpload = onRetryUpload,
+                onClearImage = onClearImage,
+            )
         }
 
         Spacer(Modifier.height(12.dp))
@@ -749,48 +826,19 @@ private fun SearchControls(
             Spacer(Modifier.height(6.dp))
             Text(it, style = MaterialTheme.typography.bodySmall)
         }
+        state.searchRestoreNotice?.let {
+            Spacer(Modifier.height(6.dp))
+            Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.secondary)
+        }
+        if (state.searchPhase == SearchPhase.ERROR) {
+            state.searchError?.let { ErrorBanner(it) }
+            TextButton(onClick = onSearch, enabled = canSearch) { Text("重试") }
+        } else if (state.searchPhase == SearchPhase.CANCELLED) {
+            Text("已取消", style = MaterialTheme.typography.bodySmall)
+        }
         state.errorMessage?.let {
             Spacer(Modifier.height(8.dp))
             ErrorBanner(it)
-        }
-    }
-}
-
-@Composable
-private fun QueryImageControl(
-    query: QueryImageUiState?,
-    onPickImage: () -> Unit,
-    onCancelUpload: () -> Unit,
-    onClearImage: () -> Unit,
-) {
-    Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
-        Column(Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            if (query == null) {
-                OutlinedButton(onClick = onPickImage, modifier = Modifier.fillMaxWidth()) {
-                    Text("选择查询图片（不限文件大小）")
-                }
-            } else {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(query.displayName, modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    TextButton(onClick = if (query.uploading) onCancelUpload else onClearImage) {
-                        Text(if (query.uploading) "取消" else "移除")
-                    }
-                }
-                if (query.uploading) {
-                    val fraction = query.totalBytes?.takeIf { it > 0 }?.let {
-                        (query.bytesUploaded.toFloat() / it.toFloat()).coerceIn(0f, 1f)
-                    }
-                    if (fraction == null) LinearProgressIndicator(Modifier.fillMaxWidth())
-                    else LinearProgressIndicator(progress = { fraction }, modifier = Modifier.fillMaxWidth())
-                    Text(
-                        if (query.totalBytes == null) "已上传 ${formatBytes(query.bytesUploaded)}"
-                        else "${formatBytes(query.bytesUploaded)} / ${formatBytes(query.totalBytes)}",
-                        style = MaterialTheme.typography.bodySmall,
-                    )
-                } else {
-                    Text("上传完成", color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.bodySmall)
-                }
-            }
         }
     }
 }
@@ -805,81 +853,14 @@ private fun LibraryChip(library: LibraryDto, selected: Boolean, onClick: () -> U
 }
 
 @Composable
-private fun ResultsGrid(
-    state: AppUiState,
-    mediaUrl: (SearchItem) -> String,
-    onOpen: (Int) -> Unit,
-    onLoadMore: () -> Unit,
-    modifier: Modifier,
-) {
-    val gridState = rememberLazyGridState()
-    LaunchedEffect(gridState, state.results.size) {
-        snapshotFlow { gridState.layoutInfo.visibleItemsInfo.lastOrNull()?.index }
-            .filterNotNull()
-            .distinctUntilChanged()
-            .collect { lastVisible ->
-                if (lastVisible >= state.results.lastIndex - 8) onLoadMore()
-            }
-    }
-    LazyVerticalGrid(
-        columns = GridCells.Fixed(2),
-        state = gridState,
-        modifier = modifier,
-        contentPadding = PaddingValues(8.dp),
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
-        verticalArrangement = Arrangement.spacedBy(6.dp),
-    ) {
-        itemsIndexed(
-            state.results,
-            key = { index, item -> "${item.mediaId}:$index" },
-        ) { index, item ->
-            ResultCard(item, mediaUrl(item)) { onOpen(index) }
-        }
-        if (state.isLoadingNextPage) {
-            item(span = { androidx.compose.foundation.lazy.grid.GridItemSpan(maxLineSpan) }) {
-                Box(Modifier.fillMaxWidth().padding(20.dp), contentAlignment = Alignment.Center) {
-                    CircularProgressIndicator(Modifier.size(28.dp))
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun ResultCard(item: SearchItem, url: String, onClick: () -> Unit) {
-    val context = LocalContext.current
-    Card(
-        modifier = Modifier.fillMaxWidth().clickable(onClick = onClick),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-    ) {
-        AsyncImage(
-            model = ImageRequest.Builder(context).data(url).size(640).crossfade(true).build(),
-            contentDescription = item.name,
-            contentScale = ContentScale.Crop,
-            modifier = Modifier.fillMaxWidth().height(190.dp).background(MaterialTheme.colorScheme.surfaceVariant),
-        )
-        Column(Modifier.padding(8.dp)) {
-            Text(item.name.ifBlank { "未命名图片" }, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            val detail = buildList {
-                item.score?.let { add(DecimalFormat("0.000").format(it)) }
-                item.libraryName?.let(::add)
-            }.joinToString(" · ")
-            if (detail.isNotBlank()) {
-                Text(detail, style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            }
-        }
-    }
-}
-
-@Composable
 internal fun OriginalViewer(
     state: AppUiState,
     mediaUrl: (OriginalMediaItem) -> String,
     onIndexChanged: (Int) -> Unit,
-    onLoadMore: () -> Unit,
     onClose: () -> Unit,
     onSave: () -> Unit,
     onShare: () -> Unit,
+    onCancelTransfer: () -> Unit,
     onReaction: (String, RecommendationAction) -> Unit,
 ) {
     BackHandler(onBack = onClose)
@@ -892,8 +873,9 @@ internal fun OriginalViewer(
 
     LaunchedEffect(pagerState) {
         snapshotFlow { pagerState.currentPage }.distinctUntilChanged().collect { page ->
+            // The page boundary is handled by ViewModel.setViewerIndex against the latest list,
+            // so the viewer never duplicates the pagination decision with a stale snapshot.
             onIndexChanged(page)
-            if (state.viewerSource == ViewerSource.SEARCH && page >= viewerItems.lastIndex - 4) onLoadMore()
         }
     }
 
@@ -921,11 +903,29 @@ internal fun OriginalViewer(
                 Column(
                     Modifier.fillMaxWidth().background(androidx.compose.ui.graphics.Color.Black.copy(alpha = 0.75f)).padding(16.dp),
                 ) {
-                    Text(state.transferMessage.orEmpty(), color = androidx.compose.ui.graphics.Color.White)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            state.transferMessage.orEmpty(),
+                            color = androidx.compose.ui.graphics.Color.White,
+                            modifier = Modifier.weight(1f),
+                        )
+                        TextButton(onClick = onCancelTransfer) {
+                            Text("取消", color = androidx.compose.ui.graphics.Color.White)
+                        }
+                    }
                     Spacer(Modifier.height(6.dp))
                     val fraction = state.transferFraction
-                    if (fraction == null) LinearProgressIndicator(Modifier.fillMaxWidth())
-                    else LinearProgressIndicator(progress = { fraction }, modifier = Modifier.fillMaxWidth())
+                    if (fraction == null) LinearProgressIndicator(
+                        modifier = Modifier.fillMaxWidth(),
+                        color = androidx.compose.ui.graphics.Color.White,
+                        trackColor = androidx.compose.ui.graphics.Color.White.copy(alpha = 0.24f),
+                    )
+                    else LinearProgressIndicator(
+                        progress = { fraction },
+                        modifier = Modifier.fillMaxWidth(),
+                        color = androidx.compose.ui.graphics.Color.White,
+                        trackColor = androidx.compose.ui.graphics.Color.White.copy(alpha = 0.24f),
+                    )
                 }
             }
         }
@@ -937,12 +937,15 @@ internal fun OriginalViewer(
                 Modifier.fillMaxWidth().padding(horizontal = 20.dp).navigationBarsPadding(),
                 verticalArrangement = Arrangement.spacedBy(4.dp),
             ) {
+                val transferBusy = state.transferAttempt != null
                 TextButton(
                     onClick = { sheetItem = null; onSave() },
+                    enabled = !transferBusy,
                     modifier = Modifier.fillMaxWidth(),
                 ) { Text("保存", modifier = Modifier.fillMaxWidth(), style = MaterialTheme.typography.bodyLarge) }
                 TextButton(
                     onClick = { sheetItem = null; onShare() },
+                    enabled = !transferBusy,
                     modifier = Modifier.fillMaxWidth(),
                 ) { Text("分享", modifier = Modifier.fillMaxWidth(), style = MaterialTheme.typography.bodyLarge) }
                 (item as? RecommendationItem)?.let { recommendation ->
@@ -1097,7 +1100,7 @@ private fun SearchMode.label(): String = when (this) {
     SearchMode.COMBINED -> "图文"
 }
 
-private fun formatBytes(bytes: Long): String {
+internal fun formatBytes(bytes: Long): String {
     if (bytes < 1024) return "$bytes B"
     val units = arrayOf("KiB", "MiB", "GiB", "TiB")
     var value = bytes.toDouble()
@@ -1112,5 +1115,103 @@ private fun formatBytes(bytes: Long): String {
 private fun formatTime(millis: Long): String =
     SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.getDefault()).format(java.util.Date(millis))
 
+/**
+ * Transfer progress for a still-running save or share. It stays visible after the viewer closes,
+ * so the user always has a target name, a progress hint and a cancel entry.
+ */
+@Composable
+internal fun TransferStatusBar(
+    message: String,
+    fraction: Float?,
+    onCancel: () -> Unit,
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        color = MaterialTheme.colorScheme.surfaceVariant,
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text(message, style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Spacer(Modifier.height(4.dp))
+                if (fraction == null) {
+                    LinearProgressIndicator(Modifier.fillMaxWidth())
+                } else {
+                    LinearProgressIndicator(progress = { fraction }, modifier = Modifier.fillMaxWidth())
+                }
+            }
+            Spacer(Modifier.width(8.dp))
+            TextButton(onClick = onCancel) { Text("取消") }
+        }
+    }
+}
+
+/**
+ * Small snapshot of the media the save picker was launched for. Only identity and the fields the
+ * copy needs are kept so a configuration change can still bind the transfer to the original item
+ * without ever storing the whole result list.
+ */
+internal data class PendingSaveTarget(
+    val source: ViewerSource,
+    val mediaId: String,
+    val name: String,
+    val contentType: String?,
+    val recommendationItemId: String?,
+) {
+    fun resolve(state: AppUiState): OriginalMediaItem? {
+        if (state.phase != ConnectionPhase.READY) return null
+        val items = when (source) {
+            ViewerSource.SEARCH -> state.results
+            ViewerSource.RECOMMENDATIONS -> state.recommendations.items
+        }
+        return items.firstOrNull {
+            it.mediaId == mediaId &&
+                (it !is RecommendationItem || it.itemId == recommendationItemId)
+        }
+    }
+
+    companion object {
+        fun of(item: OriginalMediaItem, source: ViewerSource?): PendingSaveTarget = PendingSaveTarget(
+            source = source ?: ViewerSource.SEARCH,
+            mediaId = item.mediaId,
+            name = item.name,
+            contentType = item.contentType,
+            recommendationItemId = (item as? RecommendationItem)?.itemId,
+        )
+    }
+}
+
+private val PendingSaveTargetSaver: Saver<PendingSaveTarget?, Any> = Saver(
+    save = { target ->
+        target?.let {
+            arrayListOf(
+                it.source.name,
+                it.mediaId,
+                it.name,
+                it.contentType.orEmpty(),
+                it.recommendationItemId.orEmpty(),
+            )
+        }
+    },
+    restore = { saved ->
+        @Suppress("UNCHECKED_CAST")
+        val values = saved as List<String>
+        if (values.isEmpty()) {
+            null
+        } else {
+            PendingSaveTarget(
+                source = runCatching { ViewerSource.valueOf(values[0]) }.getOrDefault(ViewerSource.SEARCH),
+                mediaId = values[1],
+                name = values[2],
+                contentType = values[3].ifBlank { null },
+                recommendationItemId = values[4].ifBlank { null },
+            )
+        }
+    },
+)
+
 internal const val ORIGINAL_VIEWER_IMAGE_TAG = "original-viewer-image"
 internal const val RECOMMENDATION_GRID_TAG = "recommendation-grid"
+internal const val APP_SNACKBAR_HOST_TAG = "app-snackbar-host"
