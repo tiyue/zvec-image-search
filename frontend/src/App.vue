@@ -50,12 +50,17 @@ import type {
 
 type PageName = "search" | "tasks" | "batch" | "groups" | "recommendations" | "raw-selection" | "image-edit" | "settings";
 
+type NavGroup = "browse" | "tool";
+
 const pageDefinitions: Array<{
   id: PageName;
   label: string;
   description: string;
   icon: "search" | "tasks" | "tags" | "groups" | "image";
   shortcut: `Alt+${1 | 2 | 3 | 4 | 5 | 6 | 7 | 8}`;
+  group: NavGroup;
+  /** Keep the id reachable through its shortcut without a sidebar entry. */
+  showInNav?: boolean;
 }> = [
   {
     id: "search",
@@ -63,6 +68,7 @@ const pageDefinitions: Array<{
     description: "语义、图片与标签",
     icon: "search",
     shortcut: "Alt+1",
+    group: "browse",
   },
   {
     id: "tasks",
@@ -70,13 +76,15 @@ const pageDefinitions: Array<{
     description: "索引、同步与标注",
     icon: "tasks",
     shortcut: "Alt+2",
+    group: "tool",
   },
   {
     id: "batch",
-    label: "批量标签",
-    description: "添加、移除与替换",
-    icon: "tags",
+    label: "图库",
+    description: "浏览、整理与标签",
+    icon: "groups",
     shortcut: "Alt+3",
+    group: "browse",
   },
   {
     id: "groups",
@@ -84,6 +92,8 @@ const pageDefinitions: Array<{
     description: "重复图与近似图",
     icon: "groups",
     shortcut: "Alt+4",
+    group: "browse",
+    showInNav: false,
   },
   {
     id: "recommendations",
@@ -91,6 +101,7 @@ const pageDefinitions: Array<{
     description: "多样发现与随机探索",
     icon: "image",
     shortcut: "Alt+6",
+    group: "browse",
   },
   {
     id: "raw-selection",
@@ -98,6 +109,7 @@ const pageDefinitions: Array<{
     description: "导入、评级与导出",
     icon: "image",
     shortcut: "Alt+7",
+    group: "tool",
   },
   {
     id: "image-edit",
@@ -105,6 +117,21 @@ const pageDefinitions: Array<{
     description: "Qwen 单图指令编辑",
     icon: "image",
     shortcut: "Alt+8",
+    group: "tool",
+  },
+];
+
+/** Sidebar order: browse destinations first, then the tool pages. */
+const navigationGroups: Array<{ id: NavGroup; label: string; pages: typeof pageDefinitions }> = [
+  {
+    id: "browse",
+    label: "浏览",
+    pages: pageDefinitions.filter((page) => page.group === "browse" && page.showInNav !== false),
+  },
+  {
+    id: "tool",
+    label: "工具",
+    pages: pageDefinitions.filter((page) => page.group === "tool" && page.showInNav !== false),
   },
 ];
 
@@ -165,7 +192,7 @@ function lazyPage<P extends Component>(
 const TasksPage = lazyPage("tasks", "图库任务", () => import("./features/tasks/TasksPage.vue"));
 const OrganizePage = lazyPage(
   "batch",
-  "批量标签",
+  "图库",
   () => import("./features/organize/OrganizePage.vue"),
 );
 const RecommendationPage = lazyPage(
@@ -399,6 +426,12 @@ const inferredSearchLabel = computed(() => {
 const organizeTab = computed<"batch" | "clusters">(() =>
   activePage.value === "groups" ? "clusters" : "batch",
 );
+// The gallery is one sidebar destination: its browse and group views share the
+// "图库" entry, and the tools inside the page drive both directions.
+function isNavActive(page: PageName): boolean {
+  if (page === "batch") return activePage.value === "batch" || activePage.value === "groups";
+  return activePage.value === page;
+}
 const organizeVisited = computed(() =>
   visitedPages.value.some((page) => page === "batch" || page === "groups"),
 );
@@ -807,6 +840,10 @@ function setPage(page: PageName): void {
   }
 }
 
+function handleOrganizeTabChange(tab: "batch" | "clusters"): void {
+  setPage(tab === "clusters" ? "groups" : "batch");
+}
+
 function focusSearch(selectText = false): void {
   setPage("search");
   void nextTick(() => {
@@ -1117,21 +1154,24 @@ watch(
       </button>
 
       <nav class="nav-list">
-        <button
-          v-for="page in pageDefinitions"
-          :key="page.id"
-          class="nav-item"
-          :class="{ 'is-active': activePage === page.id }"
-          type="button"
-          :aria-current="activePage === page.id ? 'page' : undefined"
-          :aria-keyshortcuts="page.shortcut"
-          :data-page="page.id"
-          :title="`${page.label}（${page.shortcut}）`"
-          @click="setPage(page.id)"
-        >
-          <AppIcon :name="page.icon" />
-          <span><strong>{{ page.label }}</strong><small>{{ page.description }}</small></span>
-        </button>
+        <template v-for="group in navigationGroups" :key="group.id">
+          <p class="nav-group">{{ group.label }}</p>
+          <button
+            v-for="page in group.pages"
+            :key="page.id"
+            class="nav-item"
+            :class="{ 'is-active': isNavActive(page.id) }"
+            type="button"
+            :aria-current="isNavActive(page.id) ? 'page' : undefined"
+            :aria-keyshortcuts="page.shortcut"
+            :data-page="page.id"
+            :title="`${page.label}（${page.shortcut}）`"
+            @click="setPage(page.id)"
+          >
+            <AppIcon :name="page.icon" />
+            <span><strong>{{ page.label }}</strong><small>{{ page.description }}</small></span>
+          </button>
+        </template>
       </nav>
 
       <section v-if="search.history.value.length" class="sidebar-recents" aria-labelledby="recent-title">
@@ -1372,7 +1412,14 @@ watch(
       </div>
 
       <div v-if="organizeVisited" v-show="activePage === 'batch' || activePage === 'groups'" class="feature-page" data-page-section="organize">
-        <OrganizePage :key="pageKey('batch')" :active-tab="organizeTab" :show-tabs="false" @toast="handleFeatureToast" @open-image="nativeActions.open" />
+        <OrganizePage
+          :key="pageKey('batch')"
+          :active-tab="organizeTab"
+          :show-tabs="false"
+          @toast="handleFeatureToast"
+          @open-image="nativeActions.open"
+          @tab-change="handleOrganizeTabChange"
+        />
       </div>
 
       <div v-if="visitedPages.includes('settings')" v-show="activePage === 'settings'" class="settings-feature-page" data-page-section="settings">

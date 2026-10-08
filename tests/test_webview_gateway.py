@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
@@ -19,7 +20,11 @@ from image_vector_service.search_learning_store import (
 from zvec_host.configuration_service import DesktopConfigurationService
 from zvec_host.credentials import SessionCredentialStore
 from zvec_webview.facade import FacadeError, PreviewFacade
-from zvec_webview.image_registry import ImageRegistry
+from zvec_webview.image_registry import (
+    ImageQueueFull,
+    ImageRegistry,
+    ImageRegistryError,
+)
 from zvec_webview.server import GatewayError, GatewayServer
 
 
@@ -1153,6 +1158,105 @@ class GatewayTests(unittest.TestCase):
             self.assertEqual(response.headers["Content-Type"], "image/jpeg")
             self.assertTrue(response.headers["ETag"])
             self.assertNotIn(str(source).encode(), content)
+
+    def test_image_route_forwards_optional_priority_and_keeps_cache_semantics(
+        self,
+    ) -> None:
+        source = self.root / "priority.jpg"
+        Image.new("RGB", (64, 48), (12, 24, 36)).save(source)
+        metadata = self.registry.register(source)
+        url = self.server.url + f"api/image/{metadata.image_id}"
+        calls: list[dict[str, Any]] = []
+        original = self.registry.payload
+
+        def recording_payload(image_id, variant, priority=None):
+            calls.append(
+                {"image_id": image_id, "variant": variant, "priority": priority}
+            )
+            return original(image_id, variant, priority)
+
+        with (
+            patch.object(self.registry, "payload", recording_payload),
+            urlopen(
+                url + "?variant=preview&priority=prefetch",
+                timeout=5,
+            ) as response,
+        ):
+            self.assertEqual(response.status, 200)
+            self.assertEqual(
+                response.headers["Cache-Control"],
+                "private, max-age=300",
+            )
+            etag = response.headers["ETag"]
+            self.assertTrue(response.read())
+
+        self.assertEqual(calls[-1]["priority"], "prefetch")
+        self.assertEqual(calls[-1]["variant"], "preview")
+
+        with (
+            patch.object(self.registry, "payload", recording_payload),
+            urlopen(url + "?variant=thumbnail", timeout=5) as response,
+        ):
+            self.assertEqual(response.status, 200)
+        self.assertIsNone(calls[-1]["priority"])
+        self.assertEqual(calls[-1]["variant"], "thumbnail")
+
+        not_modified = Request(
+            url + "?variant=preview&priority=prefetch",
+            headers={"If-None-Match": etag},
+        )
+        with self.assertRaises(HTTPError) as caught:
+            urlopen(not_modified, timeout=5)
+        self.assertEqual(caught.exception.code, 304)
+        self.assertEqual(caught.exception.headers["ETag"], etag)
+
+    def test_image_route_rejects_unknown_priority(self) -> None:
+        source = self.root / "priority-invalid.jpg"
+        Image.new("RGB", (48, 64), (30, 40, 50)).save(source)
+        metadata = self.registry.register(source)
+
+        with self.assertRaises(HTTPError) as caught:
+            urlopen(
+                self.server.url
+                + f"api/image/{metadata.image_id}?variant=thumbnail&priority=urgent",
+                timeout=5,
+            )
+
+        self.assertEqual(caught.exception.code, 400)
+        error = json.loads(caught.exception.read().decode("utf-8"))["error"]
+        self.assertEqual(error["code"], "invalid_priority")
+
+    def test_image_route_maps_only_queue_saturation_to_503(self) -> None:
+        source = self.root / "priority-busy.jpg"
+        Image.new("RGB", (48, 48), (20, 30, 40)).save(source)
+        metadata = self.registry.register(source)
+        url = self.server.url + f"api/image/{metadata.image_id}?variant=thumbnail"
+
+        with (
+            patch.object(
+                self.registry,
+                "payload",
+                side_effect=ImageQueueFull("图片预览队列已满，请稍后重试。"),
+            ),
+            self.assertRaises(HTTPError) as busy,
+        ):
+            urlopen(url, timeout=5)
+        self.assertEqual(busy.exception.code, 503)
+        self.assertEqual(
+            json.loads(busy.exception.read().decode("utf-8"))["error"]["code"],
+            "image_busy",
+        )
+
+        with (
+            patch.object(
+                self.registry,
+                "payload",
+                side_effect=ImageRegistryError("图片引用已失效，请刷新页面。"),
+            ),
+            self.assertRaises(HTTPError) as unavailable,
+        ):
+            urlopen(url, timeout=5)
+        self.assertEqual(unavailable.exception.code, 404)
 
     def test_accepts_dropped_query_image_as_bounded_binary_upload(self) -> None:
         output = io.BytesIO()

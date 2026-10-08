@@ -1,4 +1,4 @@
-import { flushPromises, mount, type DOMWrapper } from "@vue/test-utils";
+import { enableAutoUnmount, flushPromises, mount, type DOMWrapper } from "@vue/test-utils";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import OrganizePage from "../OrganizePage.vue";
@@ -9,6 +9,8 @@ import type {
   OrganizeBootstrapResponse,
   OrganizeFolderImagesResponse,
 } from "../types";
+
+enableAutoUnmount(afterEach);
 
 function bootstrapPayload(): OrganizeBootstrapResponse {
   return {
@@ -135,8 +137,8 @@ function imageButton(wrapper: QueryWrapper, id: string) {
   return wrapper.get(`[data-image-id="${id}"] .image-select`);
 }
 
-async function mountPage(api: OrganizeApi) {
-  const wrapper = mount(OrganizePage, { props: { api } });
+async function mountPage(api: OrganizeApi, attach = false) {
+  const wrapper = mount(OrganizePage, { props: { api }, attachTo: attach ? document.body : undefined });
   await flushPromises();
   return wrapper;
 }
@@ -146,9 +148,16 @@ async function selectOneAndEnterTags(
   tags = "原神、雷电将军",
 ): Promise<void> {
   await imageButton(wrapper, "doc-1").trigger("click");
+  await openBatchDialog(wrapper);
   const input = wrapper.get(".tag-input-label textarea");
   await input.setValue(tags);
   await input.trigger("keydown", { key: "Enter" });
+}
+
+/** The complex batch-tag form now lives behind an explicit dialog. */
+async function openBatchDialog(wrapper: QueryWrapper): Promise<void> {
+  await buttonWithText(wrapper, "批量标签").trigger("click");
+  await flushPromises();
 }
 
 describe("OrganizePage batch tags", () => {
@@ -225,17 +234,22 @@ describe("OrganizePage batch tags", () => {
     const api = fakeApi();
     const wrapper = await mountPage(api);
 
-    expect(wrapper.get(".workspace-tabs").text()).toContain("批量标签");
-    expect(wrapper.get(".workspace-tabs").text()).toContain("相似分组");
-    expect(wrapper.get(".workspace-tabs").text()).not.toContain("待学习样本");
+    expect(wrapper.get(".gallery-tools").text()).toContain("批量标签");
+    expect(wrapper.get(".gallery-tools").text()).toContain("相似分组");
+    expect(wrapper.get(".gallery-tools").text()).not.toContain("待学习样本");
 
     await buttonWithText(wrapper, "相似分组").trigger("click");
     await flushPromises();
     expect(wrapper.get("#similarity-groups-title").text()).toBe("相似分组");
+    expect(wrapper.get(".gallery-tools").text()).toContain("返回图库");
     expect(api.submitJob).toHaveBeenCalledWith(
       expect.objectContaining({ task_type: "cluster_list", library_id: "lib-1" }),
       expect.any(AbortSignal),
     );
+
+    await buttonWithText(wrapper, "返回图库").trigger("click");
+    await flushPromises();
+    expect(wrapper.get(".gallery-tools").text()).toContain("相似分组");
   });
 
   it("keeps direct root images selectable when root images and child folders coexist", async () => {
@@ -359,6 +373,7 @@ describe("OrganizePage batch tags", () => {
     );
 
     await buttonWithText(wrapper, "选择整文件夹").trigger("click");
+    await openBatchDialog(wrapper);
     await wrapper.get(".tag-input-label textarea").setValue("根目录标签");
     await wrapper.get(".tag-input-label textarea").trigger("blur");
     await buttonWithText(wrapper, "添加标签").trigger("click");
@@ -779,7 +794,146 @@ describe("OrganizePage batch tags", () => {
     expect(wrapper.get(".selection-summary").text()).toContain("排除 1 张");
     expect(wrapper.get(".selection-count").text()).toBe("64");
     await buttonWithText(wrapper, "清空").trigger("click");
-    expect(wrapper.get(".selection-count").text()).toBe("0");
+    expect(wrapper.find(".selection-count").exists()).toBe(false);
+    expect(wrapper.find(".selection-toolbar").exists()).toBe(false);
+  });
+
+  it("focuses the empty tag dialog and cycles only through visible controls", async () => {
+    const wrapper = await mountPage(fakeApi(), true);
+    expect(wrapper.find(".selection-toolbar").exists()).toBe(false);
+    expect(wrapper.get(".gallery-browse-actions").text()).toContain("选择整文件夹");
+    await openBatchDialog(wrapper);
+    const close = wrapper.get(".editor-close");
+    const summary = wrapper.get(".tag-editor-tools > summary");
+    expect(document.activeElement).toBe(close.element);
+    expect(isViewerOverlayOpen()).toBe(true);
+
+    await close.trigger("keydown", { key: "Tab", shiftKey: true });
+    expect(document.activeElement).toBe(summary.element);
+    await summary.trigger("keydown", { key: "Tab" });
+    expect(document.activeElement).toBe(close.element);
+    await close.trigger("keydown", { key: "Escape" });
+    await flushPromises();
+    expect(wrapper.find(".batch-dialog").exists()).toBe(false);
+    expect(document.activeElement).toBe(buttonWithText(wrapper, "批量标签").element);
+    expect(isViewerOverlayOpen()).toBe(false);
+  });
+
+  it("preserves tag drafts, input keys and overlay release on close and unmount", async () => {
+    const wrapper = await mountPage(fakeApi(), true);
+    await imageButton(wrapper, "doc-1").trigger("click");
+    await openBatchDialog(wrapper);
+    const input = wrapper.get(".tag-input-label textarea");
+    expect(document.activeElement).toBe(input.element);
+    for (const key of [" ", "ArrowLeft", "ArrowRight"]) {
+      const event = new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true });
+      input.element.dispatchEvent(event);
+      expect(event.defaultPrevented).toBe(false);
+    }
+    await input.setValue("保留草稿");
+    await input.trigger("keydown", { key: "Enter" });
+    await input.trigger("keydown", { key: "Escape" });
+    await openBatchDialog(wrapper);
+    expect(wrapper.get(".draft-tags").text()).toContain("保留草稿");
+    expect(isViewerOverlayOpen()).toBe(true);
+    wrapper.unmount();
+    expect(isViewerOverlayOpen()).toBe(false);
+  });
+
+  it("keeps the completed batch progress and undo reachable after selection clears", async () => {
+    const wrapper = await mountPage(fakeApi());
+    await selectOneAndEnterTags(wrapper);
+    await buttonWithText(wrapper, "添加标签").trigger("click");
+    await flushPromises();
+    expect(wrapper.find(".selection-count").exists()).toBe(false);
+    expect((wrapper.get(".tag-editor-tools").element as HTMLDetailsElement).open).toBe(true);
+    expect(wrapper.find(".progress-card").exists()).toBe(true);
+    expect(buttonWithText(wrapper, "撤销最近一次批量操作").attributes("disabled")).toBeUndefined();
+  });
+
+  it("opens a narrow folder drawer, traps focus and restores it after escape", async () => {
+    const media = {
+      matches: true,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    };
+    vi.stubGlobal("matchMedia", vi.fn(() => media));
+    const wrapper = await mountPage(fakeApi(), true);
+    const toggle = wrapper.get(".folder-panel-toggle");
+    await toggle.trigger("click");
+    await flushPromises();
+    const panel = wrapper.get(".folder-panel");
+    expect(panel.classes()).toContain("is-drawer-open");
+    expect(panel.attributes("aria-modal")).toBe("true");
+    expect(document.activeElement).toBe(panel.element);
+    expect(isViewerOverlayOpen()).toBe(true);
+    await panel.trigger("keydown", { key: "Tab" });
+    expect(panel.element.contains(document.activeElement)).toBe(true);
+    await panel.trigger("keydown", { key: "Escape" });
+    await flushPromises();
+    expect(wrapper.find(".folder-drawer-backdrop").exists()).toBe(false);
+    expect(document.activeElement).toBe(toggle.element);
+    expect(isViewerOverlayOpen()).toBe(false);
+    wrapper.unmount();
+    expect(media.removeEventListener).toHaveBeenCalled();
+  });
+
+  it("keeps focus on an enabled dialog control after submitting tags", async () => {
+    const wrapper = await mountPage(fakeApi(), true);
+    await selectOneAndEnterTags(wrapper);
+    const submit = buttonWithText(wrapper, "添加标签");
+    (submit.element as HTMLElement).focus();
+    await submit.trigger("click");
+    await flushPromises();
+    expect(wrapper.get(".batch-dialog").element.contains(document.activeElement)).toBe(true);
+    expect(document.activeElement?.matches(":disabled")).toBe(false);
+  });
+
+  it("returns viewer focus to details and releases floating details when changing views", async () => {
+    vi.stubGlobal("matchMedia", vi.fn(() => ({
+      matches: true,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    })));
+    const wrapper = await mountPage(fakeApi(), true);
+    await imageButton(wrapper, "doc-1").trigger("click");
+    await buttonWithText(wrapper, "图片详情").trigger("click");
+    await flushPromises();
+    const open = wrapper.get(".details-view");
+    (open.element as HTMLElement).focus();
+    await open.trigger("click");
+    await flushPromises();
+    const closeViewer = document.body.querySelector<HTMLButtonElement>('button[aria-label="关闭查看器"]');
+    expect(closeViewer).not.toBeNull();
+    closeViewer?.click();
+    await flushPromises();
+    expect(document.activeElement).toBe(open.element);
+    expect(isViewerOverlayOpen()).toBe(true);
+    await wrapper.setProps({ activeTab: "clusters" });
+    await flushPromises();
+    expect(wrapper.find(".gallery-details").exists()).toBe(false);
+    expect(isViewerOverlayOpen()).toBe(false);
+  });
+
+  it("returns to the grid after a failed details preview followed by a grid preview", async () => {
+    const wrapper = await mountPage(fakeApi(), true);
+    await imageButton(wrapper, "doc-2").trigger("click");
+    await buttonWithText(wrapper, "图片详情").trigger("click");
+    await flushPromises();
+    const detailsOpen = wrapper.get(".details-view");
+    (detailsOpen.element as HTMLElement).focus();
+    await detailsOpen.trigger("click");
+    await flushPromises();
+    expect(document.body.querySelector('button[aria-label="关闭查看器"]')).toBeNull();
+    const tile = imageButton(wrapper, "doc-3");
+    (tile.element as HTMLElement).focus();
+    await wrapper.get('[data-image-id="doc-3"] .thumbnail-stage').trigger("dblclick");
+    await flushPromises();
+    const close = document.body.querySelector<HTMLButtonElement>('button[aria-label="关闭查看器"]');
+    expect(close).not.toBeNull();
+    close?.click();
+    await flushPromises();
+    expect(document.activeElement).toBe(tile.element);
   });
 
   it.each([
@@ -815,6 +969,7 @@ describe("OrganizePage batch tags", () => {
 
     await buttonWithText(wrapper, "选择整文件夹").trigger("click");
     await imageButton(wrapper, "doc-2").trigger("click", { ctrlKey: true });
+    await openBatchDialog(wrapper);
     await wrapper.get(".tag-input-label textarea").setValue("原神");
     await wrapper.get(".tag-input-label textarea").trigger("blur");
     await buttonWithText(wrapper, "添加标签").trigger("click");
@@ -1113,6 +1268,7 @@ describe("OrganizePage batch tags", () => {
   it("shows and updates the compact alias dictionary without identity confirmation controls", async () => {
     const api = fakeApi();
     const wrapper = await mountPage(api);
+    await openBatchDialog(wrapper);
 
     expect(wrapper.get('[data-testid="alias-dictionary"]').text()).toContain("雷电将军");
     expect(wrapper.get('[data-testid="alias-dictionary"]').text()).toContain("雷神、影");
@@ -1142,6 +1298,7 @@ describe("OrganizePage batch tags", () => {
   it("submits the current-library manual tag undo", async () => {
     const api = fakeApi();
     const wrapper = await mountPage(api);
+    await openBatchDialog(wrapper);
 
     await buttonWithText(wrapper, "撤销最近一次批量操作").trigger("click");
     await flushPromises();

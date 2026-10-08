@@ -47,10 +47,13 @@ const TasksStub = defineComponent({
 
 const OrganizeStub = defineComponent({
   name: "OrganizePage",
-  emits: ["toast", "open-image"],
-  setup(_props, { emit }) {
+  props: {
+    activeTab: { type: String, default: "batch" },
+  },
+  emits: ["toast", "open-image", "tab-change"],
+  setup(props, { emit }) {
     return () =>
-      h("section", { "data-testid": "organize-page" }, [
+      h("section", { "data-testid": "organize-page", "data-tab": props.activeTab }, [
         "智能整理内容",
         h(
           "button",
@@ -275,7 +278,7 @@ describe("App page shell", () => {
     wrapper = mountApp();
     await flushPromises();
 
-    expect(wrapper.findAll(".nav-item")).toHaveLength(7);
+    expect(wrapper.findAll(".nav-item")).toHaveLength(6);
     expect(wrapper.get(".nav-item[data-page='search']").attributes("aria-current")).toBe("page");
     expect(wrapper.get("[data-page-section='search']").isVisible()).toBe(true);
     expect(wrapper.find("[data-page-section='search'] .page-heading").exists()).toBe(false);
@@ -299,7 +302,7 @@ describe("App page shell", () => {
 
     await wrapper.get(".sidebar-toggle").trigger("click");
     expect(wrapper.get(".app-shell").classes()).toContain("sidebar-collapsed");
-    expect(wrapper.findAll(".nav-item")).toHaveLength(7);
+    expect(wrapper.findAll(".nav-item")).toHaveLength(6);
   });
 
   it("keeps the requested result count uncapped without a redundant fixed-page summary", async () => {
@@ -557,21 +560,26 @@ describe("App page shell", () => {
     await flushPromises();
 
     const destinations = [
-      ["1", "search", "search"],
-      ["2", "tasks", "tasks"],
-      ["3", "batch", "organize"],
-      ["4", "groups", "organize"],
-      ["6", "recommendations", "recommendations"],
-      ["7", "raw-selection", "raw-selection"],
-      ["8", "image-edit", "image-edit"],
+      ["1", "search", "search", ""],
+      ["2", "tasks", "tasks", ""],
+      ["3", "batch", "organize", "batch"],
+      ["4", "groups", "organize", "clusters"],
+      ["6", "recommendations", "recommendations", ""],
+      ["7", "raw-selection", "raw-selection", ""],
+      ["8", "image-edit", "image-edit", ""],
     ] as const;
-    for (const [digit, page, section] of destinations) {
+    for (const [digit, page, section, tab] of destinations) {
       window.dispatchEvent(
         new KeyboardEvent("keydown", { key: digit, code: `Digit${digit}`, altKey: true }),
       );
       await wrapper.vm.$nextTick();
       expect(wrapper.get(`[data-page-section='${section}']`).isVisible()).toBe(true);
-      expect(wrapper.get(`.nav-item[data-page='${page}']`).attributes("aria-current")).toBe("page");
+      // 相似分组 lives inside the gallery, so Alt+4 highlights the 图库 entry.
+      const navPage = page === "groups" ? "batch" : page;
+      expect(wrapper.get(`.nav-item[data-page='${navPage}']`).attributes("aria-current")).toBe("page");
+      if (tab) {
+        expect(wrapper.get("[data-testid='organize-page']").attributes("data-tab")).toBe(tab);
+      }
     }
 
     expect(wrapper.find(".nav-item[data-page='learning']").exists()).toBe(false);

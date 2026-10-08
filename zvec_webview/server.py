@@ -32,7 +32,13 @@ from .diagnostics import (
 )
 from .facade import FacadeError, PreviewFacade
 from .frontend_assets import FrontendAssetError, validate_frontend_build
-from .image_registry import ImageRegistryError, ImageVariant
+from .image_registry import (
+    IMAGE_PRIORITIES,
+    ImagePriority,
+    ImageQueueFull,
+    ImageRegistryError,
+    ImageVariant,
+)
 
 _MAX_JSON_BYTES: Final = 2 * 1024 * 1024
 _MAX_DIAGNOSTIC_JSON_BYTES: Final = 64 * 1024
@@ -1296,10 +1302,24 @@ def _handler_type(gateway: GatewayServer) -> type[BaseHTTPRequestHandler]:
                 # The runtime allow-list above narrows the value for users; this
                 # cast communicates the same invariant to static type checkers.
                 variant = cast(ImageVariant, raw_variant)
-                payload = gateway._facade.image_registry.payload(
-                    segments[1],
-                    variant,
+                priority_text = _query_optional_text(
+                    query_values, "priority", "", maximum=20
                 )
+                if priority_text and priority_text not in IMAGE_PRIORITIES:
+                    raise FacadeError(
+                        "invalid_priority", "图片优先级参数无效。", status=400
+                    )
+                priority = cast(ImagePriority, priority_text) if priority_text else None
+                try:
+                    payload = gateway._facade.image_registry.payload(
+                        segments[1],
+                        variant,
+                        priority,
+                    )
+                except ImageQueueFull as exc:
+                    # Only the bounded-queue saturation changes the status code;
+                    # every other registry error keeps its existing semantics.
+                    raise FacadeError("image_busy", str(exc), status=503) from exc
                 if self.headers.get("If-None-Match") == payload.etag:
                     self.send_response(HTTPStatus.NOT_MODIFIED)
                     self._security_headers(cache="private, max-age=300")

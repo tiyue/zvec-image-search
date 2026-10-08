@@ -12,6 +12,7 @@ import PaginationBar from "../../components/PaginationBar.vue";
 import ImageViewer from "../../components/ImageViewer.vue";
 import { useGalleryDensity } from "../../composables/useGalleryDensity";
 import {
+  acquireViewerOverlay,
   isViewerOverlayOpen,
   useImageViewerSession,
   type ViewerImage,
@@ -26,6 +27,7 @@ import {
   type OrganizeGalleryCapacity,
 } from "./galleryCapacity";
 import SimilarityGroupsPanel from "./SimilarityGroupsPanel.vue";
+import GalleryDetails from "./GalleryDetails.vue";
 
 import type {
   FolderNameTagMode,
@@ -55,6 +57,8 @@ const props = withDefaults(defineProps<{
 const emit = defineEmits<{
   toast: [title: string, message: string, kind: ToastKind];
   openImage: [imageId: string];
+  /** The gallery asks the shell to switch between the browse and group views. */
+  tabChange: [tab: WorkspaceTab];
 }>();
 
 const organize = useOrganize(props.api, {
@@ -71,7 +75,14 @@ const containerWidth = ref(0);
 const galleryCapacity = ref<OrganizeGalleryCapacity>(
   calculateOrganizeGalleryCapacity(0, 0, galleryDensity.density.value),
 );
-const editorOpen = ref(false);
+const batchDialogOpen = ref(false);
+const detailsOpen = ref(false);
+const batchDialogRef = ref<HTMLElement | null>(null);
+const batchButtonRef = ref<HTMLButtonElement | null>(null);
+const detailsButtonRef = ref<HTMLButtonElement | null>(null);
+let viewerDetailsFocus: HTMLElement | null = null;
+const folderPanelRef = ref<HTMLElement | null>(null);
+const folderPanelToggleRef = ref<HTMLButtonElement | null>(null);
 const deleteConfirmation = ref("");
 const deleteTargetKey = ref("");
 const folderNameTagModalOpen = ref(false);
@@ -79,12 +90,18 @@ const folderNameTagScope = ref<"folder" | "library">("folder");
 const folderNameTagMode = ref<FolderNameTagMode>("normal");
 const folderNameTagForce = ref(true);
 const folderPanelCollapsed = ref(false);
+// Under the drawer breakpoint the folder navigation leaves the grid and opens
+// on demand so the narrow workspace stays reachable.
+const narrowLayout = ref(false);
+const folderDrawerOpen = ref(false);
 const activeWorkspaceTab = ref<WorkspaceTab>(props.activeTab);
 const visitedWorkspaceTabs = ref<Set<WorkspaceTab>>(
   new Set([props.activeTab]),
 );
 let galleryObserver: ResizeObserver | null = null;
 let galleryResizeTimer: number | null = null;
+let narrowMediaQuery: MediaQueryList | null = null;
+let releaseModalOverlay: (() => void) | null = null;
 let initialLoadStarted = false;
 const taskSubmissionLocked = computed(
   () => Boolean(organize.busyAction.value) || organize.jobRunning.value,
@@ -101,12 +118,217 @@ function changeLibrary(event: Event): void {
 function selectWorkspaceTab(tab: WorkspaceTab): void {
   activeWorkspaceTab.value = tab;
   visitedWorkspaceTabs.value = new Set([...visitedWorkspaceTabs.value, tab]);
-  if (tab !== "batch") editorOpen.value = false;
+  if (tab !== "batch") {
+    batchDialogOpen.value = false;
+    folderDrawerOpen.value = false;
+    detailsOpen.value = false;
+  }
 }
 
 watch(
   () => props.activeTab,
   (tab) => selectWorkspaceTab(tab),
+);
+
+// The gallery tools drive both views of the same mounted page. Switching also
+// tells the shell so its navigation stays in sync with Alt+3 / Alt+4.
+function requestWorkspaceTab(tab: WorkspaceTab): void {
+  selectWorkspaceTab(tab);
+  emit("tabChange", tab);
+}
+
+function openBatchDialog(): void {
+  if (activeWorkspaceTab.value !== "batch") requestWorkspaceTab("batch");
+  batchDialogOpen.value = true;
+}
+
+function closeBatchDialog(): void {
+  if (!batchDialogOpen.value) return;
+  batchDialogOpen.value = false;
+  void nextTick(() => batchButtonRef.value?.focus({ preventScroll: true }));
+}
+
+function openDetails(): void {
+  detailsOpen.value = true;
+}
+
+function closeDetails(): void {
+  if (!detailsOpen.value) return;
+  detailsOpen.value = false;
+  void nextTick(() => {
+    detailsButtonRef.value?.focus({ preventScroll: true });
+    // The floating details pane holds the overlay slot, so a change deferred
+    // while it was open is re-measured once it is gone.
+    updateGalleryCapacity(true);
+  });
+}
+
+function toggleDetails(): void {
+  if (detailsOpen.value) closeDetails();
+  else openDetails();
+}
+
+function openDetailsImage(imageId: string): void {
+  const image =
+    organize.images.value.find((item) => item.id === imageId) ??
+    organize.selectedKnownImages.value.find((item) => item.id === imageId);
+  if (image) openViewer(image);
+}
+
+// Native `summary` is focusable but carries no tabindex attribute, so it has to
+// be selected explicitly; the collapsed `details` descendants are filtered out
+// below so Tab cannot land on a control inside a collapsed form.
+const DIALOG_FOCUSABLE =
+  'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), summary, [tabindex]:not([tabindex="-1"])';
+
+function firstSummary(details: HTMLElement): HTMLElement | null {
+  for (const child of Array.from(details.children)) {
+    if (child.tagName === "SUMMARY") return child as HTMLElement;
+  }
+  return null;
+}
+
+/** A control inside a closed `details` is hidden unless it is the summary. */
+function hiddenByClosedDetails(element: HTMLElement, root: HTMLElement): boolean {
+  let node: HTMLElement | null = element.parentElement;
+  while (node && node !== root) {
+    if (node instanceof HTMLDetailsElement && !node.open) {
+      const summary = firstSummary(node);
+      if (!summary || !summary.contains(element)) return true;
+    }
+    node = node.parentElement;
+  }
+  return false;
+}
+
+function isDisplayed(element: HTMLElement, root: HTMLElement): boolean {
+  let node: HTMLElement | null = element;
+  while (node) {
+    if (node.hidden) return false;
+    const style = window.getComputedStyle(node);
+    if (style.display === "none" || style.visibility === "hidden") return false;
+    if (node === root) break;
+    node = node.parentElement;
+  }
+  return !hiddenByClosedDetails(element, root);
+}
+
+// The tag dialog is a real modal: Tab cycles inside it, Escape closes it, and
+// the held overlay keeps the background page shortcuts idle while it is open.
+function dialogFocusable(root: HTMLElement | null = batchDialogRef.value): HTMLElement[] {
+  if (!root) return [];
+  return Array.from(root.querySelectorAll<HTMLElement>(DIALOG_FOCUSABLE)).filter(
+    (element) => isDisplayed(element, root),
+  );
+}
+
+function trapTab(event: KeyboardEvent, root: HTMLElement | null = batchDialogRef.value): void {
+  const elements = dialogFocusable(root);
+  if (elements.length === 0) return;
+  const first = elements[0];
+  const last = elements[elements.length - 1];
+  const active = document.activeElement;
+  const inside = active instanceof HTMLElement && Boolean(root?.contains(active));
+  if (event.shiftKey) {
+    if (!inside || active === first) {
+      event.preventDefault();
+      last.focus();
+    }
+  } else if (!inside || active === last) {
+    event.preventDefault();
+    first.focus();
+  }
+}
+
+function handleDialogKeydown(event: KeyboardEvent): void {
+  event.stopPropagation();
+  if (event.key === "Tab") trapTab(event);
+  else if (event.key === "Escape") {
+    event.preventDefault();
+    closeBatchDialog();
+  }
+}
+
+watch([batchDialogOpen, taskSubmissionLocked, organize.selectedCount], ([open], [wasOpen]) => {
+  if (!open) return;
+  void nextTick(() => {
+    const root = batchDialogRef.value;
+    if (!root) return;
+    const active = document.activeElement;
+    if (
+      wasOpen && active instanceof HTMLElement && root.contains(active) &&
+      isDisplayed(active, root) && !active.matches(":disabled")
+    ) return;
+    const input = root.querySelector<HTMLElement>(".tag-input-label textarea");
+    const target = input && isDisplayed(input, root) ? input : dialogFocusable()[0] ?? root;
+    target.focus({ preventScroll: true });
+  });
+});
+
+// The tag dialog and the narrow folder drawer are the page's modal surfaces.
+// Holding the shared viewer-overlay slot keeps the shell's window-level
+// shortcuts idle while either is open, whatever element currently has focus.
+const modalSurfaceOpen = computed(() => batchDialogOpen.value || folderDrawerOpen.value);
+
+watch(modalSurfaceOpen, (open) => {
+  if (open) {
+    if (!releaseModalOverlay) releaseModalOverlay = acquireViewerOverlay();
+    return;
+  }
+  if (!releaseModalOverlay) return;
+  releaseModalOverlay();
+  releaseModalOverlay = null;
+  // A capacity change deferred while the modal was open is re-measured here.
+  void nextTick(() => updateGalleryCapacity(true));
+});
+
+function toggleFolderPanel(): void {
+  if (!narrowLayout.value) {
+    folderPanelCollapsed.value = !folderPanelCollapsed.value;
+    return;
+  }
+  if (folderDrawerOpen.value) closeFolderDrawer();
+  else folderDrawerOpen.value = true;
+}
+
+function handleNarrowChange(event: MediaQueryListEvent): void {
+  narrowLayout.value = event.matches;
+  if (!narrowLayout.value) folderDrawerOpen.value = false;
+}
+
+function closeFolderDrawer(): void {
+  if (!folderDrawerOpen.value) return;
+  folderDrawerOpen.value = false;
+  void nextTick(() => folderPanelToggleRef.value?.focus({ preventScroll: true }));
+}
+
+function handleFolderDrawerKeydown(event: KeyboardEvent): void {
+  if (!narrowLayout.value || !folderDrawerOpen.value) return;
+  event.stopPropagation();
+  if (event.key === "Tab") trapTab(event, folderPanelRef.value);
+  else if (event.key === "Escape") {
+    event.preventDefault();
+    closeFolderDrawer();
+  }
+}
+
+// Picking a folder loads its images; the narrow drawer then gets out of the way.
+function selectFolderFromPanel(folderKey: string): void {
+  void organize.selectFolder(folderKey);
+  if (narrowLayout.value) closeFolderDrawer();
+}
+
+watch(folderDrawerOpen, (open) => {
+  if (open) void nextTick(() => folderPanelRef.value?.focus({ preventScroll: true }));
+});
+
+// An empty selection (or a data-source switch that clears it) must not leave a
+// details pane describing images that are no longer selected.
+watch(
+  () => organize.selectedCount.value,
+  (count) => {
+    if (!count) detailsOpen.value = false;
+  },
 );
 
 // The density tier is shared with the search grid: recompute the folder
@@ -225,6 +447,9 @@ function openViewer(image: OrganizeImage): void {
     emit("toast", "无法查看大图", "当前图片文件不可用。", "error");
     return;
   }
+  const active = document.activeElement;
+  viewerDetailsFocus =
+    active instanceof HTMLElement && active.closest(".gallery-details") ? active : null;
   // A capacity re-read may already be in flight; cancel it so it cannot unload
   // the window under the overlay. The capacity the gallery actually shows is
   // reported back so closing re-reads at the measured one.
@@ -245,11 +470,16 @@ function openViewerFromSelection(): void {
 
 function closeViewer(): void {
   const imageId = imageViewer.currentId.value;
+  const detailsFocus = viewerDetailsFocus;
+  viewerDetailsFocus = null;
   imageViewer.close();
   // A cross-page step may still be loading; stop it so a late page cannot
   // replace the window or the selection the user returns to.
   organize.cancelPendingImageLoad();
-  void nextTick(() => focusTile(imageId));
+  void nextTick(() => {
+    if (detailsOpen.value && detailsFocus?.isConnected) detailsFocus.focus({ preventScroll: true });
+    else focusTile(imageId);
+  });
 }
 
 // Whatever closed the overlay, the capacity deferred while it was open is
@@ -430,6 +660,11 @@ onMounted(async () => {
     galleryObserver = new ResizeObserver(scheduleGalleryCapacityUpdate);
     galleryObserver.observe(galleryViewport.value);
   }
+  if (typeof window !== "undefined" && typeof window.matchMedia === "function") {
+    narrowMediaQuery = window.matchMedia("(max-width: 760px)");
+    narrowLayout.value = narrowMediaQuery.matches;
+    narrowMediaQuery.addEventListener("change", handleNarrowChange);
+  }
   initialLoadStarted = true;
   if (props.autoLoad) void organize.load();
 });
@@ -437,16 +672,20 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   galleryObserver?.disconnect();
   if (galleryResizeTimer !== null) window.clearTimeout(galleryResizeTimer);
+  narrowMediaQuery?.removeEventListener("change", handleNarrowChange);
+  narrowMediaQuery = null;
+  releaseModalOverlay?.();
+  releaseModalOverlay = null;
 });
 </script>
 
 <template>
-  <section class="organize-page" :class="{ 'embedded-navigation': !showTabs }" aria-labelledby="batch-tag-title">
+  <section class="organize-page" :class="{ 'embedded-navigation': !showTabs }" aria-label="图库">
     <header v-if="showTabs" class="page-heading">
       <div>
-        <p class="eyebrow">批量标签</p>
-        <h1 id="batch-tag-title">按文件夹快速整理图片</h1>
-        <p>选择图片后一次添加、移除或替换人工标签。模型身份无需逐项确认。</p>
+        <p class="eyebrow">图库</p>
+        <h1>浏览与整理图片</h1>
+        <p>选择文件夹浏览图片，按需打开图片详情或批量标签。</p>
       </div>
       <div class="heading-actions">
         <label>
@@ -478,29 +717,54 @@ onBeforeUnmount(() => {
       </div>
     </header>
 
-    <nav v-if="showTabs" class="workspace-tabs" aria-label="智能整理功能">
-      <button
-        type="button"
-        :class="{ active: activeWorkspaceTab === 'batch' }"
-        :aria-pressed="activeWorkspaceTab === 'batch'"
-        @click="selectWorkspaceTab('batch')"
-      >
-        <strong>批量标签</strong>
-        <small>按文件夹手工整理</small>
+    <nav class="gallery-tools" aria-label="图库工具">
+      <button ref="batchButtonRef" class="tool-button" type="button" @click="openBatchDialog">
+        批量标签
       </button>
       <button
+        class="tool-button"
         type="button"
-        :class="{ active: activeWorkspaceTab === 'clusters' }"
-        :aria-pressed="activeWorkspaceTab === 'clusters'"
-        @click="selectWorkspaceTab('clusters')"
+        @click="requestWorkspaceTab(activeWorkspaceTab === 'clusters' ? 'batch' : 'clusters')"
       >
-        <strong>相似分组</strong>
-        <small>重复图与语义近邻</small>
+        {{ activeWorkspaceTab === "clusters" ? "返回图库" : "相似分组" }}
+      </button>
+      <button
+        ref="detailsButtonRef"
+        v-if="activeWorkspaceTab === 'batch'"
+        class="tool-button"
+        type="button"
+        :disabled="!organize.selectedCount.value"
+        :aria-pressed="detailsOpen"
+        @click="toggleDetails"
+      >
+        图片详情
       </button>
     </nav>
 
-    <div v-show="activeWorkspaceTab === 'batch'" class="batch-tag-workspace" :class="{ 'is-folder-collapsed': folderPanelCollapsed }">
-      <aside class="folder-panel panel" :class="{ 'is-collapsed': folderPanelCollapsed }" aria-labelledby="folder-panel-title">
+    <div
+      v-show="activeWorkspaceTab === 'batch'"
+      class="batch-tag-workspace"
+      :class="{
+        'is-folder-collapsed': folderPanelCollapsed && !narrowLayout,
+        'with-details': detailsOpen,
+      }"
+    >
+      <div
+        v-if="narrowLayout && folderDrawerOpen"
+        class="folder-drawer-backdrop"
+        role="presentation"
+        @click="closeFolderDrawer"
+      />
+      <aside
+        ref="folderPanelRef"
+        class="folder-panel panel"
+        tabindex="-1"
+        :class="{ 'is-collapsed': folderPanelCollapsed && !narrowLayout, 'is-drawer-open': narrowLayout && folderDrawerOpen }"
+        aria-labelledby="folder-panel-title"
+        :role="narrowLayout && folderDrawerOpen ? 'dialog' : undefined"
+        :aria-modal="narrowLayout && folderDrawerOpen ? true : undefined"
+        @keydown="handleFolderDrawerKeydown"
+      >
         <header class="panel-heading">
           <div>
             <p class="eyebrow">图库导航</p>
@@ -606,7 +870,7 @@ onBeforeUnmount(() => {
             :class="{ active: folder.key === organize.selectedFolderKey.value }"
             :data-folder-key="folder.key"
           >
-            <button class="folder-select-button" type="button" @click="organize.selectFolder(folder.key)">
+            <button class="folder-select-button" type="button" @click="selectFolderFromPanel(folder.key)">
               <span class="folder-glyph" aria-hidden="true">◆</span>
               <span class="folder-copy">
                 <strong>{{ folder.name }}</strong>
@@ -660,8 +924,16 @@ onBeforeUnmount(() => {
 
       <main class="gallery-panel panel" aria-labelledby="folder-gallery-title">
         <header class="gallery-heading">
-          <button class="folder-panel-toggle" type="button" :aria-label="folderPanelCollapsed ? '展开文件夹导航' : '收起文件夹导航'" @click="folderPanelCollapsed = !folderPanelCollapsed">
-            {{ folderPanelCollapsed ? "›" : "‹" }}
+          <button
+            ref="folderPanelToggleRef"
+            class="folder-panel-toggle"
+            :class="{ 'is-drawer-entry': narrowLayout }"
+            type="button"
+            :aria-label="narrowLayout ? '图库导航' : (folderPanelCollapsed ? '展开文件夹导航' : '收起文件夹导航')"
+            :aria-expanded="narrowLayout ? folderDrawerOpen : undefined"
+            @click="toggleFolderPanel"
+          >
+            {{ narrowLayout ? "目录" : (folderPanelCollapsed ? "›" : "‹") }}
           </button>
           <div>
             <p class="eyebrow">当前文件夹</p>
@@ -688,16 +960,17 @@ onBeforeUnmount(() => {
           </label>
         </header>
 
-        <section class="selection-toolbar" aria-label="图片选择操作">
-          <div class="selection-summary">
+        <section
+          :class="organize.selectedCount.value ? 'selection-toolbar' : 'gallery-browse-actions'"
+          :aria-label="organize.selectedCount.value ? '图片选择操作' : '文件夹浏览操作'"
+        >
+          <div v-if="organize.selectedCount.value" class="selection-summary">
             <strong>{{ organize.selectionDescription.value }}</strong>
             <span>单击单选，Ctrl 多选，Shift 连续选择</span>
           </div>
           <div class="selection-actions">
             <button class="toolbar-button" type="button" @click="organize.selectCurrentPage">全选当前页</button>
             <button class="toolbar-button" type="button" @click="organize.selectWholeFolder">选择整文件夹</button>
-            <button class="toolbar-button" type="button" @click="organize.invertCurrentPage">反选当前页</button>
-            <button class="toolbar-button quiet" type="button" @click="organize.clearSelection">清空</button>
             <button
               class="toolbar-button"
               type="button"
@@ -706,9 +979,11 @@ onBeforeUnmount(() => {
             >
               从文件夹名生成
             </button>
-            <button class="toolbar-button editor-toggle" type="button" @click="editorOpen = true">
-              标签设置
-            </button>
+            <template v-if="organize.selectedCount.value">
+              <span class="selection-count" :title="`已选择 ${organize.selectedCount.value} 张图片`">{{ organize.selectedCount.value }}</span>
+              <button class="toolbar-button" type="button" @click="organize.invertCurrentPage">反选当前页</button>
+              <button class="toolbar-button quiet" type="button" @click="organize.clearSelection">清空</button>
+            </template>
           </div>
         </section>
 
@@ -718,7 +993,7 @@ onBeforeUnmount(() => {
             <span>大文件夹会分页加载，不会阻塞窗口。</span>
           </div>
           <div v-else-if="!organize.images.value.length" class="empty-state gallery-empty">
-            <strong>{{ organize.selectedFolderKey.value ? "当前文件夹没有图片" : "请从左侧选择文件夹" }}</strong>
+            <strong>{{ organize.selectedFolderKey.value ? "当前文件夹没有图片" : "请选择文件夹" }}</strong>
             <span>缩略图会完整显示，不会裁切主体。</span>
           </div>
           <div
@@ -801,10 +1076,30 @@ onBeforeUnmount(() => {
         />
       </main>
 
-      <aside
-        class="tag-editor panel"
-        :class="{ 'is-open': editorOpen }"
+      <GalleryDetails
+        v-if="detailsOpen"
+        :images="organize.selectedKnownImages.value"
+        :selected-count="organize.selectedCount.value"
+        :description="organize.selectionDescription.value"
+        @close="closeDetails"
+        @open="openDetailsImage"
+      />
+    </div>
+
+    <div
+      v-if="batchDialogOpen"
+      class="batch-dialog-backdrop"
+      role="presentation"
+      @click.self="closeBatchDialog"
+    >
+      <section
+        ref="batchDialogRef"
+        class="batch-dialog"
+        role="dialog"
+        aria-modal="true"
         aria-labelledby="tag-editor-title"
+        tabindex="-1"
+        @keydown="handleDialogKeydown"
       >
         <header class="panel-heading">
           <div>
@@ -812,18 +1107,18 @@ onBeforeUnmount(() => {
             <h2 id="tag-editor-title">批量修改</h2>
           </div>
           <div class="tag-editor-heading-actions">
-            <span class="selection-count">{{ organize.selectedCount.value }}</span>
-            <button class="editor-close" type="button" aria-label="关闭标签设置" @click="editorOpen = false">×</button>
+            <span class="batch-selection-count">{{ organize.selectedCount.value }}</span>
+            <button class="editor-close" type="button" aria-label="关闭标签设置" @click="closeBatchDialog">×</button>
           </div>
         </header>
 
         <section v-if="!organize.selectedCount.value" class="tag-editor-empty">
           <span aria-hidden="true">◇</span>
-          <div><strong>开始批量操作</strong><p>在左侧选择文件夹，然后点击中间图片进行选中</p></div>
+          <div><strong>开始批量操作</strong><p>先选择文件夹，再选中要处理的图片。</p></div>
           <div class="empty-editor-actions"><button type="button" disabled>添加标签</button><button type="button" disabled>移除标签</button><button type="button" disabled>替换人工标签</button></div>
         </section>
 
-        <details class="tag-editor-tools" :open="Boolean(organize.selectedCount.value)">
+        <details class="tag-editor-tools" :open="Boolean(organize.selectedCount.value || organize.activeJob.value)">
         <summary>标签与别名设置</summary>
         <div class="tag-editor-tools-content">
         <section class="selection-card">
@@ -831,7 +1126,7 @@ onBeforeUnmount(() => {
           <p v-if="organize.selectionPreviewIncomplete.value">
             标签统计只预览已加载的 {{ organize.selectedKnownImages.value.length }} 张；提交仍会作用于完整选择。
           </p>
-          <p v-else>右侧操作只影响已选图片，不会改动其他文件。</p>
+          <p v-else>本次操作只影响已选图片。</p>
         </section>
 
         <label class="tag-input-label">
@@ -995,7 +1290,7 @@ onBeforeUnmount(() => {
         </button>
         </div>
         </details>
-      </aside>
+      </section>
     </div>
 
     <SimilarityGroupsPanel
@@ -1006,14 +1301,6 @@ onBeforeUnmount(() => {
       :library-id="organize.selectedLibraryId.value"
       @toast="(title, message, kind) => emit('toast', title, message, kind)"
       @open-image="(imageId) => emit('openImage', imageId)"
-    />
-
-    <button
-      v-if="editorOpen"
-      class="editor-backdrop"
-      type="button"
-      aria-label="关闭标签设置"
-      @click="editorOpen = false"
     />
 
     <div
@@ -1262,7 +1549,7 @@ onBeforeUnmount(() => {
 
 <style scoped>
 .organize-page { display: grid; height: 100%; min-height: 0; grid-template-rows: auto auto minmax(0,1fr); gap: 12px; overflow: hidden; color: #17203a; }
-.organize-page.embedded-navigation { grid-template-rows:minmax(0,1fr); gap:0; }
+.organize-page.embedded-navigation { grid-template-rows:auto minmax(0,1fr); gap:8px; }
 .page-heading, .heading-actions, .panel-heading, .gallery-heading, .selection-toolbar, .selection-actions, .pagination-bar, .progress-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .page-heading { align-items: flex-end; padding: 2px 2px 4px; }
 .page-heading h1 { margin: 2px 0 0; font-size: clamp(23px, 2vw, 31px); line-height: 1.15; }
@@ -1280,15 +1567,16 @@ textarea { resize: vertical; line-height: 1.5; }
 .primary { color: white; background: linear-gradient(135deg, #7364eb, #5b4bd6); }
 .secondary { color: #5647ce; background: #efedff; }
 .danger-soft { color: #a74755; background: #fff0f2; }
-.workspace-tabs { display: inline-flex; width: max-content; max-width: 100%; gap: 5px; padding: 4px; border: 1px solid #e1e4ee; border-radius: 13px; background: rgba(246,247,251,.94); }
-.workspace-tabs button { display: grid; min-width: 150px; gap: 1px; padding: 7px 13px; border: 0; border-radius: 9px; color: #6c7589; background: transparent; text-align: left; cursor: pointer; }
-.workspace-tabs button strong { font-size: 11px; }.workspace-tabs button small { font-size: 9px; opacity: .78; }
-.workspace-tabs button.active { color: #5143c2; background: #fff; box-shadow: 0 3px 12px rgba(53,59,86,.1); }
+.gallery-tools { display: flex; min-width: 0; flex-wrap: wrap; align-items: center; gap: 8px; }
+.gallery-browse-actions { display: flex; min-width: 0; align-items: center; gap: 8px; padding-bottom: 8px; }
+.tool-button { min-height: 32px; padding: 0 12px; border: 1px solid #dedede; border-radius: 8px; color: #333; background: #f5f5f5; font: inherit; font-size: 12px; font-weight: 500; cursor: pointer; }
+.tool-button[aria-pressed="true"] { border-color: #999; background: #e8e8e8; }
 .organize-intelligence-workspace { height:100%; min-height:0; }
-.batch-tag-workspace { display: grid; height: 100%; min-height: 0; grid-template-columns: 320px minmax(0,1fr) 380px; gap: 14px; }
-.batch-tag-workspace.is-folder-collapsed { grid-template-columns:44px minmax(0,1fr) 380px; gap:10px; }
+.batch-tag-workspace { display: grid; height: 100%; min-height: 0; grid-template-columns: 320px minmax(0,1fr) var(--organize-details-width, 0px); gap: 14px; }
+.batch-tag-workspace.is-folder-collapsed { grid-template-columns:44px minmax(0,1fr) var(--organize-details-width, 0px); gap:10px; }
 .folder-panel { display: grid; grid-template-rows: auto auto auto auto minmax(0,1fr) auto; padding: 14px; overflow: hidden; }
 .folder-panel-toggle { display:grid; width:28px; height:28px; flex:0 0 auto; place-items:center; padding:0; border:0; border-radius:8px; color:#555; font:inherit; font-size:20px; background:#ededed; }
+.folder-panel-toggle.is-drawer-entry { width:auto; padding:0 10px; font-size:12px; font-weight:500; }
 .folder-library-control { display:grid; grid-template-columns:minmax(0,1fr) 38px; align-items:center; gap:6px; margin-top:10px; }
 .folder-library-control label { min-width:0; }
 .folder-library-control select { width:100%; height:38px; padding:0 8px; font-size:11px; }
@@ -1296,10 +1584,9 @@ textarea { resize: vertical; line-height: 1.5; }
 .folder-panel.is-collapsed { padding:7px; }
 .folder-panel.is-collapsed .panel-heading { justify-content:center; }
 .folder-panel.is-collapsed .panel-heading>div,.folder-panel.is-collapsed .panel-heading>.count-pill,.folder-panel.is-collapsed>:not(.panel-heading) { display:none; }
-.tag-editor { padding: 14px; overflow: auto; }
 .gallery-panel { display: grid; grid-template-rows: auto auto minmax(0,1fr) auto; padding: 14px; overflow: hidden; }
 .panel-heading h2, .gallery-heading h2 { margin: 2px 0 0; font-size: 18px; }
-.count-pill, .selection-count { display: grid; min-width: 31px; height: 31px; place-items: center; border-radius: 999px; color: #5b4bd6; background: #efedff; font-size: 12px; font-weight: 850; }
+.count-pill, .selection-count, .batch-selection-count { display: grid; min-width: 31px; height: 31px; place-items: center; border-radius: 999px; color: #5b4bd6; background: #efedff; font-size: 12px; font-weight: 850; }
 .root-list { display: grid; gap: 6px; margin-top: 13px; }
 .root-row { display: grid; grid-template-columns: minmax(0,1fr) auto; align-items: stretch; gap: 5px; border: 1px solid transparent; border-radius: 11px; background: #f7f8fc; }
 .root-row.active { border-color: #cbc4ff; background: #f0eeff; }
@@ -1368,7 +1655,7 @@ textarea { resize: vertical; line-height: 1.5; }
 .mini-tag.more { color: #697187; background: #eff1f5; }
 .no-tag { color: #a0a6b5; font-size: 10px; }
 .gallery-panel :deep(.gallery-pagination) { min-height: 52px; padding-top: 9px; border-top: 1px solid #edf0f5; }
-.editor-toggle,.editor-close { display: none; }
+.editor-close { display: grid; width: 30px; height: 30px; place-items: center; padding: 0; border: 0; border-radius: 8px; color: #6f5260; background: #fff0f2; font-size: 17px; cursor: pointer; }
 .tag-editor-heading-actions { display: flex; align-items: center; gap: 7px; }
 .selection-card, .operation-preview, .progress-card { margin-top: 12px; padding: 11px; border-radius: 12px; background: #f7f8fc; }
 .selection-card { border: 1px solid #e5e7f0; }
@@ -1422,7 +1709,6 @@ textarea { resize: vertical; line-height: 1.5; }
 .empty-state.compact { min-height: 90px; font-size: 12px; }
 .gallery-empty { min-height: 390px; }
 .muted { color: #999fae; font-size: 10px; }
-.editor-backdrop { display: none; }
 .folder-tag-modal-backdrop { position: fixed; z-index: 45; inset: 0; display: grid; place-items: center; padding: 24px; background: rgba(16,22,38,.48); backdrop-filter: blur(4px); }
 .folder-tag-modal { display: grid; width: min(760px,100%); max-height: min(780px,calc(100vh - 48px)); gap: 14px; overflow: auto; padding: 20px; border: 1px solid #dedede; border-radius: 14px; color: #242424; background: #fff; box-shadow: 0 24px 70px rgb(0 0 0 / 18%); }
 .folder-tag-modal > header,.folder-tag-modal > footer,.folder-tag-preview-action { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
@@ -1471,24 +1757,29 @@ textarea { resize: vertical; line-height: 1.5; }
 .delete-modal label { display: grid; gap: 6px; margin: 14px 0; color: #5d667b; font-size: 12px; font-weight: 750; }
 .delete-modal footer { justify-content: flex-end; }
 .delete-blocked { padding: 9px 10px; border-radius: 9px; color: #9f3647 !important; background: #fff0f2; }
+.batch-dialog-backdrop { position: fixed; z-index: 45; inset: 0; display: grid; place-items: center; padding: 24px; background: rgba(16,22,38,.52); backdrop-filter: blur(4px); }
+.batch-dialog { display: grid; width: min(560px,100%); max-height: min(820px,calc(100vh - 48px)); align-content: start; gap: 10px; overflow: auto; padding: 16px; border: 1px solid #dedede; border-radius: 14px; color: #242424; background: #fff; box-shadow: 0 24px 70px rgb(0 0 0 / 18%); }
+.batch-dialog .panel-heading { padding: 0 0 10px; border-bottom: 1px solid #eceef4; }
+.batch-dialog input,.batch-dialog select,.batch-dialog textarea { color: var(--text); border-color: var(--border-strong); background: var(--surface); }
+.batch-dialog :is(.muted, .tag-input-label small, .selection-card p, .operation-preview p, .operation-preview small, .progress-card p, .progress-card small) { color: var(--muted); }
 
 /* Fullscreen desktop treatment from the approved prototype. The three
    work areas are continuous white panes; controls, selection and behavior stay
    intact while the old purple dashboard framing is removed. */
 .organize-page { color:#242424; }
-.batch-tag-workspace { grid-template-columns:260px minmax(380px,1fr) 300px; gap:0; background:#fff; }
-.batch-tag-workspace.is-folder-collapsed { grid-template-columns:0 minmax(380px,1fr) 300px; gap:0; }
+.batch-tag-workspace { grid-template-columns:260px minmax(380px,1fr) var(--organize-details-width, 0px); gap:0; background:#fff; }
+.batch-tag-workspace.with-details { --organize-details-width:300px; }
+.batch-tag-workspace.is-folder-collapsed { grid-template-columns:0 minmax(380px,1fr) var(--organize-details-width, 0px); gap:0; }
 .folder-panel { grid-column:1; }
 .gallery-panel { grid-column:2; }
-.tag-editor { grid-column:3; }
-.folder-panel,.gallery-panel,.tag-editor { border:0; border-radius:0; background:#fff; box-shadow:none; }
+.gallery-details { grid-column:3; }
+.folder-panel,.gallery-panel,.gallery-details { border:0; border-radius:0; background:#fff; box-shadow:none; }
 .folder-panel { padding:14px 12px 14px 0; }
 .folder-panel.is-collapsed { display:none; }
 .gallery-panel { padding:14px; }
-.tag-editor { padding:14px; }
 .tag-editor-empty{display:grid;min-height:calc(100% - 52px);grid-template-rows:1fr auto;place-items:center;align-content:center;gap:12px;color:#888;text-align:center}.tag-editor-empty>span{align-self:end;font-size:28px;color:#aaa}.tag-editor-empty>div:not(.empty-editor-actions){align-self:start}.tag-editor-empty strong{display:block;color:#777;font-size:13px;font-weight:400}.tag-editor-empty p{margin:5px 0 0;font-size:11px;line-height:1.5}.empty-editor-actions{align-self:end;display:grid;width:100%;gap:6px}.empty-editor-actions button{min-height:32px;border:1px solid #e5e5e5;border-radius:8px;color:#aaa;background:#fafafa}
 .tag-editor-tools{margin-top:8px}.tag-editor-tools>summary{padding:7px 0;color:#777;font-size:11px;text-align:center;cursor:pointer;list-style:none}.tag-editor-tools[open]>summary{margin-bottom:6px;border-bottom:1px solid #e7e7e7}.tag-editor-tools-content{display:grid}
-.panel-heading .eyebrow,.gallery-heading .eyebrow,.tag-editor .eyebrow { display:none; }
+.panel-heading .eyebrow,.gallery-heading .eyebrow,.batch-dialog .eyebrow { display:none; }
 .folder-panel-toggle { width:32px; height:32px; border:0; border-radius:8px; color:#666; background:transparent; }
 .folder-panel-toggle:hover { color:#171717; background:#f2f2f2; }
 .gallery-heading { justify-content:flex-start; }
@@ -1501,7 +1792,7 @@ textarea { resize: vertical; line-height: 1.5; }
 .folder-library-control select,.folder-search input,input,select,textarea { border-color:#dedede; color:#242424; background:#fff; }
 .folder-library-refresh,.folder-search .icon-button { border-color:#dedede; color:#555; background:#f5f5f5; }
 .selection-toolbar { margin-bottom:10px; padding:8px 10px; border:0; border-radius:10px; background:#f7f7f7; }
-.toolbar-button,.toolbar-button.quiet,.editor-toggle,.folder-load-more { border-color:#dedede; color:#333; background:#f5f5f5; font-weight:500; }
+.toolbar-button,.toolbar-button.quiet,.tool-button,.folder-load-more { border-color:#dedede; color:#333; background:#f5f5f5; font-weight:500; }
 .image-grid { grid-template-columns: repeat(var(--organize-columns, 3), minmax(0, 1fr)); grid-auto-flow: row dense; gap: 8px; }
 .image-tile.span-2 { grid-column: span 2; }
 .image-tile { border:0; border-radius:10px; background:#f2f2f2; box-shadow:none; }
@@ -1515,13 +1806,10 @@ textarea { resize: vertical; line-height: 1.5; }
 .progress-track { background:#e3e3e3; }.progress-track span { background:#777; }
 
 @media (max-width: 1180px) {
-  .batch-tag-workspace { grid-template-columns: 300px minmax(0,1fr); }
-  .batch-tag-workspace.is-folder-collapsed { grid-template-columns:0 minmax(0,1fr); }
-  .editor-toggle { display: inline-flex; }
-  .tag-editor { position: fixed; z-index: 35; top: 16px; right: 16px; bottom: 16px; display: block; width: min(390px,calc(100vw - 48px)); transform: translateX(calc(100% + 32px)); transition: transform .18s ease; box-shadow: 0 24px 70px rgba(18,24,42,.24); }
-  .tag-editor.is-open { transform: translateX(0); }
-  .editor-close { display: grid; width: 30px; height: 30px; place-items: center; border: 0; border-radius: 8px; color: #6f5260; background: #fff0f2; font-size: 17px; }
-  .editor-backdrop { position: fixed; z-index: 34; inset: 0; display: block; border: 0; background: rgba(17,23,39,.28); }
+  /* Under this width the details pane floats over the gallery instead of
+     taking a grid column, so the workspace keeps two columns. */
+  .batch-tag-workspace, .batch-tag-workspace.with-details { grid-template-columns: 300px minmax(0,1fr); }
+  .batch-tag-workspace.is-folder-collapsed, .batch-tag-workspace.is-folder-collapsed.with-details { grid-template-columns:0 minmax(0,1fr); }
 }
 @media (max-width: 1100px) {
   .organize-page { overflow: auto; }
@@ -1532,10 +1820,27 @@ textarea { resize: vertical; line-height: 1.5; }
 }
 @media (max-width: 760px) {
   .page-heading, .heading-actions, .selection-toolbar { align-items: stretch; flex-direction: column; }
-  .batch-tag-workspace { grid-template-columns: 1fr; }
-  .folder-panel { min-height: 420px; }
+  /* One real column: the folder navigation becomes a drawer opened from the
+     gallery heading instead of a fixed grid cell squeezed beside the images. */
+  .batch-tag-workspace,
+  .batch-tag-workspace.with-details,
+  .batch-tag-workspace.is-folder-collapsed,
+  .batch-tag-workspace.is-folder-collapsed.with-details { grid-template-columns: minmax(0,1fr); }
+  .gallery-panel { grid-column: 1; min-height: 680px; }
+  .folder-panel {
+    position: fixed;
+    z-index: 40;
+    inset: 0 auto 0 0;
+    display: none;
+    width: min(320px, 86vw);
+    min-height: 0;
+    padding: 14px;
+    border-radius: 0;
+    box-shadow: 0 18px 48px rgb(0 0 0 / 32%);
+  }
+  .folder-panel.is-drawer-open { display: grid; }
+  .folder-drawer-backdrop { position: fixed; z-index: 39; inset: 0; background: rgb(0 0 0 / 32%); }
   .folder-list { min-height: 220px; }
-  .gallery-panel { min-height: 680px; }
   .selection-actions { justify-content: flex-start; }
   .delete-modal dl { grid-template-columns: repeat(2,minmax(0,1fr)); }
   .folder-tag-modal-backdrop { padding: 12px; }
@@ -1544,8 +1849,8 @@ textarea { resize: vertical; line-height: 1.5; }
   .folder-tag-summary > div:nth-child(2) { border-right: 0; }
   .folder-tag-summary > div:nth-child(-n+2) { border-bottom: 1px solid #e8e8e8; }
   .folder-tag-preview-action { align-items: stretch; flex-direction: column; }
-  .workspace-tabs { display: grid; width: 100%; grid-template-columns: repeat(2,minmax(0,1fr)); }
-  .workspace-tabs button { min-width: 0; padding-inline: 8px; }
+  .batch-dialog-backdrop { padding: 12px; }
+  .batch-dialog { max-height: calc(100vh - 24px); }
 }
 
 @media (max-width: 520px) {
@@ -1593,5 +1898,17 @@ textarea { resize: vertical; line-height: 1.5; }
   .no-tag { color: #a5a5a5; }
   .empty-state { color: #c0c0c0; }
   .empty-state strong { color: #ededed; }
+  .gallery-tools .tool-button { color: #e2e2e2; border-color: rgb(255 255 255 / 18%); background: #2b2b2b; }
+  .gallery-tools .tool-button[aria-pressed="true"] { background: #3a3a3a; }
+  .batch-dialog { border-color: #3d3d3d; color: #ededed; background: #202020; }
+  .batch-dialog .panel-heading { border-bottom-color: #3d3d3d; }
+  .batch-dialog .selection-card,.batch-dialog .operation-preview { border-color: #3d3d3d; background: #262626; }
+  .batch-dialog .tag-input-label { color: #c8c8c8; }
+  .batch-dialog .tag-editor-tools > summary { color: #b5b5b5; }
+  .batch-dialog .tag-editor-tools[open] > summary { border-bottom-color: #3d3d3d; }
+  .batch-dialog .tag-editor-empty { color: #a5a5a5; }
+  .batch-dialog .tag-editor-empty strong { color: #d5d5d5; }
+  .batch-dialog .alias-dictionary { border-color: #3d3d3d; background: #262626; }
+  .batch-dialog .alias-entry { color: #d5d5d5; background: #2e2e2e; }
 }
 </style>

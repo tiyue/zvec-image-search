@@ -114,16 +114,45 @@ watch(
   () => props.preloadUrls.join("\n"),
   () => {
     clearPreloads();
-    for (const url of props.preloadUrls) {
+    for (const url of props.preloadUrls.slice(0, 2)) {
       if (!url) continue;
       const preload = new Image();
       preload.decoding = "async";
-      preload.src = url;
+      preload.fetchPriority = "low";
+      preload.src = prefetchUrl(url);
       preloads.push(preload);
     }
   },
   { immediate: true },
 );
+
+/**
+ * Only this application's generic image endpoint may carry the prefetch hint.
+ * Relative URLs are resolved against the document base so a deployment base
+ * path or the runtime token prefix (`/<token>/api/image/{id}`) still matches,
+ * while blob, external, raw-selection and already-prioritised URLs stay as-is.
+ */
+function prefetchUrl(url: string): string {
+  let resolved: URL;
+  try {
+    resolved = new URL(url, document.baseURI);
+  } catch {
+    return url;
+  }
+  if (resolved.origin !== window.location.origin) return url;
+  const base = new URL(document.baseURI);
+  const basePath = base.pathname.endsWith("/")
+    ? base.pathname
+    : base.pathname.slice(0, base.pathname.lastIndexOf("/") + 1);
+  if (!resolved.pathname.startsWith(basePath)) return url;
+  const segments = resolved.pathname.slice(basePath.length).split("/");
+  if (segments.length !== 3 || segments[0] !== "api" || segments[1] !== "image" || !segments[2]) {
+    return url;
+  }
+  if (resolved.searchParams.has("priority")) return url;
+  resolved.searchParams.set("priority", "prefetch");
+  return `${resolved.pathname}${resolved.search}${resolved.hash}`;
+}
 
 function clearPreloads(): void {
   preloads.splice(0).forEach((preload) => {

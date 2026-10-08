@@ -97,6 +97,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   box-shadow: inset 0 0 0 1px rgba(0, 0, 0, .06);
 }
 .nav-list { display: grid; gap: 0; padding: 0; }
+.nav-group { margin: 8px 8px 2px; padding: 0 8px; color: var(--muted); font-size: 11px; letter-spacing: .04em; }
 .nav-item { min-height: 54px; }
 .nav-item > span, .settings-button > span { display: grid; min-width: 0; }
 .nav-item strong, .nav-item small, .settings-button strong, .settings-button small {
@@ -116,7 +117,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .sidebar-recents button:hover { background: #ececec; }
 .settings-button { flex: 0 0 auto; margin-top: 0; margin-bottom: 8px; }
 .sidebar-collapsed .brand-copy, .sidebar-collapsed .sidebar-toggle, .sidebar-collapsed .new-search-button > span,
-.sidebar-collapsed .nav-item > span, .sidebar-collapsed .sidebar-recents, .sidebar-collapsed .settings-button > span { display: none; }
+.sidebar-collapsed .nav-item > span, .sidebar-collapsed .nav-group, .sidebar-collapsed .sidebar-recents, .sidebar-collapsed .settings-button > span { display: none; }
 .sidebar-collapsed .sidebar-head { justify-content: center; padding-inline: 0; }
 .sidebar-collapsed .new-search-button, .sidebar-collapsed .settings-button, .sidebar-collapsed .nav-item { width: 36px; height: 36px; min-height: 36px; justify-content: center; margin-inline: 8px; padding: 0; }
 
@@ -235,7 +236,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 @media (max-width: 900px) {
   :root { --sidebar-width: 52px; }
   body { min-width: 320px; }
-  .brand-copy, .sidebar-toggle, .new-search-button > span, .nav-item > span, .sidebar-recents, .settings-button > span { display: none; }
+  .brand-copy, .sidebar-toggle, .new-search-button > span, .nav-item > span, .nav-group, .sidebar-recents, .settings-button > span { display: none; }
   .sidebar-head { justify-content: center; padding-inline: 0; }
   .new-search-button, .settings-button, .nav-item { width: 36px; height: 36px; min-height: 36px; justify-content: center; margin-inline: 8px; padding: 0; }
   .search-surface { width: min(720px, calc(100vw - 96px)); }
@@ -294,7 +295,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   .search-workspace .selection-toolbar > span { color: #c3c3c3; }
   .search-workspace .export-progress { color: #d0d0d0; background: #262626; }
   .feature-page[data-page-section="organize"] { color: #ededed; background: #1c1c1c; }
-  .feature-page[data-page-section="organize"] :is(.folder-panel, .gallery-panel, .tag-editor) {
+  .feature-page[data-page-section="organize"] :is(.folder-panel, .gallery-panel, .gallery-details) {
     color: #ededed !important;
     border-color: rgb(255 255 255 / 12%) !important;
     background: #202020 !important;
@@ -302,7 +303,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   .feature-page[data-page-section="organize"] :is(.root-row, .folder-item) { color: #d7d7d7; background: transparent; }
   .feature-page[data-page-section="organize"] :is(.root-row, .folder-item):hover,
   .feature-page[data-page-section="organize"] :is(.root-row, .folder-item).active { color: #fff; background: #2e2e2e; }
-  .feature-page[data-page-section="organize"] :is(.toolbar-button, .folder-load-more, .editor-toggle, .editor-close) {
+  .feature-page[data-page-section="organize"] :is(.toolbar-button, .folder-load-more, .tool-button, .editor-close) {
     color: #e2e2e2 !important;
     border-color: rgb(255 255 255 / 18%) !important;
     background: #2b2b2b !important;

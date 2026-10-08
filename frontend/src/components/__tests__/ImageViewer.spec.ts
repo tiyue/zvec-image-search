@@ -154,6 +154,103 @@ describe("ImageViewer overlay", () => {
     }
   });
 
+  function stubPreloads(): Array<{ src: string; fetchPriority: string }> {
+    const loaded: Array<{ src: string; fetchPriority: string }> = [];
+    class FakeImage {
+      decoding = "";
+      fetchPriority = "";
+      set src(value: string) {
+        loaded.push({ src: value, fetchPriority: this.fetchPriority });
+      }
+      get src(): string {
+        return "";
+      }
+    }
+    vi.stubGlobal("Image", FakeImage);
+    return loaded;
+  }
+
+  it("adds a low-priority prefetch hint to the adjacent application images", () => {
+    const loaded = stubPreloads();
+    try {
+      wrapper = mountViewer({
+        preloadUrls: [
+          "api/image/previous-id?variant=preview",
+          `${window.location.origin}/api/image/next-id?variant=thumbnail#top`,
+        ],
+      });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+
+    expect(loaded).toEqual([
+      {
+        src: "/api/image/previous-id?variant=preview&priority=prefetch",
+        fetchPriority: "low",
+      },
+      {
+        src: "/api/image/next-id?variant=thumbnail&priority=prefetch#top",
+        fetchPriority: "low",
+      },
+    ]);
+  });
+
+  it("keeps a deployment base path while adding the prefetch hint", () => {
+    const base = document.createElement("base");
+    base.setAttribute("href", "tok-abc/");
+    document.head.appendChild(base);
+    const loaded = stubPreloads();
+    try {
+      wrapper = mountViewer({
+        preloadUrls: ["api/image/next-id?variant=preview"],
+      });
+    } finally {
+      vi.unstubAllGlobals();
+      base.remove();
+    }
+
+    expect(loaded).toEqual([
+      {
+        src: "/tok-abc/api/image/next-id?variant=preview&priority=prefetch",
+        fetchPriority: "low",
+      },
+    ]);
+  });
+
+  it.each([
+    ["https://example.com/api/image/other?variant=preview", `blob:${window.location.origin}/xxxx`],
+    ["api/raw-selection/members/1/thumbnail", "api/image/known?variant=preview&priority=current"],
+    ["/ordinary.jpg", "/another-token/api/image/other?variant=preview"],
+  ])("leaves other or explicitly prioritised URLs untouched: %s", (first, second) => {
+    const loaded = stubPreloads();
+    try {
+      wrapper = mountViewer({
+        preloadUrls: [first, second],
+      });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+
+    expect(loaded.map((entry) => entry.src)).toEqual([first, second]);
+  });
+
+  it("prefetches at most the two adjacent images", () => {
+    const loaded = stubPreloads();
+    try {
+      wrapper = mountViewer({
+        preloadUrls: [
+          "api/image/a?variant=preview",
+          "api/image/b?variant=preview",
+          "api/image/c?variant=preview",
+        ],
+      });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+
+    expect(loaded).toHaveLength(2);
+  });
+
   it("routes keyboard navigation and traps Tab inside the dialog", async () => {
     wrapper = mountViewer();
 

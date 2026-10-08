@@ -17,16 +17,34 @@ from collections import OrderedDict
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final, Literal
+from typing import Final, Literal, cast
 
 from PIL import Image, ImageOps, UnidentifiedImageError
 
+from .image_scheduler import (
+    PriorityGate,
+    PriorityGateClosed,
+    PriorityGateError,
+    PriorityGateFull,
+    RenderTicket,
+)
+
 ImageVariant = Literal["thumbnail", "preview"]
+ImagePriority = Literal["current", "visible", "prefetch", "background"]
 
 _VARIANT_SIZES: Final[dict[ImageVariant, tuple[int, int]]] = {
     "thumbnail": (640, 640),
     "preview": (1920, 1920),
 }
+_DEFAULT_PRIORITY: Final[dict[ImageVariant, ImagePriority]] = {
+    "thumbnail": "visible",
+    "preview": "current",
+}
+IMAGE_PRIORITIES: Final[frozenset[str]] = frozenset(
+    {"current", "visible", "prefetch", "background"}
+)
+_MAX_PENDING_RENDERS: Final = 128
+_FAIRNESS_LIMIT: Final = 8
 _MAX_SOURCE_BYTES: Final = 512 * 1024 * 1024
 _MAX_PIXELS: Final = 200_000_000
 _DISK_CACHE_SCHEMA: Final = 1
@@ -41,6 +59,10 @@ _MAX_RECENT_DISK_ENTRIES: Final = 10_000
 
 class ImageRegistryError(RuntimeError):
     """A registered image cannot be resolved or rendered safely."""
+
+
+class ImageQueueFull(ImageRegistryError):
+    """The bounded render queue is full; the caller should retry later."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,6 +100,7 @@ class _RenderFlight:
     """Share one render between concurrent HTTP requests for the same image."""
 
     event: threading.Event
+    ticket: RenderTicket | None = None
     payload: ImagePayload | None = None
     error: BaseException | None = None
 
@@ -123,7 +146,11 @@ class ImageRegistry:
         )
         self._cache_bytes = 0
         self._flights: dict[tuple[str, ImageVariant, int, int], _RenderFlight] = {}
-        self._render_slots = threading.BoundedSemaphore(max_render_workers)
+        self._render_gate = PriorityGate(
+            max_render_workers,
+            _MAX_PENDING_RENDERS,
+            fairness_limit=_FAIRNESS_LIMIT,
+        )
         self._disk_cache_root = _prepare_disk_cache(cache_directory)
         self._disk_writes_since_prune = 0
         self._disk_prune_running = False
@@ -210,18 +237,29 @@ class ImageRegistry:
             raise ImageRegistryError("图片路径发生变化，请刷新页面。")
         return resolved
 
-    def payload(self, image_id: str, variant: ImageVariant) -> ImagePayload:
+    def payload(
+        self,
+        image_id: str,
+        variant: ImageVariant,
+        priority: ImagePriority | None = None,
+    ) -> ImagePayload:
         """Return a bounded thumbnail or preview without exposing its path."""
 
         if variant not in _VARIANT_SIZES:
             raise ImageRegistryError("不支持的图片预览尺寸。")
         normalized = _image_id(image_id)
-        return self._payload(normalized, variant, attempt=0)
+        return self._payload(
+            normalized,
+            variant,
+            _resolve_priority(priority, variant),
+            attempt=0,
+        )
 
     def _payload(
         self,
         image_id: str,
         variant: ImageVariant,
+        priority: ImagePriority,
         *,
         attempt: int,
     ) -> ImagePayload:
@@ -229,6 +267,8 @@ class ImageRegistry:
         _resolved, stat_result = _source_stat(path)
         cache_key = (image_id, variant, stat_result.st_mtime_ns, stat_result.st_size)
         with self._lock:
+            if self._closed:
+                raise ImageRegistryError("图片预览服务已关闭。")
             expected_entry = self._entries.get(image_id)
             if expected_entry is None:
                 raise ImageRegistryError("图片引用已失效，请刷新页面。")
@@ -239,17 +279,27 @@ class ImageRegistry:
             flight = self._flights.get(cache_key)
             owner = flight is None
             if flight is None:
-                flight = _RenderFlight(threading.Event())
+                flight = _RenderFlight(
+                    threading.Event(),
+                    self._render_gate.new_ticket(priority),
+                )
                 self._flights[cache_key] = flight
 
         if not owner:
+            # A caller joining an in-flight render promotes the queued work even
+            # if the owner has not reached the scheduling gate yet.
+            if flight.ticket is not None:
+                self._render_gate.upgrade(flight.ticket, priority)
             flight.event.wait()
             if flight.error is not None:
+                if isinstance(flight.error, ImageRegistryError):
+                    raise flight.error
                 raise ImageRegistryError(str(flight.error)) from flight.error
             if flight.payload is None:
                 raise ImageRegistryError("图片预览生成失败。")
             return flight.payload
 
+        assert flight.ticket is not None
         try:
             disk_path = self._disk_path(path, variant, stat_result)
             payload = (
@@ -260,8 +310,15 @@ class ImageRegistry:
             if payload is not None and disk_path is not None:
                 self._mark_disk_recent(disk_path, schedule_initial_prune=True)
             if payload is None:
-                with self._render_slots:
+                try:
+                    self._render_gate.enqueue(flight.ticket)
+                    self._render_gate.wait(flight.ticket)
+                except (PriorityGateFull, PriorityGateClosed) as exc:
+                    raise _gate_error(exc) from exc
+                try:
                     payload = _render_image(path, variant, stat_result.st_mtime_ns)
+                finally:
+                    self._render_gate.release()
             _verified_path, refreshed_stat = _source_stat(path)
             if (
                 refreshed_stat.st_mtime_ns != stat_result.st_mtime_ns
@@ -269,7 +326,12 @@ class ImageRegistry:
             ):
                 if attempt >= 1:
                     raise ImageRegistryError("图片在生成预览期间反复变化，请稍后重试。")
-                retried = self._payload(image_id, variant, attempt=attempt + 1)
+                retried = self._payload(
+                    image_id,
+                    variant,
+                    cast(ImagePriority, flight.ticket.priority),
+                    attempt=attempt + 1,
+                )
                 with self._lock:
                     flight.payload = retried
                 return retried
@@ -323,7 +385,12 @@ class ImageRegistry:
         with self._lock:
             self._closed = True
             prune_thread = self._disk_prune_thread
-        self.clear()
+            self._render_gate.close()
+            for flight in self._flights.values():
+                flight.error = ImageRegistryError("图片预览服务已关闭。")
+                flight.event.set()
+            self._flights.clear()
+            self.clear()
         if prune_thread is not None and prune_thread is not threading.current_thread():
             prune_thread.join(timeout=2.0)
 
@@ -694,9 +761,29 @@ def _image_id(value: str) -> str:
     return normalized
 
 
+def _resolve_priority(
+    priority: ImagePriority | None,
+    variant: ImageVariant,
+) -> ImagePriority:
+    if priority is None:
+        return _DEFAULT_PRIORITY[variant]
+    if not isinstance(priority, str) or priority not in IMAGE_PRIORITIES:
+        raise ImageRegistryError("不支持的图片优先级。")
+    return priority
+
+
+def _gate_error(exc: PriorityGateError) -> ImageRegistryError:
+    if isinstance(exc, PriorityGateFull):
+        return ImageQueueFull(str(exc))
+    return ImageRegistryError(str(exc))
+
+
 __all__ = [
+    "IMAGE_PRIORITIES",
     "ImageMetadata",
     "ImagePayload",
+    "ImagePriority",
+    "ImageQueueFull",
     "ImageRegistry",
     "ImageRegistryError",
     "ImageVariant",
