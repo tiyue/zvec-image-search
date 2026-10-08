@@ -8,6 +8,7 @@
 - 第一轮缩略图密度与数据库查询优化实施、分工与验收：`docs/optimization-round1-deepseek.md`
 - 第二轮应用内大图与页面按需加载实施、分工与验收：`docs/optimization-round2-deepseek.md`
 - 第三轮独立图库与图片渲染优先级实施、分工与验收：`docs/optimization-round3-deepseek.md`
+- 安卓手机与平板 UI、图片交付及数据交互优化方案（待确认）：`docs/android-optimization-plan.md`
 
 ## 发布矩阵
 
