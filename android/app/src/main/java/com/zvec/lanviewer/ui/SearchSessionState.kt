@@ -69,7 +69,10 @@ internal fun attachedQueryImageError(
     else -> null
 }
 
-/** Clears the previous search, pagination and viewer state and claims a fresh local identity. */
+/**
+ * Clears the previous search, pagination and viewer state, claims a fresh local identity and
+ * snapshots the submitted query so the results header never follows later draft edits.
+ */
 internal fun AppUiState.beginSearchSession(attempt: Long): AppUiState = copy(
     searchAttempt = attempt,
     activeSearchId = null,
@@ -86,6 +89,11 @@ internal fun AppUiState.beginSearchSession(attempt: Long): AppUiState = copy(
     searchRestoreNotice = null,
     viewerSource = null,
     viewerIndex = null,
+    submittedSearchText = searchText.trim(),
+    submittedSearchHasImage = when (resolvedSearchMode()) {
+        SearchMode.IMAGE, SearchMode.COMBINED -> true
+        else -> false
+    },
 )
 
 internal fun AppUiState.applySearchCreated(attempt: Long, searchId: String): AppUiState =

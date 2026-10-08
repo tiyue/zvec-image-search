@@ -29,7 +29,7 @@ import androidx.compose.ui.test.click
 import androidx.compose.ui.test.isPopup
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.longClick
-import androidx.compose.ui.test.onAllNodesWithText
+import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
@@ -158,9 +158,11 @@ class RecommendationUiTest {
         composeRule.onNodeWithText("旋转").performClick()
         composeRule.onNodeWithText("详细信息").performClick()
         composeRule.onNodeWithText("文件名：search.jpg").assertExists()
+        pressBack()
+        waitForSheetToClose()
+        // Save and share live in the always visible toolbar; the menu keeps the rest of the actions.
         composeRule.onNodeWithText("分享").performClick()
 
-        waitForSheetToClose()
         assertEquals(1, shareCount)
     }
 
@@ -236,12 +238,12 @@ class RecommendationUiTest {
 
     private fun openViewerSheet() {
         composeRule.onNodeWithTag(ORIGINAL_VIEWER_IMAGE_TAG).performTouchInput { longClick() }
-        composeRule.onNodeWithText("保存").assertExists()
+        composeRule.onNodeWithTag(VIEWER_SHEET_TAG).assertExists()
     }
 
     private fun waitForSheetToClose() {
         composeRule.waitUntil(timeoutMillis = 5_000) {
-            composeRule.onAllNodesWithText("保存").fetchSemanticsNodes().isEmpty()
+            composeRule.onAllNodesWithTag(VIEWER_SHEET_TAG).fetchSemanticsNodes().isEmpty()
         }
     }
 

@@ -1,5 +1,6 @@
 package com.zvec.lanviewer.ui.search
 
+import android.content.Context
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -18,9 +19,13 @@ import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyGridState
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.itemsIndexed
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -28,6 +33,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
@@ -39,26 +45,137 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
-import coil.compose.AsyncImagePainter
-import coil.compose.SubcomposeAsyncImage
-import coil.compose.SubcomposeAsyncImageContent
+import coil.compose.AsyncImage
 import coil.request.ImageRequest
 import com.zvec.lanviewer.data.model.SearchItem
 import com.zvec.lanviewer.ui.AppUiState
+import com.zvec.lanviewer.ui.GALLERY_EDGE_PADDING_DP
+import com.zvec.lanviewer.ui.GALLERY_SPACING_DP
+import com.zvec.lanviewer.ui.GalleryDensity
+import com.zvec.lanviewer.ui.GalleryDensityEntry
 import com.zvec.lanviewer.ui.SearchPhase
 import com.zvec.lanviewer.ui.canStartNextPage
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filterNotNull
-import java.text.DecimalFormat
 
 internal const val SEARCH_RESULTS_GRID_TAG = "search-results-grid"
 internal const val NEXT_PAGE_RETRY_TAG = "search-next-page-retry"
+internal const val GALLERY_CARD_TAG = "gallery-card"
 
 private const val THUMBNAIL_DECODE_SIZE = 640
 private const val LOAD_MORE_THRESHOLD = 8
 
-private data class SearchResultAction(val label: String, val onClick: () -> Unit)
+private enum class ThumbnailLoadState { LOADING, SUCCESS, ERROR }
+
+/**
+ * Thumbnail request shared by the grids and the viewer placeholder. Both call sites must keep using
+ * this builder so Coil's stable (data derived) memory cache key matches and the viewer can reuse the
+ * thumbnail the grid already loaded instead of downloading it again.
+ *
+ * The first attempt carries no extra parameter, so it stays byte-for-byte compatible with the
+ * recommendation preload request; only an explicit retry adds the parameter that forces Coil to run
+ * the request again.
+ */
+internal fun thumbnailImageRequest(context: Context, url: String, attempt: Int = 0): ImageRequest {
+    val builder = ImageRequest.Builder(context)
+        .data(url)
+        .memoryCacheKey(url)
+        .size(THUMBNAIL_DECODE_SIZE)
+        .crossfade(true)
+    if (attempt > 0) {
+        builder.setParameter("thumbnailRetry", attempt)
+    }
+    return builder.build()
+}
+
+/**
+ * One gallery thumbnail. Uses plain AsyncImage with same-size loading/error overlays instead of a
+ * subcomposing image, so scrolling the lazy grid stays cheap. The image is Fit (never cropped) and
+ * the box height is fixed per density, so loading, failure and success all keep the same height.
+ */
+@Composable
+internal fun GalleryThumbnailCard(
+    name: String,
+    url: String,
+    height: Dp,
+    onClick: () -> Unit,
+) {
+    val context = LocalContext.current
+    var attempt by remember(url) { mutableIntStateOf(0) }
+    var loadState by remember(url) { mutableStateOf(ThumbnailLoadState.LOADING) }
+    Card(
+        modifier = Modifier.fillMaxWidth().testTag(GALLERY_CARD_TAG).clickable(onClick = onClick),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(height)
+                .background(MaterialTheme.colorScheme.surfaceVariant),
+            contentAlignment = Alignment.Center,
+        ) {
+            AsyncImage(
+                model = thumbnailImageRequest(context, url, attempt),
+                contentDescription = name,
+                contentScale = ContentScale.Fit,
+                modifier = Modifier.fillMaxSize(),
+                onLoading = { loadState = ThumbnailLoadState.LOADING },
+                onSuccess = { loadState = ThumbnailLoadState.SUCCESS },
+                onError = { loadState = ThumbnailLoadState.ERROR },
+            )
+            when (loadState) {
+                ThumbnailLoadState.LOADING -> CircularProgressIndicator(Modifier.size(24.dp))
+                ThumbnailLoadState.ERROR -> Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text("加载失败", style = MaterialTheme.typography.bodySmall)
+                    TextButton(
+                        onClick = {
+                            attempt += 1
+                            loadState = ThumbnailLoadState.LOADING
+                        },
+                    ) { Text("重试") }
+                }
+                ThumbnailLoadState.SUCCESS -> Unit
+            }
+        }
+        Text(
+            name.ifBlank { "未命名图片" },
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp),
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
+}
+
+/**
+ * Short query description for the compact results header. Once a search has been submitted the
+ * summary comes from that snapshot, so editing the next draft never rewrites the finished title;
+ * only a still-unsubmitted state falls back to the live draft.
+ */
+internal fun searchSummary(state: AppUiState): String {
+    val submitted = state.submittedSearchText
+    if (submitted != null) {
+        return when {
+            submitted.isNotEmpty() -> submitted
+            state.submittedSearchHasImage -> "以图搜索"
+            else -> "全部结果"
+        }
+    }
+    val draft = state.searchText.trim()
+    return when {
+        draft.isNotEmpty() -> draft
+        state.queryImage != null -> "以图搜索"
+        else -> "全部结果"
+    }
+}
+
+internal fun loadedCountLabel(state: AppUiState): String =
+    if (state.totalResults > 0) {
+        "已加载 ${state.results.size} / ${state.totalResults}"
+    } else {
+        "已加载 ${state.results.size}"
+    }
 
 /**
  * The RESULTS tab body. Every search phase is rendered explicitly so an empty draft, a successful
@@ -69,6 +186,8 @@ internal fun SearchResultsPane(
     state: AppUiState,
     gridState: LazyGridState,
     thumbnailUrl: (SearchItem) -> String,
+    density: GalleryDensity,
+    onDensityChange: (GalleryDensity) -> Unit,
     onOpen: (Int) -> Unit,
     onLoadMore: () -> Unit,
     onRetryPage: () -> Unit,
@@ -76,55 +195,107 @@ internal fun SearchResultsPane(
     onModifySearch: () -> Unit,
     modifier: Modifier,
 ) {
-    when {
-        state.results.isNotEmpty() -> ResultsGrid(
-            state = state,
-            gridState = gridState,
-            thumbnailUrl = thumbnailUrl,
-            onOpen = onOpen,
-            onLoadMore = onLoadMore,
-            onRetryPage = onRetryPage,
-            modifier = modifier,
-        )
-        state.searchPhase == SearchPhase.SEARCHING || state.isSearching -> SearchLoadingState(
-            status = state.searchStatus,
-            modifier = modifier,
-        )
-        state.searchPhase == SearchPhase.ERROR -> SearchMessageState(
-            title = "搜索失败",
-            detail = state.searchError,
-            primary = SearchResultAction("重试", onRetrySearch),
-            secondary = SearchResultAction("修改搜索", onModifySearch),
-            modifier = modifier,
-        )
-        state.searchPhase == SearchPhase.CANCELLED -> SearchMessageState(
-            title = "已取消",
-            detail = null,
-            primary = SearchResultAction("修改搜索", onModifySearch),
-            secondary = null,
-            modifier = modifier,
-        )
-        state.searchPhase == SearchPhase.LOADED -> SearchMessageState(
-            title = "没有找到匹配图片",
-            detail = null,
-            primary = SearchResultAction("修改搜索", onModifySearch),
-            secondary = null,
-            modifier = modifier,
-        )
-        else -> SearchMessageState(
-            title = "搜索后在这里查看结果",
-            detail = null,
-            primary = null,
-            secondary = null,
-            modifier = modifier,
-        )
+    Column(modifier.fillMaxSize()) {
+        if (state.results.isNotEmpty()) {
+            ResultsHeader(
+                state = state,
+                density = density,
+                onDensityChange = onDensityChange,
+                onModifySearch = onModifySearch,
+            )
+        }
+        Box(Modifier.weight(1f).fillMaxWidth()) {
+            when {
+                state.results.isNotEmpty() -> ResultsGrid(
+                    state = state,
+                    gridState = gridState,
+                    thumbnailUrl = thumbnailUrl,
+                    density = density,
+                    onOpen = onOpen,
+                    onLoadMore = onLoadMore,
+                    onRetryPage = onRetryPage,
+                    modifier = Modifier.fillMaxSize(),
+                )
+                state.searchPhase == SearchPhase.SEARCHING || state.isSearching -> SearchLoadingState(
+                    status = state.searchStatus,
+                    modifier = Modifier.fillMaxSize(),
+                )
+                state.searchPhase == SearchPhase.ERROR -> SearchMessageState(
+                    title = "搜索失败",
+                    detail = state.searchError,
+                    primary = SearchResultAction("重试", onRetrySearch),
+                    secondary = SearchResultAction("修改搜索", onModifySearch),
+                    modifier = Modifier.fillMaxSize(),
+                )
+                state.searchPhase == SearchPhase.CANCELLED -> SearchMessageState(
+                    title = "已取消",
+                    detail = null,
+                    primary = SearchResultAction("修改搜索", onModifySearch),
+                    secondary = null,
+                    modifier = Modifier.fillMaxSize(),
+                )
+                state.searchPhase == SearchPhase.LOADED -> SearchMessageState(
+                    title = "没有找到匹配图片",
+                    detail = null,
+                    primary = SearchResultAction("修改搜索", onModifySearch),
+                    secondary = null,
+                    modifier = Modifier.fillMaxSize(),
+                )
+                else -> SearchMessageState(
+                    title = "搜索后在这里查看结果",
+                    detail = null,
+                    primary = null,
+                    secondary = null,
+                    modifier = Modifier.fillMaxSize(),
+                )
+            }
+        }
     }
 }
+
+/**
+ * Compact header row: query summary, loaded/total, the density entry and an icon button that returns
+ * to the search page. The complex choices stay in the small density menu.
+ */
+@Composable
+private fun ResultsHeader(
+    state: AppUiState,
+    density: GalleryDensity,
+    onDensityChange: (GalleryDensity) -> Unit,
+    onModifySearch: () -> Unit,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(start = 12.dp, end = 4.dp, top = 4.dp, bottom = 2.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(
+                searchSummary(state),
+                style = MaterialTheme.typography.titleSmall,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                loadedCountLabel(state),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        GalleryDensityEntry(density = density, onDensityChange = onDensityChange)
+        IconButton(onClick = onModifySearch, modifier = Modifier.size(48.dp)) {
+            Icon(Icons.Default.Edit, contentDescription = "修改搜索")
+        }
+    }
+}
+
+private data class SearchResultAction(val label: String, val onClick: () -> Unit)
 
 @Composable
 private fun SearchLoadingState(status: String?, modifier: Modifier) {
     Column(
-        modifier = modifier.fillMaxSize().padding(24.dp),
+        modifier = modifier.padding(24.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center,
     ) {
@@ -145,7 +316,7 @@ private fun SearchMessageState(
     modifier: Modifier,
 ) {
     Column(
-        modifier = modifier.fillMaxSize().padding(24.dp),
+        modifier = modifier.padding(24.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center,
     ) {
@@ -177,6 +348,7 @@ private fun ResultsGrid(
     state: AppUiState,
     gridState: LazyGridState,
     thumbnailUrl: (SearchItem) -> String,
+    density: GalleryDensity,
     onOpen: (Int) -> Unit,
     onLoadMore: () -> Unit,
     onRetryPage: () -> Unit,
@@ -199,18 +371,23 @@ private fun ResultsGrid(
             }
     }
     LazyVerticalGrid(
-        columns = GridCells.Fixed(2),
+        columns = GridCells.Adaptive(density.targetCellWidthDp.dp),
         state = gridState,
         modifier = modifier.testTag(SEARCH_RESULTS_GRID_TAG),
-        contentPadding = PaddingValues(8.dp),
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
-        verticalArrangement = Arrangement.spacedBy(6.dp),
+        contentPadding = PaddingValues(GALLERY_EDGE_PADDING_DP.dp),
+        horizontalArrangement = Arrangement.spacedBy(GALLERY_SPACING_DP.dp),
+        verticalArrangement = Arrangement.spacedBy(GALLERY_SPACING_DP.dp),
     ) {
         itemsIndexed(
             state.results,
             key = { index, item -> "${item.mediaId}:$index" },
         ) { index, item ->
-            ResultCard(item = item, url = thumbnailUrl(item), onClick = { onOpen(index) })
+            GalleryThumbnailCard(
+                name = item.name,
+                url = thumbnailUrl(item),
+                height = density.cellHeightDp.dp,
+                onClick = { onOpen(index) },
+            )
         }
         if (state.isLoadingNextPage) {
             item(span = { GridItemSpan(maxLineSpan) }) {
@@ -238,50 +415,5 @@ private fun NextPageError(message: String, onRetry: () -> Unit) {
         Text("下一页加载失败", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.error)
         Text(message, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.secondary)
         TextButton(onClick = onRetry, modifier = Modifier.testTag(NEXT_PAGE_RETRY_TAG)) { Text("重试") }
-    }
-}
-
-@Composable
-private fun ResultCard(item: SearchItem, url: String, onClick: () -> Unit) {
-    val context = LocalContext.current
-    var attempt by remember(url) { mutableIntStateOf(0) }
-    Card(
-        modifier = Modifier.fillMaxWidth().clickable(onClick = onClick),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-    ) {
-        SubcomposeAsyncImage(
-            model = ImageRequest.Builder(context)
-                .data(url)
-                .size(THUMBNAIL_DECODE_SIZE)
-                .crossfade(true)
-                .setParameter("thumbnailRetry", attempt)
-                .build(),
-            contentDescription = item.name,
-            contentScale = ContentScale.Crop,
-            modifier = Modifier.fillMaxWidth().height(190.dp).background(MaterialTheme.colorScheme.surfaceVariant),
-        ) {
-            when (painter.state) {
-                is AsyncImagePainter.State.Error -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Text("加载失败", style = MaterialTheme.typography.bodySmall)
-                        TextButton(onClick = { attempt += 1 }) { Text("重试") }
-                    }
-                }
-                is AsyncImagePainter.State.Loading -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    CircularProgressIndicator(Modifier.size(28.dp))
-                }
-                else -> SubcomposeAsyncImageContent()
-            }
-        }
-        Column(Modifier.padding(8.dp)) {
-            Text(item.name.ifBlank { "未命名图片" }, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            val detail = buildList {
-                item.score?.let { add(DecimalFormat("0.000").format(it)) }
-                item.libraryName?.let(::add)
-            }.joinToString(" · ")
-            if (detail.isNotBlank()) {
-                Text(detail, style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            }
-        }
     }
 }

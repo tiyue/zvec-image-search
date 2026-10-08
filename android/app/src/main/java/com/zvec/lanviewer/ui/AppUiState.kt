@@ -65,6 +65,8 @@ data class AppUiState(
     val selectedLibraryIds: Set<String> = emptySet(),
     val searchMode: SearchMode = SearchMode.TEXT,
     val searchText: String = "",
+    val submittedSearchText: String? = null,
+    val submittedSearchHasImage: Boolean = false,
     val topKText: String = "36",
     val queryImage: QueryImageUiState? = null,
     val isSearching: Boolean = false,

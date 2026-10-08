@@ -10,6 +10,7 @@
 - 第三轮独立图库与图片渲染优先级实施、分工与验收：`docs/optimization-round3-deepseek.md`
 - 安卓手机与平板 UI、图片交付及数据交互优化方案：`docs/android-optimization-plan.md`
 - 安卓 A 阶段图片交付、状态与原生验收：`docs/android-optimization-round-a.md`
+- 安卓 B 阶段自适应浏览、大图交互与原生验收：`docs/android-optimization-round-b.md`
 
 ## 发布矩阵
 

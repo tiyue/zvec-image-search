@@ -3,6 +3,7 @@ package com.zvec.lanviewer.ui
 import com.zvec.lanviewer.data.model.SearchItem
 import com.zvec.lanviewer.data.model.SearchMode
 import com.zvec.lanviewer.data.model.SearchPageResponse
+import com.zvec.lanviewer.ui.search.searchSummary
 import kotlinx.collections.immutable.persistentListOf
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -206,6 +207,28 @@ class SearchSessionStateTest {
             attachedQueryImageError(uploading = false, queryImageId = null, uploadError = null),
         )
         assertNull(attachedQueryImageError(uploading = false, queryImageId = "q1", uploadError = null))
+    }
+
+    @Test
+    fun completedQueryTitleDoesNotFollowDraftEdits() {
+        val submitted = AppUiState(searchText = "日落").beginSearchSession(1L)
+        val editingNextDraft = submitted.copy(searchText = "海边")
+        assertEquals("日落", searchSummary(editingNextDraft))
+    }
+
+    @Test
+    fun resubmittingCapturesTheNewSummarySnapshot() {
+        val first = AppUiState(searchText = "日落").beginSearchSession(1L)
+        assertEquals("日落", searchSummary(first))
+
+        val second = first.copy(searchText = "海边").beginSearchSession(2L)
+        assertEquals("海边", searchSummary(second))
+    }
+
+    @Test
+    fun submittedImageOnlyQuerySummarizesAsImageSearch() {
+        val imageOnly = AppUiState(submittedSearchText = "", submittedSearchHasImage = true)
+        assertEquals("以图搜索", searchSummary(imageOnly))
     }
 
     private fun invalidMessage(state: AppUiState): String? =

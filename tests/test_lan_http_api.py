@@ -1835,9 +1835,7 @@ class SearchSourceThumbnailHttpTests(unittest.TestCase):
 
         self.assertEqual(thumbnail.status, 200)
         self.assertEqual(thumbnail.headers["content-type"], "image/jpeg")
-        self.assertEqual(
-            thumbnail.headers["content-length"], str(len(thumbnail.body))
-        )
+        self.assertEqual(thumbnail.headers["content-length"], str(len(thumbnail.body)))
         self.assertTrue(thumbnail.body)
         self.assertEqual(head.status, 200)
         self.assertEqual(head.body, b"")

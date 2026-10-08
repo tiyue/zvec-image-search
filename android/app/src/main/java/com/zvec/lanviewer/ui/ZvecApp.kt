@@ -11,8 +11,8 @@ import android.net.Uri
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
@@ -26,12 +26,15 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.requiredSize
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
@@ -42,6 +45,8 @@ import androidx.compose.foundation.lazy.grid.LazyGridState
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.itemsIndexed
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -51,6 +56,8 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
@@ -64,11 +71,19 @@ import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.List
+import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Star
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -81,26 +96,33 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
-import coil.compose.SubcomposeAsyncImage
-import coil.compose.SubcomposeAsyncImageContent
 import coil.request.ImageRequest
+import coil.imageLoader
+import coil.memory.MemoryCache
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -114,7 +136,12 @@ import com.zvec.lanviewer.data.model.RecommendationItem
 import com.zvec.lanviewer.data.model.SearchItem
 import com.zvec.lanviewer.data.model.SearchMode
 import com.zvec.lanviewer.ui.search.QueryImageControl
+import com.zvec.lanviewer.ui.search.GalleryThumbnailCard
 import com.zvec.lanviewer.ui.search.SearchResultsPane
+import com.zvec.lanviewer.ui.search.thumbnailImageRequest
+import com.zvec.lanviewer.ui.viewer.clampViewerPan
+import com.zvec.lanviewer.ui.viewer.viewerImageLayout
+import com.zvec.lanviewer.ui.viewer.viewerPanLimits
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
 import java.text.DecimalFormat
@@ -223,6 +250,11 @@ fun ZvecApp(viewModel: AppViewModel) {
             OriginalViewer(
                 state = state,
                 mediaUrl = viewModel::mediaUrl,
+                // The placeholder must be the exact URL the grid loaded: search items use the
+                // repository thumbnail, recommendations the URL the server already returned.
+                thumbnailUrl = { item ->
+                    if (item is RecommendationItem) item.thumbnailUrl else viewModel.thumbnailUrl(item)
+                },
                 onIndexChanged = viewModel::setViewerIndex,
                 onClose = viewModel::closeViewer,
                 onSave = {
@@ -474,6 +506,9 @@ internal fun SearchScreen(
     onOpenRecommendation: (Int) -> Unit,
     onDisconnect: () -> Unit,
 ) {
+    // Search results and recommendations share one local density choice; it never reaches the
+    // Windows service, the search request or the query image upload.
+    val densityPreference = rememberGalleryDensity()
     Column(modifier.fillMaxSize().statusBarsPadding()) {
         Box(Modifier.weight(1f).fillMaxWidth()) {
             when (selectedTab) {
@@ -494,6 +529,8 @@ internal fun SearchScreen(
                     state = state,
                     gridState = searchGridState,
                     thumbnailUrl = thumbnailUrl,
+                    density = densityPreference.density,
+                    onDensityChange = densityPreference::select,
                     onOpen = onOpen,
                     onLoadMore = onLoadMore,
                     onRetryPage = onRetryPage,
@@ -507,6 +544,8 @@ internal fun SearchScreen(
                     onVisible = onRecommendationsVisible,
                     onOpen = onOpenRecommendation,
                     gridState = recommendationGridState,
+                    density = densityPreference.density,
+                    onDensityChange = densityPreference::select,
                 )
                 MobileTab.DEVICE -> DevicePanel(state = state, onDisconnect = onDisconnect)
             }
@@ -527,15 +566,15 @@ internal fun SearchScreen(
 private fun MobileBottomBar(selected: MobileTab, onSelected: (MobileTab) -> Unit) {
     NavigationBar(modifier = Modifier.fillMaxWidth().navigationBarsPadding()) {
         listOf(
-            Triple(MobileTab.SEARCH, "⌕", "搜索"),
-            Triple(MobileTab.RESULTS, "▧", "结果"),
-            Triple(MobileTab.RECOMMENDATIONS, "✦", "推荐"),
-            Triple(MobileTab.DEVICE, "▣", "设备"),
-        ).forEach { (tab, glyph, label) ->
+            Triple(MobileTab.SEARCH, Icons.Default.Search, "搜索"),
+            Triple(MobileTab.RESULTS, Icons.AutoMirrored.Filled.List, "结果"),
+            Triple(MobileTab.RECOMMENDATIONS, Icons.Default.Star, "推荐"),
+            Triple(MobileTab.DEVICE, Icons.Default.Settings, "设备"),
+        ).forEach { (tab, icon, label) ->
             NavigationBarItem(
                 selected = selected == tab,
                 onClick = { onSelected(tab) },
-                icon = { Text(glyph, fontSize = 18.sp) },
+                icon = { Icon(icon, contentDescription = null) },
                 label = { Text(label) },
                 alwaysShowLabel = true,
             )
@@ -550,6 +589,8 @@ internal fun RecommendationPanel(
     onVisible: (Boolean) -> Unit,
     onOpen: (Int) -> Unit,
     gridState: LazyGridState,
+    density: GalleryDensity = GalleryDensity.STANDARD,
+    onDensityChange: (GalleryDensity) -> Unit = {},
 ) {
     val recommendations = state.recommendations
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -571,11 +612,11 @@ internal fun RecommendationPanel(
     }
     Column(Modifier.fillMaxSize()) {
         Row(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+            modifier = Modifier.fillMaxWidth().padding(start = 12.dp, end = 4.dp, top = 4.dp, bottom = 2.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Column(Modifier.weight(1f)) {
-                Text("推荐", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
+                Text("推荐", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
                 if (recommendations.partial) {
                     Text(
                         recommendations.partialReason ?: "可用图片不足，已展示当前结果",
@@ -584,6 +625,7 @@ internal fun RecommendationPanel(
                     )
                 }
             }
+            GalleryDensityEntry(density = density, onDensityChange = onDensityChange)
             TextButton(onClick = onLoad, enabled = !recommendations.isLoading) {
                 Text(if (recommendations.isLoading) "加载中" else "换一批")
             }
@@ -591,18 +633,19 @@ internal fun RecommendationPanel(
         recommendations.errorMessage?.let { ErrorBanner(it) }
         when {
             recommendations.items.isNotEmpty() -> LazyVerticalGrid(
-                columns = GridCells.Fixed(2),
+                columns = GridCells.Adaptive(density.targetCellWidthDp.dp),
                 state = gridState,
                 modifier = Modifier.fillMaxSize().testTag(RECOMMENDATION_GRID_TAG),
-                contentPadding = PaddingValues(8.dp),
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
-                verticalArrangement = Arrangement.spacedBy(6.dp),
+                contentPadding = PaddingValues(GALLERY_EDGE_PADDING_DP.dp),
+                horizontalArrangement = Arrangement.spacedBy(GALLERY_SPACING_DP.dp),
+                verticalArrangement = Arrangement.spacedBy(GALLERY_SPACING_DP.dp),
             ) {
                 itemsIndexed(recommendations.items, key = { _, item -> item.itemId }) { index, item ->
-                    RecommendationCard(
-                        item = item,
+                    GalleryThumbnailCard(
+                        name = item.name,
                         url = item.thumbnailUrl,
-                        onOpen = { onOpen(index) },
+                        height = density.cellHeightDp.dp,
+                        onClick = { onOpen(index) },
                     )
                 }
             }
@@ -612,36 +655,6 @@ internal fun RecommendationPanel(
             else -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 Text("暂时没有可推荐的图片", color = MaterialTheme.colorScheme.secondary)
             }
-        }
-    }
-}
-
-@Composable
-internal fun RecommendationCard(
-    item: RecommendationItem,
-    url: String,
-    onOpen: () -> Unit,
-) {
-    val context = LocalContext.current
-    Card(
-        modifier = Modifier.fillMaxWidth().clickable(onClick = onOpen),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-    ) {
-        AsyncImage(
-            model = ImageRequest.Builder(context).data(url).size(640).crossfade(true).build(),
-            contentDescription = item.name,
-            contentScale = ContentScale.Crop,
-            modifier = Modifier.fillMaxWidth().height(190.dp).background(MaterialTheme.colorScheme.surfaceVariant),
-        )
-        Column(Modifier.padding(8.dp)) {
-            Text(item.name.ifBlank { "未命名图片" }, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            Text(
-                item.libraryName.ifBlank { item.bucket },
-                style = MaterialTheme.typography.bodySmall,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                color = MaterialTheme.colorScheme.secondary,
-            )
         }
     }
 }
@@ -714,19 +727,31 @@ private fun SearchControls(
     onCancelSearch: () -> Unit,
 ) {
     var optionsOpen by remember { mutableStateOf(false) }
+    val focusManager = LocalFocusManager.current
     val canSearch = when (state.searchMode) {
         SearchMode.TAG -> state.searchText.isNotBlank()
         else -> if (state.queryImage == null) state.searchText.isNotBlank()
             else !state.queryImage.uploading && state.queryImage.queryImageId != null
     }
 
+    fun submitSearch() {
+        // Collapse the keyboard before the search runs so the first results stay visible.
+        focusManager.clearFocus()
+        onSearch()
+    }
+
     if (optionsOpen) {
         ModalBottomSheet(onDismissRequest = { optionsOpen = false }) {
             Column(
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp).navigationBarsPadding(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .imePadding()
+                    .padding(horizontal = 20.dp)
+                    .navigationBarsPadding()
+                    .verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(14.dp),
             ) {
-                Text("搜索设置", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
+                Text("搜索设置", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
                 OutlinedTextField(
                     value = state.topKText,
                     onValueChange = onTopK,
@@ -749,96 +774,121 @@ private fun SearchControls(
         }
     }
 
-    Column(
-        modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp),
-        verticalArrangement = Arrangement.Center,
-        horizontalAlignment = Alignment.CenterHorizontally,
+    // The search page scrolls and follows the IME so the input row, the query image preview and the
+    // settings entry all stay reachable on short, landscape or large-font layouts.
+    Box(
+        modifier = Modifier.fillMaxSize().imePadding(),
+        contentAlignment = Alignment.Center,
     ) {
-        Text("你想找什么？", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Medium)
-        Spacer(Modifier.height(6.dp))
-        Text("搜索电脑上的本地图库", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.secondary)
-        Spacer(Modifier.height(22.dp))
-
-        Surface(
-            modifier = Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(28.dp),
-            color = MaterialTheme.colorScheme.surface,
-            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
-            shadowElevation = 2.dp,
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalArrangement = Arrangement.Center,
+            horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            Row(
-                modifier = Modifier.fillMaxWidth().height(56.dp).padding(horizontal = 7.dp),
-                verticalAlignment = Alignment.CenterVertically,
+            Text("你想找什么？", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Medium)
+            Spacer(Modifier.height(6.dp))
+            Text("搜索电脑上的本地图库", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.secondary)
+            Spacer(Modifier.height(22.dp))
+
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(28.dp),
+                color = MaterialTheme.colorScheme.surface,
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                shadowElevation = 2.dp,
             ) {
-                if (state.searchMode != SearchMode.TAG) {
-                    TextButton(onClick = onPickImage, modifier = Modifier.size(42.dp), contentPadding = PaddingValues(0.dp)) {
-                        Text("＋", fontSize = 22.sp, color = MaterialTheme.colorScheme.secondary)
+                Row(
+                    modifier = Modifier.fillMaxWidth().height(56.dp).padding(horizontal = 7.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    if (state.searchMode != SearchMode.TAG) {
+                        TextButton(
+                            onClick = onPickImage,
+                            modifier = Modifier.size(48.dp).semantics { contentDescription = "添加图片" },
+                            contentPadding = PaddingValues(0.dp),
+                        ) {
+                            Text("＋", fontSize = 22.sp, color = MaterialTheme.colorScheme.secondary)
+                        }
+                    }
+                    BasicTextField(
+                        value = state.searchText,
+                        onValueChange = onText,
+                        modifier = Modifier
+                            .weight(1f)
+                            .padding(horizontal = 6.dp)
+                            .semantics { contentDescription = "搜索文字输入框" },
+                        singleLine = true,
+                        textStyle = MaterialTheme.typography.bodyLarge.copy(color = MaterialTheme.colorScheme.onSurface),
+                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                        keyboardActions = KeyboardActions(onSearch = { if (canSearch) submitSearch() }),
+                        decorationBox = { field ->
+                            if (state.searchText.isBlank()) {
+                                Text(
+                                    if (state.searchMode == SearchMode.TAG) "输入标签" else "描述人物、场景或动作",
+                                    color = MaterialTheme.colorScheme.secondary,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
+                            field()
+                        },
+                    )
+                    TextButton(onClick = { onMode(if (state.searchMode == SearchMode.TAG) SearchMode.TEXT else SearchMode.TAG) }) {
+                        Text(if (state.searchMode == SearchMode.TAG) "标签" else "语义", color = MaterialTheme.colorScheme.secondary)
+                    }
+                    Button(
+                        onClick = { if (state.isSearching) onCancelSearch() else submitSearch() },
+                        enabled = if (state.isSearching) true else canSearch,
+                        modifier = Modifier
+                            .size(48.dp)
+                            .semantics { contentDescription = if (state.isSearching) "取消搜索" else "搜索" },
+                        contentPadding = PaddingValues(0.dp),
+                        shape = RoundedCornerShape(50),
+                    ) {
+                        Text(if (state.isSearching) "×" else "↑", fontSize = 20.sp)
                     }
                 }
-                BasicTextField(
-                    value = state.searchText,
-                    onValueChange = onText,
-                    modifier = Modifier.weight(1f).padding(horizontal = 6.dp),
-                    singleLine = true,
-                    textStyle = MaterialTheme.typography.bodyLarge.copy(color = MaterialTheme.colorScheme.onSurface),
-                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
-                    keyboardActions = KeyboardActions(onSearch = { if (canSearch) onSearch() }),
-                    decorationBox = { field ->
-                        if (state.searchText.isBlank()) {
-                            Text(
-                                if (state.searchMode == SearchMode.TAG) "输入标签" else "描述人物、场景或动作",
-                                color = MaterialTheme.colorScheme.secondary,
-                                style = MaterialTheme.typography.bodyMedium,
-                            )
-                        }
-                        field()
-                    },
-                )
-                TextButton(onClick = { onMode(if (state.searchMode == SearchMode.TAG) SearchMode.TEXT else SearchMode.TAG) }) {
-                    Text(if (state.searchMode == SearchMode.TAG) "标签" else "语义", color = MaterialTheme.colorScheme.secondary)
-                }
-                Button(
-                    onClick = if (state.isSearching) onCancelSearch else onSearch,
-                    enabled = if (state.isSearching) true else canSearch,
-                    modifier = Modifier.size(42.dp),
-                    contentPadding = PaddingValues(0.dp),
-                    shape = RoundedCornerShape(50),
-                ) {
-                    Text(if (state.isSearching) "×" else "↑", fontSize = 20.sp)
-                }
             }
-        }
 
-        if (state.queryImage != null && state.searchMode != SearchMode.TAG) {
-            Spacer(Modifier.height(10.dp))
-            QueryImageControl(
-                query = state.queryImage,
-                onPickImage = onPickImage,
-                onCancelUpload = onCancelUpload,
-                onRetryUpload = onRetryUpload,
-                onClearImage = onClearImage,
-            )
-        }
+            if (state.queryImage != null && state.searchMode != SearchMode.TAG) {
+                Spacer(Modifier.height(10.dp))
+                QueryImageControl(
+                    query = state.queryImage,
+                    onPickImage = onPickImage,
+                    onCancelUpload = onCancelUpload,
+                    onRetryUpload = onRetryUpload,
+                    onClearImage = onClearImage,
+                )
+            }
 
-        Spacer(Modifier.height(12.dp))
-        TextButton(onClick = { optionsOpen = true }) { Text("☷  搜索设置", color = MaterialTheme.colorScheme.secondary) }
-        state.searchStatus?.let {
-            Spacer(Modifier.height(6.dp))
-            Text(it, style = MaterialTheme.typography.bodySmall)
-        }
-        state.searchRestoreNotice?.let {
-            Spacer(Modifier.height(6.dp))
-            Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.secondary)
-        }
-        if (state.searchPhase == SearchPhase.ERROR) {
-            state.searchError?.let { ErrorBanner(it) }
-            TextButton(onClick = onSearch, enabled = canSearch) { Text("重试") }
-        } else if (state.searchPhase == SearchPhase.CANCELLED) {
-            Text("已取消", style = MaterialTheme.typography.bodySmall)
-        }
-        state.errorMessage?.let {
-            Spacer(Modifier.height(8.dp))
-            ErrorBanner(it)
+            Spacer(Modifier.height(12.dp))
+            TextButton(onClick = { optionsOpen = true }) {
+                Icon(Icons.Default.Settings, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(6.dp))
+                Text("搜索设置", color = MaterialTheme.colorScheme.secondary)
+            }
+            state.searchStatus?.let {
+                Spacer(Modifier.height(6.dp))
+                Text(it, style = MaterialTheme.typography.bodySmall)
+            }
+            state.searchRestoreNotice?.let {
+                Spacer(Modifier.height(6.dp))
+                Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.secondary)
+            }
+            if (state.searchPhase == SearchPhase.ERROR) {
+                state.searchError?.let { ErrorBanner(it) }
+                TextButton(onClick = { submitSearch() }, enabled = canSearch) { Text("重试") }
+            } else if (state.searchPhase == SearchPhase.CANCELLED) {
+                Text("已取消", style = MaterialTheme.typography.bodySmall)
+            }
+            state.errorMessage?.let {
+                Spacer(Modifier.height(8.dp))
+                ErrorBanner(it)
+            }
         }
     }
 }
@@ -856,6 +906,7 @@ private fun LibraryChip(library: LibraryDto, selected: Boolean, onClick: () -> U
 internal fun OriginalViewer(
     state: AppUiState,
     mediaUrl: (OriginalMediaItem) -> String,
+    thumbnailUrl: (OriginalMediaItem) -> String = mediaUrl,
     onIndexChanged: (Int) -> Unit,
     onClose: () -> Unit,
     onSave: () -> Unit,
@@ -869,7 +920,9 @@ internal fun OriginalViewer(
     val pagerState = rememberPagerState(initialPage = initial, pageCount = { viewerItems.size })
     var sheetItem by remember { mutableStateOf<OriginalMediaItem?>(null) }
     var showInfo by remember { mutableStateOf(false) }
+    var chromeVisible by remember { mutableStateOf(true) }
     val rotations = remember { mutableStateMapOf<Int, Float>() }
+    val transferBusy = state.transferAttempt != null
 
     LaunchedEffect(pagerState) {
         snapshotFlow { pagerState.currentPage }.distinctUntilChanged().collect { page ->
@@ -879,52 +932,44 @@ internal fun OriginalViewer(
         }
     }
 
-    Surface(color = androidx.compose.ui.graphics.Color.Black, modifier = Modifier.fillMaxSize()) {
+    Surface(color = Color.Black, modifier = Modifier.fillMaxSize()) {
         Box(Modifier.fillMaxSize()) {
             HorizontalPager(state = pagerState, modifier = Modifier.fillMaxSize()) { page ->
                 val item = viewerItems[page]
-                Box(
-                    Modifier.fillMaxSize(),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    ZoomableOriginalImage(
-                        url = mediaUrl(item),
-                        contentDescription = item.name,
-                        rotation = rotations[page] ?: 0f,
-                        onLongPress = { sheetItem = item; showInfo = false },
-                    )
-                }
+                ViewerImage(
+                    originalUrl = mediaUrl(item),
+                    placeholderUrl = thumbnailUrl(item),
+                    contentDescription = item.name,
+                    rotation = rotations[page] ?: 0f,
+                    onSingleTap = { chromeVisible = !chromeVisible },
+                    onLongPress = { sheetItem = item; showInfo = false },
+                    onClose = onClose,
+                )
             }
 
-            AnimatedVisibility(
-                visible = state.transferMessage != null,
-                modifier = Modifier.align(Alignment.BottomCenter),
-            ) {
-                Column(
-                    Modifier.fillMaxWidth().background(androidx.compose.ui.graphics.Color.Black.copy(alpha = 0.75f)).padding(16.dp),
-                ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(
-                            state.transferMessage.orEmpty(),
-                            color = androidx.compose.ui.graphics.Color.White,
-                            modifier = Modifier.weight(1f),
-                        )
-                        TextButton(onClick = onCancelTransfer) {
-                            Text("取消", color = androidx.compose.ui.graphics.Color.White)
-                        }
-                    }
-                    Spacer(Modifier.height(6.dp))
-                    val fraction = state.transferFraction
-                    if (fraction == null) LinearProgressIndicator(
-                        modifier = Modifier.fillMaxWidth(),
-                        color = androidx.compose.ui.graphics.Color.White,
-                        trackColor = androidx.compose.ui.graphics.Color.White.copy(alpha = 0.24f),
+            if (chromeVisible) {
+                ViewerTopBar(
+                    position = "${pagerState.currentPage + 1} / ${viewerItems.size}",
+                    onBack = onClose,
+                    modifier = Modifier.align(Alignment.TopCenter),
+                )
+            }
+
+            Column(Modifier.align(Alignment.BottomCenter).fillMaxWidth()) {
+                // Progress sits above the toolbar, so the two never cover each other.
+                state.transferMessage?.let { message ->
+                    ViewerTransferPanel(
+                        message = message,
+                        fraction = state.transferFraction,
+                        onCancel = onCancelTransfer,
                     )
-                    else LinearProgressIndicator(
-                        progress = { fraction },
-                        modifier = Modifier.fillMaxWidth(),
-                        color = androidx.compose.ui.graphics.Color.White,
-                        trackColor = androidx.compose.ui.graphics.Color.White.copy(alpha = 0.24f),
+                }
+                if (chromeVisible) {
+                    ViewerBottomBar(
+                        transferBusy = transferBusy,
+                        onSave = { sheetItem = null; onSave() },
+                        onShare = { sheetItem = null; onShare() },
+                        onMore = { sheetItem = viewerItems.getOrNull(pagerState.currentPage) },
                     )
                 }
             }
@@ -934,20 +979,14 @@ internal fun OriginalViewer(
     sheetItem?.let { item ->
         ModalBottomSheet(onDismissRequest = { sheetItem = null }) {
             Column(
-                Modifier.fillMaxWidth().padding(horizontal = 20.dp).navigationBarsPadding(),
+                Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 20.dp)
+                    .navigationBarsPadding()
+                    .verticalScroll(rememberScrollState())
+                    .testTag(VIEWER_SHEET_TAG),
                 verticalArrangement = Arrangement.spacedBy(4.dp),
             ) {
-                val transferBusy = state.transferAttempt != null
-                TextButton(
-                    onClick = { sheetItem = null; onSave() },
-                    enabled = !transferBusy,
-                    modifier = Modifier.fillMaxWidth(),
-                ) { Text("保存", modifier = Modifier.fillMaxWidth(), style = MaterialTheme.typography.bodyLarge) }
-                TextButton(
-                    onClick = { sheetItem = null; onShare() },
-                    enabled = !transferBusy,
-                    modifier = Modifier.fillMaxWidth(),
-                ) { Text("分享", modifier = Modifier.fillMaxWidth(), style = MaterialTheme.typography.bodyLarge) }
                 (item as? RecommendationItem)?.let { recommendation ->
                     val reactionPending = recommendation.itemId in state.recommendations.pendingReactionItemIds
                     val reaction = state.recommendations.reactions[recommendation.itemId]
@@ -1014,69 +1053,273 @@ internal fun OriginalViewer(
     }
 }
 
-@Composable
-private fun ZoomableOriginalImage(url: String, contentDescription: String, rotation: Float = 0f, onLongPress: () -> Unit = {}) {
-    val context = LocalContext.current
-    var scale by remember(url) { mutableFloatStateOf(1f) }
-    var offset by remember(url) { mutableStateOf(Offset.Zero) }
-    var viewport by remember(url) { mutableStateOf(IntSize.Zero) }
+private enum class OriginalLoadState { LOADING, SUCCESS, ERROR }
 
-    fun clampOffset(candidate: Offset, currentScale: Float): Offset {
-        val maxX = viewport.width * (currentScale - 1f) / 2f
-        val maxY = viewport.height * (currentScale - 1f) / 2f
-        return Offset(candidate.x.coerceIn(-maxX, maxX), candidate.y.coerceIn(-maxY, maxY))
+private const val MAX_VIEWER_SCALE = 6f
+private const val DOUBLE_TAP_SCALE = 2.5f
+
+/** Top toolbar: back plus the current position inside the browsed list. */
+@Composable
+private fun ViewerTopBar(position: String, onBack: () -> Unit, modifier: Modifier = Modifier) {
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .background(Color.Black.copy(alpha = 0.55f))
+            .statusBarsPadding()
+            .padding(horizontal = 4.dp, vertical = 2.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        IconButton(onClick = onBack, modifier = Modifier.size(48.dp)) {
+            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回", tint = Color.White)
+        }
+        Text(
+            position,
+            modifier = Modifier.weight(1f),
+            color = Color.White,
+            style = MaterialTheme.typography.bodyMedium,
+            textAlign = TextAlign.Center,
+        )
+        Spacer(Modifier.width(48.dp))
+    }
+}
+
+/** Bottom toolbar: the discoverable entry points for the common viewer actions. */
+@Composable
+private fun ViewerBottomBar(
+    transferBusy: Boolean,
+    onSave: () -> Unit,
+    onShare: () -> Unit,
+    onMore: () -> Unit,
+) {
+    val labelColor = if (transferBusy) Color.White.copy(alpha = 0.38f) else Color.White
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(Color.Black.copy(alpha = 0.55f))
+            .navigationBarsPadding()
+            .padding(horizontal = 8.dp, vertical = 4.dp),
+        horizontalArrangement = Arrangement.SpaceEvenly,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        TextButton(
+            onClick = onSave,
+            enabled = !transferBusy,
+            modifier = Modifier.defaultMinSize(minWidth = 88.dp, minHeight = 48.dp),
+        ) { Text("保存", color = labelColor) }
+        TextButton(
+            onClick = onShare,
+            enabled = !transferBusy,
+            modifier = Modifier.defaultMinSize(minWidth = 88.dp, minHeight = 48.dp),
+        ) { Text("分享", color = labelColor) }
+        IconButton(onClick = onMore, modifier = Modifier.size(48.dp)) {
+            Icon(Icons.Default.MoreVert, contentDescription = "更多", tint = Color.White)
+        }
+    }
+}
+
+@Composable
+private fun ViewerTransferPanel(message: String, fraction: Float?, onCancel: () -> Unit) {
+    Column(
+        Modifier.fillMaxWidth().background(Color.Black.copy(alpha = 0.75f)).padding(16.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(message, color = Color.White, modifier = Modifier.weight(1f))
+            TextButton(onClick = onCancel) { Text("取消", color = Color.White) }
+        }
+        Spacer(Modifier.height(6.dp))
+        if (fraction == null) {
+            LinearProgressIndicator(
+                modifier = Modifier.fillMaxWidth(),
+                color = Color.White,
+                trackColor = Color.White.copy(alpha = 0.24f),
+            )
+        } else {
+            LinearProgressIndicator(
+                progress = { fraction },
+                modifier = Modifier.fillMaxWidth(),
+                color = Color.White,
+                trackColor = Color.White.copy(alpha = 0.24f),
+            )
+        }
+    }
+}
+
+/**
+ * One viewer page. The thumbnail the grid already loaded is reused as the progressive placeholder;
+ * originals load for composed pager pages without adding a separate prefetch job. Fit bounds come
+ * from the real intrinsic size and the Fit result, so rotation and zoom never compute pan against
+ * the whole viewport.
+ */
+@Composable
+private fun ViewerImage(
+    originalUrl: String,
+    placeholderUrl: String,
+    contentDescription: String,
+    rotation: Float,
+    onSingleTap: () -> Unit,
+    onLongPress: () -> Unit,
+    onClose: () -> Unit,
+) {
+    val context = LocalContext.current
+    val density = LocalDensity.current
+    var scale by remember(originalUrl) { mutableFloatStateOf(1f) }
+    var offset by remember(originalUrl) { mutableStateOf(Offset.Zero) }
+    var viewport by remember(originalUrl) { mutableStateOf(IntSize.Zero) }
+    var imageSize by remember(originalUrl) { mutableStateOf<IntSize?>(null) }
+    var attempt by remember(originalUrl) { mutableIntStateOf(0) }
+    var loadState by remember(originalUrl) { mutableStateOf(OriginalLoadState.LOADING) }
+    val cachedThumbnail = remember(placeholderUrl) {
+        context.imageLoader.memoryCache?.get(MemoryCache.Key(placeholderUrl))?.bitmap?.asImageBitmap()
     }
 
-    SubcomposeAsyncImage(
-        model = ImageRequest.Builder(context).data(url).crossfade(true).build(),
-        contentDescription = contentDescription,
-        contentScale = ContentScale.Fit,
+    val layout = remember(viewport, imageSize, rotation) {
+        val size = imageSize
+        if (size == null) {
+            null
+        } else {
+            viewerImageLayout(viewport.width, viewport.height, size.width, size.height, rotation)
+        }
+    }
+
+    fun limitsFor(currentScale: Float) = viewerPanLimits(
+        viewportWidth = viewport.width,
+        viewportHeight = viewport.height,
+        imageWidth = imageSize?.width ?: 0,
+        imageHeight = imageSize?.height ?: 0,
+        rotationDegrees = rotation,
+        scale = currentScale,
+    )
+
+    fun clamped(candidate: Offset, currentScale: Float): Offset {
+        if (currentScale <= 1f) return Offset.Zero
+        val limits = limitsFor(currentScale) ?: return Offset.Zero
+        return Offset(clampViewerPan(candidate.x, limits.maxX), clampViewerPan(candidate.y, limits.maxY))
+    }
+
+    // A rotation or a newly known size can invalidate the previous pan; recenter instead of keeping
+    // an offset that would push the picture outside the viewport at 1x.
+    LaunchedEffect(rotation, viewport, imageSize) {
+        offset = clamped(offset, scale)
+    }
+
+    Box(
         modifier = Modifier
             .fillMaxSize()
             .testTag(ORIGINAL_VIEWER_IMAGE_TAG)
             .onSizeChanged { viewport = it }
-            .graphicsLayer {
-                scaleX = scale
-                scaleY = scale
-                translationX = offset.x
-                translationY = offset.y
-                rotationZ = rotation
-            }
-            .pointerInput(url) {
+            .pointerInput(originalUrl, rotation) {
                 detectTapGestures(
+                    onTap = { onSingleTap() },
                     onDoubleTap = {
-                        scale = if (scale > 1f) 1f else 2.5f
-                        if (scale == 1f) offset = Offset.Zero
+                        if (imageSize?.let { it.width > 0 && it.height > 0 } == true) {
+                            scale = if (scale > 1f) 1f else DOUBLE_TAP_SCALE
+                            offset = clamped(offset, scale)
+                        }
                     },
                     onLongPress = { onLongPress() },
                 )
             }
-            .pointerInput(url) {
+            .pointerInput(originalUrl, rotation) {
                 awaitEachGesture {
                     awaitFirstDown(requireUnconsumed = false)
                     do {
                         val event = awaitPointerEvent()
                         val pressedCount = event.changes.count { it.pressed }
-                        if (pressedCount >= 2 || scale > 1f) {
-                            val newScale = (scale * event.calculateZoom()).coerceIn(1f, 6f)
-                            val newOffset = if (newScale == 1f) Offset.Zero
-                            else clampOffset(offset + event.calculatePan(), newScale)
+                        if (imageSize?.let { it.width > 0 && it.height > 0 } == true &&
+                            (pressedCount >= 2 || scale > 1f)
+                        ) {
+                            val newScale = (scale * event.calculateZoom()).coerceIn(1f, MAX_VIEWER_SCALE)
+                            val moved = offset + event.calculatePan()
                             scale = newScale
-                            offset = newOffset
-                            event.changes.forEach { it.consume() }
+                            offset = clamped(moved, newScale)
+                            event.changes.forEach { change ->
+                                if (change.position != change.previousPosition) change.consume()
+                            }
                         }
                     } while (event.changes.any { it.pressed })
                 }
             },
+        contentAlignment = Alignment.Center,
     ) {
-        when (painter.state) {
-            is coil.compose.AsyncImagePainter.State.Loading -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                CircularProgressIndicator(color = androidx.compose.ui.graphics.Color.White)
+        Box(
+            modifier = Modifier
+                .then(
+                    if (layout != null) {
+                        with(density) {
+                            // requiredSize keeps the unrotated canvas at its true extent even when a
+                            // quarter turn makes it wider than the viewport; the rotation layer then
+                            // fits the picture instead of the parent clamping the canvas.
+                            Modifier.requiredSize(layout.contentWidth.toDp(), layout.contentHeight.toDp())
+                        }
+                    } else {
+                        Modifier.fillMaxSize()
+                    },
+                )
+                .graphicsLayer {
+                    scaleX = scale
+                    scaleY = scale
+                    translationX = offset.x
+                    translationY = offset.y
+                    rotationZ = rotation
+                },
+            contentAlignment = Alignment.Center,
+        ) {
+            if (loadState != OriginalLoadState.SUCCESS) {
+                // Same URL and identical request builder as the grid, so Coil's stable memory cache
+                // key matches and the placeholder really reuses the already loaded thumbnail.
+                if (cachedThumbnail != null) {
+                    Image(
+                        bitmap = cachedThumbnail,
+                        contentDescription = null,
+                        contentScale = ContentScale.Fit,
+                        modifier = Modifier.fillMaxSize(),
+                    )
+                } else {
+                    AsyncImage(
+                        model = thumbnailImageRequest(context, placeholderUrl),
+                        contentDescription = null,
+                        contentScale = ContentScale.Fit,
+                        modifier = Modifier.fillMaxSize(),
+                    )
+                }
             }
-            is coil.compose.AsyncImagePainter.State.Error -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                Text("无法显示此原图，可尝试保存后用其他应用打开", color = androidx.compose.ui.graphics.Color.White)
+            AsyncImage(
+                model = ImageRequest.Builder(context)
+                    .data(originalUrl)
+                    .crossfade(true)
+                    .setParameter("originalRetry", attempt)
+                    .build(),
+                contentDescription = contentDescription,
+                contentScale = ContentScale.Fit,
+                modifier = Modifier.fillMaxSize(),
+                onLoading = { loadState = OriginalLoadState.LOADING },
+                onSuccess = { success ->
+                    val drawable = success.result.drawable
+                    imageSize = IntSize(drawable.intrinsicWidth, drawable.intrinsicHeight)
+                    loadState = OriginalLoadState.SUCCESS
+                },
+                onError = { loadState = OriginalLoadState.ERROR },
+            )
+        }
+
+        when (loadState) {
+            OriginalLoadState.LOADING -> CircularProgressIndicator(color = Color.White)
+            OriginalLoadState.ERROR -> Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Text("无法显示此原图", color = Color.White)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    TextButton(
+                        onClick = {
+                            attempt += 1
+                            loadState = OriginalLoadState.LOADING
+                        },
+                    ) { Text("重试", color = Color.White) }
+                    TextButton(onClick = onClose) { Text("退出", color = Color.White) }
+                }
             }
-            else -> SubcomposeAsyncImageContent()
+            OriginalLoadState.SUCCESS -> Unit
         }
     }
 }
@@ -1215,3 +1458,4 @@ private val PendingSaveTargetSaver: Saver<PendingSaveTarget?, Any> = Saver(
 internal const val ORIGINAL_VIEWER_IMAGE_TAG = "original-viewer-image"
 internal const val RECOMMENDATION_GRID_TAG = "recommendation-grid"
 internal const val APP_SNACKBAR_HOST_TAG = "app-snackbar-host"
+internal const val VIEWER_SHEET_TAG = "viewer-sheet"

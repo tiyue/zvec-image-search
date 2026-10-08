@@ -503,9 +503,7 @@ class PreviewLanAdapterTests(unittest.TestCase):
         self.assertIsNone(
             self.adapter.resolve_thumbnail(media_id, client_id="tablet-a")
         )
-        self.assertIsNone(
-            self.adapter.resolve_original(media_id, client_id="tablet-a")
-        )
+        self.assertIsNone(self.adapter.resolve_original(media_id, client_id="tablet-a"))
 
     def test_source_change_mints_new_capability_and_invalidates_old_etag(self) -> None:
         search_id = self.adapter.create_search(self._request(), client_id="tablet-a")
