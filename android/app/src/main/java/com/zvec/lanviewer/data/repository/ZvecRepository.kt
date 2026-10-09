@@ -6,8 +6,10 @@ import android.net.Uri
 import androidx.core.content.FileProvider
 import com.zvec.lanviewer.data.discovery.UdpDiscoveryService
 import com.zvec.lanviewer.data.local.ConnectionStore
+import com.zvec.lanviewer.data.local.ConnectionMode
 import com.zvec.lanviewer.data.local.InstallationStore
 import com.zvec.lanviewer.data.local.SavedConnection
+import com.zvec.lanviewer.data.local.ServerAddress
 import com.zvec.lanviewer.data.model.DiscoveredServer
 import com.zvec.lanviewer.data.model.DownloadProgress
 import com.zvec.lanviewer.data.model.LibrariesResponse
@@ -68,6 +70,70 @@ class ZvecRepository(
         // Discovery identity is untrusted and can be spoofed. A token survives only an exact-origin update.
         if (!canRetainBearer(previous, connection)) tokenStore.clear()
         connectionStore.write(connection)
+    }
+
+    /**
+     * Registers the endpoints the desktop authenticated for this device. The aliases are trusted
+     * only because this runs after a Bearer-authenticated `/status` on the current origin and the
+     * instance id matches the already-saved one (an initial null id is allowed to bind the
+     * authenticated id). A mismatched id never overwrites the saved profile, and when the status
+     * advertises endpoints that do not cover the current authenticated origin the previous profile,
+     * aliases, mode and token are all preserved.
+     */
+    fun registerAuthenticatedEndpoints(status: StatusResponse) {
+        val saved = connectionStore.read() ?: return
+        val existingId = saved.instanceId
+        if (existingId != null && existingId != status.instanceId) return
+        val advertised = status.connectionEndpoints
+        val advertisedLan = advertised?.lan?.let(ServerAddress::parseOrigin)
+        val advertisedRemote = advertised?.remote?.let(ServerAddress::parseOrigin)
+        val current = ServerAddress.parseOrigin(saved.baseUrl)
+        if (advertised != null) {
+            // A status is only this profile's if it advertises the origin this device is currently
+            // authenticated on, or an alias the device already authenticated earlier. A mismatched
+            // endpoint list must not move the aliases, mode or token to another address.
+            val trusted = listOfNotNull(
+                advertisedLan,
+                advertisedRemote,
+                saved.lanBaseUrl?.let(ServerAddress::parseOrigin),
+                saved.remoteBaseUrl?.let(ServerAddress::parseOrigin),
+            ).toSet()
+            if (current == null || current !in trusted) return
+        }
+        val effectiveLan = advertisedLan ?: saved.lanBaseUrl
+        val effectiveRemote = advertisedRemote ?: saved.remoteBaseUrl
+        val mode = when {
+            current != null && current == effectiveRemote -> ConnectionMode.REMOTE
+            current != null && current == effectiveLan -> ConnectionMode.LAN
+            // No advertised alias matches this origin (for example a manually chosen or
+            // VPN/private remote entry): keep the user's explicit mode instead of reclassifying.
+            else -> saved.mode
+        }
+        val updated = saved.copy(
+            instanceId = saved.instanceId ?: status.instanceId,
+            displayName = status.name,
+            mode = mode,
+            lanBaseUrl = effectiveLan,
+            remoteBaseUrl = effectiveRemote,
+            supportsRemoteMedia = status.mediaProfiles.contains(REMOTE_MEDIA_PROFILE),
+        )
+        if (!canRetainBearer(saved, updated)) tokenStore.clear()
+        connectionStore.write(updated)
+    }
+
+    /**
+     * Moves the active origin to an endpoint this profile already authenticated, keeping the aliases
+     * and the bearer token. Returns null when the requested mode has no registered endpoint or when
+     * the destination is not part of the trusted profile, so the caller never reuses a token for an
+     * arbitrary address.
+     */
+    fun switchRegisteredEndpoint(mode: ConnectionMode): SavedConnection? {
+        val saved = connectionStore.read() ?: return null
+        val target = saved.endpointFor(mode)?.takeIf { it.isNotBlank() } ?: return null
+        val next = saved.copy(baseUrl = target, mode = mode)
+        if (!canRetainBearer(saved, next)) return null
+        connectionStore.write(next)
+        return next
     }
 
     suspend fun beginPairing(baseUrl: String): PairingAttempt {
@@ -137,6 +203,8 @@ class ZvecRepository(
 
     fun thumbnailUrl(mediaId: String): String = api.thumbnailUrl(mediaId)
 
+    fun previewUrl(mediaId: String): String = api.previewUrl(mediaId)
+
     suspend fun cacheOriginal(
         item: OriginalMediaItem,
         onProgress: (DownloadProgress) -> Unit = {},
@@ -170,6 +238,10 @@ class ZvecRepository(
         tokenStore.clear()
         connectionStore.clear()
     }
+
+    companion object {
+        const val REMOTE_MEDIA_PROFILE = "remote-v1"
+    }
 }
 
 internal fun applyPairingPollResponse(
@@ -188,5 +260,25 @@ internal fun applyPairingPollResponse(
     else -> throw IOException("未知配对状态")
 }
 
-internal fun canRetainBearer(previous: SavedConnection?, next: SavedConnection): Boolean =
-    previous?.baseUrl == next.baseUrl
+internal fun classifyOriginMode(origin: String): ConnectionMode {
+    val host = origin.substringAfter("://", origin).substringBefore('/').substringBefore(':')
+    return if (ServerAddress.isValidIpv4(host) && !ServerAddress.isPrivateIpv4(host)) {
+        ConnectionMode.REMOTE
+    } else {
+        ConnectionMode.LAN
+    }
+}
+
+/**
+ * A bearer survives an exact-origin profile update (metadata/alias refresh) or a move to an
+ * endpoint the *previous authenticated profile* already registered under the same instance id.
+ * The next profile's own aliases are never consulted, so a forged or spoofed profile cannot move
+ * the token to a new origin.
+ */
+internal fun canRetainBearer(previous: SavedConnection?, next: SavedConnection): Boolean {
+    if (previous == null) return false
+    if (previous.baseUrl == next.baseUrl) return true
+    val instanceId = previous.instanceId
+    if (instanceId.isNullOrBlank() || next.instanceId != instanceId) return false
+    return next.baseUrl == previous.lanBaseUrl || next.baseUrl == previous.remoteBaseUrl
+}

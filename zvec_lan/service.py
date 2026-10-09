@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -50,6 +51,7 @@ class LanGatewayServer:
         search_backend: LanSearchBackend,
         media_resolver: MediaResolver,
         recommendation_backend: RecommendationBackend | None = None,
+        endpoint_provider: Callable[[], Mapping[str, object]] | None = None,
         credential_store: CredentialStore | None = None,
         upload_directory: str | Path | None = None,
         upload_min_free_bytes: int = DEFAULT_MIN_FREE_BYTES,
@@ -78,6 +80,7 @@ class LanGatewayServer:
             search_backend=search_backend,
             media_resolver=media_resolver,
             recommendation_backend=recommendation_backend,
+            endpoint_provider=endpoint_provider,
             pairing_manager=self._pairing,
             query_images=self._query_images,
             host=bind_host,

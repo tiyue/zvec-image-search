@@ -1095,6 +1095,28 @@ def _handler_type(gateway: GatewayServer) -> type[BaseHTTPRequestHandler]:
             if method == "DELETE" and segments == ("lan-access", "device"):
                 self._json(HTTPStatus.OK, gateway._facade.revoke_lan_device())
                 return
+            if method == "GET" and segments == ("remote-access",):
+                _reject_unknown_query(query_values, set())
+                self._json(HTTPStatus.OK, gateway._facade.remote_access_status())
+                return
+            if method == "POST" and segments == ("remote-access", "import"):
+                self._json(
+                    HTTPStatus.OK,
+                    gateway._facade.import_remote_access_config(self._read_json()),
+                )
+                return
+            if method == "PUT" and segments == ("remote-access",):
+                self._json(
+                    HTTPStatus.OK,
+                    gateway._facade.update_remote_access(self._read_json()),
+                )
+                return
+            if method == "POST" and segments == ("remote-access", "start"):
+                self._json(HTTPStatus.OK, gateway._facade.start_remote_access())
+                return
+            if method == "POST" and segments == ("remote-access", "stop"):
+                self._json(HTTPStatus.OK, gateway._facade.stop_remote_access())
+                return
             if method == "PUT" and segments == ("models",):
                 body = self._read_json()
                 if "json_text" in body:

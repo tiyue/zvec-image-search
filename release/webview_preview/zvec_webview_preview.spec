@@ -8,6 +8,7 @@ RELEASE_DIR = ROOT / "release" / "webview_preview"
 ICON = ROOT / "assets" / "Zvec.AppIcon.ico"
 VERSION_INFO = RELEASE_DIR / "yaolens_version_info.txt"
 WEB_ASSETS = ROOT / "zvec_webview" / "frontend_dist"
+FRP_DIR = ROOT / "third_party" / "frp" / "windows-amd64"
 
 # All executables intentionally share one Analysis/PYZ/COLLECT dependency graph.
 analysis = Analysis(
@@ -18,6 +19,9 @@ analysis = Analysis(
         (str(ROOT / "model-catalog.default.json"), "."),
         (str(ICON), "assets"),
         (str(WEB_ASSETS), "zvec_webview/frontend_dist"),
+        (str(FRP_DIR / "frpc.exe"), "frp"),
+        (str(FRP_DIR / "LICENSE"), "frp"),
+        (str(FRP_DIR / "provenance.json"), "frp"),
     ],
     hiddenimports=[
         "image_service",
@@ -53,6 +57,9 @@ analysis = Analysis(
         "zvec_webview.lan_access",
         "zvec_webview.lan_settings",
         "zvec_webview.native_bridge",
+        "zvec_webview.remote_access",
+        "zvec_webview.remote_image",
+        "zvec_webview.remote_settings",
         "zvec_webview.resident_task",
         "zvec_webview.runtime",
         "zvec_webview.server",

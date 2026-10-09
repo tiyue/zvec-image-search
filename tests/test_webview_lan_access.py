@@ -19,8 +19,9 @@ from zvec_lan import (
     MemoryCredentialStore,
     SearchPending,
     SearchRequest,
+    ThumbnailPayload,
 )
-from zvec_webview.image_registry import ImageRegistry
+from zvec_webview.image_registry import ImageRegistry, ImageRegistryError
 from zvec_webview.lan_access import (
     LanAccessController,
     LanAccessError,
@@ -504,6 +505,126 @@ class PreviewLanAdapterTests(unittest.TestCase):
             self.adapter.resolve_thumbnail(media_id, client_id="tablet-a")
         )
         self.assertIsNone(self.adapter.resolve_original(media_id, client_id="tablet-a"))
+
+    def test_remote_variants_reuse_registry_and_share_capability_checks(self) -> None:
+        search_id = self.adapter.create_search(self._request(), client_id="tablet-a")
+        self.facade.complete(search_id, self.digest)
+        page = self.adapter.get_search_page(
+            search_id, page=1, page_size=15, client_id="tablet-a"
+        )
+        assert not isinstance(page, SearchPending)
+        media_id = page.items[0].media_id
+
+        thumbnail = self.adapter.resolve_thumbnail(media_id, client_id="tablet-a")
+        remote = self.adapter.resolve_remote_thumbnail(media_id, client_id="tablet-a")
+        preview = self.adapter.resolve_preview(media_id, client_id="tablet-a")
+
+        self.assertIsInstance(remote, ThumbnailPayload)
+        self.assertIsInstance(preview, ThumbnailPayload)
+        assert remote is not None and preview is not None and thumbnail is not None
+        allowed_types = {"image/jpeg", "image/png", "image/webp"}
+        self.assertIn(remote.content_type, allowed_types)
+        self.assertIn(preview.content_type, allowed_types)
+        with Image.open(io.BytesIO(remote.content)) as rendered:
+            self.assertLessEqual(max(rendered.size), 640)
+        with Image.open(io.BytesIO(preview.content)) as rendered:
+            self.assertLessEqual(max(rendered.size), 1600)
+        self.assertNotEqual(remote.etag, thumbnail.etag)
+
+        self.assertIsNone(
+            self.adapter.resolve_remote_thumbnail(media_id, client_id="tablet-b")
+        )
+        self.assertIsNone(
+            self.adapter.resolve_preview(media_id, client_id="tablet-b")
+        )
+        self.assertIsNone(
+            self.adapter.resolve_remote_thumbnail("unknown", client_id="tablet-a")
+        )
+        self.assertIsNone(
+            self.adapter.resolve_preview("unknown", client_id="tablet-a")
+        )
+
+        Image.new("RGB", (90, 130), (10, 20, 30)).save(self.source)
+
+        self.assertIsNone(
+            self.adapter.resolve_remote_thumbnail(media_id, client_id="tablet-a")
+        )
+        self.assertIsNone(self.adapter.resolve_preview(media_id, client_id="tablet-a"))
+
+    def test_remote_variants_expire_with_the_search(self) -> None:
+        search_id = self.adapter.create_search(self._request(), client_id="tablet-a")
+        self.facade.complete(search_id, self.digest)
+        page = self.adapter.get_search_page(
+            search_id, page=1, page_size=15, client_id="tablet-a"
+        )
+        assert not isinstance(page, SearchPending)
+        media_id = page.items[0].media_id
+        self.assertIsNotNone(
+            self.adapter.resolve_remote_thumbnail(media_id, client_id="tablet-a")
+        )
+
+        self.adapter.delete_search(search_id, client_id="tablet-a")
+
+        self.assertIsNone(
+            self.adapter.resolve_remote_thumbnail(media_id, client_id="tablet-a")
+        )
+        self.assertIsNone(self.adapter.resolve_preview(media_id, client_id="tablet-a"))
+
+    def test_remote_render_failure_is_an_explicit_backend_error(self) -> None:
+        search_id = self.adapter.create_search(self._request(), client_id="tablet-a")
+        self.facade.complete(search_id, self.digest)
+        page = self.adapter.get_search_page(
+            search_id, page=1, page_size=15, client_id="tablet-a"
+        )
+        assert not isinstance(page, SearchPending)
+        media_id = page.items[0].media_id
+
+        with (
+            patch.object(
+                self.registry,
+                "payload",
+                side_effect=ImageRegistryError("render failed"),
+            ),
+            self.assertRaises(LanBackendError) as caught,
+        ):
+            self.adapter.resolve_remote_thumbnail(media_id, client_id="tablet-a")
+        self.assertEqual(caught.exception.code, "remote_media_unavailable")
+        self.assertEqual(caught.exception.status, 503)
+
+        # The LAN thumbnail keeps its existing fail-closed ``None`` semantics.
+        with patch.object(
+            self.registry,
+            "payload",
+            side_effect=ImageRegistryError("render failed"),
+        ):
+            self.assertIsNone(
+                self.adapter.resolve_thumbnail(media_id, client_id="tablet-a")
+            )
+
+    def test_remote_variant_source_mutation_during_render_is_rejected(self) -> None:
+        search_id = self.adapter.create_search(self._request(), client_id="tablet-a")
+        self.facade.complete(search_id, self.digest)
+        page = self.adapter.get_search_page(
+            search_id, page=1, page_size=15, client_id="tablet-a"
+        )
+        assert not isinstance(page, SearchPending)
+        media_id = page.items[0].media_id
+        render = self.registry.payload
+
+        def render_then_mutate(image_id: str, variant: str):
+            payload = render(image_id, variant)
+            # The source changes after bytes were produced but before the
+            # adapter re-checks the file version.
+            Image.new("RGB", (90, 130), (5, 5, 5)).save(self.source)
+            return payload
+
+        with patch.object(self.registry, "payload", render_then_mutate):
+            self.assertIsNone(
+                self.adapter.resolve_remote_thumbnail(media_id, client_id="tablet-a")
+            )
+            self.assertIsNone(
+                self.adapter.resolve_preview(media_id, client_id="tablet-a")
+            )
 
     def test_source_change_mints_new_capability_and_invalidates_old_etag(self) -> None:
         search_id = self.adapter.create_search(self._request(), client_id="tablet-a")

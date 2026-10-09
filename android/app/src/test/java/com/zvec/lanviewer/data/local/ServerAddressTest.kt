@@ -63,6 +63,31 @@ class ServerAddressTest {
     }
 
     @Test
+    fun parseOriginKeepsTheExplicitPortUnlikeFromHostPort() {
+        // A status-provided endpoint carries its own port; the parser must not override it.
+        assertEquals("http://192.168.1.10:7031", ServerAddress.parseOrigin("http://192.168.1.10:7031"))
+        assertEquals(
+            "http://39.105.48.52:38522",
+            ServerAddress.parseOrigin("http://39.105.48.52:38522/"),
+        )
+        // fromHostPort still overrides any supplied port with its own argument (unchanged behavior).
+        assertEquals("http://192.168.1.10:38522", ServerAddress.fromHostPort("192.168.1.10:7031", 38522))
+    }
+
+    @Test
+    fun parseOriginRejectsUnsupportedOrigins() {
+        listOf(
+            "",
+            "192.168.1.10:38522",
+            "https://192.168.1.10:38522",
+            "http://zvec.local:38522",
+            "http://192.168.1.10:38522/admin",
+            "http://192.168.1.10:38522?token=1",
+            "http://192.168.01.20:38522",
+        ).forEach { assertNull("Expected rejection: $it", ServerAddress.parseOrigin(it)) }
+    }
+
+    @Test
     fun rejectsDnsHttpsAndPathInputs() {
         assertNull(ServerAddress.fromHostPort("zvec.local", 38522))
         assertNull(ServerAddress.fromHostPort("https://192.168.1.20", 38522))

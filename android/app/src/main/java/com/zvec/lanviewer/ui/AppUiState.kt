@@ -1,7 +1,9 @@
 package com.zvec.lanviewer.ui
 
 import android.net.Uri
+import com.zvec.lanviewer.data.local.ConnectionMode
 import com.zvec.lanviewer.data.local.SavedFileRecord
+import com.zvec.lanviewer.data.local.SavedConnection
 import com.zvec.lanviewer.data.model.DiscoveredServer
 import com.zvec.lanviewer.data.model.LibraryDto
 import com.zvec.lanviewer.data.model.OriginalMediaItem
@@ -61,6 +63,14 @@ data class AppUiState(
     val pairingSecondsRemaining: Long = 0L,
     val serverName: String? = null,
     val connectionDetail: String? = null,
+    val connectionMode: ConnectionMode = ConnectionMode.LAN,
+    val connectionOrigin: String? = null,
+    val supportsRemoteMedia: Boolean = false,
+    val lanEndpoint: String? = null,
+    val remoteEndpoint: String? = null,
+    val discoveryMode: ConnectionMode = ConnectionMode.LAN,
+    val remoteRestoreFailed: Boolean = false,
+    val viewerOriginalRequested: Boolean = false,
     val libraries: List<LibraryDto> = emptyList(),
     val selectedLibraryIds: Set<String> = emptySet(),
     val searchMode: SearchMode = SearchMode.TEXT,
@@ -90,6 +100,25 @@ data class AppUiState(
     val transferAttempt: Long? = null,
     val savedFiles: List<SavedFileRecord> = emptyList(),
 )
+
+/**
+ * What the viewer should render for one media item. `displayUrl == null` means only the thumbnail
+ * placeholder is available; a remote desktop without `remote-v1` uses this to show an upgrade hint
+ * and an explicit "view original" action instead of silently pulling the full-size file.
+ */
+internal data class ViewerImageTarget(
+    val thumbnailUrl: String,
+    val displayUrl: String?,
+    val displayIsPreview: Boolean,
+    val canViewOriginal: Boolean,
+    val originalSizeBytes: Long?,
+    val unavailableReason: String?,
+)
+
+internal fun ConnectionMode.label(): String = when (this) {
+    ConnectionMode.LAN -> "局域网"
+    ConnectionMode.REMOTE -> "远程"
+}
 
 internal fun AppUiState.viewerItems(): List<OriginalMediaItem> = when (viewerSource) {
     ViewerSource.SEARCH -> results
@@ -130,3 +159,55 @@ internal fun AppUiState.afterPairingApproved(): AppUiState = copy(
     connectionDetail = "电脑已批准，正在载入图库…",
     errorMessage = null,
 )
+
+/**
+ * Applies a switch to another endpoint of the same authenticated profile. The query draft (text,
+ * mode, top_k, libraries, image Uri) is preserved; the staged server results, recommendation batch,
+ * viewer and old errors are cleared because they belong to the previous origin, and the user is
+ * told to query again. A new origin always requires the query image to be re-uploaded.
+ */
+internal fun AppUiState.afterModeSwitched(connection: SavedConnection): AppUiState = copy(
+    phase = ConnectionPhase.CONNECTING,
+    isDiscovering = false,
+    connectionMode = connection.mode,
+    connectionOrigin = connection.baseUrl,
+    lanEndpoint = connection.lanBaseUrl,
+    remoteEndpoint = connection.remoteBaseUrl,
+    supportsRemoteMedia = connection.supportsRemoteMedia,
+    discoveryMode = connection.mode,
+    errorMessage = null,
+    pairingCode = null,
+    pairingSecondsRemaining = 0L,
+    connectionDetail = "正在切换到${connection.mode.label()}…",
+    remoteRestoreFailed = false,
+    results = persistentListOf(),
+    totalResults = 0,
+    activeSearchId = null,
+    nextPage = 1,
+    isSearching = false,
+    isLoadingNextPage = false,
+    searchStatus = null,
+    searchError = null,
+    nextPageError = null,
+    searchPhase = SearchPhase.IDLE,
+    searchRestoreNotice = MODE_SWITCH_NOTICE,
+    submittedSearchText = null,
+    submittedSearchHasImage = false,
+    viewerSource = null,
+    viewerIndex = null,
+    viewerOriginalRequested = false,
+    recommendations = RecommendationUiState(),
+    // The staged query image id belongs to the previous origin, so it must be re-uploaded. The
+    // selected Uri/name/mime are kept; the progress and status are reset and the error tells the
+    // user why, which is what makes the existing retry button appear.
+    queryImage = queryImage?.copy(
+        queryImageId = null,
+        uploading = false,
+        bytesUploaded = 0L,
+        totalBytes = null,
+        uploadError = MODE_SWITCH_REUPLOAD_NOTICE,
+    ),
+)
+
+internal const val MODE_SWITCH_NOTICE = "连接方式已切换，请重新查询"
+internal const val MODE_SWITCH_REUPLOAD_NOTICE = "连接方式已切换，请重新上传查询图片"

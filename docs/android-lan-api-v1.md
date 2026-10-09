@@ -1,11 +1,12 @@
 # YaoLens Android LAN API v1
 
-This contract defines the private-network boundary between YaoLens Windows and
-YaoLens Android. The existing backend remains bound to loopback and is never
-exposed to the LAN.
+This contract defines the phone gateway between YaoLens Windows and Android.
+LAN connects directly; REMOTE reaches the same gateway through the app-managed
+FRPC TCP tunnel and the user's existing ECS FRPS. The backend stays on loopback.
 
 Version 1 uses plain HTTP and does not provide end-to-end transport encryption.
-It is intended only for trusted home LANs, not public or shared networks.
+FRPC forwarding does not add end-to-end HTTP encryption. No new server-side
+API, HTTPS, DNS or multi-proxy support is introduced by this iteration.
 
 ## Discovery
 
@@ -27,9 +28,11 @@ It is intended only for trusted home LANs, not public or shared networks.
 The nonce must match. Discovery grants no authority. Manual host and port entry
 is the required fallback when a router blocks broadcast traffic.
 
-Both clients accept literal RFC1918 IPv4 addresses only: `10/8`, `172.16/12`
-and `192.168/16`. Loopback, link-local, public addresses, DNS names, URL
-credentials, paths, queries and fragments are rejected. The HTTP data plane
+UDP discovery accepts literal RFC1918 IPv4 addresses only: `10/8`, `172.16/12`
+and `192.168/16`. Android manual HTTP entry also accepts public IPv4 literals.
+DNS names, HTTPS, URL credentials, non-root paths, queries and fragments are
+rejected. Windows still binds the gateway to a configured private IPv4 address.
+The forwarded public port must equal its listening port. The HTTP data plane
 rejects browser `Origin`/`Sec-Fetch-*` requests and an unexpected `Host` header
 to prevent a web page or DNS rebinding from reaching the pairing surface.
 
@@ -109,12 +112,32 @@ GET    /api/v1/media/{media_id}/original
 HEAD   /api/v1/media/{media_id}/original
 GET    /api/v1/media/{media_id}/thumbnail
 HEAD   /api/v1/media/{media_id}/thumbnail
+GET    /api/v1/media/{media_id}/remote-thumbnail
+HEAD   /api/v1/media/{media_id}/remote-thumbnail
+GET    /api/v1/media/{media_id}/preview
+HEAD   /api/v1/media/{media_id}/preview
 DELETE /api/v1/session
 ```
 
 The LAN route table must not expose settings, credentials, model configuration,
 indexing, annotation, migration, cache cleanup, filesystem paths, native actions,
 or deletion of library files.
+
+### Authenticated connection profile
+
+`GET /api/v1/status` retains its existing fields and adds optional
+`connection_endpoints` (`lan`/`remote` HTTP IPv4 origins) and
+`media_profiles: ["remote-v1"]`. The facade supplies endpoints from its running
+LAN listener and imported FRPC configuration; missing endpoints are omitted.
+Standalone legacy gateways may omit these additions.
+
+Android saves one device token and the authenticated endpoints for one
+`instance_id`. A registered LAN/REMOTE switch and a process restart reuse that
+token. Discovery IDs and newly entered addresses cannot establish aliases.
+Switching clears results and server query-image IDs, retains the query draft,
+and asks the user to query again. An active original save/share blocks switching.
+`401` enters pairing; a remote connection failure keeps the token and saved
+address and offers retry or an explicit LAN switch without automatic UDP fallback.
 
 ### Query image upload
 
@@ -233,7 +256,26 @@ the existing persistent cache, per-image single-flight and bounded renderer.
 The route never returns a path, token, internal registry ID or original bytes.
 Search result payloads keep their existing media URL behavior; TC-007 changes
 only recommendation items so that `thumbnail_url` uses `/thumbnail` while
-`preview_url` remains `/original`.
+`preview_url` remains `/original`. Android builds all grid/recommendation media
+URLs from `media_id` and the active origin rather than these absolute URLs.
+
+### Remote media
+
+`remote-thumbnail` fits within a 640px longest edge and targets 80 KiB;
+`preview` fits within 1600px and targets 500 KiB. These budgets are best effort;
+each delivered variant has a hard 1 MiB cap. Bounded encoding attempts preserve
+alpha, EXIF orientation and matching color profiles, avoid upscaling, and leave
+the source unchanged. They share existing bounded rendering, single-flight and
+versioned memory/disk caching. Desktop thumbnail/preview rendering stays intact.
+
+Both routes use the same Bearer/capability/source-version checks as thumbnail,
+including GET/HEAD, private ETag and conditional 304. Unsupported legacy
+resolvers or rendering failure return 503; they never fall back to original.
+Android REMOTE uses remote thumbnails for the grid and preloads, requests a
+preview only for the current viewer page, and offers explicit original loading
+with its size. Without `remote-v1`, the viewer gives an upgrade reason and an
+explicit original action. Save/share always use original bytes and existing
+Range/resume behavior. LAN keeps the existing thumbnail/original behavior.
 
 ## Recommendations
 

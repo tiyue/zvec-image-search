@@ -47,6 +47,9 @@ def _valid_payload(root: Path) -> Path:
         _write(payload, entry_point)
     for relative in (
         "_internal/python312.dll",
+        "_internal/frp/frpc.exe",
+        "_internal/frp/LICENSE",
+        "_internal/frp/provenance.json",
         "_internal/pythonnet/runtime/Python.Runtime.dll",
         "_internal/pythonnet/runtime/netstandard.dll",
         "_internal/pythonnet/runtime/System.Runtime.dll",
@@ -447,8 +450,12 @@ class WebviewPreviewSourceContractTest(unittest.TestCase):
         self.assertIn('"zvec_lan.http_server"', spec)
         self.assertIn('"zvec_lan.service"', spec)
         self.assertIn('"zvec_webview.lan_access"', spec)
+        self.assertIn('"zvec_webview.remote_access"', spec)
+        self.assertIn('"zvec_webview.remote_settings"', spec)
         self.assertIn('"zvec_webview.resident_task"', spec)
         self.assertIn('"zvec_webview.single_instance"', spec)
+        self.assertIn('FRP_DIR / "frpc.exe"', spec)
+        self.assertIn('FRP_DIR / "LICENSE"', spec)
         self.assertIn('name="YaoLens"', spec)
         self.assertIn('"tkinter"', spec)
         self.assertIn('"pystray"', spec)
@@ -794,6 +801,18 @@ class WebviewPreviewPayloadContractTest(unittest.TestCase):
                 _write(payload, relative)
                 errors = "\n".join(inspect_payload(payload).errors)
                 self.assertIn(expected, errors)
+
+
+class FrpcPayloadContractTest(unittest.TestCase):
+    def test_missing_internal_components_are_rejected(self) -> None:
+        for name in ("frpc.exe", "LICENSE", "provenance.json"):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                payload = _valid_payload(Path(temporary))
+                (payload / "_internal/frp" / name).unlink()
+                self.assertIn(
+                    f"Required FRPC component is missing: _internal/frp/{name}",
+                    inspect_payload(payload).errors,
+                )
 
 
 class WebviewPreviewFrozenEntryTest(unittest.TestCase):

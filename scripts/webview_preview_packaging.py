@@ -362,6 +362,8 @@ def validate_static_inputs(plan: BuildPlan) -> None:
         plan.repository_root / "zvec_webview" / "lan_access.py",
         plan.repository_root / "zvec_webview" / "lan_settings.py",
         plan.repository_root / "zvec_webview" / "native_bridge.py",
+        plan.repository_root / "zvec_webview" / "remote_access.py",
+        plan.repository_root / "zvec_webview" / "remote_settings.py",
         plan.repository_root / "zvec_webview" / "resident_task.py",
         plan.repository_root / "zvec_webview" / "runtime.py",
         plan.repository_root / "zvec_webview" / "server.py",
@@ -408,6 +410,8 @@ def validate_static_inputs(plan: BuildPlan) -> None:
         / "hook-webview.py",
         plan.repository_root / "release" / "webview_preview" / "hooks" / "hook-clr.py",
         plan.repository_root / "release" / "webview_preview" / "hooks" / "hook-zvec.py",
+        plan.repository_root / "third_party" / "frp" / "windows-amd64" / "frpc.exe",
+        plan.repository_root / "third_party" / "frp" / "windows-amd64" / "LICENSE",
         plan.spec_path,
         plan.icon_path,
         plan.nsis_path,
@@ -589,6 +593,13 @@ def inspect_payload(payload_directory: Path) -> PayloadInspection:
     for suffix in _REQUIRED_RELATIVE_SUFFIXES:
         if not any(path.endswith(suffix.casefold()) for path in folded_relative):
             errors.append(f"Required web asset is missing: {suffix}")
+    for relative in (
+        "_internal/frp/frpc.exe",
+        "_internal/frp/LICENSE",
+        "_internal/frp/provenance.json",
+    ):
+        if relative.casefold() not in folded_relative:
+            errors.append(f"Required FRPC component is missing: {relative}")
     frontend_manifests = [
         path
         for relative, path in folded_relative.items()

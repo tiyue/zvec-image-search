@@ -7,6 +7,7 @@ import type {
 } from "../../search-learning";
 import SettingsPage from "../SettingsPage.vue";
 import type { LanAccessApi } from "../lanTypes";
+import type { RemoteAccessApi } from "../remoteTypes";
 import type { SettingsApi, SettingsResponse } from "../types";
 
 function settingsPayload(overrides: Partial<SettingsResponse> = {}): SettingsResponse {
@@ -155,6 +156,41 @@ function fakeLanApi(): LanAccessApi {
     approve: vi.fn(async () => status),
     reject: vi.fn(async () => status),
     revokeDevice: vi.fn(async () => status),
+  };
+}
+
+function fakeRemoteApi(): RemoteAccessApi {
+  return {
+    status: vi.fn(async () => ({
+      configured: false,
+      enabled: false,
+      state: "unconfigured",
+      message: "尚未导入 FRPC 配置。",
+      public_url: "",
+      server_host: "",
+      server_port: null,
+      remote_port: null,
+    })),
+    importConfig: vi.fn(async () => ({
+      configured: true,
+      enabled: false,
+      state: "disabled",
+    })),
+    update: vi.fn(async (body) => ({
+      configured: true,
+      enabled: body.enabled,
+      state: "connecting",
+    })),
+    start: vi.fn(async () => ({
+      configured: true,
+      enabled: true,
+      state: "connecting",
+    })),
+    stop: vi.fn(async () => ({
+      configured: true,
+      enabled: false,
+      state: "disabled",
+    })),
   };
 }
 
@@ -407,5 +443,22 @@ describe("SettingsPage", () => {
       "仍有任务运行，请先等待完成或取消任务。",
       "error",
     ]);
+  });
+
+  it("mounts the remote access section only after selecting its navigation entry", async () => {
+    const remoteApi = fakeRemoteApi();
+    const wrapper = mount(SettingsPage, {
+      props: { api: fakeApi(), lanApi: fakeLanApi(), remoteApi },
+    });
+    await flushPromises();
+
+    expect(remoteApi.status).not.toHaveBeenCalled();
+
+    await buttonWithText(wrapper, "远程访问").trigger("click");
+    await flushPromises();
+
+    expect(remoteApi.status).toHaveBeenCalledTimes(1);
+    expect(wrapper.text()).toContain("导入 FRPC 配置");
+    expect(wrapper.text()).toContain("尚未导入 FRPC 配置。");
   });
 });

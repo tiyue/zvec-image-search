@@ -11,6 +11,7 @@
 - 安卓手机与平板 UI、图片交付及数据交互优化方案：`docs/android-optimization-plan.md`
 - 安卓 A 阶段图片交付、状态与原生验收：`docs/android-optimization-round-a.md`
 - 安卓 B 阶段自适应浏览、大图交互与原生验收：`docs/android-optimization-round-b.md`
+- FRPC 内置托管、安卓双模式与远程压缩图片实施：`docs/remote-access-image-delivery-deepseek.md`
 
 ## 发布矩阵
 

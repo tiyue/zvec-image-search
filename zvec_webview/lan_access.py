@@ -35,7 +35,7 @@ from zvec_lan import (
     ThumbnailPayload,
 )
 
-from .image_registry import ImageRegistry, ImageRegistryError
+from .image_registry import ImageRegistry, ImageRegistryError, ImageVariant
 from .lan_settings import (
     LanAccessSettings,
     LanSettingsError,
@@ -611,6 +611,43 @@ class PreviewLanAdapter:
         *,
         client_id: str,
     ) -> ThumbnailPayload | None:
+        return self._resolve_registry_variant(
+            media_id,
+            client_id=client_id,
+            variant="thumbnail",
+        )
+
+    def resolve_remote_thumbnail(
+        self,
+        media_id: str,
+        *,
+        client_id: str,
+    ) -> ThumbnailPayload | None:
+        return self._resolve_registry_variant(
+            media_id,
+            client_id=client_id,
+            variant="remote_thumbnail",
+        )
+
+    def resolve_preview(
+        self,
+        media_id: str,
+        *,
+        client_id: str,
+    ) -> ThumbnailPayload | None:
+        return self._resolve_registry_variant(
+            media_id,
+            client_id=client_id,
+            variant="remote_preview",
+        )
+
+    def _resolve_registry_variant(
+        self,
+        media_id: str,
+        *,
+        client_id: str,
+        variant: ImageVariant,
+    ) -> ThumbnailPayload | None:
         owner = _client_id(client_id)
         self._cleanup_expired_searches()
         normalized_id = _safe_text(media_id, maximum=160)
@@ -636,19 +673,32 @@ class PreviewLanAdapter:
         try:
             resolved = source_path.resolve(strict=True)
             status = resolved.stat()
-            if (
-                resolved != source_path
-                or resolved.is_symlink()
-                or not resolved.is_file()
-                or (resolved, status.st_mtime_ns, status.st_size) != source_version
-            ):
-                return None
+        except OSError:
+            return None
+        if (
+            resolved != source_path
+            or resolved.is_symlink()
+            or not resolved.is_file()
+            or (resolved, status.st_mtime_ns, status.st_size) != source_version
+        ):
+            return None
+        try:
             payload = self._facade.image_registry.payload(
                 source_image_id,
-                "thumbnail",
+                variant,
             )
             after = resolved.stat()
-        except (ImageRegistryError, OSError):
+        except ImageRegistryError as exc:
+            # A remote render failure must stay an explicit service error; it
+            # must never silently fall back to serving the original bytes.
+            if variant in {"remote_thumbnail", "remote_preview"}:
+                raise LanBackendError(
+                    "remote_media_unavailable",
+                    "电脑端暂时无法生成远程预览图片。",
+                    status=503,
+                ) from exc
+            return None
+        except OSError:
             return None
         if (resolved, after.st_mtime_ns, after.st_size) != source_version:
             return None
@@ -1045,10 +1095,12 @@ class LanAccessController:
         gateway_factory: Callable[..., Any] = LanGatewayServer,
         credential_store: Any | None = None,
         recommendation_backend: RecommendationService | None = None,
+        endpoint_provider: Callable[[], Mapping[str, str]] | None = None,
     ) -> None:
         self._config_home = Path(config_home).expanduser().resolve()
         self._settings = settings_store or LanSettingsStore(self._config_home)
         self._identity = _InstanceIdStore(self._config_home)
+        self._endpoint_provider = endpoint_provider
         if recommendation_backend is None:
             client_provider = getattr(facade, "_ready_client", None)
             if callable(client_provider):
@@ -1230,6 +1282,7 @@ class LanAccessController:
                 search_backend=self._adapter,
                 recommendation_backend=self._adapter,
                 media_resolver=self._adapter,
+                endpoint_provider=self._endpoint_provider,
                 credential_store=self._credentials,
                 upload_directory=self._config_home / "lan-query-images",
                 bind_host=settings.bind_host,
@@ -1328,6 +1381,23 @@ class LanAccessController:
     def close(self) -> None:
         with suppress(LanAccessError):
             self.stop()
+
+    def running_listener(self) -> tuple[str, int] | None:
+        """Return the live gateway's advertised host and HTTP port, if any."""
+
+        with self._lock:
+            server = self._server
+            if server is None or not server.is_running:
+                return None
+            try:
+                address = server.address
+            except Exception:
+                return None
+        host = getattr(address, "advertised_host", None)
+        port = getattr(address, "api_port", None)
+        if not isinstance(host, str) or not host or not isinstance(port, int):
+            return None
+        return (host, port)
 
     def _running_server(self) -> Any:
         with self._lock:

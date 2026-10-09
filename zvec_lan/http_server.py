@@ -67,6 +67,10 @@ DEFAULT_CONNECTION_IDLE_TIMEOUT_SECONDS = 60.0
 DEFAULT_MAX_CONNECTIONS = 64
 _MAX_JSON_BYTES = 64 * 1024
 _MAX_THUMBNAIL_BYTES = 32 * 1024 * 1024
+# Remote variants are delivered over a public tunnel and stay inside 1 MiB.
+_MAX_REMOTE_MEDIA_BYTES = 1024 * 1024
+_REMOTE_MEDIA_TYPES = frozenset({"image/jpeg", "image/png", "image/webp"})
+_MEDIA_PROFILES = ("remote-v1",)
 _MAX_CHUNK_LINE_BYTES = 8192
 _MAX_TRAILER_BYTES = 64 * 1024
 _OPAQUE_ID = re.compile(r"^[A-Za-z0-9._~-]{1,256}$")
@@ -123,6 +127,7 @@ class LanApiServer:
         pairing_manager: PairingManager,
         query_images: QueryImageStore,
         recommendation_backend: RecommendationBackend | None = None,
+        endpoint_provider: Callable[[], Mapping[str, object]] | None = None,
         host: str = "0.0.0.0",
         port: int = API_PORT,
         stream_chunk_bytes: int = DEFAULT_STREAM_CHUNK_BYTES,
@@ -153,6 +158,7 @@ class LanApiServer:
         self._search_backend = search_backend
         self._recommendation_backend = recommendation_backend
         self._media_resolver = media_resolver
+        self._endpoint_provider = endpoint_provider
         self._pairing = pairing_manager
         self._query_images = query_images
         self._pairing.set_session_cleanup_callback(self._cleanup_session_resources)
@@ -209,6 +215,29 @@ class LanApiServer:
     @property
     def query_image_store(self) -> QueryImageStore:
         return self._query_images
+
+    def connection_endpoints(self) -> dict[str, str]:
+        """Return trusted LAN/remote origins supplied by the desktop owner.
+
+        The desktop provider is the only source of truth: request Host headers
+        and UDP discovery data are never used to synthesize an alias.
+        """
+
+        provider = self._endpoint_provider
+        if provider is None:
+            return {}
+        try:
+            supplied = provider()
+        except Exception:
+            return {}
+        if not isinstance(supplied, Mapping):
+            return {}
+        endpoints: dict[str, str] = {}
+        for key in ("lan", "remote"):
+            origin = _valid_endpoint_origin(supplied.get(key))
+            if origin:
+                endpoints[key] = origin
+        return endpoints
 
     def start(self) -> LanApiAddress:
         with self._lock:
@@ -466,14 +495,16 @@ class _LanRequestHandler(BaseHTTPRequestHandler):
                 self._require_method("GET")
                 self._require_no_query(target.query)
                 self._authenticate()
-                self._send_json(
-                    HTTPStatus.OK,
-                    {
-                        "protocol": PROTOCOL_VERSION,
-                        "instance_id": self.gateway._instance_id,
-                        "name": self.gateway._name,
-                    },
-                )
+                payload: dict[str, object] = {
+                    "protocol": PROTOCOL_VERSION,
+                    "instance_id": self.gateway._instance_id,
+                    "name": self.gateway._name,
+                    "media_profiles": list(_MEDIA_PROFILES),
+                }
+                endpoints = self.gateway.connection_endpoints()
+                if endpoints:
+                    payload["connection_endpoints"] = endpoints
+                self._send_json(HTTPStatus.OK, payload)
                 return
 
             if path == "/api/v1/libraries":
@@ -570,6 +601,39 @@ class _LanRequestHandler(BaseHTTPRequestHandler):
                     self._serve_thumbnail(media_id, client)
                 else:
                     self._serve_original(media_id, client)
+                return
+
+            remote_media_match = re.fullmatch(
+                r"/api/v1/media/([^/]+)/(remote-thumbnail|preview)",
+                path,
+            )
+            if remote_media_match is not None:
+                self._require_method("GET", "HEAD")
+                self._require_no_query(target.query)
+                client, _token = self._authenticate()
+                media_id = _opaque_segment(remote_media_match.group(1))
+                method_name = (
+                    "resolve_remote_thumbnail"
+                    if remote_media_match.group(2) == "remote-thumbnail"
+                    else "resolve_preview"
+                )
+                resolver = getattr(
+                    self.gateway._media_resolver,
+                    method_name,
+                    None,
+                )
+                if not callable(resolver):
+                    raise _ApiProblem(
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                        "media_unavailable",
+                        "This computer cannot generate remote media yet.",
+                    )
+                self._serve_remote_media(
+                    media_id,
+                    client,
+                    resolver,
+                    description=remote_media_match.group(2),
+                )
                 return
 
             if path == "/api/v1/session":
@@ -1157,6 +1221,57 @@ class _LanRequestHandler(BaseHTTPRequestHandler):
                 500,
                 "invalid_thumbnail_payload",
                 "Thumbnail media is unavailable.",
+            )
+        common_headers = (
+            ("ETag", payload.etag),
+            ("Cache-Control", "private, max-age=300"),
+        )
+        if _if_none_match(self.headers.get("If-None-Match"), payload.etag):
+            self.send_response(HTTPStatus.NOT_MODIFIED)
+            self._send_headers(common_headers)
+            self.end_headers()
+            return
+        self.send_response(HTTPStatus.OK)
+        self._send_headers(common_headers)
+        self.send_header("Content-Type", payload.content_type)
+        self.send_header("Content-Length", str(len(payload.content)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(payload.content)
+
+    def _serve_remote_media(
+        self,
+        media_id: str,
+        client: AuthenticatedClient,
+        resolver: Callable[..., ThumbnailPayload | None],
+        *,
+        description: str,
+    ) -> None:
+        self._require_active_session(client)
+        payload = self._backend_call(
+            resolver,
+            media_id,
+            client_id=client.session_id,
+        )
+        if payload is None:
+            raise _ApiProblem(
+                404,
+                "media_not_found",
+                f"Remote {description} media was not found.",
+            )
+        self._require_active_session(client)
+        if (
+            not isinstance(payload, ThumbnailPayload)
+            or not isinstance(payload.content, bytes)
+            or not 0 < len(payload.content) <= _MAX_REMOTE_MEDIA_BYTES
+            or payload.content_type not in _REMOTE_MEDIA_TYPES
+            or not _valid_thumbnail_etag(payload.etag)
+        ):
+            raise _ApiProblem(
+                500,
+                "invalid_media_payload",
+                "Remote media is unavailable.",
             )
         common_headers = (
             ("ETag", payload.etag),
@@ -1866,3 +1981,43 @@ def _safe_media_type(source: MediaSource) -> str:
         return supplied
     guessed, _encoding = mimetypes.guess_type(source.path.name)
     return guessed or "application/octet-stream"
+
+
+def _valid_endpoint_origin(value: object) -> str:
+    """Return a normalized HTTP IPv4 origin, or an empty string."""
+
+    if not isinstance(value, str):
+        return ""
+    normalized = value.strip().rstrip("/")
+    if not normalized or len(normalized) > 256:
+        return ""
+    if any(character in normalized for character in "\r\n\0\t "):
+        return ""
+    try:
+        parts = urlsplit(normalized)
+    except ValueError:
+        return ""
+    if parts.scheme != "http":
+        return ""
+    if parts.path not in {"", "/"} or parts.query or parts.fragment:
+        return ""
+    if parts.username is not None or parts.password is not None:
+        return ""
+    host = parts.hostname
+    if not host:
+        return ""
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return ""
+    if address.version != 4:
+        return ""
+    try:
+        port = parts.port
+    except ValueError:
+        return ""
+    if port is None:
+        port = 80
+    if not 1 <= port <= 65535:
+        return ""
+    return f"{parts.scheme}://{address}:{port}"

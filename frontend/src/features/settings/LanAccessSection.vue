@@ -40,7 +40,7 @@ function readableTime(value: string): string {
 
     <div class="lan-warning">
       <strong>仅限可信的家庭局域网</strong>
-      <span>当前链路使用未加密 HTTP，原图和搜索请求会在局域网内直接传输。只应在你自己控制的家庭专用网络启用，不要用于公共、共享或访客 Wi-Fi。</span>
+      <span>当前链路使用未加密 HTTP，原图和搜索请求会在局域网内直接传输。只应在你自己控制的家庭专用网络启用，不要用于公共、共享或访客 Wi-Fi；需要在家庭网络之外访问时，请在“远程访问”中导入 FRPC 配置后开启。</span>
     </div>
 
     <form class="lan-form" @submit.prevent="lan.save">

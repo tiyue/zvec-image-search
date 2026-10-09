@@ -1,6 +1,7 @@
 package com.zvec.lanviewer.data.network
 
 import com.zvec.lanviewer.data.local.ConnectionReader
+import com.zvec.lanviewer.data.local.ConnectionMode
 import com.zvec.lanviewer.data.local.SavedConnection
 import com.zvec.lanviewer.data.model.PairRequest
 import com.zvec.lanviewer.data.model.RecommendationAction
@@ -73,6 +74,63 @@ class LanApiClientTest {
 
         assertEquals("desktop", client.status().instanceId)
         assertEquals("Bearer top-secret-token", server.takeRequest().getHeader("Authorization"))
+    }
+
+    @Test
+    fun legacyStatusWithoutEndpointsDecodesWithDefaults() = runBlocking {
+        server.enqueue(
+            MockResponse().setResponseCode(200)
+                .setHeader("Content-Type", "application/json")
+                .setBody("""{"protocol":1,"instance_id":"desktop","name":"Zvec PC"}"""),
+        )
+
+        val status = client.status()
+
+        assertEquals("desktop", status.instanceId)
+        assertNull(status.connectionEndpoints)
+        assertTrue(status.mediaProfiles.isEmpty())
+    }
+
+    @Test
+    fun statusDecodesConnectionEndpointsAndMediaProfiles() = runBlocking {
+        server.enqueue(
+            MockResponse().setResponseCode(200)
+                .setHeader("Content-Type", "application/json")
+                .setBody(
+                    """{"protocol":1,"instance_id":"desktop","name":"Zvec PC",""" +
+                        """"connection_endpoints":{"lan":"http://192.168.1.10:38522","remote":"http://39.105.48.52:38522"},""" +
+                        """"media_profiles":["remote-v1"]}""",
+                ),
+        )
+
+        val status = client.status()
+
+        assertEquals("http://192.168.1.10:38522", status.connectionEndpoints?.lan)
+        assertEquals("http://39.105.48.52:38522", status.connectionEndpoints?.remote)
+        assertEquals(listOf("remote-v1"), status.mediaProfiles)
+    }
+
+    @Test
+    fun remoteModeSelectsRemoteAndPreviewRoutesWhileLanStaysUnchanged() {
+        assertEquals("$baseUrl/api/v1/media/m1/thumbnail", client.thumbnailUrl("m1"))
+
+        val remoteClient = LanApiClient(
+            connectionReader = ConnectionReader {
+                SavedConnection(
+                    baseUrl = baseUrl,
+                    instanceId = "instance",
+                    displayName = "test",
+                    mode = ConnectionMode.REMOTE,
+                    supportsRemoteMedia = true,
+                )
+            },
+            tokenStore = InMemoryTokenStore("top-secret-token"),
+            maxConcurrentRequests = 10,
+        )
+
+        assertEquals("$baseUrl/api/v1/media/m1/remote-thumbnail", remoteClient.thumbnailUrl("m1"))
+        assertEquals("$baseUrl/api/v1/media/m1/preview", remoteClient.previewUrl("m1"))
+        assertEquals("$baseUrl/api/v1/media/m1/original", remoteClient.mediaUrl("m1"))
     }
 
     @Test

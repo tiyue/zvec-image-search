@@ -532,5 +532,52 @@ class WebviewAppLifecycleTest(unittest.TestCase):
         self.assertGreaterEqual(len(harness.runtime.close_calls), 1)
 
 
+class PreviewRuntimeRemoteStartTest(unittest.TestCase):
+    def test_start_runs_enabled_remote_after_lan_startup(self) -> None:
+        from zvec_webview.runtime import PreviewRuntime
+
+        calls: list[str] = []
+
+        class _Facade:
+            config_home = Path(".")
+            image_registry = object()
+
+            def start_backend_async(self):
+                calls.append("backend")
+                return None
+
+            def start_lan_access_if_enabled(self) -> None:
+                calls.append("lan")
+
+            def start_remote_access_if_enabled(self) -> None:
+                calls.append("remote")
+
+            def close(self, *, force: bool = False) -> None:
+                calls.append("close")
+
+            def has_active_jobs(self) -> bool:
+                return False
+
+        class _Gateway:
+            def start(self):
+                calls.append("gateway.start")
+                return SimpleNamespace(url="http://127.0.0.1:43123/token/")
+
+            def stop(self) -> None:
+                calls.append("gateway.stop")
+
+        runtime = PreviewRuntime(facade=_Facade(), gateway=_Gateway())
+        started = runtime.start()
+
+        self.assertEqual(calls, ["gateway.start", "backend", "lan", "remote"])
+        self.assertEqual(started.address.url, "http://127.0.0.1:43123/token/")
+        self.assertTrue(started.backend_started_async is False)
+        runtime.close()
+        self.assertEqual(
+            calls,
+            ["gateway.start", "backend", "lan", "remote", "close", "gateway.stop"],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

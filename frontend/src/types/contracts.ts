@@ -198,6 +198,7 @@ export interface PywebviewApi {
   select_directory(): Promise<NativeDirectorySelection>;
   select_raw_images?(): Promise<NativeFileSelection>;
   select_json_file(): Promise<NativeDirectorySelection>;
+  select_frpc_config_file(): Promise<NativeDirectorySelection>;
   select_query_image(): Promise<NativeImageSelection>;
   exit_application?(): Promise<NativeResult>;
   open_image(imageId: string): Promise<NativeResult>;

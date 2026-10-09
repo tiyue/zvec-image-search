@@ -14,6 +14,7 @@ import androidx.lifecycle.viewmodel.CreationExtras
 import coil.imageLoader
 import coil.request.ImageRequest
 import coil.request.SuccessResult
+import com.zvec.lanviewer.data.local.ConnectionMode
 import com.zvec.lanviewer.data.local.SavedConnection
 import com.zvec.lanviewer.data.local.SavedFileRecord
 import com.zvec.lanviewer.data.local.SavedFilesStore
@@ -229,6 +230,15 @@ class AppViewModel(
     }
 
     fun discover() {
+        // UDP discovery is a LAN-only feature. In REMOTE mode the entry is the manual/pairing form,
+        // so a discover call must never start a scan or repaint the REMOTE screen with stale results.
+        if (_state.value.discoveryMode == ConnectionMode.REMOTE) {
+            cancelDiscovery()
+            _state.update {
+                it.copy(isDiscovering = false, discoveredServers = emptyList())
+            }
+            return
+        }
         connectionFlight.cancel()
         discover(preservedError = null)
     }
@@ -282,18 +292,42 @@ class AppViewModel(
                 baseUrl = baseUrl,
                 instanceId = server.instanceId,
                 displayName = server.name,
+                mode = ConnectionMode.LAN,
             ),
         )
     }
 
-    fun connectManual(host: String, portText: String) {
+    fun connectManual(host: String, portText: String, mode: ConnectionMode = ConnectionMode.LAN) {
         val port = portText.toIntOrNull()
         val baseUrl = port?.let { ServerAddress.fromHostPort(host, it) }
         if (baseUrl == null) {
             showMessage("请输入有效的电脑 IP 和端口（1–65535）")
             return
         }
-        connect(SavedConnection(baseUrl, instanceId = null, displayName = host.trim()))
+        connect(SavedConnection(baseUrl, instanceId = null, displayName = host.trim(), mode = mode))
+    }
+
+    /**
+     * The user's LAN/REMOTE choice on the discovery page. Switching to REMOTE cancels a running LAN
+     * scan and clears its stale results/errors so a late UDP response can never repaint the REMOTE
+     * manual/pairing entry; switching back to LAN starts a normal discovery.
+     */
+    fun setDiscoveryMode(mode: ConnectionMode) {
+        if (_state.value.remoteRestoreFailed && mode == ConnectionMode.LAN) {
+            leaveRemoteRestore()
+            return
+        }
+        if (_state.value.discoveryMode == mode) return
+        _state.update { it.copy(discoveryMode = mode) }
+        when (mode) {
+            ConnectionMode.LAN -> discover()
+            ConnectionMode.REMOTE -> {
+                cancelDiscovery()
+                _state.update {
+                    it.copy(isDiscovering = false, discoveredServers = emptyList(), errorMessage = null)
+                }
+            }
+        }
     }
 
     fun cancelPairing() {
@@ -569,15 +603,94 @@ class AppViewModel(
 
     fun thumbnailUrl(item: OriginalMediaItem): String = repository.thumbnailUrl(item.mediaId)
 
+    /**
+     * One production media plan for the viewer. LAN keeps the original auto-original behavior; REMOTE
+     * shows the compressed `/preview` for the current page only and never loads `/preview` or
+     * `/original` for composed adjacent pages, so a swipe never pulls a neighbouring large file.
+     */
+    internal fun viewerTarget(item: OriginalMediaItem, isCurrent: Boolean): ViewerImageTarget {
+        val state = _state.value
+        val thumbnail = repository.thumbnailUrl(item.mediaId)
+        if (state.connectionMode != ConnectionMode.REMOTE) {
+            return ViewerImageTarget(
+                thumbnailUrl = thumbnail,
+                displayUrl = repository.mediaUrl(item.mediaId),
+                displayIsPreview = false,
+                canViewOriginal = false,
+                originalSizeBytes = null,
+                unavailableReason = null,
+            )
+        }
+        if (isCurrent && state.viewerOriginalRequested) {
+            return ViewerImageTarget(
+                thumbnailUrl = thumbnail,
+                displayUrl = repository.mediaUrl(item.mediaId),
+                displayIsPreview = false,
+                canViewOriginal = false,
+                originalSizeBytes = item.sizeBytes,
+                unavailableReason = null,
+            )
+        }
+        if (!isCurrent) {
+            return ViewerImageTarget(
+                thumbnailUrl = thumbnail,
+                displayUrl = null,
+                displayIsPreview = true,
+                canViewOriginal = false,
+                originalSizeBytes = item.sizeBytes,
+                unavailableReason = null,
+            )
+        }
+        return if (state.supportsRemoteMedia) {
+            ViewerImageTarget(
+                thumbnailUrl = thumbnail,
+                displayUrl = repository.previewUrl(item.mediaId),
+                displayIsPreview = true,
+                canViewOriginal = true,
+                originalSizeBytes = item.sizeBytes,
+                unavailableReason = null,
+            )
+        } else {
+            ViewerImageTarget(
+                thumbnailUrl = thumbnail,
+                displayUrl = null,
+                displayIsPreview = true,
+                canViewOriginal = true,
+                originalSizeBytes = item.sizeBytes,
+                unavailableReason = REMOTE_PREVIEW_UPGRADE_REASON,
+            )
+        }
+    }
+
+    /** Loads the full original for the current page only, after an explicit user action. */
+    fun requestViewerOriginal() {
+        val snapshot = _state.value
+        if (snapshot.connectionMode != ConnectionMode.REMOTE) return
+        if (snapshot.viewerIndex == null || snapshot.viewerOriginalRequested) return
+        _state.update { it.copy(viewerOriginalRequested = true) }
+    }
+
     fun openViewer(index: Int) {
         if (index in _state.value.results.indices) {
-            _state.update { it.copy(viewerSource = ViewerSource.SEARCH, viewerIndex = index) }
+            _state.update {
+                it.copy(
+                    viewerSource = ViewerSource.SEARCH,
+                    viewerIndex = index,
+                    viewerOriginalRequested = false,
+                )
+            }
         }
     }
 
     fun setViewerIndex(index: Int) {
         if (index in _state.value.viewerItems().indices) {
-            _state.update { it.copy(viewerIndex = index) }
+            _state.update { current ->
+                if (current.viewerIndex == index) {
+                    current
+                } else {
+                    current.copy(viewerIndex = index, viewerOriginalRequested = false)
+                }
+            }
             if (_state.value.viewerSource == ViewerSource.SEARCH && index >= _state.value.results.lastIndex - 4) {
                 loadNextPage()
             }
@@ -585,7 +698,9 @@ class AppViewModel(
     }
 
     fun closeViewer() {
-        _state.update { it.copy(viewerSource = null, viewerIndex = null) }
+        _state.update {
+            it.copy(viewerSource = null, viewerIndex = null, viewerOriginalRequested = false)
+        }
     }
 
     fun loadRecommendations() {
@@ -738,7 +853,13 @@ class AppViewModel(
 
     fun openRecommendation(index: Int) {
         val item = _state.value.recommendations.items.getOrNull(index) ?: return
-        _state.update { it.copy(viewerSource = ViewerSource.RECOMMENDATIONS, viewerIndex = index) }
+        _state.update {
+            it.copy(
+                viewerSource = ViewerSource.RECOMMENDATIONS,
+                viewerIndex = index,
+                viewerOriginalRequested = false,
+            )
+        }
         recordRecommendationAction(item, RecommendationAction.OPEN)
     }
 
@@ -844,7 +965,9 @@ class AppViewModel(
                     }
                 }
             },
-            thumbnailUrls = { response -> response.items.map(RecommendationItem::thumbnailUrl) },
+            // Recommendation items may advertise private thumbnail_url values; the phone must always
+            // build the thumbnail from the current origin/profile so remote preloads stay compressed.
+            thumbnailUrls = { response -> response.items.map { repository.thumbnailUrl(it.mediaId) } },
             preload = ::preloadRecommendationThumbnail,
         )
     }
@@ -897,7 +1020,9 @@ class AppViewModel(
         val items = recommendation.items.toList()
         val next = viewModelScope.launch {
             val results = coroutineScope {
-                items.map { item -> async { preloadRecommendationThumbnail(item.thumbnailUrl) } }.awaitAll()
+                items.map { item ->
+                    async { preloadRecommendationThumbnail(repository.thumbnailUrl(item.mediaId)) }
+                }.awaitAll()
             }
             if (!recommendationsVisible || _state.value.recommendations.batchId != batchId) return@launch
             settledRecommendationBatchId = batchId
@@ -1125,31 +1250,65 @@ class AppViewModel(
         cancelDiscovery()
         val saved = repository.savedConnection()
         if (saved == null || !repository.hasToken()) {
+            val mode = saved?.mode ?: ConnectionMode.LAN
+            _state.update {
+                it.copy(
+                    discoveryMode = mode,
+                    connectionMode = mode,
+                    remoteRestoreFailed = false,
+                )
+            }
             discover()
             return
         }
-        _state.update { it.copy(phase = ConnectionPhase.CONNECTING) }
+        _state.update {
+            it.copy(
+                phase = ConnectionPhase.CONNECTING,
+                connectionMode = saved.mode,
+                connectionOrigin = saved.baseUrl,
+                lanEndpoint = saved.lanBaseUrl,
+                remoteEndpoint = saved.remoteBaseUrl,
+                supportsRemoteMedia = saved.supportsRemoteMedia,
+                discoveryMode = saved.mode,
+                remoteRestoreFailed = false,
+            )
+        }
         var rediscoveryMessage: String? = null
+        var handledAsRemoteFailure = false
         connectionFlight.launch(
             key = saved.baseUrl,
             onComplete = {
                 // Completion clears the single-flight slot before discovery starts, so a
                 // discovery result can never race a stale restore job.
-                rediscoveryMessage?.let { message -> discover(preservedError = message) }
+                if (!handledAsRemoteFailure) {
+                    rediscoveryMessage?.let { message -> discover(preservedError = message) }
+                }
             },
         ) {
             try {
                 loadReadyStateWithRetry()
             } catch (error: Throwable) {
                 if (error is CancellationException) throw error
+                if (error is ApiException && error.httpStatus == 401) {
+                    startPairing(saved.baseUrl)
+                    return@launch
+                }
                 rediscoveryMessage = pairingErrorMessage(PairingStage.RESTORE, error)
-                failPairing(requireNotNull(rediscoveryMessage))
+                if (saved.mode == ConnectionMode.REMOTE) {
+                    // A remote restore failure must not fall back to UDP discovery; keep the saved
+                    // remote address so the user can retry or switch back to LAN.
+                    handledAsRemoteFailure = true
+                    enterRemoteRestoreFailure(saved, requireNotNull(rediscoveryMessage))
+                } else {
+                    failPairing(requireNotNull(rediscoveryMessage))
+                }
             }
         }
     }
 
     private fun connect(connection: SavedConnection) {
         cancelDiscovery()
+        _state.update { it.copy(remoteRestoreFailed = false, discoveryMode = connection.mode) }
         connectionFlight.launch(connection.baseUrl) {
             repository.selectConnection(connection)
             _state.update {
@@ -1161,6 +1320,11 @@ class AppViewModel(
                     pairingCode = null,
                     pairingSecondsRemaining = 0,
                     connectionDetail = null,
+                    connectionMode = connection.mode,
+                    connectionOrigin = connection.baseUrl,
+                    lanEndpoint = connection.lanBaseUrl,
+                    remoteEndpoint = connection.remoteBaseUrl,
+                    supportsRemoteMedia = connection.supportsRemoteMedia,
                 )
             }
             if (repository.hasToken()) {
@@ -1169,14 +1333,72 @@ class AppViewModel(
                     return@launch
                 } catch (error: Throwable) {
                     if (error is CancellationException) throw error
-                    if (error !is ApiException || error.httpStatus != 401) {
-                        failPairing(PairingStage.RESTORE, error)
-                        return@launch
-                    }
+                    onConnectionFailure(connection, error)
+                    return@launch
                 }
             }
             startPairing(connection.baseUrl)
         }
+    }
+
+    /**
+     * Switches between already-authenticated endpoints of the current profile. A running transfer
+     * blocks the switch, in-flight work is invalidated before it is cancelled, and the staged results
+     * are cleared. No token is cleared and no pairing is started because the target is trusted.
+     */
+    fun switchConnectionMode(mode: ConnectionMode) {
+        val snapshot = _state.value
+        if (snapshot.phase != ConnectionPhase.READY && !snapshot.remoteRestoreFailed) return
+        if (snapshot.transferAttempt != null) {
+            showMessage("正在传输文件，暂时无法切换连接方式")
+            return
+        }
+        if (snapshot.connectionMode == mode && !snapshot.remoteRestoreFailed) return
+        val target = repository.savedConnection()?.endpointFor(mode)
+        if (target.isNullOrBlank()) {
+            showMessage(missingEndpointMessage(mode))
+            return
+        }
+        // Invalidate and cancel the previous origin's work before the store moves to the new origin.
+        cancelInFlightForModeSwitch()
+        val switched = repository.switchRegisteredEndpoint(mode)
+        if (switched == null) {
+            showMessage(missingEndpointMessage(mode))
+            return
+        }
+        _state.update { it.afterModeSwitched(switched) }
+        _events.tryEmit(AppEvent.Message(MODE_SWITCH_NOTICE))
+        connectionFlight.launch(switched.baseUrl) {
+            try {
+                loadReadyStateWithRetry()
+            } catch (error: Throwable) {
+                if (error is CancellationException) throw error
+                onConnectionFailure(switched, error)
+            }
+        }
+    }
+
+    /** Retries the saved remote (or LAN) restore without dropping the token on a transient failure. */
+    fun retryRemoteRestore() {
+        restoreOrDiscover()
+    }
+
+    /** Leaves a failed remote restore: reuse the registered LAN endpoint when present, else discover. */
+    fun leaveRemoteRestore() {
+        val saved = repository.savedConnection()
+        if (saved?.lanBaseUrl.isNullOrBlank()) {
+            _state.update {
+                it.copy(
+                    connectionMode = ConnectionMode.LAN,
+                    discoveryMode = ConnectionMode.LAN,
+                    remoteRestoreFailed = false,
+                    errorMessage = null,
+                )
+            }
+            discover()
+            return
+        }
+        switchConnectionMode(ConnectionMode.LAN)
     }
 
     private suspend fun startPairing(baseUrl: String) {
@@ -1299,15 +1521,90 @@ class AppViewModel(
         discoveryJob = null
     }
 
+    /**
+     * Invalidates every old search/upload/recommendation identity *before* cancelling its job, so a
+     * late response from the previous origin can never apply over the switched profile. The query
+     * draft text/mode/top_k/libraries and the image Uri are preserved; the old query_image_id is
+     * dropped because it belongs to the previous origin.
+     */
+    private fun cancelInFlightForModeSwitch() {
+        val attempt = nextSearchAttempt()
+        _state.update {
+            it.copy(searchAttempt = attempt, searchPhase = SearchPhase.CANCELLED)
+        }
+        cancelDiscovery()
+        connectionFlight.cancel()
+        // Give the running upload a fresh identity before cancelling it, so its cancellation handler
+        // (which removes the query image) no longer matches this attempt and cannot drop the draft
+        // image that the mode switch must preserve.
+        val uploadAttempt = nextUploadAttempt()
+        _state.update { current ->
+            current.copy(
+                queryImage = current.queryImage?.copy(
+                    uploadAttempt = uploadAttempt,
+                    uploading = false,
+                ),
+            )
+        }
+        uploadJob?.cancel()
+        uploadJob = null
+        pageJob?.cancel()
+        pageJob = null
+        searchJob?.cancel()
+        searchJob = null
+        actionJob?.cancel()
+        actionJob = null
+        recommendationsVisible = false
+        cancelRecommendationDelivery()
+        recommendationActionJob?.cancel()
+        recommendationActionJob = null
+    }
+
+    private fun enterRemoteRestoreFailure(connection: SavedConnection, message: String) {
+        _state.update {
+            it.copy(
+                phase = ConnectionPhase.DISCOVERY,
+                isDiscovering = false,
+                remoteRestoreFailed = true,
+                connectionMode = ConnectionMode.REMOTE,
+                connectionOrigin = connection.baseUrl,
+                lanEndpoint = connection.lanBaseUrl,
+                remoteEndpoint = connection.remoteBaseUrl,
+                errorMessage = message,
+                connectionDetail = null,
+                pairingCode = null,
+                pairingSecondsRemaining = 0L,
+            )
+        }
+    }
+
+    private suspend fun onConnectionFailure(connection: SavedConnection, error: Throwable) {
+        if (error is ApiException && error.httpStatus == 401) {
+            // Only a received 401 invalidates the credential; a timeout/offline keeps the token.
+            startPairing(connection.baseUrl)
+            return
+        }
+        val message = pairingErrorMessage(PairingStage.RESTORE, error)
+        if (connection.mode == ConnectionMode.REMOTE) {
+            enterRemoteRestoreFailure(connection, message)
+        } else {
+            failPairing(message)
+        }
+    }
+
+    private fun missingEndpointMessage(mode: ConnectionMode): String = when (mode) {
+        ConnectionMode.REMOTE ->
+            "尚未登记远程入口。请在电脑端导入 FRPC 配置并开启远程访问，再重新打开 App 同步入口。"
+        ConnectionMode.LAN ->
+            "尚未登记局域网入口，请重新发现或手工连接。"
+    }
+
     private suspend fun loadReadyState() {
         val status = repository.status()
         val libraries = repository.libraries()
+        // Only a Bearer-authenticated status may register the LAN/REMOTE aliases or bind the id.
+        repository.registerAuthenticatedEndpoints(status)
         val saved = repository.savedConnection()
-        if (saved != null && saved.instanceId != status.instanceId) {
-            repository.selectConnection(
-                saved.copy(instanceId = status.instanceId, displayName = status.name),
-            )
-        }
         _state.update {
             it.copy(
                 phase = ConnectionPhase.READY,
@@ -1316,6 +1613,12 @@ class AppViewModel(
                 errorMessage = null,
                 pairingCode = null,
                 connectionDetail = null,
+                remoteRestoreFailed = false,
+                connectionMode = saved?.mode ?: it.connectionMode,
+                connectionOrigin = saved?.baseUrl ?: it.connectionOrigin,
+                lanEndpoint = saved?.lanBaseUrl,
+                remoteEndpoint = saved?.remoteBaseUrl,
+                supportsRemoteMedia = saved?.supportsRemoteMedia ?: false,
             )
         }
     }
@@ -1454,6 +1757,8 @@ class AppViewModel(
         private const val DEFAULT_TOP_K_TEXT = "36"
         private const val SEARCH_RESTORE_NOTICE = "上次搜索已结束，请重新搜索"
         private const val SEARCH_RESTORE_IMAGE_NOTICE = "上次搜索已结束，请重新选择查询图片并重新搜索"
+        private const val REMOTE_PREVIEW_UPGRADE_REASON =
+            "电脑端未提供远程预览；请更新电脑端，或点击下方按钮打开原图。"
         private const val KEY_SEARCH_TEXT = "searchText"
         private const val KEY_SEARCH_MODE = "searchMode"
         private const val KEY_TOP_K = "topK"

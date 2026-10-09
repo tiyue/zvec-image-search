@@ -213,11 +213,17 @@ class _FakeResolver:
         self,
         sources: dict[str, MediaSource],
         thumbnails: dict[str, ThumbnailPayload] | None = None,
+        remote_thumbnails: dict[str, ThumbnailPayload] | None = None,
+        previews: dict[str, ThumbnailPayload] | None = None,
     ) -> None:
         self.sources = sources
         self.thumbnails = dict(thumbnails or {})
+        self.remote_thumbnails = dict(remote_thumbnails or {})
+        self.previews = dict(previews or {})
         self.calls: list[tuple[str, str]] = []
         self.thumbnail_calls: list[tuple[str, str]] = []
+        self.remote_thumbnail_calls: list[tuple[str, str]] = []
+        self.preview_calls: list[tuple[str, str]] = []
 
     def resolve_original(
         self,
@@ -236,6 +242,44 @@ class _FakeResolver:
     ) -> ThumbnailPayload | None:
         self.thumbnail_calls.append((media_id, client_id))
         return self.thumbnails.get(media_id)
+
+    def resolve_remote_thumbnail(
+        self,
+        media_id: str,
+        *,
+        client_id: str,
+    ) -> ThumbnailPayload | None:
+        self.remote_thumbnail_calls.append((media_id, client_id))
+        return self.remote_thumbnails.get(media_id)
+
+    def resolve_preview(
+        self,
+        media_id: str,
+        *,
+        client_id: str,
+    ) -> ThumbnailPayload | None:
+        self.preview_calls.append((media_id, client_id))
+        return self.previews.get(media_id)
+
+
+class _LegacyResolver:
+    """A standalone resolver that predates the remote media methods."""
+
+    def resolve_original(
+        self,
+        media_id: str,
+        *,
+        client_id: str,
+    ) -> MediaSource | None:
+        return None
+
+    def resolve_thumbnail(
+        self,
+        media_id: str,
+        *,
+        client_id: str,
+    ) -> ThumbnailPayload | None:
+        return None
 
 
 class LanHttpApiTests(unittest.TestCase):
@@ -344,6 +388,8 @@ class LanHttpApiTests(unittest.TestCase):
         max_connections: int = 64,
         pairing_manager: PairingManager | None = None,
         query_images: QueryImageStore | None = None,
+        media_resolver: Any = None,
+        endpoint_provider: Any = None,
     ) -> tuple[LanApiServer, Any, QueryImageStore]:
         uploads = query_images or QueryImageStore(
             self.root / f"extra-uploads-{time.time_ns()}"
@@ -353,7 +399,8 @@ class LanHttpApiTests(unittest.TestCase):
             name="Zvec on TEST-PC",
             search_backend=self.backend,
             recommendation_backend=self.backend,
-            media_resolver=self.resolver,
+            media_resolver=self.resolver if media_resolver is None else media_resolver,
+            endpoint_provider=endpoint_provider,
             pairing_manager=(
                 self.pairing if pairing_manager is None else pairing_manager
             ),
@@ -1157,6 +1204,7 @@ class LanHttpApiTests(unittest.TestCase):
                 "protocol": 1,
                 "instance_id": "stable-instance-id-1234567890",
                 "name": "Zvec on TEST-PC",
+                "media_profiles": ["remote-v1"],
             },
         )
         self.assertEqual(
@@ -1164,6 +1212,57 @@ class LanHttpApiTests(unittest.TestCase):
             {"libraries": [{"id": "library-1", "name": "Family Photos", "count": 42}]},
         )
         self.assertNotIn(b"C:\\Private", libraries.body)
+
+    def test_status_reports_only_trusted_connection_endpoints(self) -> None:
+        provided = {
+            "lan": "http://192.168.1.20:39000",
+            "remote": "http://39.105.48.52:38522",
+        }
+        server, address, _uploads = self.start_extra_server(
+            endpoint_provider=lambda: provided
+        )
+
+        response = self.request(
+            "GET",
+            "/api/v1/status",
+            port=address.port,
+        )
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(
+            response.json()["connection_endpoints"],
+            {
+                "lan": "http://192.168.1.20:39000",
+                "remote": "http://39.105.48.52:38522",
+            },
+        )
+
+    def test_status_omits_endpoints_that_are_not_trusted_ipv4_origins(self) -> None:
+        provided = {
+            "lan": "http://attacker.example.com:80",
+            "remote": "http://10.0.0.5:38522/path?q=1",
+        }
+        server, address, _uploads = self.start_extra_server(
+            endpoint_provider=lambda: provided
+        )
+
+        response = self.request("GET", "/api/v1/status", port=address.port)
+
+        self.assertEqual(response.status, 200)
+        self.assertNotIn("connection_endpoints", response.json())
+
+    def test_status_tolerates_a_failing_endpoint_provider(self) -> None:
+        def broken() -> dict[str, str]:
+            raise RuntimeError("desktop provider exploded")
+
+        server, address, _uploads = self.start_extra_server(
+            endpoint_provider=broken
+        )
+
+        response = self.request("GET", "/api/v1/status", port=address.port)
+
+        self.assertEqual(response.status, 200)
+        self.assertNotIn("connection_endpoints", response.json())
 
     def test_backend_error_message_cannot_leak_an_absolute_path(self) -> None:
         self.backend.library_error = LanBackendError(
@@ -1522,6 +1621,126 @@ class LanHttpApiTests(unittest.TestCase):
         )
         self.assertNotIn("thumbnail-body", oversized.body.decode(errors="ignore"))
 
+    def test_remote_thumbnail_and_preview_get_head_etag_contract(self) -> None:
+        remote_body = b"remote-thumb"
+        preview_body = b"remote-preview"
+        self.resolver.remote_thumbnails["media-1"] = ThumbnailPayload(
+            content=remote_body,
+            content_type="image/webp",
+            etag='"remote-thumb-1"',
+        )
+        self.resolver.previews["media-1"] = ThumbnailPayload(
+            content=preview_body,
+            content_type="image/jpeg",
+            etag='"preview-1"',
+        )
+
+        thumb = self.request("GET", "/api/v1/media/media-1/remote-thumbnail")
+        head = self.request("HEAD", "/api/v1/media/media-1/remote-thumbnail")
+        not_modified = self.request(
+            "GET",
+            "/api/v1/media/media-1/remote-thumbnail",
+            headers={"If-None-Match": '"remote-thumb-1"'},
+        )
+        preview = self.request("GET", "/api/v1/media/media-1/preview")
+
+        self.assertEqual(thumb.status, 200)
+        self.assertEqual(thumb.body, remote_body)
+        self.assertEqual(thumb.headers["content-type"], "image/webp")
+        self.assertEqual(thumb.headers["cache-control"], "private, max-age=300")
+        self.assertEqual(thumb.headers["etag"], '"remote-thumb-1"')
+        self.assertEqual(head.status, 200)
+        self.assertEqual(head.body, b"")
+        self.assertEqual(head.headers["content-length"], str(len(remote_body)))
+        self.assertEqual(not_modified.status, 304)
+        self.assertEqual(not_modified.body, b"")
+        self.assertEqual(preview.status, 200)
+        self.assertEqual(preview.body, preview_body)
+        self.assertEqual(preview.headers["content-type"], "image/jpeg")
+        self.assertEqual(
+            self.resolver.remote_thumbnail_calls,
+            [("media-1", self.client_id)] * 3,
+        )
+        self.assertEqual(self.resolver.preview_calls, [("media-1", self.client_id)])
+
+    def test_remote_media_routes_reject_queries_wrong_methods_and_anonymous(
+        self,
+    ) -> None:
+        self.resolver.remote_thumbnails["media-1"] = ThumbnailPayload(
+            content=b"x",
+            content_type="image/jpeg",
+            etag='"r"',
+        )
+        self.resolver.previews["media-1"] = ThumbnailPayload(
+            content=b"x",
+            content_type="image/jpeg",
+            etag='"p"',
+        )
+
+        query = self.request("GET", "/api/v1/media/media-1/remote-thumbnail?w=1")
+        anonymous = self.request(
+            "GET",
+            "/api/v1/media/media-1/preview",
+            authenticated=False,
+        )
+        wrong = self.request("POST", "/api/v1/media/media-1/preview")
+
+        self.assertEqual(query.status, 400)
+        self.assertEqual(query.json()["error"]["code"], "invalid_query")
+        self.assertEqual(anonymous.status, 401)
+        self.assertEqual(wrong.status, 405)
+
+    def test_remote_media_missing_and_invalid_payloads_fail_without_details(
+        self,
+    ) -> None:
+        missing = self.request("GET", "/api/v1/media/missing/remote-thumbnail")
+        self.resolver.remote_thumbnails["bad"] = ThumbnailPayload(
+            content=b"remote-body",
+            content_type="image/gif",
+            etag='"bad"',
+        )
+        self.resolver.previews["big"] = ThumbnailPayload(
+            content=b"x" * (1024 * 1024 + 1),
+            content_type="image/jpeg",
+            etag='"big"',
+        )
+        invalid = self.request("GET", "/api/v1/media/bad/remote-thumbnail")
+        oversized = self.request("GET", "/api/v1/media/big/preview")
+
+        self.assertEqual(missing.status, 404)
+        self.assertEqual(missing.json()["error"]["code"], "media_not_found")
+        self.assertEqual(invalid.status, 500)
+        self.assertEqual(invalid.json()["error"]["code"], "invalid_media_payload")
+        self.assertNotIn(b"remote-body", invalid.body)
+        self.assertEqual(oversized.status, 500)
+
+    def test_remote_routes_require_the_new_resolver_methods(self) -> None:
+        _server, address, _uploads = self.start_extra_server(
+            media_resolver=_LegacyResolver()
+        )
+
+        remote = self.request(
+            "GET",
+            "/api/v1/media/media-1/remote-thumbnail",
+            port=address.port,
+        )
+        preview = self.request(
+            "GET",
+            "/api/v1/media/media-1/preview",
+            port=address.port,
+        )
+        original = self.request(
+            "GET",
+            "/api/v1/media/media-1/original",
+            port=address.port,
+        )
+
+        for response in (remote, preview):
+            self.assertEqual(response.status, 503)
+            self.assertEqual(response.json()["error"]["code"], "media_unavailable")
+            self.assertNotIn(b"Traceback", response.body)
+        self.assertEqual(original.status, 404)
+
     def test_if_range_and_head_range_follow_single_range_semantics(self) -> None:
         etag = f'"{self.media_sha256}"'
         stale = self.request(
@@ -1850,6 +2069,60 @@ class SearchSourceThumbnailHttpTests(unittest.TestCase):
         self.assertEqual(original.status, 200)
         self.assertEqual(original.body, self.source_bytes)
 
+    def test_search_source_remote_thumbnail_and_preview_routes(self) -> None:
+        created = self.json_request(
+            "/api/v1/searches",
+            {
+                "mode": "text",
+                "text": "原神",
+                "library_ids": ["lib-a"],
+                "top_k": 100,
+            },
+        )
+        self.assertEqual(created.status, 202)
+        search_id = created.json()["search_id"]
+        self.facade.complete(search_id, self.digest)
+
+        page = self.request(
+            "GET",
+            f"/api/v1/searches/{search_id}?page=1&page_size=100",
+        )
+        self.assertEqual(page.status, 200)
+        media_id = page.json()["items"][0]["media_id"]
+
+        remote = self.request(
+            "GET",
+            f"/api/v1/media/{media_id}/remote-thumbnail",
+        )
+        preview = self.request("GET", f"/api/v1/media/{media_id}/preview")
+        not_modified = self.request(
+            "GET",
+            f"/api/v1/media/{media_id}/remote-thumbnail",
+            headers={"If-None-Match": remote.headers["etag"]},
+        )
+
+        self.assertEqual(remote.status, 200)
+        self.assertIn(
+            remote.headers["content-type"],
+            {"image/jpeg", "image/png", "image/webp"},
+        )
+        self.assertLessEqual(len(remote.body), 1024 * 1024)
+        with Image.open(io.BytesIO(remote.body)) as rendered:
+            self.assertLessEqual(max(rendered.size), 640)
+        self.assertEqual(not_modified.status, 304)
+        self.assertEqual(preview.status, 200)
+        with Image.open(io.BytesIO(preview.body)) as rendered:
+            self.assertLessEqual(max(rendered.size), 1600)
+
+        # The original route still returns the complete unmodified bytes.
+        original = self.request("GET", f"/api/v1/media/{media_id}/original")
+        self.assertEqual(original.status, 200)
+        self.assertEqual(original.body, self.source_bytes)
+        self.assertEqual(
+            hashlib.sha256(self.source_path.read_bytes()).hexdigest(),
+            self.digest,
+        )
+
 
 class LanGatewayLifecycleTests(unittest.TestCase):
     def test_gateway_passes_recommendation_backend_to_http_api(self) -> None:
@@ -1870,6 +2143,28 @@ class LanGatewayLifecycleTests(unittest.TestCase):
             self.addCleanup(gateway.stop)
 
             self.assertIs(gateway.api_server._recommendation_backend, backend)
+
+    def test_gateway_passes_endpoint_provider_to_http_api(self) -> None:
+        def provider() -> dict[str, str]:
+            return {"lan": "http://127.0.0.1:39000"}
+
+        with tempfile.TemporaryDirectory() as directory:
+            backend = _FakeBackend()
+            gateway = LanGatewayServer(
+                instance_id="stable-instance-id-1234567890",
+                name="Zvec on TEST-PC",
+                advertised_host="127.0.0.1",
+                search_backend=backend,
+                media_resolver=_FakeResolver({}),
+                endpoint_provider=provider,
+                upload_directory=Path(directory) / "uploads",
+                bind_host="127.0.0.1",
+                api_port=0,
+                discovery_port=0,
+            )
+            self.addCleanup(gateway.stop)
+
+            self.assertIs(gateway.api_server._endpoint_provider, provider)
 
     @staticmethod
     def pair_device(

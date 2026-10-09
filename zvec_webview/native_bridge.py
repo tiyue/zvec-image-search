@@ -85,6 +85,18 @@ class NativeBridge:
         except Exception as exc:
             return _bridge_error(exc)
 
+    def select_frpc_config_file(self) -> dict[str, Any]:
+        """Select one local TOML FRPC configuration file for an explicit import."""
+
+        try:
+            result = self._create_dialog("frpc_toml")
+            path = _first_dialog_path(result)
+            if path is not None and path.suffix.casefold() != ".toml":
+                raise ValueError("请选择 TOML 文件。")
+            return {"ok": True, "path": str(path) if path is not None else None}
+        except Exception as exc:
+            return _bridge_error(exc)
+
     def select_raw_images(self) -> dict[str, Any]:
         """Select supported RAW-workspace sources without registering them.
 
@@ -403,6 +415,9 @@ class NativeBridge:
         file_types: tuple[str, ...]
         if kind == "json":
             file_types = ("JSON 文件 (*.json)", "所有文件 (*.*)")
+            allow_multiple = False
+        elif kind == "frpc_toml":
+            file_types = ("FRPC 配置 (*.toml)", "所有文件 (*.*)")
             allow_multiple = False
         elif kind == "raw_images":
             file_types = ("Sony A7M4 ARW / 图片 (*.arw;*.jpg;*.jpeg;*.png)",)

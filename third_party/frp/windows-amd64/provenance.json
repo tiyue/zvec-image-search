@@ -1,0 +1,10 @@
+{
+  "name": "frp",
+  "version": "0.61.1",
+  "platform": "windows_amd64",
+  "source": "https://github.com/fatedier/frp/releases/download/v0.61.1/frp_0.61.1_windows_amd64.zip",
+  "archive_sha256": "e0094cd0baf03d5ff9ce9739199406871ad8788cf51e766f00ad3a9e7a836f3a",
+  "frpc_sha256": "d9a8cf8bc61bd5c8d57a2a4801316a18291f76d45dc5fd8aaf425bd91b57159d",
+  "license": "Apache-2.0",
+  "purpose": "Internal Windows YaoLens remote-access component; not a standalone release asset."
+}

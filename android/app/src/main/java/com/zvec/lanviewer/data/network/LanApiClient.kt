@@ -3,6 +3,7 @@ package com.zvec.lanviewer.data.network
 import android.content.ContentResolver
 import android.net.Uri
 import com.zvec.lanviewer.data.local.ConnectionReader
+import com.zvec.lanviewer.data.local.ConnectionMode
 import com.zvec.lanviewer.data.model.ErrorEnvelope
 import com.zvec.lanviewer.data.model.LibrariesResponse
 import com.zvec.lanviewer.data.model.PairPollRequest
@@ -242,8 +243,21 @@ class LanApiClient(
     fun mediaUrl(mediaId: String): String =
         currentEndpoint("api", "v1", "media", mediaId, "original").toString()
 
-    fun thumbnailUrl(mediaId: String): String =
-        currentEndpoint("api", "v1", "media", mediaId, "thumbnail").toString()
+    /**
+     * Grid and recommendation-preload thumbnail. LAN keeps the original `/thumbnail`; REMOTE uses the
+     * compressed `/remote-thumbnail` so a public link never pulls the full-size LAN thumbnail.
+     */
+    fun thumbnailUrl(mediaId: String): String {
+        val segment = if (currentMode() == ConnectionMode.REMOTE) "remote-thumbnail" else "thumbnail"
+        return currentEndpoint("api", "v1", "media", mediaId, segment).toString()
+    }
+
+    /** REMOTE default viewer image; only requested when the status advertises the `remote-v1` profile. */
+    fun previewUrl(mediaId: String): String =
+        currentEndpoint("api", "v1", "media", mediaId, "preview").toString()
+
+    private fun currentMode(): ConnectionMode =
+        connectionReader.read()?.mode ?: ConnectionMode.LAN
 
     private fun currentEndpoint(vararg segments: String): HttpUrl {
         val baseUrl = connectionReader.read()?.baseUrl

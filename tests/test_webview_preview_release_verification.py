@@ -32,6 +32,9 @@ def _payload(root: Path) -> Path:
         _write(payload, entry_point)
     for relative in (
         "_internal/python312.dll",
+        "_internal/frp/frpc.exe",
+        "_internal/frp/LICENSE",
+        "_internal/frp/provenance.json",
         "_internal/pythonnet/runtime/Python.Runtime.dll",
         "_internal/pythonnet/runtime/netstandard.dll",
         "_internal/pythonnet/runtime/System.Runtime.dll",

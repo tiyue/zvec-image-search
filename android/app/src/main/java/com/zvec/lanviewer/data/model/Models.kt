@@ -55,6 +55,18 @@ data class StatusResponse(
     val protocol: Int,
     @SerialName("instance_id") val instanceId: String,
     val name: String,
+    @SerialName("connection_endpoints") val connectionEndpoints: ConnectionEndpoints? = null,
+    @SerialName("media_profiles") val mediaProfiles: List<String> = emptyList(),
+)
+
+/**
+ * Authenticated HTTP IPv4 origins the desktop offers for the same device license.
+ * The phone only registers these after a Bearer-authenticated `/status` on its current origin.
+ */
+@Serializable
+data class ConnectionEndpoints(
+    val lan: String? = null,
+    val remote: String? = null,
 )
 
 @Serializable

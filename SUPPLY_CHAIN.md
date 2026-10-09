@@ -42,6 +42,17 @@ NSIS 安装脚本和已经通过测试的前端静态资源。构建产物必须
 验证步骤会检查 Vite 资源闭包、冻结清单、便携 ZIP 和 NSIS 安装器内容，
 并生成 Windows 验证报告和 SHA-256 清单。
 
+### 内置 FRPC
+
+Windows 包内部包含官方 FRP 0.61.1 Windows amd64 的 `frpc.exe`、Apache-2.0
+许可证与 `provenance.json`，源码目录为 `third_party/frp/windows-amd64/`。
+来源为官方同版本 Release，ZIP SHA-256 为
+`e0094cd0baf03d5ff9ce9739199406871ad8788cf51e766f00ad3a9e7a836f3a`，
+FRPC SHA-256 为 `d9a8cf8bc61bd5c8d57a2a4801316a18291f76d45dc5fd8aaf425bd91b57159d`。
+包装检查要求 `_internal/frp/` 内三个文件齐全。FRPC 只作为现有 Windows
+产品的内部组件，不新增发布附件；用户 FRP 配置和凭据不得进入产品包。
+Python 3.10 使用固定 `tomli==2.2.1` 读取 TOML；3.11 起使用标准库 `tomllib`。
+
 ### 安装与常驻约束
 
 - NSIS 安装版只为执行安装的当前用户注册登录任务。任务必须使用 `AtLogon`、

@@ -7,8 +7,10 @@ import {
 } from "../search-learning";
 import DataMigrationSection from "./DataMigrationSection.vue";
 import LanAccessSection from "./LanAccessSection.vue";
+import RemoteAccessSection from "./RemoteAccessSection.vue";
 import type { LanAccessApi } from "./lanTypes";
 import type { DataMigrationApi } from "./migrationTypes";
+import type { RemoteAccessApi } from "./remoteTypes";
 import type {
   LibraryDraft,
   ModelChoice,
@@ -21,6 +23,7 @@ import { useSettings } from "./useSettings";
 const props = withDefaults(defineProps<{
   api?: SettingsApi;
   lanApi?: LanAccessApi;
+  remoteApi?: RemoteAccessApi;
   migrationApi?: DataMigrationApi;
   learningApi?: SearchLearningApi;
   autoLoad?: boolean;
@@ -43,7 +46,15 @@ const choosingDirectory = ref("");
 const confirmingExit = ref(false);
 const exiting = ref(false);
 const activeSection = ref<
-  "libraries" | "models" | "credentials" | "tags" | "learning" | "lan" | "migration" | "application"
+  | "libraries"
+  | "models"
+  | "credentials"
+  | "tags"
+  | "learning"
+  | "lan"
+  | "remote"
+  | "migration"
+  | "application"
 >("libraries");
 
 function selectDefault(libraryId: string): void {
@@ -143,7 +154,7 @@ async function exitApplication(): Promise<void> {
 </script>
 
 <template>
-  <section class="settings-page" aria-labelledby="settings-title">
+  <section class="settings-page" :class="{ 'remote-settings-active': activeSection === 'remote' }" aria-labelledby="settings-title">
     <header class="page-heading">
       <div>
         <p class="eyebrow">本地配置</p>
@@ -171,6 +182,9 @@ async function exitApplication(): Promise<void> {
         </button>
         <button type="button" :class="{ active: activeSection === 'lan' }" @click="activeSection = 'lan'">
           <span>局域网访问</span>
+        </button>
+        <button type="button" :class="{ active: activeSection === 'remote' }" @click="activeSection = 'remote'">
+          <span>远程访问</span>
         </button>
         <button type="button" :class="{ active: activeSection === 'learning' }" @click="activeSection = 'learning'">
           <span>搜索学习</span>
@@ -413,6 +427,13 @@ async function exitApplication(): Promise<void> {
     <LanAccessSection
       v-show="activeSection === 'lan'"
       :api="props.lanApi"
+      @toast="(title, message, kind) => emit('toast', title, message, kind)"
+    />
+
+    <RemoteAccessSection
+      v-show="activeSection === 'remote'"
+      :visible="activeSection === 'remote'"
+      :api="props.remoteApi"
       @toast="(title, message, kind) => emit('toast', title, message, kind)"
     />
 
@@ -756,6 +777,13 @@ label small { color: #8a91a2; font-weight: 500; }
   .section-actions { align-items: flex-end; flex-direction: column; }
 }
 @media (prefers-color-scheme: dark) {
+  :global(.settings-feature-page:has(.remote-settings-active)) { background: #1c1c1c; }
+  .remote-settings-active { color: #ededed; }
+  .remote-settings-active .settings-nav { border-color: #444; }
+  .remote-settings-active .settings-nav button { color: #b8b8b8; }
+  .remote-settings-active .settings-nav button:hover,
+  .remote-settings-active .settings-nav button.active { color: #ededed; background: #303030; }
+  .remote-settings-active .page-heading > button.secondary { color: #ededed !important; border-color: #444 !important; background: #303030 !important; }
   .application-action { border-color: #3f3f3f; }
   .application-action small { color: #b8b8b8; }
   .button.danger { color: #ffd8dd; border-color: #713f47; background: #492b30; }

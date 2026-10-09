@@ -3,20 +3,20 @@
     "file": "assets/shared-BIpLNPMn.css",
     "src": "_shared-BIpLNPMn.css"
   },
-  "_shared-C9AQRKMF.js": {
-    "file": "assets/shared-C9AQRKMF.js",
+  "_shared-D3cHntRF.js": {
+    "file": "assets/shared-D3cHntRF.js",
     "name": "shared",
     "css": [
       "assets/shared-BIpLNPMn.css"
     ]
   },
   "index.html": {
-    "file": "assets/index-DQkCFWkD.js",
+    "file": "assets/index-cJXYQXk4.js",
     "name": "index",
     "src": "index.html",
     "isEntry": true,
     "imports": [
-      "_shared-C9AQRKMF.js"
+      "_shared-D3cHntRF.js"
     ],
     "dynamicImports": [
       "src/features/tasks/TasksPage.vue",
@@ -38,72 +38,72 @@
     "src": "src/assets/yaolens-logo.png"
   },
   "src/features/image-edit/ImageEditPage.vue": {
-    "file": "assets/ImageEditPage-CkavXEo7.js",
+    "file": "assets/ImageEditPage-DpS9r_v-.js",
     "name": "ImageEditPage",
     "src": "src/features/image-edit/ImageEditPage.vue",
     "isDynamicEntry": true,
     "imports": [
-      "_shared-C9AQRKMF.js"
+      "_shared-D3cHntRF.js"
     ],
     "css": [
       "assets/ImageEditPage-Bbhnaf2o.css"
     ]
   },
   "src/features/organize/OrganizePage.vue": {
-    "file": "assets/OrganizePage-DMrWWZoo.js",
+    "file": "assets/OrganizePage-CDygw9eA.js",
     "name": "OrganizePage",
     "src": "src/features/organize/OrganizePage.vue",
     "isDynamicEntry": true,
     "imports": [
-      "_shared-C9AQRKMF.js"
+      "_shared-D3cHntRF.js"
     ],
     "css": [
       "assets/OrganizePage-BrNLTa8M.css"
     ]
   },
   "src/features/raw-selection/RawSelectionPage.vue": {
-    "file": "assets/RawSelectionPage-CvPfHtuk.js",
+    "file": "assets/RawSelectionPage-BiuD-oXX.js",
     "name": "RawSelectionPage",
     "src": "src/features/raw-selection/RawSelectionPage.vue",
     "isDynamicEntry": true,
     "imports": [
-      "_shared-C9AQRKMF.js"
+      "_shared-D3cHntRF.js"
     ],
     "css": [
       "assets/RawSelectionPage-By18ls2U.css"
     ]
   },
   "src/features/recommendations/RecommendationPage.vue": {
-    "file": "assets/RecommendationPage-BKPoAXzF.js",
+    "file": "assets/RecommendationPage-Hgkf30sY.js",
     "name": "RecommendationPage",
     "src": "src/features/recommendations/RecommendationPage.vue",
     "isDynamicEntry": true,
     "imports": [
-      "_shared-C9AQRKMF.js"
+      "_shared-D3cHntRF.js"
     ],
     "css": [
       "assets/RecommendationPage-C_ykFa04.css"
     ]
   },
   "src/features/settings/SettingsPage.vue": {
-    "file": "assets/SettingsPage-DBZDfNzH.js",
+    "file": "assets/SettingsPage-SnR3Xj1f.js",
     "name": "SettingsPage",
     "src": "src/features/settings/SettingsPage.vue",
     "isDynamicEntry": true,
     "imports": [
-      "_shared-C9AQRKMF.js"
+      "_shared-D3cHntRF.js"
     ],
     "css": [
-      "assets/SettingsPage-BosJCI-G.css"
+      "assets/SettingsPage-CcLON0OZ.css"
     ]
   },
   "src/features/tasks/TasksPage.vue": {
-    "file": "assets/TasksPage-tsTKl94Y.js",
+    "file": "assets/TasksPage--g__YX27.js",
     "name": "TasksPage",
     "src": "src/features/tasks/TasksPage.vue",
     "isDynamicEntry": true,
     "imports": [
-      "_shared-C9AQRKMF.js"
+      "_shared-D3cHntRF.js"
     ],
     "css": [
       "assets/TasksPage-BxrZGcxf.css"

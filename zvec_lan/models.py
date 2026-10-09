@@ -192,6 +192,22 @@ class MediaResolver(Protocol):
     ) -> ThumbnailPayload | None:
         """Return a bounded encoded thumbnail without exposing its path."""
 
+    def resolve_remote_thumbnail(
+        self,
+        media_id: str,
+        *,
+        client_id: str,
+    ) -> ThumbnailPayload | None:
+        """Return a bounded remote-mode thumbnail without exposing its path."""
+
+    def resolve_preview(
+        self,
+        media_id: str,
+        *,
+        client_id: str,
+    ) -> ThumbnailPayload | None:
+        """Return a bounded remote-mode preview without exposing its path."""
+
 
 class LanBackendError(RuntimeError):
     """A safe, intentional error raised by a LAN adapter.

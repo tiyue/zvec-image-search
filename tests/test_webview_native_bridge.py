@@ -111,6 +111,50 @@ class NativeBridgeTests(unittest.TestCase):
             self.assertEqual(response["code"], "native_action_failed")
             self.assertIn("JSON", response["error"])
 
+    def test_frpc_toml_selection_uses_a_toml_filter_and_returns_the_path(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "frpc.TOML"
+            path.write_text('serverAddr = "1.2.3.4"', encoding="utf-8")
+            bridge = NativeBridge(ImageRegistry())
+            window = _Window(path)
+            bridge.attach_window(window)
+            fake_webview = SimpleNamespace(
+                FileDialog=SimpleNamespace(OPEN="open", FOLDER="folder")
+            )
+
+            with patch.dict(sys.modules, {"webview": fake_webview}):
+                response = bridge.select_frpc_config_file()
+
+            self.assertEqual(response, {"ok": True, "path": str(path)})
+            self.assertEqual(window.dialog_type, "open")
+            self.assertEqual(window.dialog_kwargs["allow_multiple"], False)
+            self.assertEqual(
+                window.dialog_kwargs["file_types"],
+                ("FRPC 配置 (*.toml)", "所有文件 (*.*)"),
+            )
+            self.assertNotIn(path.read_text(encoding="utf-8"), repr(response))
+
+    def test_frpc_toml_selection_rejects_a_non_toml_file_without_raising(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "frpc.ini"
+            path.write_text("[common]", encoding="utf-8")
+            bridge = NativeBridge(ImageRegistry())
+            bridge.attach_window(_Window(path))
+            fake_webview = SimpleNamespace(
+                FileDialog=SimpleNamespace(OPEN="open", FOLDER="folder")
+            )
+
+            with patch.dict(sys.modules, {"webview": fake_webview}):
+                response = bridge.select_frpc_config_file()
+
+            self.assertFalse(response["ok"])
+            self.assertEqual(response["code"], "native_action_failed")
+            self.assertIn("TOML", response["error"])
+
     def test_raw_selection_allows_multiple_supported_images_in_order(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

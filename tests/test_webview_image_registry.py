@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import os
 import tempfile
 import threading
 import time
@@ -1005,6 +1006,98 @@ class ImageRegistryTests(unittest.TestCase):
         self.assertEqual(
             [call.args[0] for call in create.call_args_list], ["visible", "current"]
         )
+
+    def test_remote_variants_are_bounded_and_separate_from_thumbnail(self) -> None:
+        source = _image(self.root / "remote.jpg", size=(2400, 1600))
+        registry = ImageRegistry(max_entries=10, max_cache_bytes=8 * 1024 * 1024)
+        self.addCleanup(registry.close)
+        image_id = registry.register(source).image_id
+
+        thumbnail = registry.payload(image_id, "thumbnail")
+        remote_thumbnail = registry.payload(image_id, "remote_thumbnail")
+        remote_preview = registry.payload(image_id, "remote_preview")
+
+        self.assertEqual(thumbnail.content_type, "image/jpeg")
+        allowed = {"image/jpeg", "image/png", "image/webp"}
+        self.assertIn(remote_thumbnail.content_type, allowed)
+        self.assertIn(remote_preview.content_type, allowed)
+        self.assertLessEqual(len(remote_thumbnail.content), 1024 * 1024)
+        self.assertLessEqual(len(remote_preview.content), 1024 * 1024)
+        self.assertNotEqual(remote_thumbnail.etag, thumbnail.etag)
+        self.assertLessEqual(max(_decoded_size(remote_thumbnail.content)), 640)
+        self.assertLessEqual(max(_decoded_size(remote_preview.content)), 1600)
+        self.assertIs(
+            registry.payload(image_id, "remote_thumbnail"),
+            remote_thumbnail,
+        )
+
+    def test_remote_variant_disk_cache_survives_restart(self) -> None:
+        source = _image(self.root / "persist.jpg", size=(2400, 1600))
+        cache = self.root / "cache"
+        first = ImageRegistry(cache_directory=cache)
+        image_id = first.register(source).image_id
+        payload = first.payload(image_id, "remote_thumbnail")
+        first.close()
+
+        second = ImageRegistry(cache_directory=cache)
+        self.addCleanup(second.close)
+        cached = second.payload(
+            second.register(source).image_id,
+            "remote_thumbnail",
+        )
+
+        self.assertEqual(cached.content, payload.content)
+        self.assertEqual(cached.content_type, payload.content_type)
+        files = list((cache / "thumbnails-v1").rglob("*.cache"))
+        self.assertTrue(files)
+        with Image.open(files[0]) as stored:
+            stored.verify()
+
+    def test_remote_variant_source_change_invalidates_the_cached_payload(self) -> None:
+        source = _image(self.root / "change.jpg", size=(2400, 1600))
+        registry = ImageRegistry(cache_directory=self.root / "cache")
+        self.addCleanup(registry.close)
+        image_id = registry.register(source).image_id
+        first = registry.payload(image_id, "remote_thumbnail")
+
+        Image.new("RGB", (2400, 1600), (200, 10, 10)).save(source, format="JPEG")
+        stat_result = os.stat(source)
+        os.utime(source, ns=(stat_result.st_atime_ns + 5_000_000_000,) * 2)
+        registry.register(source)
+        second = registry.payload(image_id, "remote_thumbnail")
+
+        self.assertNotEqual(first.etag, second.etag)
+
+    def test_remote_variants_are_persisted_under_a_profile_namespace(self) -> None:
+        source = _image(self.root / "namespace.jpg", size=(1200, 800))
+        registry = ImageRegistry(cache_directory=self.root / "cache")
+        self.addCleanup(registry.close)
+        registry.register(source)
+        stat_result = source.stat()
+        thumbnail_path = registry._disk_path(source.resolve(), "thumbnail", stat_result)
+        remote_path = registry._disk_path(
+            source.resolve(),
+            "remote_thumbnail",
+            stat_result,
+        )
+
+        self.assertIsNotNone(thumbnail_path)
+        self.assertIsNotNone(remote_path)
+        self.assertNotEqual(thumbnail_path, remote_path)
+
+    def test_remote_variants_leave_the_source_and_thumbnail_untouched(self) -> None:
+        source = _image(self.root / "stable.jpg", size=(2400, 1600))
+        original_bytes = source.read_bytes()
+        registry = ImageRegistry(cache_directory=self.root / "cache")
+        self.addCleanup(registry.close)
+        image_id = registry.register(source).image_id
+        thumbnail = registry.payload(image_id, "thumbnail")
+
+        registry.payload(image_id, "remote_thumbnail")
+        registry.payload(image_id, "remote_preview")
+
+        self.assertEqual(source.read_bytes(), original_bytes)
+        self.assertTrue(thumbnail.content.startswith(b"\xff\xd8"))
 
 
 if __name__ == "__main__":

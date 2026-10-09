@@ -127,6 +127,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.zvec.lanviewer.data.local.SavedFileRecord
+import com.zvec.lanviewer.data.local.ConnectionMode
 import com.zvec.lanviewer.data.local.ServerAddress
 import com.zvec.lanviewer.data.model.DiscoveredServer
 import com.zvec.lanviewer.data.model.LibraryDto
@@ -250,11 +251,11 @@ fun ZvecApp(viewModel: AppViewModel) {
             OriginalViewer(
                 state = state,
                 mediaUrl = viewModel::mediaUrl,
-                // The placeholder must be the exact URL the grid loaded: search items use the
-                // repository thumbnail, recommendations the URL the server already returned.
-                thumbnailUrl = { item ->
-                    if (item is RecommendationItem) item.thumbnailUrl else viewModel.thumbnailUrl(item)
-                },
+                // Every grid, preload and viewer call uses the current-origin helper; a recommendation
+                // item's private thumbnail_url/preview_url is never used directly.
+                thumbnailUrl = { item -> viewModel.thumbnailUrl(item) },
+                viewerTarget = viewModel::viewerTarget,
+                onViewOriginal = viewModel::requestViewerOriginal,
                 onIndexChanged = viewModel::setViewerIndex,
                 onClose = viewModel::closeViewer,
                 onSave = {
@@ -279,6 +280,9 @@ fun ZvecApp(viewModel: AppViewModel) {
                         onDiscover = viewModel::discover,
                         onServer = viewModel::connect,
                         onManual = viewModel::connectManual,
+                        onDiscoveryMode = viewModel::setDiscoveryMode,
+                        onRetryRemoteRestore = viewModel::retryRemoteRestore,
+                        onLeaveRemoteRestore = viewModel::leaveRemoteRestore,
                     )
                     ConnectionPhase.CONNECTING -> CenterStatus(
                         title = "正在连接",
@@ -297,9 +301,11 @@ fun ZvecApp(viewModel: AppViewModel) {
                         recommendationGridState = recommendationGridState,
                         modifier = Modifier.padding(padding),
                         thumbnailUrl = { item -> viewModel.thumbnailUrl(item) },
+                        recommendationThumbnailUrl = { item -> viewModel.thumbnailUrl(item) },
                         transferMessage = state.transferMessage,
                         transferFraction = state.transferFraction,
                         onCancelTransfer = viewModel::cancelTransfer,
+                        onSwitchMode = viewModel::switchConnectionMode,
                         onSelectedTab = { tab ->
                             awaitingFirstResult = searchNavigationAfterTabSelected(awaitingFirstResult, tab)
                             selectedTab = tab
@@ -349,7 +355,10 @@ private fun DiscoveryScreen(
     modifier: Modifier,
     onDiscover: () -> Unit,
     onServer: (DiscoveredServer) -> Unit,
-    onManual: (String, String) -> Unit,
+    onManual: (String, String, ConnectionMode) -> Unit,
+    onDiscoveryMode: (ConnectionMode) -> Unit,
+    onRetryRemoteRestore: () -> Unit,
+    onLeaveRemoteRestore: () -> Unit,
 ) {
     var host by remember { mutableStateOf("") }
     var port by remember { mutableStateOf(ServerAddress.DEFAULT_PORT.toString()) }
@@ -362,40 +371,94 @@ private fun DiscoveryScreen(
         item {
             Text("YaoLens", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
             Spacer(Modifier.height(6.dp))
-            Text("在同一局域网内发现 Windows 上的 YaoLens。首次连接需要在电脑端确认六位码。")
+            Text("连接你自己控制的 Windows 电脑。首次连接需要在电脑端确认六位码。")
         }
-        item {
-            Surface(
-                color = MaterialTheme.colorScheme.errorContainer,
-                shape = RoundedCornerShape(12.dp),
-            ) {
-                Text(
-                    "当前 Preview 使用未加密 HTTP，仅可连接你自己控制的家庭专用网络。不要在公共、共享或访客 Wi-Fi 使用。",
-                    modifier = Modifier.fillMaxWidth().padding(12.dp),
-                    color = MaterialTheme.colorScheme.onErrorContainer,
-                    style = MaterialTheme.typography.bodyMedium,
-                )
-            }
-        }
-        item {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("自动发现", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-                Spacer(Modifier.weight(1f))
-                OutlinedButton(onClick = onDiscover, enabled = !state.isDiscovering) {
-                    Text(if (state.isDiscovering) "搜索中…" else "重新搜索")
+        // The unencrypted-HTTP household warning only applies to the LAN entry; the REMOTE entry
+        // shows its own concise FRPC setup/pair-once guidance below instead.
+        if (state.discoveryMode == ConnectionMode.LAN) {
+            item {
+                Surface(
+                    color = MaterialTheme.colorScheme.errorContainer,
+                    shape = RoundedCornerShape(12.dp),
+                ) {
+                    Text(
+                        "当前 Preview 使用未加密 HTTP，仅可连接你自己控制的家庭专用网络。不要在公共、共享或访客 Wi-Fi 使用。",
+                        modifier = Modifier.fillMaxWidth().padding(12.dp),
+                        color = MaterialTheme.colorScheme.onErrorContainer,
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
                 }
             }
         }
-        if (state.isDiscovering) item { LinearProgressIndicator(Modifier.fillMaxWidth()) }
-        items(state.discoveredServers.size, key = { state.discoveredServers[it].stableKey }) { index ->
-            val server = state.discoveredServers[index]
-            Card(
-                modifier = Modifier.fillMaxWidth().clickable { onServer(server) },
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-            ) {
-                Column(Modifier.padding(16.dp)) {
-                    Text(server.name, fontWeight = FontWeight.SemiBold)
-                    Text("${server.host}:${server.port}", style = MaterialTheme.typography.bodySmall)
+        item {
+            Text("连接方式", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+            Spacer(Modifier.height(8.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FilterChip(
+                    selected = state.discoveryMode == ConnectionMode.LAN,
+                    onClick = { onDiscoveryMode(ConnectionMode.LAN) },
+                    label = { Text("局域网") },
+                )
+                FilterChip(
+                    selected = state.discoveryMode == ConnectionMode.REMOTE,
+                    onClick = { onDiscoveryMode(ConnectionMode.REMOTE) },
+                    label = { Text("非局域网（远程）") },
+                )
+            }
+        }
+        if (state.remoteRestoreFailed) {
+            item {
+                Surface(
+                    color = MaterialTheme.colorScheme.surfaceVariant,
+                    shape = RoundedCornerShape(12.dp),
+                ) {
+                    Column(
+                        Modifier.fillMaxWidth().padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Text("远程连接不可用", fontWeight = FontWeight.SemiBold)
+                        Text(
+                            state.connectionOrigin ?: state.remoteEndpoint ?: "已保存的远程地址",
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                        state.errorMessage?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(onClick = onRetryRemoteRestore) { Text("重试") }
+                            OutlinedButton(onClick = onLeaveRemoteRestore) { Text("改用局域网") }
+                        }
+                    }
+                }
+            }
+        } else {
+            if (state.discoveryMode == ConnectionMode.LAN) {
+                item {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("自动发现", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                        Spacer(Modifier.weight(1f))
+                        OutlinedButton(onClick = onDiscover, enabled = !state.isDiscovering) {
+                            Text(if (state.isDiscovering) "搜索中…" else "重新搜索")
+                        }
+                    }
+                }
+                if (state.isDiscovering) item { LinearProgressIndicator(Modifier.fillMaxWidth()) }
+                items(state.discoveredServers.size, key = { state.discoveredServers[it].stableKey }) { index ->
+                    val server = state.discoveredServers[index]
+                    Card(
+                        modifier = Modifier.fillMaxWidth().clickable { onServer(server) },
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                    ) {
+                        Column(Modifier.padding(16.dp)) {
+                            Text(server.name, fontWeight = FontWeight.SemiBold)
+                            Text("${server.host}:${server.port}", style = MaterialTheme.typography.bodySmall)
+                        }
+                    }
+                }
+            } else {
+                item {
+                    Text(
+                        "远程连接需先在电脑端开启远程访问（FRPC），再填写电脑的公网 IP 与端口；首次连接仍需在电脑端确认六位码完成配对。",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
                 }
             }
         }
@@ -407,7 +470,7 @@ private fun DiscoveryScreen(
                     value = host,
                     onValueChange = { host = it },
                     label = { Text("电脑 IP") },
-                    placeholder = { Text("192.168.1.20") },
+                    placeholder = { Text(if (state.discoveryMode == ConnectionMode.REMOTE) "203.0.113.7" else "192.168.1.20") },
                     singleLine = true,
                     modifier = Modifier.weight(1f),
                 )
@@ -420,11 +483,13 @@ private fun DiscoveryScreen(
                 )
             }
             Spacer(Modifier.height(10.dp))
-            Button(onClick = { onManual(host, port) }, modifier = Modifier.fillMaxWidth()) {
-                Text("连接")
+            Button(onClick = { onManual(host, port, state.discoveryMode) }, modifier = Modifier.fillMaxWidth()) {
+                Text(if (state.discoveryMode == ConnectionMode.REMOTE) "连接远程" else "连接")
             }
         }
-        state.errorMessage?.let { message -> item { ErrorBanner(message) } }
+        if (!state.remoteRestoreFailed) {
+            state.errorMessage?.let { message -> item { ErrorBanner(message) } }
+        }
     }
 }
 
@@ -483,9 +548,11 @@ internal fun SearchScreen(
     recommendationGridState: LazyGridState,
     modifier: Modifier,
     thumbnailUrl: (SearchItem) -> String,
+    recommendationThumbnailUrl: (RecommendationItem) -> String = { it.thumbnailUrl },
     transferMessage: String?,
     transferFraction: Float?,
     onCancelTransfer: () -> Unit,
+    onSwitchMode: (ConnectionMode) -> Unit = {},
     onSelectedTab: (MobileTab) -> Unit,
     onMode: (SearchMode) -> Unit,
     onText: (String) -> Unit,
@@ -546,8 +613,13 @@ internal fun SearchScreen(
                     gridState = recommendationGridState,
                     density = densityPreference.density,
                     onDensityChange = densityPreference::select,
+                    thumbnailUrl = recommendationThumbnailUrl,
                 )
-                MobileTab.DEVICE -> DevicePanel(state = state, onDisconnect = onDisconnect)
+                MobileTab.DEVICE -> DevicePanel(
+                    state = state,
+                    onSwitchMode = onSwitchMode,
+                    onDisconnect = onDisconnect,
+                )
             }
         }
 
@@ -591,6 +663,7 @@ internal fun RecommendationPanel(
     gridState: LazyGridState,
     density: GalleryDensity = GalleryDensity.STANDARD,
     onDensityChange: (GalleryDensity) -> Unit = {},
+    thumbnailUrl: (RecommendationItem) -> String = { it.thumbnailUrl },
 ) {
     val recommendations = state.recommendations
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -643,7 +716,7 @@ internal fun RecommendationPanel(
                 itemsIndexed(recommendations.items, key = { _, item -> item.itemId }) { index, item ->
                     GalleryThumbnailCard(
                         name = item.name,
-                        url = item.thumbnailUrl,
+                        url = thumbnailUrl(item),
                         height = density.cellHeightDp.dp,
                         onClick = { onOpen(index) },
                     )
@@ -660,7 +733,11 @@ internal fun RecommendationPanel(
 }
 
 @Composable
-private fun DevicePanel(state: AppUiState, onDisconnect: () -> Unit) {
+private fun DevicePanel(
+    state: AppUiState,
+    onSwitchMode: (ConnectionMode) -> Unit,
+    onDisconnect: () -> Unit,
+) {
     val context = LocalContext.current
     LazyColumn(
         modifier = Modifier.fillMaxSize().padding(20.dp),
@@ -673,8 +750,36 @@ private fun DevicePanel(state: AppUiState, onDisconnect: () -> Unit) {
             Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) {
                 Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     Text(state.serverName ?: "YaoLens 电脑", fontWeight = FontWeight.SemiBold)
+                    Text(
+                        "当前连接 · ${state.connectionMode.label()} · ${state.connectionOrigin ?: "未知地址"}",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
                     Text("已连接 · ${state.libraries.size} 个图库", style = MaterialTheme.typography.bodySmall)
                 }
+            }
+        }
+        item {
+            Text("连接方式", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+            Spacer(Modifier.height(8.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FilterChip(
+                    selected = state.connectionMode == ConnectionMode.LAN,
+                    onClick = { onSwitchMode(ConnectionMode.LAN) },
+                    label = { Text("局域网") },
+                )
+                FilterChip(
+                    selected = state.connectionMode == ConnectionMode.REMOTE,
+                    onClick = { onSwitchMode(ConnectionMode.REMOTE) },
+                    label = { Text("远程") },
+                )
+            }
+            if (state.connectionMode == ConnectionMode.REMOTE && !state.supportsRemoteMedia) {
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    "电脑端未提供远程预览，大图需手动查看原图。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.secondary,
+                )
             }
         }
         item {
@@ -913,6 +1018,8 @@ internal fun OriginalViewer(
     onShare: () -> Unit,
     onCancelTransfer: () -> Unit,
     onReaction: (String, RecommendationAction) -> Unit,
+    viewerTarget: ((OriginalMediaItem, Boolean) -> ViewerImageTarget)? = null,
+    onViewOriginal: () -> Unit = {},
 ) {
     BackHandler(onBack = onClose)
     val viewerItems = state.viewerItems()
@@ -923,6 +1030,7 @@ internal fun OriginalViewer(
     var chromeVisible by remember { mutableStateOf(true) }
     val rotations = remember { mutableStateMapOf<Int, Float>() }
     val transferBusy = state.transferAttempt != null
+    val remote = state.connectionMode == ConnectionMode.REMOTE
 
     LaunchedEffect(pagerState) {
         snapshotFlow { pagerState.currentPage }.distinctUntilChanged().collect { page ->
@@ -936,20 +1044,34 @@ internal fun OriginalViewer(
         Box(Modifier.fillMaxSize()) {
             HorizontalPager(state = pagerState, modifier = Modifier.fillMaxSize()) { page ->
                 val item = viewerItems[page]
+                val isCurrent = page == pagerState.currentPage
+                val target = viewerTarget?.invoke(item, isCurrent) ?: ViewerImageTarget(
+                    thumbnailUrl = thumbnailUrl(item),
+                    displayUrl = mediaUrl(item),
+                    displayIsPreview = false,
+                    canViewOriginal = false,
+                    originalSizeBytes = null,
+                    unavailableReason = null,
+                )
                 ViewerImage(
-                    originalUrl = mediaUrl(item),
-                    placeholderUrl = thumbnailUrl(item),
+                    target = target,
                     contentDescription = item.name,
                     rotation = rotations[page] ?: 0f,
                     onSingleTap = { chromeVisible = !chromeVisible },
                     onLongPress = { sheetItem = item; showInfo = false },
                     onClose = onClose,
+                    onViewOriginal = onViewOriginal,
                 )
             }
 
             if (chromeVisible) {
                 ViewerTopBar(
                     position = "${pagerState.currentPage + 1} / ${viewerItems.size}",
+                    badge = when {
+                        !remote -> null
+                        state.viewerOriginalRequested -> "原图"
+                        else -> "预览"
+                    },
                     onBack = onClose,
                     modifier = Modifier.align(Alignment.TopCenter),
                 )
@@ -1060,7 +1182,12 @@ private const val DOUBLE_TAP_SCALE = 2.5f
 
 /** Top toolbar: back plus the current position inside the browsed list. */
 @Composable
-private fun ViewerTopBar(position: String, onBack: () -> Unit, modifier: Modifier = Modifier) {
+private fun ViewerTopBar(
+    position: String,
+    badge: String?,
+    onBack: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
     Row(
         modifier = modifier
             .fillMaxWidth()
@@ -1079,7 +1206,21 @@ private fun ViewerTopBar(position: String, onBack: () -> Unit, modifier: Modifie
             style = MaterialTheme.typography.bodyMedium,
             textAlign = TextAlign.Center,
         )
-        Spacer(Modifier.width(48.dp))
+        if (badge != null) {
+            Surface(
+                color = Color.Black.copy(alpha = 0.35f),
+                shape = RoundedCornerShape(50),
+            ) {
+                Text(
+                    badge,
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+                    color = Color.White,
+                    style = MaterialTheme.typography.labelMedium,
+                )
+            }
+        } else {
+            Spacer(Modifier.width(48.dp))
+        }
     }
 }
 
@@ -1145,29 +1286,32 @@ private fun ViewerTransferPanel(message: String, fraction: Float?, onCancel: () 
 }
 
 /**
- * One viewer page. The thumbnail the grid already loaded is reused as the progressive placeholder;
- * originals load for composed pager pages without adding a separate prefetch job. Fit bounds come
- * from the real intrinsic size and the Fit result, so rotation and zoom never compute pan against
- * the whole viewport.
+ * One viewer page. The grid thumbnail is reused as the progressive placeholder. LAN pages load the
+ * original directly (unchanged behavior). REMOTE pages load only the page's compressed preview; when
+ * a page has no display url (an adjacent page, or an old desktop without `remote-v1`) it keeps the
+ * thumbnail and never silently pulls a large file. Fit bounds come from the real intrinsic size and
+ * the Fit result, so rotation and zoom never compute pan against the whole viewport.
  */
 @Composable
 private fun ViewerImage(
-    originalUrl: String,
-    placeholderUrl: String,
+    target: ViewerImageTarget,
     contentDescription: String,
     rotation: Float,
     onSingleTap: () -> Unit,
     onLongPress: () -> Unit,
     onClose: () -> Unit,
+    onViewOriginal: () -> Unit,
 ) {
     val context = LocalContext.current
     val density = LocalDensity.current
-    var scale by remember(originalUrl) { mutableFloatStateOf(1f) }
-    var offset by remember(originalUrl) { mutableStateOf(Offset.Zero) }
-    var viewport by remember(originalUrl) { mutableStateOf(IntSize.Zero) }
-    var imageSize by remember(originalUrl) { mutableStateOf<IntSize?>(null) }
-    var attempt by remember(originalUrl) { mutableIntStateOf(0) }
-    var loadState by remember(originalUrl) { mutableStateOf(OriginalLoadState.LOADING) }
+    val displayUrl = target.displayUrl
+    val placeholderUrl = target.thumbnailUrl
+    var scale by remember(displayUrl) { mutableFloatStateOf(1f) }
+    var offset by remember(displayUrl) { mutableStateOf(Offset.Zero) }
+    var viewport by remember(displayUrl) { mutableStateOf(IntSize.Zero) }
+    var imageSize by remember(displayUrl) { mutableStateOf<IntSize?>(null) }
+    var attempt by remember(displayUrl) { mutableIntStateOf(0) }
+    var loadState by remember(displayUrl) { mutableStateOf(OriginalLoadState.LOADING) }
     val cachedThumbnail = remember(placeholderUrl) {
         context.imageLoader.memoryCache?.get(MemoryCache.Key(placeholderUrl))?.bitmap?.asImageBitmap()
     }
@@ -1207,7 +1351,7 @@ private fun ViewerImage(
             .fillMaxSize()
             .testTag(ORIGINAL_VIEWER_IMAGE_TAG)
             .onSizeChanged { viewport = it }
-            .pointerInput(originalUrl, rotation) {
+            .pointerInput(displayUrl, rotation) {
                 detectTapGestures(
                     onTap = { onSingleTap() },
                     onDoubleTap = {
@@ -1219,7 +1363,7 @@ private fun ViewerImage(
                     onLongPress = { onLongPress() },
                 )
             }
-            .pointerInput(originalUrl, rotation) {
+            .pointerInput(displayUrl, rotation) {
                 awaitEachGesture {
                     awaitFirstDown(requireUnconsumed = false)
                     do {
@@ -1241,88 +1385,133 @@ private fun ViewerImage(
             },
         contentAlignment = Alignment.Center,
     ) {
-        Box(
-            modifier = Modifier
-                .then(
-                    if (layout != null) {
-                        with(density) {
-                            // requiredSize keeps the unrotated canvas at its true extent even when a
-                            // quarter turn makes it wider than the viewport; the rotation layer then
-                            // fits the picture instead of the parent clamping the canvas.
-                            Modifier.requiredSize(layout.contentWidth.toDp(), layout.contentHeight.toDp())
-                        }
-                    } else {
-                        Modifier.fillMaxSize()
-                    },
-                )
-                .graphicsLayer {
-                    scaleX = scale
-                    scaleY = scale
-                    translationX = offset.x
-                    translationY = offset.y
-                    rotationZ = rotation
-                },
-            contentAlignment = Alignment.Center,
-        ) {
-            if (loadState != OriginalLoadState.SUCCESS) {
-                // Same URL and identical request builder as the grid, so Coil's stable memory cache
-                // key matches and the placeholder really reuses the already loaded thumbnail.
-                if (cachedThumbnail != null) {
-                    Image(
-                        bitmap = cachedThumbnail,
-                        contentDescription = null,
-                        contentScale = ContentScale.Fit,
-                        modifier = Modifier.fillMaxSize(),
-                    )
-                } else {
-                    AsyncImage(
-                        model = thumbnailImageRequest(context, placeholderUrl),
-                        contentDescription = null,
-                        contentScale = ContentScale.Fit,
-                        modifier = Modifier.fillMaxSize(),
-                    )
+        if (displayUrl == null) {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                ViewerThumbnailPlaceholder(context, placeholderUrl, cachedThumbnail)
+                if (target.unavailableReason != null) {
+                    Surface(
+                        color = Color.Black.copy(alpha = 0.7f),
+                        shape = RoundedCornerShape(10.dp),
+                        modifier = Modifier.padding(24.dp),
+                    ) {
+                        Text(
+                            target.unavailableReason,
+                            modifier = Modifier.padding(12.dp),
+                            color = Color.White,
+                            textAlign = TextAlign.Center,
+                        )
+                    }
                 }
             }
-            AsyncImage(
-                model = ImageRequest.Builder(context)
-                    .data(originalUrl)
-                    .crossfade(true)
-                    .setParameter("originalRetry", attempt)
-                    .build(),
-                contentDescription = contentDescription,
-                contentScale = ContentScale.Fit,
-                modifier = Modifier.fillMaxSize(),
-                onLoading = { loadState = OriginalLoadState.LOADING },
-                onSuccess = { success ->
-                    val drawable = success.result.drawable
-                    imageSize = IntSize(drawable.intrinsicWidth, drawable.intrinsicHeight)
-                    loadState = OriginalLoadState.SUCCESS
-                },
-                onError = { loadState = OriginalLoadState.ERROR },
-            )
+        } else {
+            Box(
+                modifier = Modifier
+                    .then(
+                        if (layout != null) {
+                            with(density) {
+                                // requiredSize keeps the unrotated canvas at its true extent even when a
+                                // quarter turn makes it wider than the viewport; the rotation layer then
+                                // fits the picture instead of the parent clamping the canvas.
+                                Modifier.requiredSize(layout.contentWidth.toDp(), layout.contentHeight.toDp())
+                            }
+                        } else {
+                            Modifier.fillMaxSize()
+                        },
+                    )
+                    .graphicsLayer {
+                        scaleX = scale
+                        scaleY = scale
+                        translationX = offset.x
+                        translationY = offset.y
+                        rotationZ = rotation
+                    },
+                contentAlignment = Alignment.Center,
+            ) {
+                if (loadState != OriginalLoadState.SUCCESS) {
+                    // Same URL and identical request builder as the grid, so Coil's stable memory cache
+                    // key matches and the placeholder really reuses the already loaded thumbnail.
+                    ViewerThumbnailPlaceholder(context, placeholderUrl, cachedThumbnail)
+                }
+                AsyncImage(
+                    model = ImageRequest.Builder(context)
+                        .data(displayUrl)
+                        .crossfade(true)
+                        .setParameter("originalRetry", attempt)
+                        .build(),
+                    contentDescription = contentDescription,
+                    contentScale = ContentScale.Fit,
+                    modifier = Modifier.fillMaxSize(),
+                    onLoading = { loadState = OriginalLoadState.LOADING },
+                    onSuccess = { success ->
+                        val drawable = success.result.drawable
+                        imageSize = IntSize(drawable.intrinsicWidth, drawable.intrinsicHeight)
+                        loadState = OriginalLoadState.SUCCESS
+                    },
+                    onError = { loadState = OriginalLoadState.ERROR },
+                )
+            }
+
+            when (loadState) {
+                OriginalLoadState.LOADING -> CircularProgressIndicator(color = Color.White)
+                OriginalLoadState.ERROR -> Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Text("无法显示此原图", color = Color.White)
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        TextButton(
+                            onClick = {
+                                attempt += 1
+                                loadState = OriginalLoadState.LOADING
+                            },
+                        ) { Text("重试", color = Color.White) }
+                        TextButton(onClick = onClose) { Text("退出", color = Color.White) }
+                    }
+                }
+                OriginalLoadState.SUCCESS -> Unit
+            }
         }
 
-        when (loadState) {
-            OriginalLoadState.LOADING -> CircularProgressIndicator(color = Color.White)
-            OriginalLoadState.ERROR -> Column(
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(8.dp),
+        if (target.canViewOriginal) {
+            Surface(
+                color = Color.Black.copy(alpha = 0.6f),
+                shape = RoundedCornerShape(50),
+                modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 88.dp),
             ) {
-                Text("无法显示此原图", color = Color.White)
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    TextButton(
-                        onClick = {
-                            attempt += 1
-                            loadState = OriginalLoadState.LOADING
-                        },
-                    ) { Text("重试", color = Color.White) }
-                    TextButton(onClick = onClose) { Text("退出", color = Color.White) }
+                TextButton(onClick = onViewOriginal) {
+                    Text(viewOriginalLabel(target.originalSizeBytes), color = Color.White)
                 }
             }
-            OriginalLoadState.SUCCESS -> Unit
         }
     }
 }
+
+/** Reuses the exact thumbnail request the grid used, so Coil's memory cache key matches. */
+@Composable
+private fun ViewerThumbnailPlaceholder(
+    context: android.content.Context,
+    placeholderUrl: String,
+    cachedThumbnail: androidx.compose.ui.graphics.ImageBitmap?,
+) {
+    if (cachedThumbnail != null) {
+        Image(
+            bitmap = cachedThumbnail,
+            contentDescription = null,
+            contentScale = ContentScale.Fit,
+            modifier = Modifier.fillMaxSize(),
+        )
+    } else {
+        AsyncImage(
+            model = thumbnailImageRequest(context, placeholderUrl),
+            contentDescription = null,
+            contentScale = ContentScale.Fit,
+            modifier = Modifier.fillMaxSize(),
+        )
+    }
+}
+
+private fun viewOriginalLabel(sizeBytes: Long?): String =
+    if (sizeBytes != null && sizeBytes > 0) "查看原图 · ${formatBytes(sizeBytes)}" else "查看原图"
 
 @Composable
 private fun ErrorBanner(message: String) {

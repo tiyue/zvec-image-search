@@ -29,17 +29,42 @@ from .image_scheduler import (
     RenderTicket,
 )
 
-ImageVariant = Literal["thumbnail", "preview"]
+ImageVariant = Literal[
+    "thumbnail",
+    "preview",
+    "remote_thumbnail",
+    "remote_preview",
+]
 ImagePriority = Literal["current", "visible", "prefetch", "background"]
 
 _VARIANT_SIZES: Final[dict[ImageVariant, tuple[int, int]]] = {
     "thumbnail": (640, 640),
     "preview": (1920, 1920),
+    "remote_thumbnail": (640, 640),
+    "remote_preview": (1600, 1600),
 }
 _DEFAULT_PRIORITY: Final[dict[ImageVariant, ImagePriority]] = {
     "thumbnail": "visible",
     "preview": "current",
+    "remote_thumbnail": "visible",
+    "remote_preview": "current",
 }
+# Remote variants fit a small public-tunnel budget; the original PNG/JPEG
+# variants keep their existing 32 MiB disk payload allowance.
+_REMOTE_VARIANTS: Final[frozenset[ImageVariant]] = frozenset(
+    {"remote_thumbnail", "remote_preview"}
+)
+_PERSISTED_VARIANTS: Final[frozenset[ImageVariant]] = frozenset(
+    {"thumbnail", "remote_thumbnail", "remote_preview"}
+)
+_REMOTE_TARGET_BYTES: Final[dict[ImageVariant, int]] = {
+    "remote_thumbnail": 80 * 1024,
+    "remote_preview": 500 * 1024,
+}
+_MAX_REMOTE_PAYLOAD_BYTES: Final = 1024 * 1024
+_REMOTE_CONTENT_TYPES: Final[frozenset[str]] = frozenset(
+    {"image/jpeg", "image/png", "image/webp"}
+)
 IMAGE_PRIORITIES: Final[frozenset[str]] = frozenset(
     {"current", "visible", "prefetch", "background"}
 )
@@ -475,13 +500,17 @@ class ImageRegistry:
         stat_result: os.stat_result,
     ) -> Path | None:
         root = self._disk_cache_root
-        if root is None or variant != "thumbnail":
+        if root is None or variant not in _PERSISTED_VARIANTS:
             return None
         normalized_path = os.path.normcase(str(path))
+        namespace = (
+            f"\0{_remote_profile_version()}" if variant in _REMOTE_VARIANTS else ""
+        )
         digest = hashlib.sha256(
             (
                 f"{_DISK_CACHE_SCHEMA}\0{normalized_path}\0"
                 f"{stat_result.st_mtime_ns}\0{stat_result.st_size}\0{variant}"
+                f"{namespace}"
             ).encode("utf-8", errors="surrogatepass")
         ).hexdigest()
         shard = root / digest[:2]
@@ -545,6 +574,8 @@ class ImageRegistry:
 
 
 def _render_image(path: Path, variant: ImageVariant, mtime_ns: int) -> ImagePayload:
+    if variant in _REMOTE_VARIANTS:
+        return _render_remote_image(path, variant, mtime_ns)
     try:
         with Image.open(path) as source:
             width, height = source.size
@@ -590,6 +621,47 @@ def _render_image(path: Path, variant: ImageVariant, mtime_ns: int) -> ImagePayl
         raise ImageRegistryError("图片预览生成失败。")
     etag = f'"{mtime_ns:x}-{len(content):x}-{variant}"'
     return ImagePayload(content=content, content_type=content_type, etag=etag)
+
+
+def _render_remote_image(
+    path: Path,
+    variant: ImageVariant,
+    mtime_ns: int,
+) -> ImagePayload:
+    """Render a bounded remote variant from the original source."""
+
+    # Imported lazily so ``remote_image`` can reuse ``ImageRegistryError``.
+    from .remote_image import encode_remote_media
+
+    try:
+        encoding = encode_remote_media(
+            path,
+            long_edge=_VARIANT_SIZES[variant][0],
+            target_bytes=_REMOTE_TARGET_BYTES[variant],
+            hard_cap_bytes=_MAX_REMOTE_PAYLOAD_BYTES,
+        )
+    except ImageRegistryError:
+        raise
+    except (OSError, UnidentifiedImageError, ValueError) as exc:
+        raise ImageRegistryError("图片格式损坏或暂不支持预览。") from exc
+    content = encoding.content
+    if (
+        not content
+        or len(content) > _MAX_REMOTE_PAYLOAD_BYTES
+        or encoding.content_type not in _REMOTE_CONTENT_TYPES
+    ):
+        raise ImageRegistryError("无法在大小限制内生成远程预览图片。")
+    return ImagePayload(
+        content=content,
+        content_type=encoding.content_type,
+        etag=f'"{mtime_ns:x}-{len(content):x}-{variant}"',
+    )
+
+
+def _remote_profile_version() -> str:
+    from .remote_image import REMOTE_PROFILE_VERSION
+
+    return REMOTE_PROFILE_VERSION
 
 
 def _prepare_disk_cache(cache_directory: str | Path | None) -> Path | None:
@@ -670,7 +742,9 @@ def _read_disk_payload(
         if not path.is_file() or _is_link_like(path) or _is_link_like(path.parent):
             return None
         size = path.stat().st_size
-        if size <= 0 or size > _MAX_DISK_PAYLOAD_BYTES:
+        remote = variant in _REMOTE_VARIANTS
+        max_bytes = _MAX_REMOTE_PAYLOAD_BYTES if remote else _MAX_DISK_PAYLOAD_BYTES
+        if size <= 0 or size > max_bytes:
             path.unlink(missing_ok=True)
             return None
         content = path.read_bytes()
@@ -683,6 +757,8 @@ def _read_disk_payload(
             content_type = "image/jpeg"
         elif image_format == "PNG":
             content_type = "image/png"
+        elif image_format == "WEBP" and remote:
+            content_type = "image/webp"
         else:
             raise ValueError("unsupported thumbnail cache format")
         return ImagePayload(

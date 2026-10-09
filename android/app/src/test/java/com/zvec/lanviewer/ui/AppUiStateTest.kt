@@ -1,5 +1,7 @@
 package com.zvec.lanviewer.ui
 
+import com.zvec.lanviewer.data.local.ConnectionMode
+import com.zvec.lanviewer.data.local.SavedConnection
 import com.zvec.lanviewer.data.model.SearchItem
 import com.zvec.lanviewer.data.model.SearchMode
 import com.zvec.lanviewer.data.model.RecommendationItem
@@ -7,6 +9,7 @@ import kotlinx.collections.immutable.persistentListOf
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class AppUiStateTest {
@@ -80,5 +83,49 @@ class AppUiStateTest {
 
         assertEquals("recommended", recommendationState.currentViewerItem()?.mediaId)
         assertEquals(listOf(recommendation), recommendationState.viewerItems())
+    }
+
+    @Test
+    fun modeSwitchKeepsDraftAndClearsStagedResultsAndViewer() {
+        val state = AppUiState(
+            phase = ConnectionPhase.READY,
+            searchText = "sunset",
+            searchMode = SearchMode.TAG,
+            topKText = "48",
+            selectedLibraryIds = setOf("lib-1"),
+            results = persistentListOf(SearchItem(mediaId = "m1")),
+            totalResults = 1,
+            activeSearchId = "search-1",
+            viewerSource = ViewerSource.SEARCH,
+            viewerIndex = 0,
+            errorMessage = "旧错误",
+        )
+
+        val switched = state.afterModeSwitched(
+            SavedConnection(
+                baseUrl = "http://39.105.48.52:38522",
+                instanceId = "pc-1",
+                displayName = "PC",
+                mode = ConnectionMode.REMOTE,
+                lanBaseUrl = "http://192.168.1.10:38522",
+                remoteBaseUrl = "http://39.105.48.52:38522",
+                supportsRemoteMedia = true,
+            ),
+        )
+
+        assertEquals("sunset", switched.searchText)
+        assertEquals(SearchMode.TAG, switched.searchMode)
+        assertEquals("48", switched.topKText)
+        assertEquals(setOf("lib-1"), switched.selectedLibraryIds)
+        assertTrue(switched.results.isEmpty())
+        assertEquals(0, switched.totalResults)
+        assertNull(switched.activeSearchId)
+        assertNull(switched.viewerIndex)
+        assertNull(switched.viewerSource)
+        assertNull(switched.errorMessage)
+        assertEquals(ConnectionPhase.CONNECTING, switched.phase)
+        assertEquals(ConnectionMode.REMOTE, switched.connectionMode)
+        assertEquals("http://39.105.48.52:38522", switched.connectionOrigin)
+        assertEquals(MODE_SWITCH_NOTICE, switched.searchRestoreNotice)
     }
 }

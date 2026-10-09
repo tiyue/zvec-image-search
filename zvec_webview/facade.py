@@ -133,6 +133,7 @@ from zvec_host.search_service import (
 
 from .image_registry import ImageRegistry, ImageRegistryError
 from .lan_access import LanAccessController, LanAccessError
+from .remote_access import RemoteAccessController, RemoteAccessError
 
 _TERMINAL_STATUSES = frozenset(
     {
@@ -333,6 +334,7 @@ class PreviewFacade:
         search_learning_service: SearchLearningService | None = None,
         data_migration_coordinator: DataMigrationCoordinator | None = None,
         lan_access_controller: LanAccessController | None = None,
+        remote_access_controller: RemoteAccessController | None = None,
         observer_job_history_fallback: bool = False,
     ) -> None:
         if not isinstance(observer_job_history_fallback, bool):
@@ -436,6 +438,11 @@ class PreviewFacade:
         self._lan_access = lan_access_controller or LanAccessController(
             self,
             self._configuration.config_home,
+            endpoint_provider=self._connection_endpoints,
+        )
+        self._remote_access = remote_access_controller or RemoteAccessController(
+            self._configuration.config_home,
+            lan_endpoint=self._current_lan_endpoint,
         )
 
     @property
@@ -573,16 +580,56 @@ class PreviewFacade:
         return self._lan_access_call(self._lan_access.status)
 
     def update_lan_access(self, payload: Mapping[str, Any]) -> JsonObject:
-        return self._lan_access_call(lambda: self._lan_access.update(payload))
+        # The tunnel points at the previous listener; rebuild it after a valid
+        # LAN listener change so no stale "connected" state survives.
+        self._pause_remote_for_lan()
+        try:
+            return self._lan_access_call(lambda: self._lan_access.update(payload))
+        finally:
+            self._remote_restart_after_lan()
 
     def start_lan_access(self) -> JsonObject:
-        return self._lan_access_call(self._lan_access.start)
+        status = self._lan_access_call(self._lan_access.start)
+        self._remote_restart_after_lan()
+        return status
 
     def start_lan_access_if_enabled(self) -> None:
         self._lan_access.start_if_enabled()
 
     def stop_lan_access(self) -> JsonObject:
+        self._pause_remote_for_lan()
         return self._lan_access_call(self._lan_access.stop)
+
+    def remote_access_status(self) -> JsonObject:
+        return self._remote_access_call(self._remote_access.status)
+
+    def import_remote_access_config(self, payload: Mapping[str, Any]) -> JsonObject:
+        source_path = (
+            payload.get("source_path") if isinstance(payload, Mapping) else None
+        )
+        return self._remote_access_call(
+            lambda: self._remote_access.import_config(source_path)
+        )
+
+    def update_remote_access(self, payload: Mapping[str, Any]) -> JsonObject:
+        enabled = payload.get("enabled") if isinstance(payload, Mapping) else None
+        if enabled is True:
+            self._prepare_remote_start()
+        return self._remote_access_call(
+            lambda: self._remote_access.set_enabled(enabled)
+        )
+
+    def start_remote_access(self) -> JsonObject:
+        # Fail fast with an actionable message when configuration or the mobile
+        # gateway is missing.
+        self._prepare_remote_start()
+        return self._remote_access_call(self._remote_access.start)
+
+    def stop_remote_access(self) -> JsonObject:
+        return self._remote_access_call(self._remote_access.stop)
+
+    def start_remote_access_if_enabled(self) -> None:
+        self._remote_access.start_if_enabled()
 
     def approve_lan_pairing(self, pairing_id: str) -> JsonObject:
         return self._lan_access_call(lambda: self._lan_access.approve(pairing_id))
@@ -603,6 +650,83 @@ class PreviewFacade:
                 exc.message,
                 status=exc.status,
             ) from exc
+
+    @staticmethod
+    def _remote_access_call(call: Callable[[], JsonObject]) -> JsonObject:
+        try:
+            return call()
+        except RemoteAccessError as exc:
+            raise FacadeError(
+                exc.code,
+                exc.message,
+                status=exc.status,
+            ) from exc
+
+    def _current_lan_endpoint(self) -> tuple[str, int]:
+        listener = self._lan_access.running_listener()
+        if listener is None:
+            raise LanAccessError(
+                "lan_not_running",
+                "局域网服务尚未运行，开启移动端网关后才能启动远程访问。",
+                status=409,
+            )
+        return listener
+
+    def _connection_endpoints(self) -> dict[str, str]:
+        """Trusted LAN/remote origins for the authenticated status contract.
+
+        The LAN origin comes from the live listener's advertised address, and
+        the remote origin from our owned FRPC configuration.  Request Host
+        headers and UDP discovery data are never used here.  The remote
+        controller is created after the LAN controller, so it is only touched
+        when this callback is actually requested.
+        """
+
+        endpoints: dict[str, str] = {}
+        listener = self._lan_access.running_listener()
+        if listener is not None:
+            host, port = listener
+            endpoints["lan"] = f"http://{host}:{port}"
+        remote = self._remote_access.public_url
+        if remote:
+            endpoints["remote"] = remote
+        return endpoints
+
+    def _pause_remote_for_lan(self) -> None:
+        with suppress(Exception):
+            self._remote_access.pause()
+
+    def _remote_restart_after_lan(self) -> None:
+        try:
+            if not self._lan_access.status().get("running"):
+                return
+        except Exception:
+            return
+        self._remote_access.restart_if_enabled()
+
+    def _prepare_remote_start(self) -> None:
+        if not self._remote_access.status().get("configured"):
+            raise FacadeError(
+                "remote_not_configured",
+                "请先导入 FRPC 配置文件。",
+                status=409,
+            )
+        self._ensure_lan_for_remote()
+
+    def _ensure_lan_for_remote(self) -> None:
+        try:
+            status = self._lan_access.status()
+            if not status.get("running"):
+                if not status.get("enabled"):
+                    raise LanAccessError(
+                        "lan_access_disabled",
+                        "请先开启 Android 局域网访问并保存设置。",
+                        status=409,
+                    )
+                self._lan_access.start()
+            self._current_lan_endpoint()
+        except LanAccessError as exc:
+            raise FacadeError(exc.code, exc.message, status=exc.status) from exc
 
     def job_history(
         self,
@@ -3278,6 +3402,7 @@ class PreviewFacade:
                     self._activity.close(timeout=2.0)
                 if self._owns_search_learning:
                     self._search_learning.close()
+                self._remote_access.close()
                 self._lan_access.close()
                 self._registry.close()
                 self._invalidate_catalog()
