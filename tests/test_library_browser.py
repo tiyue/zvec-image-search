@@ -766,6 +766,15 @@ class FolderListQueryTest(unittest.TestCase):
     def test_search_matches_folder_names_root_paths_and_literal_wildcards(
         self,
     ) -> None:
+        # The production search also matches roots.current_path, so the default
+        # roots under a random tempfile directory would let wildcard queries
+        # ("_", "%") hit the temp name.  Rebind this test's roots to
+        # deterministic absolute metadata paths so the literal-wildcard
+        # assertions cannot depend on the temp name.  Only the root rows change;
+        # the query reads the database and never needs these paths to exist.
+        anchor = Path(self.state_path.anchor)
+        self.state.record_root("root-a", str(anchor / "gallery-a"), True)
+        self.state.record_root("root-b", str(anchor / "gallery-b"), True)
         with LibraryBrowser(
             library_id="library-a", state_path=self.state_path
         ) as browser:
