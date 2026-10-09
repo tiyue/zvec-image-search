@@ -57,6 +57,7 @@ from .recommendations import (
     PreparedPersonalizationProfile,
     RecommendationCandidate,
     RecommendationSelection,
+    RecommendationSlot,
     apply_personalization_profile,
     prepare_personalization_profile,
     select_recommendations,
@@ -1782,7 +1783,7 @@ class BackendJobManager:
         request_id: str,
         *,
         selector: Callable[..., RecommendationSelection],
-        slot_quotas: Mapping[str, int],
+        slot_quotas: Mapping[RecommendationSlot, int],
     ) -> dict[str, Any]:
         total_started = perf_counter()
         existing = store.batch_for_request(viewer_id, request_id)
@@ -5436,7 +5437,7 @@ def _recommendation_seed(viewer_id: str, request_id: str) -> int:
 
 def _recommendation_requires_candidate_expansion(
     selection: RecommendationSelection,
-    slot_quotas: Mapping[str, int] = SLOT_QUOTAS,
+    slot_quotas: Mapping[RecommendationSlot, int] = SLOT_QUOTAS,
 ) -> bool:
     if selection.status != "complete" or selection.history_window != 240:
         return True
@@ -5759,7 +5760,7 @@ def _recommendation_response(
     diversity: Mapping[str, object],
     personalization: Mapping[str, object],
     selection: RecommendationSelection | None = None,
-    slot_quotas: Mapping[str, int] = SLOT_QUOTAS,
+    slot_quotas: Mapping[RecommendationSlot, int] = SLOT_QUOTAS,
 ) -> dict[str, Any]:
     counts = {slot: 0 for slot in slot_quotas}
     if selection is not None:

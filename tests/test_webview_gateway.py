@@ -694,9 +694,10 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(history["page_size"], 60)
 
         for page_size in ("0", "101", "many"):
-            with self.subTest(page_size=page_size), self.assertRaises(
-                HTTPError
-            ) as caught:
+            with (
+                self.subTest(page_size=page_size),
+                self.assertRaises(HTTPError) as caught,
+            ):
                 urlopen(
                     self.server.url
                     + f"api/results/latest?page=1&page_size={page_size}",

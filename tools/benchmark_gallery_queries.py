@@ -750,9 +750,7 @@ def _write_cost(
         started = time.perf_counter()
         state.set_many(entries)
         elapsed = (time.perf_counter() - started) * 1_000
-        index_present_after = _connection_has_index(
-            state.connection, FOLDER_PAGE_INDEX
-        )
+        index_present_after = _connection_has_index(state.connection, FOLDER_PAGE_INDEX)
     finally:
         state.close()
     return {
@@ -835,9 +833,7 @@ def run_scenario(scenario: Scenario, work_root: Path, *, keep: bool) -> dict[str
                 ).fetchone()[0]
             )
             rows = int(
-                reader.connection.execute(
-                    "SELECT COUNT(*) FROM entries"
-                ).fetchone()[0]
+                reader.connection.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
             )
         finally:
             reader.close()

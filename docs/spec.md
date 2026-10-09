@@ -1,6 +1,6 @@
 # 曜镜（YaoLens）项目规格文档
 
-> 版本：0.5（机器 SemVer：0.5.0）| 最后更新：2026-08-21
+> 版本：0.6（机器 SemVer：0.6.0）| 最后更新：2026-10-10
 
 ## 概述
 
@@ -378,15 +378,16 @@ CLI 入口将配置创建、迁移/后端服务、需要 `ImageVectorService` �
 - **安装版常驻**：NSIS 注册当前用户登录任务；卸载时移除该任务
 - **portable 常驻**：不注册计划任务，仅手工启动后的当前登录会话内常驻
 - **安卓端**：Gradle 构建 .apk
-- **发布版本**：机器版本 `0.5.0`，公开展示版本 `0.5`，稳定标签 `v0.5.0`
-- **Windows 版本资源**：发布载荷内三个可执行文件的产品名均为 `YaoLens`，文件版本与产品版本均展示为 `0.5.0`，固定数值版本为 `0.5.0.0`
+- **发布版本**：机器版本 `0.6.0`，公开展示版本 `0.6`，稳定标签 `v0.6.0`；Android 手机 versionCode 为 `600000`
+- **Windows 版本资源**：发布载荷内三个可执行文件的产品名均为 `YaoLens`，文件版本与产品版本均展示为 `0.6.0`，固定数值版本为 `0.6.0.0`
 - **发布矩阵**：仅发布 YaoLens Windows、Android 及对应校验、验证报告和策略元数据
-- **公开附件**：`YaoLens-0.5-win-x64-portable.zip`、`YaoLens-0.5-win-x64-setup.exe`、`YaoLens-0.5-android.apk`
+- **公开附件**：`YaoLens-0.6-win-x64-portable.zip`、`YaoLens-0.6-win-x64-setup.exe`、`YaoLens-0.6-android.apk`
 - **矩阵约束**：登录常驻不新增独立附件或产品，现有 GitHub Release 资产矩阵保持不变
 - **禁止产物**：不发布 Zvec-Desktop 安装包、便携包或 Python wheel
 - **内部组件**：`zvec.exe`、`zvec-backend.exe` 仅随 WebView 包交付
 - **质量门禁**：搜索质量验证；显式使用 `allow_uncertified_search_quality=true` 时记录为未提供正式认证
 - **冻结依赖门禁**：Windows 构建环境固定安装并校验 `watchdog==6.0.0`；冻结包自检必须成功导入 `image_vector_service.file_watcher` 与 `watchdog.observers`，防止自动索引监听依赖遗漏后进入发布包
+- **0.6 发布记录**：`docs/release-0.6.md` 记录本轮范围、构建、验收和公开附件；旧标签和附件不覆盖，Wear 模块不增加独立 Release 附件。
 
 ## API 协议
 

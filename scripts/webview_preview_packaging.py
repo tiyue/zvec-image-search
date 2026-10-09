@@ -593,13 +593,13 @@ def inspect_payload(payload_directory: Path) -> PayloadInspection:
     for suffix in _REQUIRED_RELATIVE_SUFFIXES:
         if not any(path.endswith(suffix.casefold()) for path in folded_relative):
             errors.append(f"Required web asset is missing: {suffix}")
-    for relative in (
+    for required_relative in (
         "_internal/frp/frpc.exe",
         "_internal/frp/LICENSE",
         "_internal/frp/provenance.json",
     ):
-        if relative.casefold() not in folded_relative:
-            errors.append(f"Required FRPC component is missing: {relative}")
+        if required_relative.casefold() not in folded_relative:
+            errors.append(f"Required FRPC component is missing: {required_relative}")
     frontend_manifests = [
         path
         for relative, path in folded_relative.items()

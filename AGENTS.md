@@ -12,6 +12,7 @@
 - 安卓 A 阶段图片交付、状态与原生验收：`docs/android-optimization-round-a.md`
 - 安卓 B 阶段自适应浏览、大图交互与原生验收：`docs/android-optimization-round-b.md`
 - FRPC 内置托管、安卓双模式与远程压缩图片实施：`docs/remote-access-image-delivery-deepseek.md`
+- YaoLens 0.6 版本、打包、发布和验收记录：`docs/release-0.6.md`
 
 ## 发布矩阵
 

@@ -164,9 +164,7 @@ class _FakeBackend:
         client_id: str,
         device_id: str,
     ) -> dict[str, object]:
-        self.watch_recommendation_created.append(
-            (request_id, client_id, device_id)
-        )
+        self.watch_recommendation_created.append((request_id, client_id, device_id))
         return {
             "request_id": request_id,
             "batch_id": "watch-batch-1",
@@ -1255,9 +1253,7 @@ class LanHttpApiTests(unittest.TestCase):
         def broken() -> dict[str, str]:
             raise RuntimeError("desktop provider exploded")
 
-        server, address, _uploads = self.start_extra_server(
-            endpoint_provider=broken
-        )
+        server, address, _uploads = self.start_extra_server(endpoint_provider=broken)
 
         response = self.request("GET", "/api/v1/status", port=address.port)
 

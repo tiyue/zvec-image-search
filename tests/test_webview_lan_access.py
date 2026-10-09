@@ -534,15 +534,11 @@ class PreviewLanAdapterTests(unittest.TestCase):
         self.assertIsNone(
             self.adapter.resolve_remote_thumbnail(media_id, client_id="tablet-b")
         )
-        self.assertIsNone(
-            self.adapter.resolve_preview(media_id, client_id="tablet-b")
-        )
+        self.assertIsNone(self.adapter.resolve_preview(media_id, client_id="tablet-b"))
         self.assertIsNone(
             self.adapter.resolve_remote_thumbnail("unknown", client_id="tablet-a")
         )
-        self.assertIsNone(
-            self.adapter.resolve_preview("unknown", client_id="tablet-a")
-        )
+        self.assertIsNone(self.adapter.resolve_preview("unknown", client_id="tablet-a"))
 
         Image.new("RGB", (90, 130), (10, 20, 30)).save(self.source)
 

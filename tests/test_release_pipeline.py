@@ -89,7 +89,7 @@ class ReleaseRequestPolicyTest(unittest.TestCase):
         )
         self.assertEqual(outputs["exact_tag_ref"], "false")
         self.assertEqual(outputs["search_quality_certified"], "false")
-        self.assertEqual(outputs["public_version"], "0.5")
+        self.assertEqual(outputs["public_version"], public_version(version))
 
     def test_uncertified_release_must_be_explicit(self) -> None:
         root = repository_root()
@@ -341,15 +341,15 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
 
     def test_public_version_and_android_version_are_synchronized(self) -> None:
         root = repository_root()
-        self.assertEqual(read_project_version(root), "0.5.0")
-        self.assertEqual(public_version(read_project_version(root)), "0.5")
+        self.assertEqual(read_project_version(root), "0.6.0")
+        self.assertEqual(public_version(read_project_version(root)), "0.6")
         android = (root / "android/app/build.gradle.kts").read_text(encoding="utf-8")
-        self.assertIn("versionCode = 500010", android)
-        self.assertIn('versionName = "0.5.0"', android)
+        self.assertIn("versionCode = 600000", android)
+        self.assertIn('versionName = "0.6.0"', android)
         frontend = json.loads(
             (root / "frontend/package.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(frontend["version"], "0.5.0")
+        self.assertEqual(frontend["version"], "0.6.0")
 
     def test_public_release_documents_use_stable_yaolens_names(self) -> None:
         root = repository_root()
@@ -359,9 +359,9 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
         )
         folded = documents.casefold()
         for expected in (
-            "YaoLens-0.5-win-x64-portable.zip",
-            "YaoLens-0.5-win-x64-setup.exe",
-            "YaoLens-0.5-android.apk",
+            "YaoLens-0.6-win-x64-portable.zip",
+            "YaoLens-0.6-win-x64-setup.exe",
+            "YaoLens-0.6-android.apk",
         ):
             self.assertIn(expected, documents)
         for forbidden in (
@@ -376,7 +376,7 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
         self.assertNotRegex(folded, r"\bsigned\b")
 
         spec = (root / "docs/spec.md").read_text(encoding="utf-8")
-        self.assertIn("版本：0.5（机器 SemVer：0.5.0）", spec)
+        self.assertIn("版本：0.6（机器 SemVer：0.6.0）", spec)
         self.assertIn("公开主程序 `YaoLens.exe`", spec)
 
 
