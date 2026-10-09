@@ -83,6 +83,15 @@ class _State:
             if str(entry["doc_id"]) in requested
         }
 
+    def update_perceptual_hashes(self, updates: Any) -> None:
+        for doc_id, value in updates:
+            if not value:
+                continue
+            for entry in self.entries:
+                if entry["doc_id"] == doc_id and not entry.get("perceptual_hash"):
+                    entry["perceptual_hash"] = str(value)
+                    break
+
 
 class _Resolver:
     def resolve_fields(self, fields: dict[str, Any]) -> Path:
@@ -133,7 +142,9 @@ class _ForbiddenModelClient:
 
 class _AutoTaggingReview:
     def __init__(self) -> None:
-        self.tags: dict[str, list[str]] = {"doc-a": [], "doc-b": []}
+        self.tags: dict[str, list[str]] = {
+            doc_id: [] for doc_id in ("doc-a", "doc-b", "doc-c", "doc-d")
+        }
         self.fail_docs: set[str] = set()
         self.finalized = 0
 

@@ -25,3 +25,4 @@ APK 沿用既有 debug 构建/签名，不生成或承诺商店正式签名。�
 - 全仓 Ruff lint/format 通过；主 mypy 136 文件、冻结入口 2 文件、搜索质量工具 18 文件通过。预检查先复现6处类型错误与4文件格式阻断，最小修正涉及 `scripts/webview_preview_packaging.py`、`image_vector_service/backend_server.py`、`tests/test_lan_http_api.py`、`tests/test_webview_gateway.py`、`tests/test_webview_lan_access.py` 和 `tools/benchmark_gallery_queries.py`；四处格式修改 AST 相同，推荐只改类型声明，FRPC 检查只改局部变量名。
 - 发布、打包和推荐68项回归初次有3个旧版本断言失败；同步对应仓库版本断言（包括 `tests/test_webview_preview_packaging.py`）后68项全部通过，不删除或弱化检查。
 - Vite 重新构建成功，与已提交前端产物完全一致；0.6.0/0.6/0.6.0.0 版本与资源闭包已独立验证。
+- 首轮云端工作流 `37958821714` 在Linux全量1697项回归出现4个旧测试替身错误，发布被门禁阻止；安卓、前端、Python 3.10/3.14兼容及Windows冻结包/安装器门禁已经通过。协调者在本地9项聚类集成用例复现同样4错，限定 `tests/test_clustering_task_integration.py` 补真实内存感知哈希写回、初始化四个文档标签后9项通过，保留所有断言。第四份执行器报告 completed、scope为空、runtime_cleanup=removed。修复后重新执行全部发布门禁；仅更新本任务新建且尚无Release的0.6标签，旧0.5保持。
